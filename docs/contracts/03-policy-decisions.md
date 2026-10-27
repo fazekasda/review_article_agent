@@ -40,7 +40,9 @@ proposals below cannot silently weaken them.
 The three repair-round maxima (3, 2, 2) above are **already-confirmed numeric
 limits** and must **not** be confused with the **open** thresholds listed in section
 3 (tracing hop/source/retry defaults, coverage stop rules, costs/concurrency). A
-model edit cannot replenish an exhausted repair budget ([spec line 55](../specification.md)).
+model edit cannot replenish an exhausted repair budget, and **no decision record in
+this register — and no ordinary approval — lifts these fixed repair-round maxima**
+([spec line 55](../specification.md)).
 
 ---
 
@@ -67,7 +69,7 @@ later steps can validate records mechanically.
 | `affected_stages` | string[] | Implementation step ids whose behavior depends on this record. |
 | `blocking_dependencies` | string[] | Named behaviors that must stay blocked while the record is open. |
 | `fail_closed_behavior` | string | What the system does when the value is unset/unknown. |
-| `numeric_value` | number \| string \| `UNSET` | A number only when the **user** set it; `UNSET` otherwise. Never invented to let a stage pass. |
+| `numeric_value` | number \| string \| `UNSET` | A **single representative scalar** only, set only when the **user** set it; `UNSET` otherwise. A structured value (e.g. a multi-ceiling caps object) is carried in `notes` and its detail stays unresolved. Never invented to let a stage pass. |
 | `notes` | string | Caveats, limitations, revisit conditions. |
 
 **Hard rule — no fabricated thresholds.** `numeric_value` is `UNSET` unless the user
@@ -85,7 +87,10 @@ rest. Unless an entry says otherwise, every entry in sections 2–5 inherits:
 `recommendation`/`options`/`affected_stages`/`blocking_dependencies`/
 `fail_closed_behavior`/`notes` taken from the entry text. A validator can therefore
 materialize a complete record for any entry by combining its stated fields with these
-defaults; no entry may rely on an **unstated, non-default** value.
+defaults; no entry may rely on an **unstated, non-default** value. `numeric_value` is a
+single representative scalar; where a value is structured (multiple ceilings, a caps
+object), the projection shows only a representative scalar and the structure is left
+unresolved in `notes`.
 
 ### 1.2 Status values and transitions
 
@@ -126,17 +131,21 @@ defaults; no entry may rely on an **unstated, non-default** value.
    revision decision, not an in-place edit of the accepted text.
 5. No agent/model output may set any status; only explicit user evidence may.
 
-### 1.4 Complete record examples (valid and invalid)
+### 1.4 Decision-record examples (types checked; illustrative, never an acceptance)
 
-**Valid full record (still `proposed`, i.e. OPEN).** Every field present:
+These examples are **synthetic/illustrative**. None is an acceptance; `user_evidence`
+values shown are hypothetical placeholders, never a real approval, and no example
+lifts the fixed repair-round maxima (section 0).
+
+**Full proposed record (every field present).**
 
 ```json
 {
   "id": "POL-OPS-COST",
   "title": "Cost and concurrency limits",
   "status": "proposed",
-  "baseline_excerpt": "Bounded budgets/concurrency; no busy loop while waiting.",
-  "baseline_ref": "docs/specification.md lines 11, 13",
+  "baseline_excerpt": "Within-project concurrency may be bounded independently.",
+  "baseline_ref": "docs/specification.md line 11",
   "recommendation": "Define per-project and per-stage cost ceilings and a within-project concurrency bound.",
   "options": [
     "explicit ceilings + concurrency bound",
@@ -151,18 +160,23 @@ defaults; no entry may rely on an **unstated, non-default** value.
   "blocking_dependencies": ["any new paid call", "concurrency above the bound"],
   "fail_closed_behavior": "With unset ceilings, no new paid call is issued; unknown cost retains its reserve.",
   "numeric_value": "UNSET",
-  "notes": "Distinct from the confirmed repair-round maxima."
+  "notes": "Representative scalar only; a multi-ceiling caps object is structured and unresolved. Distinct from the confirmed repair-round maxima."
 }
 ```
 
-**Valid transitioned record.** The only legal change is a user-driven transition,
-which **must** carry evidence and an exact revision:
+The `baseline_excerpt` above is an **exact** source fragment (spec line 11). The
+broader cost/concurrency baseline is the paraphrase recorded in POL-OPS-COST; a record
+must never present a paraphrase as an excerpt.
+
+**Illustrative transition PATCH (NOT a full record; synthetic, not an acceptance).**
+This shows only the fields a user transition changes; every other mandatory field is
+inherited from the full record above and is **not** re-listed here.
 
 ```json
 {
   "id": "POL-OPS-COST",
   "status": "accepted",
-  "user_evidence": "<verbatim user statement>, 2026-10-27",
+  "user_evidence": "<verbatim user statement>, <date>",
   "decided_against_revision": "<40-char commit SHA>",
   "numeric_value": "<user-supplied ceiling>"
 }
@@ -183,7 +197,8 @@ Rejected: rule 1.3(2) requires `user_evidence` **and** `decided_against_revision
 ```
 
 Rejected: a coordinator/session may not set a numeric scientific threshold; only the
-user may, and only on an accepted/modified transition.
+user may, and only on an accepted/modified transition. The value `0.95` is a
+deliberately invalid fixture, **not** a recommendation.
 
 ---
 
@@ -496,9 +511,10 @@ approve any of the choices below, which Step 01 must present for the user's deci
 
 ### ARCH-ASSETS — Immutable assets and revision dependencies
 
-- **Proposal.** Assets are content-addressed immutable revisions; approvals and
-  dependency edges reference exact artifact revisions, not filenames or generic
-  permissions ([spec lines 54–55](../specification.md)). An approved artifact edited
+- **Proposal.** Assets are immutable revisions identified by the canonical tuple
+  `{project_id, artifact_id, revision_id}`; approvals and dependency edges reference
+  those exact tuples, not filenames or generic permissions
+  ([spec lines 54–55](../specification.md)). An approved artifact edited
   afterward becomes a proposal and invalidates affected checks
   ([02 lines 16–17](../implementation/02-project-foundation.md)).
 - **Alternatives.** (a) hash-addressed immutable revisions + dependency edges;
@@ -595,68 +611,104 @@ approve any of the choices below, which Step 01 must present for the user's deci
 
 ## 5. Rights and privacy model v1
 
-### 5.1 RightsRecord v1 — mandatory, fully typed
+### 5.1 RightsRecord v1 — canonical immutable identity and typing
 
-A `RightsRecord` v1 is mandatory for every acquired source and every use of it. The
-table below is the **type definition**; every field is required, and a record missing
-a required field is **invalid** and fail-closed (see the validity rules below and the
-examples in 5.6).
+**Canonical immutable reference.** Across the Step 01 contracts, content is identified
+by the canonical immutable tuple `{project_id, artifact_id, revision_id}`. Two tuples
+denote the same content revision only if **all three** components match, and a
+reference used by a record must be **same-project** as that record. Sibling contract
+**C01** maps its reference/projection fields onto this canonical record (mapping below).
+
+**Record identity (immutable).** A `RightsRecord` v1 is immutable and identified by
+`{project_id, rights_id, record_revision}`; any change produces a **new**
+`record_revision` (a new immutable record), never an in-place edit.
+
+**Subject — discriminated union.** The record's subject is exactly one of:
+
+- `{"kind": "source_revision", "project_id": ..., "artifact_id": ..., "revision_id": ...}`
+  — used whenever a content **revision exists**.
+- `{"kind": "subject_artifact_ref", "project_id": ..., "artifact_id": ...}` — used
+  **only** for pre-acquisition / missing-full-text cases where **no content revision
+  exists yet**. It carries **no** `revision_id`; a content version is never fabricated.
+
+**Fields (all mandatory):**
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `rights_id` | string | Stable id of this rights record, e.g. `RIGHTS-<source>`. |
-| `project_id` | string | App-owned **project** id this record belongs to. |
-| `source_revision` | string | Immutable **source revision** ref the rights bind to (content-addressed asset revision). |
-| `record_revision` | integer | Version of this rights record; bumped on change and bound by decisions. |
-| `authorizing_revision` | string \| null | Exact revision the authorization binds to; `null` until authorized. |
-| `operations` | object | Per-operation status map over the four operations (enum below). |
-| `basis` | object | Per-operation evidence/basis (shape below). |
+| `rights_id` | string | Stable id; identity = `{project_id, rights_id, record_revision}`. |
+| `project_id` | string | Owning app-owned project id. |
+| `record_revision` | integer | Immutable revision of this record; a change makes a new record. |
+| `subject` | object | Discriminated union above (`kind` ∈ `source_revision` \| `subject_artifact_ref`). |
+| `operations` | object | Map over the four operations → `allowed` \| `not_allowed` \| `unknown` \| `not_applicable`. |
+| `basis` | object | Per-operation typed evidence (shape below). |
+| `authorization` | object \| null | Exact auth provenance `{actor, method, authorized_at, against_revision, basis}`; `null` until authorized. |
 | `restrictions` | string[] | Declared limits, e.g. `no_redistribution`, `no_hosting`, `quote_limit`. |
-| `privacy` | object | `{personal_data: bool, confidentiality: enum}` where `confidentiality` ∈ `public` \| `confidential` \| `unknown`. |
-| `recorded_by` | string | Actor that recorded the record (user or agent id). |
+| `privacy` | object | `{personal_data: bool, confidentiality: public \| confidential \| unknown, denial: bool}`. |
+| `recorded_by` | string | Actor that recorded the record. **Not** an authorization. |
 | `recorded_at` | string | ISO-8601 timestamp. |
-| `derived_status` | enum | `valid` \| `incomplete` \| `inconsistent` — **computed**, not hand-set. |
+| `derived_status` | enum | `incomplete` \| `valid` \| `inconsistent` — **computed**, not hand-set. |
 
-**Operation enum (canonical).** Each of the four operations takes exactly one value:
-`allowed` | `not_allowed` | `unknown` | `not_applicable`. These are the canonical
-operation-status values used across the Step 01 contracts (sibling contract C01 uses
-the same four).
+**Operation enum (canonical).** `allowed` | `not_allowed` | `unknown` |
+`not_applicable` — the canonical operation-status values used across the Step 01
+contracts (sibling contract C01 uses the same four).
 
 **Operations (four, separate).** `acquisition`, `storage`, `redistribution`,
 `hosted_transfer`. The four rights are **separate**: "Acquisition, storage,
 redistribution, and hosted-model transfer rights are separate. Uploading a file is not
 proof of all rights." ([spec line 63](../specification.md)).
 
-**Basis (per operation).** `{kind, evidence_ref}` where `kind` ∈ `license` |
-`public_domain` | `statutory` | `publisher_permission` | `user_authorization` |
-`unknown`, and `evidence_ref` is a non-empty provenance pointer or `null`.
+**Basis evidence (typed, per operation).** Each operation's basis is
+`{"kind": license|public_domain|statutory|publisher_permission|user_authorization|unknown,
+"evidence": {"ref": string, "provenance": string}}`; both `ref` and `provenance` must
+be non-empty for `allowed`.
 
-**Validity rules.**
+**C01 reference/projection mapping.** C01's per-operation reference fields map by name
+onto the canonical record: `acquisition_right -> operations.acquisition`,
+`storage_right -> operations.storage`,
+`redistribution_right -> operations.redistribution`,
+`hosted_transfer_right -> operations.hosted_transfer`; a C01 `reference` maps onto
+`subject`, and a C01 `projection` maps onto a read-only view of these fields. (C01 is
+not present in this checkout; this mapping is the contract it must satisfy.)
 
-1. `allowed` **requires** a `basis.kind` other than `unknown` **and** a non-`null`
-   `evidence_ref`; otherwise the record is `inconsistent` and **rejected**.
-2. A missing operation or missing field defaults to `unknown` and marks the record
-   `incomplete`.
-3. **A user cannot confer a nonexistent right.** `user_authorization` records the
-   user's own permission to act within the rights they hold; it **cannot** set
-   `redistribution` or `hosted_transfer` to `allowed` for a third-party copyrighted
-   source without a `license` / `publisher_permission` / `public_domain` basis.
-4. **Unknown storage retains metadata only.** When `storage` is `unknown`, only source
-   **metadata** is retained (identity/locator/provenance), pending a **lawful
-   quarantine disposition**; source **bytes are not unconditionally retained**.
-5. **Exports distinguish citation from redistribution.** A **bibliographic citation**
-   of a source in the manuscript is governed by attribution and is **not**
-   redistribution. Including source **content/excerpts** (redistribution) requires
+**Status semantics (raw-incomplete vs. valid, with no contradiction).**
+
+1. A record with a missing or ill-typed mandatory field is **raw incomplete input** — a
+   **diagnostic only** (`derived_status = incomplete`). It is **not** an operational
+   `RightsRecord` and authorizes **nothing**. There is **no accepted operational
+   record** until every mandatory field is present and valid.
+2. `derived_status = inconsistent` (e.g. `allowed` without evidence, or a subject/evidence
+   in a different project) means the **whole record is invalid and authorizes nothing** —
+   no partial operation proceeds from it.
+3. Only a fully valid record (`derived_status = valid`) yields **rights-only
+   eligibility** (section 5.2).
+4. **A user cannot confer a nonexistent right.** `user_authorization` records the user's
+   own permission to act within the rights they hold; it **cannot** set `redistribution`
+   or `hosted_transfer` to `allowed` for a third-party copyrighted source without a
+   `license` / `publisher_permission` / `public_domain` basis.
+5. **Unknown storage retains metadata only.** When `storage` is `unknown`, only source
+   **metadata** is retained (identity/locator/provenance), pending a **lawful quarantine
+   disposition**; source **bytes are not unconditionally retained**.
+6. **Exports distinguish citation from redistribution.** A **bibliographic citation** of
+   a source in the manuscript is governed by attribution and is **not** redistribution.
+   Including source **content/excerpts** (redistribution) requires
    `redistribution: allowed`.
 
-### 5.2 Rights enforcement
+### 5.2 Rights eligibility is not final authorization
 
-- **Unknown blocks the affected operation.** An operation whose required right is
-  `unknown` (or `not_allowed`) is **blocked**, not attempted; the block is an explicit
-  state. `not_applicable` never unblocks a real operation.
-- **Hosted tools default denied.** Sending source content to a hosted model/provider
-  defaults to **`unknown` → blocked** until the user authorizes `hosted_transfer` for
-  that source. This is independent of, and additional to, the P5 gate (POL-P5).
+- **Rights-only eligibility.** A valid `allowed` operation grants **rights-only
+  eligibility**. It is **not** final authorization and does **not** bypass any other
+  gate: P5 (AI-use / provider / journal terms), budget/concurrency limits, privacy, and
+  the exact-revision human approval gates all remain **required**.
+- **Privacy denial outranks an allowed right.** If `privacy.denial` is true (or
+  confidentiality constraints deny), the affected operation is **blocked** even when its
+  rights status is `allowed`.
+- **Hosted transfer needs out-of-band authorization.** `recorded_by` (in-band recording)
+  **cannot** grant `hosted_transfer`. Hosted-model transfer requires an **out-of-band
+  authenticated human authorization** recorded in `authorization` against the exact
+  revision; no in-band recorded grant confers it. This is additional to the P5 gate.
+- **Unknown/not_allowed block; not_applicable never unblocks.** An operation whose right
+  is `unknown` or `not_allowed` is **blocked**, not attempted; `not_applicable` never
+  unblocks a real operation.
 
 ### 5.3 Logging, fixtures, and secrets
 
@@ -686,20 +738,22 @@ constraint), hosted-model transfer and submission-facing output stay gated
 (sections 5.2, POL-P5). "Uploading a file is not proof of all rights"
 ([spec line 63](../specification.md)).
 
-### 5.6 RightsRecord examples (complete valid; rejected missing/inconsistent)
+### 5.6 RightsRecord examples (structural/type-checked; illustrative, not authorizations)
 
-These examples are **synthetic**; they reference no licensed text.
+All examples are **synthetic** (no licensed text) and are **not** authorizations. A
+structural validator checks field **types** and the **same-project** invariant on the
+subject and on each operation's evidence; a mismatch makes the record invalid.
 
-**Example A — valid record (public-domain source).** All four operations `allowed`,
-each with a real basis and non-`null` evidence:
+**Example A — valid record (public-domain source; content revision exists).** Subject
+is the canonical tuple `{project_id, artifact_id, revision_id}`; every operation has
+typed evidence; hosted transfer carries an **out-of-band** human authorization.
 
 ```json
 {
-  "rights_id": "RIGHTS-syn-example-A",
+  "rights_id": "RIGHTS-syn-A",
   "project_id": "proj-syn-1",
-  "source_revision": "asset:sha256:synA...",
   "record_revision": 1,
-  "authorizing_revision": "commit:syn0001",
+  "subject": {"kind": "source_revision", "project_id": "proj-syn-1", "artifact_id": "art-syn-A", "revision_id": "rev-syn-A"},
   "operations": {
     "acquisition": "allowed",
     "storage": "allowed",
@@ -707,31 +761,39 @@ each with a real basis and non-`null` evidence:
     "hosted_transfer": "allowed"
   },
   "basis": {
-    "acquisition": {"kind": "public_domain", "evidence_ref": "lic:pd-syn-A"},
-    "storage": {"kind": "public_domain", "evidence_ref": "lic:pd-syn-A"},
-    "redistribution": {"kind": "public_domain", "evidence_ref": "lic:pd-syn-A"},
-    "hosted_transfer": {"kind": "public_domain", "evidence_ref": "lic:pd-syn-A"}
+    "acquisition": {"kind": "public_domain", "evidence": {"ref": "lic:pd-syn-A", "provenance": "publisher:pd-list"}},
+    "storage": {"kind": "public_domain", "evidence": {"ref": "lic:pd-syn-A", "provenance": "publisher:pd-list"}},
+    "redistribution": {"kind": "public_domain", "evidence": {"ref": "lic:pd-syn-A", "provenance": "publisher:pd-list"}},
+    "hosted_transfer": {"kind": "public_domain", "evidence": {"ref": "lic:pd-syn-A", "provenance": "publisher:pd-list"}}
+  },
+  "authorization": {
+    "actor": "human:user",
+    "method": "out_of_band_authenticated",
+    "authorized_at": "2026-10-27T00:00:00Z",
+    "against_revision": {"project_id": "proj-syn-1", "artifact_id": "art-syn-A", "revision_id": "rev-syn-A"},
+    "basis": {"kind": "public_domain", "evidence": {"ref": "lic:pd-syn-A", "provenance": "publisher:pd-list"}}
   },
   "restrictions": [],
-  "privacy": {"personal_data": false, "confidentiality": "public"},
-  "recorded_by": "user",
+  "privacy": {"personal_data": false, "confidentiality": "public", "denial": false},
+  "recorded_by": "agent:recorder",
   "recorded_at": "2026-10-27T00:00:00Z",
   "derived_status": "valid"
 }
 ```
 
-Expected: every operation permitted; `derived_status = valid`; a manuscript may both
-**cite** the source and **redistribute** its content.
+Expected outcome: **rights-only eligible** for the four operations — **not** final
+authorization. P5 terms, budget/concurrency limits, privacy, and the exact user
+approval gates **remain required**. `recorded_by` is an agent and confers nothing;
+`hosted_transfer` eligibility rests on the out-of-band `authorization` entry.
 
-**Example B — rejected, inconsistent (grant without evidence / user overreach).**
+**Example B — invalid/inconsistent (the whole record authorizes nothing).**
 
 ```json
 {
-  "rights_id": "RIGHTS-syn-example-B",
+  "rights_id": "RIGHTS-syn-B",
   "project_id": "proj-syn-1",
-  "source_revision": "asset:sha256:synB...",
   "record_revision": 1,
-  "authorizing_revision": null,
+  "subject": {"kind": "source_revision", "project_id": "proj-syn-1", "artifact_id": "art-syn-B", "revision_id": "rev-syn-B"},
   "operations": {
     "acquisition": "allowed",
     "storage": "allowed",
@@ -739,29 +801,81 @@ Expected: every operation permitted; `derived_status = valid`; a manuscript may 
     "hosted_transfer": "allowed"
   },
   "basis": {
-    "acquisition": {"kind": "statutory", "evidence_ref": "law:syn"},
-    "storage": {"kind": "statutory", "evidence_ref": "law:syn"},
-    "redistribution": {"kind": "unknown", "evidence_ref": null},
-    "hosted_transfer": {"kind": "user_authorization", "evidence_ref": null}
+    "acquisition": {"kind": "statutory", "evidence": {"ref": "law:syn", "provenance": "statute:id"}},
+    "storage": {"kind": "statutory", "evidence": {"ref": "law:syn", "provenance": "statute:id"}},
+    "redistribution": {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}},
+    "hosted_transfer": {"kind": "user_authorization", "evidence": {"ref": "", "provenance": ""}}
   },
+  "authorization": null,
   "restrictions": ["no_hosting"],
-  "privacy": {"personal_data": false, "confidentiality": "public"},
-  "recorded_by": "user",
+  "privacy": {"personal_data": false, "confidentiality": "public", "denial": false},
+  "recorded_by": "human:user",
   "recorded_at": "2026-10-27T00:00:00Z",
   "derived_status": "inconsistent"
 }
 ```
 
-Rejected: `hosted_transfer: allowed` has a `null` `evidence_ref` (rule 1), and a
-`user_authorization` basis cannot confer `hosted_transfer` on a third-party source
-(rule 3). Expected behavior: the record is **inconsistent/rejected**;
-`hosted_transfer` and `redistribution` stay **blocked**, while acquisition/storage
-proceed.
+Rejected: `hosted_transfer: allowed` has empty evidence `ref`/`provenance` (status
+rule 1); a `user_authorization` basis cannot confer `hosted_transfer` on a third-party
+source; and in-band `recorded_by` cannot grant it (status rule 4, §5.2). Because the
+record is `inconsistent`, **the whole record authorizes nothing** — no operation
+(including acquisition/storage) proceeds from it. Previously valid rights are
+**separate** records and are unaffected; a corrected **new valid revision**
+(`record_revision: 2`) may be recorded authorizing only the rights-clean operations.
 
-**Example C — missing record (incomplete).** A synthetic source with **no**
-`RightsRecord` resolves every operation to its default `unknown`. Only source
-**metadata** is retained pending a lawful quarantine disposition (rule 4); **all four
-operations are blocked** until the user supplies rights evidence.
+**Example C — pre-acquisition / missing full text (no content revision).** Uses the
+`subject_artifact_ref` discriminator with **no** `revision_id`; nothing implies a
+content version.
+
+```json
+{
+  "rights_id": "RIGHTS-syn-C",
+  "project_id": "proj-syn-1",
+  "record_revision": 1,
+  "subject": {"kind": "subject_artifact_ref", "project_id": "proj-syn-1", "artifact_id": "art-syn-C"},
+  "operations": {
+    "acquisition": "unknown",
+    "storage": "unknown",
+    "redistribution": "unknown",
+    "hosted_transfer": "unknown"
+  },
+  "basis": {
+    "acquisition": {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}},
+    "storage": {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}},
+    "redistribution": {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}},
+    "hosted_transfer": {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
+  },
+  "authorization": null,
+  "restrictions": [],
+  "privacy": {"personal_data": false, "confidentiality": "unknown", "denial": false},
+  "recorded_by": "agent:recorder",
+  "recorded_at": "2026-10-27T00:00:00Z",
+  "derived_status": "valid"
+}
+```
+
+Expected: a **valid** record whose operations are all `unknown` → **all four blocked**;
+only source **metadata** is retained pending a lawful quarantine disposition (status
+rule 5). No content revision is asserted.
+
+**Example D — raw incomplete input (diagnostic only).** A record missing mandatory
+fields (`basis`, `authorization`, `privacy`) is **raw incomplete input**:
+`derived_status = incomplete`. It is **not** an operational record and authorizes
+**nothing**.
+
+```json
+{
+  "rights_id": "RIGHTS-syn-D",
+  "project_id": "proj-syn-1",
+  "record_revision": 1,
+  "subject": {"kind": "source_revision", "project_id": "proj-syn-1", "artifact_id": "art-syn-D", "revision_id": "rev-syn-D"},
+  "operations": {"acquisition": "allowed", "storage": "allowed", "redistribution": "unknown", "hosted_transfer": "unknown"},
+  "derived_status": "incomplete"
+}
+```
+
+`basis`, `authorization`, and `privacy` are absent, so a validator reports `incomplete`
+and rejects this as an operational record; no field here authorizes any operation.
 
 ---
 
@@ -795,8 +909,9 @@ for sections 1.2–1.3. Short answers are enough; no long prose required.
     ARCH-IPC, ARCH-PKG, ARCH-MIGRATE, ARCH-ACTIVE-ENF (section 4; the one-active-project
     **invariant** is already confirmed — only its enforcement mechanism is open) — and,
     if accepted, against which exact revision?
-14. **Rights:** Confirm the mandatory `RightsRecord` v1 fields (section 5.1) and that
-    `unknown`/`not_allowed` block the affected operation.
+14. **Rights:** Confirm the canonical `RightsRecord` v1 fields and tuples (section 5.1),
+    that `unknown`/`not_allowed` block the affected operation, and that a valid
+    `allowed` right is **rights-only eligibility**, not final authorization (section 5.2).
 
 ---
 
@@ -822,7 +937,7 @@ for sections 1.2–1.3. Short answers are enough; no long prose required.
 | ARCH-PKG | Python package layout | user | **proposed (OPEN)** | — | 02–04 |
 | ARCH-MIGRATE | Migrations + backup/WAL consistency | user | **proposed (OPEN)** | — | 02 |
 | ARCH-ACTIVE-ENF | Active-project enforcement mechanism (invariant confirmed) | user | **proposed (OPEN)** | — | 02, 03 |
-| RIGHTS-v1 | `RightsRecord` v1 types and enforcement | user | **proposed (OPEN)** | — | 04, 06, 09, 14 |
+| RIGHTS-v1 | Canonical `RightsRecord` v1 tuples + rights-only eligibility | user | **proposed (OPEN)** | — | 04, 06, 09, 14 |
 
 **No record above is accepted. No dependent behavior is unblocked. Step 01 is not
 complete.**
