@@ -111,6 +111,10 @@ class LiveJevCredentialError(LiveJevError):
     """No usable OPENROUTER_API_KEY was found (nothing was sent)."""
 
 
+class LiveJevEndpointError(LiveJevError):
+    """Live mode was pointed at an endpoint other than the documented one."""
+
+
 class LiveJevTransportError(LiveJevError):
     """The request never produced a usable response (billing ambiguous)."""
 
@@ -647,8 +651,16 @@ def run_live(
     """Execute the live fallback.  Raises only for pre-call refusals.
 
     Returns a report dict whose ``status`` is one of ``completed``,
-    ``api_error`` or ``transport_error``.
+    ``protocol_error``, ``api_error`` or ``transport_error``.  Once the request
+    has been submitted, no outcome -- including a malformed 200 -- can raise out
+    of this function, so a billed call is never reported as ``not_incurred``.
     """
+    # The supplied credential must never travel to an arbitrary host.
+    if endpoint != ENDPOINT:
+        raise LiveJevEndpointError(
+            f"live mode is restricted to the documented endpoint {ENDPOINT!r}; "
+            f"refusing {endpoint!r}"
+        )
     if not authorized:
         raise LiveJevAuthorizationError("live execution requires explicit --i-authorize-live")
     if max_calls < 1:
@@ -717,36 +729,80 @@ def run_live(
             ],
         }
 
+    # --- Post-submission boundary -----------------------------------------
+    # The request has been submitted, so every outcome is reported as a result.
+    # Nothing below may raise into the pre-call "not_incurred" handler: a billed
+    # call must never be silently zeroed.
     try:
         payload = json.loads(response.body_text)
-    except json.JSONDecodeError:
+    except ValueError:
+        return _malformed_200_report(
+            base, calls_attempted, "response body is not valid JSON", None
+        )
+
+    reported_cost = _extract_reported_cost(payload)
+    try:
+        normalized = validate_response(payload, questions)
         return {
             **base,
-            "status": "api_error",
+            "status": "completed",
             "calls_attempted": calls_attempted,
             "http_status": response.status,
-            "cost_usd": None,
-            "cost_status": "unknown",
-            "reserve_retained": True,
-            "error": {"kind": "protocol_error", "message": "response body is not valid JSON"},
-            "notes": ["200 with an unreadable body: billing may have occurred, reserve retained"],
+            **normalized.to_report(),
+            "cost_usd": normalized.cost_usd,
+            "cost_status": normalized.cost_status,
+            "reserve_retained": normalized.cost_usd is None,
+            "notes": (
+                ["provider reported cost"]
+                if normalized.cost_usd is not None
+                else ["provider did not report usage.cost: cost is explicit-unknown; reserve retained"]
+            ),
         }
+    except Exception as exc:  # noqa: BLE001 - MUST NOT escape as not_incurred
+        return _malformed_200_report(
+            base,
+            calls_attempted,
+            f"{type(exc).__name__}: {redact(exc)}",
+            reported_cost,
+        )
 
-    normalized = validate_response(payload, questions)
+
+def _extract_reported_cost(payload: Any) -> float | None:
+    """Independently validate a finite reported ``usage.cost``, else ``None``."""
+    if not isinstance(payload, Mapping):
+        return None
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        return None
+    cost = usage.get("cost")
+    if _is_finite_number(cost) and float(cost) >= 0:
+        return float(cost)
+    return None
+
+
+def _malformed_200_report(
+    base: dict, calls_attempted: int, message: str, reported_cost: float | None
+) -> dict:
+    """A malformed 200 is a post-submission outcome, never ``not_incurred``.
+
+    The reserve is retained and the cost is explicit-unknown unless the provider
+    reported a finite, independently validated cost.
+    """
+    cost_known = reported_cost is not None
     return {
         **base,
-        "status": "completed",
+        "status": "protocol_error",
         "calls_attempted": calls_attempted,
-        "http_status": response.status,
-        **normalized.to_report(),
-        "cost_usd": normalized.cost_usd,
-        "cost_status": normalized.cost_status,
-        "reserve_retained": normalized.cost_usd is None,
-        "notes": (
-            ["provider reported cost"]
-            if normalized.cost_usd is not None
-            else ["provider did not report usage.cost: cost is explicit-unknown; reserve retained"]
-        ),
+        "http_status": 200,
+        "cost_usd": reported_cost,
+        "cost_status": "provider_reported" if cost_known else "unknown",
+        "reserve_retained": not cost_known,
+        "error": {"kind": "protocol_error", "message": message},
+        "notes": [
+            "the request was submitted (http 200) and the response was malformed",
+            "cost is provider-reported" if cost_known
+            else "cost is explicit-unknown; the allocated reserve is retained",
+        ],
     }
 
 
@@ -775,7 +831,11 @@ def _write_report(report: dict, path: str | None) -> None:
             handle.write("\n")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    transport: Callable[..., TransportResponse] = post_decisions,
+) -> int:
     parser = argparse.ArgumentParser(description="Direct OpenRouter Jev decision fallback (dry run by default).")
     parser.add_argument("--live", action="store_true", help="enable a live call (requires other flags)")
     parser.add_argument("--i-authorize-live", action="store_true", help="explicit live-call authorization")
@@ -815,7 +875,7 @@ def main(argv: list[str] | None = None) -> int:
             questions, state,
             api_key=api_key, ceiling_usd=args.max_cost_usd, authorized=True,
             endpoint=args.endpoint, timeout=args.timeout, max_calls=args.max_calls,
-            server_cap=not args.no_server_cap,
+            server_cap=not args.no_server_cap, transport=transport,
         )
         report["api_key_source"] = source
         report["api_key_loaded"] = True

@@ -29,7 +29,7 @@ No API field is invented. Every shape below is from those pages.
 | File | Purpose |
 | --- | --- |
 | `live_jev.py` | Stdlib-only reusable client: synthetic request builder, conservative cost preflight, strict response validator, single-shot live runner, CLI (dry-run default). |
-| `test_live_jev.py` | 39 offline `unittest` cases (validation, error, accounting, dry-run/live gating, redaction). No network, no key. |
+| `test_live_jev.py` | 51 offline `unittest` cases (validation, error, post-submission accounting, endpoint guard, dry-run/live gating, redaction). No network, no key. |
 | `report/live-evidence.json` | Sanitized machine-readable result of the one authorized live call. |
 
 Python 3.14, standard library only. No third-party dependency; nothing is
@@ -39,7 +39,7 @@ installed and no service is started.
 
 ```sh
 cd spikes/runtime/live-jev
-python3 -m unittest -v test_live_jev            # 39 tests, offline, ~0.006s
+python3 -m unittest -v test_live_jev            # 51 tests, offline, ~0.01s
 python3 live_jev.py                             # dry run (default): plans, sends nothing
 
 # live (needs an explicit key file AND the authorization flag AND a ceiling):
@@ -99,6 +99,33 @@ real key value).
 * **Direct calls are not in OpenCode session statistics** and are accounted here
   separately.
 
+### Repair 1 — post-submission billing boundary and endpoint guard
+
+Review found a billing bug: after a 200, `validate_response` ran **outside** the
+try, so a malformed response raised out of `run_live` into the CLI's pre-call
+handler, which reported `cost_status: "not_incurred"` — silently zeroing a call
+that had in fact been billed.
+
+* **Post-submission boundary.** Once the request is submitted, nothing can raise
+  out of `run_live`. Every malformed 200 (invalid JSON; missing/empty `answers`;
+  absent/malformed `usage`; undeclared question names; an answer whose type does
+  not match its question; an out-of-range probability; a choice outside the
+  declared options; a score outside the declared levels; a `bool`/non-finite
+  number) now yields a `protocol_error` report with `calls_attempted: 1`.
+* **Reserve policy.** Such a report retains the reserve with `cost_status:
+  "unknown"` **unless** the response carried a finite, independently validated
+  `usage.cost`, in which case it is honoured as `provider_reported`. `not_incurred`
+  is never produced for a submitted request.
+* **Endpoint guard.** Live mode refuses any `--endpoint` other than the exact
+  documented `https://openrouter.ai/api/alpha/decisions` (checked before any
+  credential is used or any call is made), so an arbitrary `--endpoint` cannot
+  exfiltrate the supplied key. Refusal is a pre-call `LiveJevEndpointError`
+  (`calls_attempted: 0`).
+* **Tests added** (still no paid call; the live path is exercised through an
+  injected transport): malformed answers, mismatched answer type, empty answers,
+  malformed-200 with/without a valid cost, arbitrary/trailing-slash endpoint
+  rejection before transport, and two CLI billing paths.
+
 ### The one authorized live call
 
 Max allocated for this task: **$0.25**. One call was made (no retry).
@@ -157,11 +184,13 @@ shapes, and partial errors must **not** be interpreted as scientific exclusions.
 | Native typed decision route/schema confirmed | Decisions endpoint + request/response schema in `live_jev.py`; `report/live-evidence.json` |
 | Conservative preflight cost ≤ ceiling; no call if unbounded | `preflight_cost` + `test_missing_ceiling_is_refused`, `test_over_ceiling_is_refused`, `test_oversize_request_is_refused`; live bound `$0.0000387` |
 | Max 2 calls, no automatic retries, fail closed | `MAX_LIVE_CALLS`; `test_max_calls_capped`, `test_transport_error_no_retry`, `test_ambiguous_500_retains_reserve` |
+| Malformed 200 never reported `not_incurred` | `_malformed_200_report`; `PostSubmissionBoundaryTests` (5 cases), `test_unparseable_200_body` |
+| Credential cannot be exfiltrated via `--endpoint` | `LiveJevEndpointError`; `EndpointGuardTests` (3 cases), `CliBillingTests.test_cli_endpoint_rejection_blocked_before_any_call` |
 | Real predicate/choice/score outputs | live report: three valid typed answers |
 | Per-question failures | mock-only missing/error paths; documented gap (above) |
 | Provider cost tracked; unknown explicit + reserve retained | live `cost_usd=$0.00002037`; `test_completed_without_cost_retains_reserve`, `test_missing_cost_is_explicit_unknown` |
 | Reusable safe script, dry-run default, explicit live flag + ceiling | CLI + `test_dry_run_exit_zero`, `test_live_without_authorization_exit_two`, `test_live_without_authorization_is_refused` |
-| Offline regression tests | 39 `unittest` cases, all pass |
+| Offline regression tests | 51 `unittest` cases, all pass |
 | Credential handling | `load_api_key` (only `OPENROUTER_API_KEY`); `test_env_file_parses_only_the_key`, `test_env_file_missing_key_fails_closed`, `test_request_body_never_contains_the_key`; worktree leak scan found none |
 
 ## Limitations

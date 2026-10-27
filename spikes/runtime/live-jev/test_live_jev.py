@@ -296,7 +296,10 @@ class LiveOrchestrationTests(unittest.TestCase):
     def test_unparseable_200_body(self):
         transport = FakeTransport(lj.TransportResponse(200, "<html>nope</html>"))
         report = run_with(transport)
-        self.assertEqual(report["status"], "api_error")
+        self.assertEqual(report["status"], "protocol_error")
+        self.assertEqual(report["calls_attempted"], 1)
+        self.assertEqual(report["cost_status"], "unknown")
+        self.assertNotEqual(report["cost_status"], "not_incurred")
         self.assertTrue(report["reserve_retained"])
 
     def test_request_body_never_contains_the_key(self):
@@ -375,6 +378,164 @@ class CliTests(unittest.TestCase):
 
     def test_live_without_authorization_exit_two(self):
         self.assertEqual(lj.main(["--live", "--max-cost-usd", "0.25"]), 2)
+
+
+# --- post-submission boundary (repair 1) ----------------------------------
+
+
+class PostSubmissionBoundaryTests(unittest.TestCase):
+    """A malformed 200 must never be reported as ``not_incurred``."""
+
+    def _report(self, body):
+        return run_with(FakeTransport(lj.TransportResponse(200, body)))
+
+    def test_malformed_answers_never_not_incurred(self):
+        payload = valid_response()  # carries a finite usage.cost
+        payload["answers"] = ["not", "a", "map"]
+        report = self._report(json.dumps(payload))
+        self.assertEqual(report["status"], "protocol_error")
+        self.assertEqual(report["calls_attempted"], 1)
+        self.assertNotEqual(report["cost_status"], "not_incurred")
+        # a finite, independently validated reported cost is still honoured
+        self.assertEqual(report["cost_status"], "provider_reported")
+        self.assertAlmostEqual(report["cost_usd"], 0.000005166)
+        self.assertFalse(report["reserve_retained"])
+
+    def test_malformed_answers_without_cost_is_unknown_retained(self):
+        payload = valid_response()
+        payload["answers"] = ["not", "a", "map"]
+        payload["usage"].pop("cost", None)
+        report = self._report(json.dumps(payload))
+        self.assertEqual(report["status"], "protocol_error")
+        self.assertEqual(report["cost_status"], "unknown")
+        self.assertNotEqual(report["cost_status"], "not_incurred")
+        self.assertTrue(report["reserve_retained"])
+
+    def test_empty_answers_is_protocol_error_retained(self):
+        payload = valid_response()
+        payload["answers"] = {}
+        payload["usage"].pop("cost", None)
+        report = self._report(json.dumps(payload))
+        self.assertEqual(report["status"], "protocol_error")
+        self.assertEqual(report["cost_status"], "unknown")
+        self.assertTrue(report["reserve_retained"])
+
+    def test_mismatched_answer_type_is_protocol_error_retained(self):
+        payload = valid_response()
+        payload["answers"]["study_design"] = {"type": "noul", "noul": 0.4}
+        payload["usage"].pop("cost", None)
+        report = self._report(json.dumps(payload))
+        self.assertEqual(report["status"], "protocol_error")
+        self.assertEqual(report["cost_status"], "unknown")
+        self.assertTrue(report["reserve_retained"])
+        self.assertEqual(report["error"]["kind"], "protocol_error")
+
+    def test_malformed_200_with_valid_cost_releases_reserve(self):
+        payload = valid_response()
+        payload["answers"] = {"study_design": {"type": "noul", "noul": 0.4}}
+        report = self._report(json.dumps(payload))
+        self.assertEqual(report["status"], "protocol_error")
+        self.assertEqual(report["cost_status"], "provider_reported")
+        self.assertAlmostEqual(report["cost_usd"], 0.000005166)
+        self.assertFalse(report["reserve_retained"])
+
+    def test_malformed_200_with_invalid_cost_stays_unknown(self):
+        for bad in ("abc", -1, float("inf")):
+            payload = valid_response()
+            payload["answers"] = {}
+            payload["usage"] = {"input_tokens": 1, "output_tokens": 1, "cost": bad}
+            report = self._report(json.dumps(payload))
+            self.assertEqual(report["status"], "protocol_error")
+            self.assertEqual(report["cost_status"], "unknown")
+            self.assertTrue(report["reserve_retained"])
+
+    def test_validation_error_on_200_does_not_escape_run_live(self):
+        # Any exception raised post-submission is absorbed into a report.
+        payload = valid_response()
+        payload["answers"] = {"unexpected": {"type": "noul", "noul": 0.5}}
+        report = self._report(json.dumps(payload))  # must not raise
+        self.assertEqual(report["status"], "protocol_error")
+
+
+# --- endpoint guard (repair 1) --------------------------------------------
+
+
+class EndpointGuardTests(unittest.TestCase):
+    def test_arbitrary_endpoint_rejected_before_transport(self):
+        transport = FakeTransport(lj.TransportResponse(200, json.dumps(valid_response())))
+        with self.assertRaises(lj.LiveJevEndpointError):
+            run_with(transport, endpoint="https://evil.example/api/alpha/decisions")
+        self.assertEqual(transport.calls, [])
+
+    def test_trailing_slash_endpoint_rejected(self):
+        transport = FakeTransport(lj.TransportResponse(200, json.dumps(valid_response())))
+        with self.assertRaises(lj.LiveJevEndpointError):
+            run_with(transport, endpoint=lj.ENDPOINT + "/")
+        self.assertEqual(transport.calls, [])
+
+    def test_documented_endpoint_allowed(self):
+        transport = FakeTransport(lj.TransportResponse(200, json.dumps(valid_response())))
+        report = run_with(transport, endpoint=lj.ENDPOINT)
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(len(transport.calls), 1)
+
+
+# --- CLI billing path (repair 1) ------------------------------------------
+
+
+class CliBillingTests(unittest.TestCase):
+    def _env_file(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".env", delete=False)
+        handle.write('OPENROUTER_API_KEY="sk-or-v1-cli-test"\n')
+        handle.close()
+        return handle.name
+
+    def test_cli_malformed_200_reports_unknown_not_not_incurred(self):
+        payload = valid_response()
+        payload["answers"] = {"study_design": {"type": "noul", "noul": 0.4}}
+        payload["usage"].pop("cost", None)
+        env = self._env_file()
+        out = env + ".report.json"
+        transport = FakeTransport(lj.TransportResponse(200, json.dumps(payload)))
+        try:
+            code = lj.main(
+                ["--live", "--i-authorize-live", "--max-cost-usd", "0.25",
+                 "--env-file", env, "--report-out", out],
+                transport=transport,
+            )
+            self.assertEqual(code, 4)
+            report = json.load(open(out))
+            self.assertEqual(report["status"], "protocol_error")
+            self.assertEqual(report["calls_attempted"], 1)
+            self.assertNotEqual(report["cost_status"], "not_incurred")
+            self.assertTrue(report["reserve_retained"])
+            self.assertNotIn("sk-or-", json.dumps(report))
+        finally:
+            os.unlink(env)
+            if os.path.exists(out):
+                os.unlink(out)
+
+    def test_cli_endpoint_rejection_blocked_before_any_call(self):
+        env = self._env_file()
+        out = env + ".report.json"
+        transport = FakeTransport(lj.TransportResponse(200, json.dumps(valid_response())))
+        try:
+            code = lj.main(
+                ["--live", "--i-authorize-live", "--max-cost-usd", "0.25",
+                 "--endpoint", "https://evil.example/collect",
+                 "--env-file", env, "--report-out", out],
+                transport=transport,
+            )
+            self.assertEqual(code, 3)
+            self.assertEqual(transport.calls, [])
+            report = json.load(open(out))
+            self.assertEqual(report["status"], "blocked")
+            self.assertEqual(report["calls_attempted"], 0)
+            self.assertEqual(report["cost_status"], "not_incurred")
+        finally:
+            os.unlink(env)
+            if os.path.exists(out):
+                os.unlink(out)
 
 
 if __name__ == "__main__":
