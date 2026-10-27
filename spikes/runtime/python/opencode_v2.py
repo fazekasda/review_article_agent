@@ -173,12 +173,16 @@ class ReconcileResult:
     * ``queued`` — the ID is enqueued in the session inbox and not yet delivered
       (no projected user message yet).
     * ``in_progress`` — the user message is projected but its turn has no
-      authoritative ``idle`` terminal yet. A completed ``assistant`` message does
-      not end the turn.
+      authoritative ``idle`` terminal yet, and nothing in the window shows the
+      turn has died. A completed ``assistant`` message does not end the turn.
     * ``completed`` — the correlated ``idle`` terminal for *this* turn succeeded.
     * ``failed`` / ``interrupted`` — the correlated ``idle`` terminal for *this*
       turn ended without success.
-    * ``unknown`` — no reliable trace; ``reason`` explains why. Never success.
+    * ``unknown`` — no reliable trace, an unread/ambiguous window, **or** an
+      assistant that ended in error with no authoritative ``idle`` (the turn
+      cannot be assumed to still be running); ``reason`` explains why. Never
+      success, and never a confident ``failed``/``interrupted`` without an
+      authoritative terminal.
 
     ``completion`` is the correlation evidence (the ``idle`` message for *this*
     turn only), or ``None``.
@@ -757,6 +761,14 @@ class OpenCodeV2Client:
         earlier (or later) turn never completes the target. If the timeline cannot
         be read far enough to be certain, the state is ``unknown``, never
         ``completed``.
+
+        An assistant that ended in **error** with no authoritative ``idle`` is
+        ``unknown``, not ``in_progress``: a live service persists such an
+        assistant (``finish="error"``) when a turn is torn down, e.g. by a restart,
+        and then never writes a terminal ``idle``. The outcome is genuinely
+        indeterminate, so it is reported ``unknown`` rather than implying the turn
+        is still running. No authoritative terminal exists, so it is deliberately
+        not a confident ``failed``/``interrupted`` either.
         """
         self._require_message_id(admission_id)
         inbox = self.list_inbox(session_id)
@@ -831,6 +843,21 @@ class OpenCodeV2Client:
                     durable,
                     None,
                     reason="turn window not fully read (message paging limit)",
+                )
+            if _window_has_terminal_assistant_error(window):
+                # A live server persists an errored assistant (finish="error") and
+                # no authoritative idle when a turn is torn down, e.g. by a service
+                # restart. The turn is not "still running": report unknown, never
+                # completed, and do not invent an authoritative failed/interrupted.
+                return ReconcileResult(
+                    admission_id,
+                    "unknown",
+                    durable,
+                    None,
+                    reason=(
+                        "assistant reported an error and no authoritative idle "
+                        "exists for this turn (errored turn; not completion)"
+                    ),
                 )
             return ReconcileResult(
                 admission_id,
@@ -949,6 +976,24 @@ class OpenCodeV2Client:
     def _require_message_id(message_id: str) -> None:
         if not isinstance(message_id, str) or not MESSAGE_ID_RE.match(message_id):
             raise ValueError(f"message id must match ^msg_, got {message_id!r}")
+
+
+def _window_has_terminal_assistant_error(window: list[dict[str, Any]]) -> bool:
+    """True when a turn window holds an assistant that ended in error.
+
+    A message-level error (``finish == "error"`` or a structured ``error`` field)
+    with no authoritative ``idle`` means the turn must not be assumed to still be
+    running: a live server persists such an assistant, with no terminal ``idle``,
+    when a turn is torn down (for example by a service restart). Used by
+    :meth:`OpenCodeV2Client._reconcile_turn` to report ``unknown`` rather than
+    ``in_progress``.
+    """
+    for message in window:
+        if message.get("type") != "assistant":
+            continue
+        if message.get("finish") == "error" or message.get("error"):
+            return True
+    return False
 
 
 # --- typed decision helpers ---------------------------------------------------

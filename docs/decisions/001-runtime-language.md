@@ -12,11 +12,13 @@ is blocked; criterion 6's global-config isolation is documented, not proven). Se
 [the step-00 handoff](../implementation/handoffs/00-runtime-spike.md).
 
 **Evidence update (integrated baseline, branch `task/spike-combined`).** Criteria
-1 (disconnect + second-client retrieval), 2 (idempotent admission), and 5 (fresh
-critic) are now verified against a **real** disposable app-owned OpenCode v2.2.0
-service for **both** prototypes, and criterion 3 (restart) is verified with a
-stated caveat. Only the model transport was a deterministic local fixture. The
-language recommendation below is unchanged and still **not ratified**.
+1 (disconnect + second-client retrieval), 2 (idempotent admission), 3 (restart),
+and 5 (fresh critic) are now verified against a **real** disposable app-owned
+OpenCode v2.2.0 service for **both** prototypes; criterion 4 is met through the
+direct-OpenRouter fallback that step line 19 explicitly allows, with per-question
+failures still mock-only. Only the model transport was a deterministic local
+fixture. The language recommendation below is unchanged and still **not
+ratified**.
 
 ## Context and constraints
 
@@ -58,22 +60,21 @@ language recommendation below is unchanged and still **not ratified**.
 ### Option A — Python core plus a hand-written OpenCode HTTP integration
 
 - Implemented in `spikes/runtime/python/` (`opencode_v2.py`, stdlib-only).
-- 78 `unittest` cases pass (Python 3.14.4): session create with pinned
+- 79 `unittest` cases pass (Python 3.14.4): session create with pinned
   `agent`/`model.Ref`, admission as durable receipt, per-turn positional
   reconciliation, bounded wait, redirect/loopback/token safety, fresh critic vs
   fork, and a strict typed decision boundary validated against the published
   answer schemas.
 - Verified against the real disposable service: create with pinned role/model,
   disconnect + second-process retrieval (`completed`), idempotent retry (one
-  input), and a fresh pinned critic. On the in-flight **restart** it reports
-  `in_progress` (non-terminal, never success).
+  input), and a fresh pinned critic. On the in-flight **restart** it reports the
+  explicit `unknown` (an errored assistant with no authoritative `idle` is no
+  longer treated as `in_progress`).
 - Pros: the language of the scientific/data tooling; the only live-verified model
   path (Jev) is already Python; stdlib-only, no dependency surface.
 - Cons: it **re-implements the HTTP contract by hand**. Every field must track the
   experimental OpenAPI; the official client's envelope unwrapping, generated
-  error `_tag`s, and descriptors are not reused, so drift risk is on us. It also
-  does not distinguish a post-restart turn from a merely slow one
-  (`in_progress` vs the explicit `unknown` the criterion prefers).
+  error `_tag`s, and descriptors are not reused, so drift risk is on us.
 
 ### Option B — TypeScript core using the official `@opencode/client`
 
@@ -100,11 +101,14 @@ language recommendation below is unchanged and still **not ratified**.
   unknown/interrupted are explicit; fresh critic is a new session, never a fork).
 - **Both prototypes now agree on a real service too** (`spikes/runtime/integration/`,
   16/16 checks): same service, real Basic auth, pinned create, real disconnect +
-  second-process retrieval, idempotent retry (one input, HTTP `200`), and a fresh
-  pinned critic. On the in-flight **restart** the server wrote no terminal
-  outcome; **TypeScript reported `unknown`, Python reported `in_progress`** — a
-  real, observed divergence (Python is non-terminal but not the explicit
-  `interrupted`/`unknown` the criterion names).
+  second-process retrieval, idempotent retry (one input, HTTP `200`), a fresh
+  pinned critic, and an in-flight **restart** after which **both** report the
+  explicit `unknown` (the server wrote no terminal outcome; the turn does not
+  continue).
+- **Criterion 4 is met via the allowed fallback.** Line 19 explicitly permits a
+  tested direct-OpenRouter fallback and accounting boundary in place of the native
+  route, so the native route's absence is not by itself an unmet mandatory
+  criterion; per-question decision failures remain mock-only and visible.
 - **Native OpenCode `generate.decisions` route is unverified.** Only the
   documented **direct-OpenRouter fallback** was exercised live, and it is
   accounted separately from OpenCode session statistics
@@ -144,9 +148,8 @@ decided — **all pending user acceptance**:
   writer-history fork is not a clean critic; direct calls are not covered by
   session statistics and are accounted separately.
 - **Explicitly not decided:** the native OpenCode `generate.decisions` route
-  (still unverified), whether the Python prototype's post-restart `in_progress`
-  should be tightened to `unknown`/`interrupted`, and any production
-  architecture.
+  (unexercised; the direct fallback that line 19 allows is the path used) and any
+  production architecture.
 
 ## Consequences and verification
 
@@ -157,11 +160,11 @@ decided — **all pending user acceptance**:
   different option (Python core) would not invalidate the Python spike; accepting
   Option B makes the TypeScript prototype the base and keeps the Python Jev client
   as a tool.
-- Verification that must still happen before this is more than "proposed": decide
-  criterion 4 — either the native decision route on the disposable service (paid)
-  or explicit acceptance of the direct-fallback boundary — and decide the
-  Python post-restart `in_progress` divergence. The real client↔service lifecycle
-  (submit, disconnect, second-client retrieval, restart) is **now recorded**
+- Verification that must still happen before this is more than "proposed": the
+  user's explicit acceptance of this language recommendation (and, if the native
+  decision route is preferred over the documented direct fallback, its
+  verification). The real client↔service lifecycle (submit, disconnect,
+  second-client retrieval, restart) is **now recorded**
   (`spikes/runtime/integration/report/combined-evidence.json`).
 - Conditions for revisiting: a live lifecycle failure, a decision to use the
   native decision route instead of the fallback, or a user preference for a
@@ -178,6 +181,6 @@ decided — **all pending user acceptance**:
   `spikes/runtime/live-jev/report/live-evidence.json`.
 - Combined real-service evidence (sanitized, fixture model disclosed):
   `spikes/runtime/integration/report/combined-evidence.json`.
-- Unresolved follow-up: native `generate.decisions`; global config isolation;
-  Python post-restart `in_progress`. No secrets or licensed full text are included
-  here.
+- Unresolved follow-up: native `generate.decisions` (the direct fallback is the
+  allowed path used); global config isolation; live per-question decision
+  failures (mock-only). No secrets or licensed full text are included here.

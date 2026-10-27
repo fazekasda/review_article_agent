@@ -17,7 +17,7 @@ No API field is invented.
 | --- | --- |
 | `opencode_v2.py` | Stdlib-only client: session create, admission, per-turn reconciliation, bounded wait, interrupt, fork, fresh critic, typed decisions. |
 | `mock_server.py` | Deterministic local mock of the used endpoints (incl. cursor paging, a redirect route, and Bearer/Basic auth). |
-| `test_opencode_v2.py` | 78 unittest cases (success, retry, reconciliation, paging query conformance, auth schemes, typed-decision boundary, error, invalid input, endpoint safety). |
+| `test_opencode_v2.py` | 79 unittest cases (success, retry, reconciliation, paging query conformance, auth schemes, typed-decision boundary, error, invalid input, endpoint safety, restart-repair regression). |
 | `demo_lifecycle.py` | Two-client durability demo against the mock. |
 
 Python 3.14 (`python3`), standard library only. No third-party dependency.
@@ -26,7 +26,7 @@ Python 3.14 (`python3`), standard library only. No third-party dependency.
 
 ```sh
 cd spikes/runtime/python
-python3 -m unittest -v test_opencode_v2   # 78 tests, ~2.5s
+python3 -m unittest -v test_opencode_v2   # 79 tests, ~2.5s
 python3 demo_lifecycle.py                 # prints the two-client transcript
 python3 mock_server.py --token secret     # optional: standalone mock, Bearer auth
 python3 mock_server.py --basic-password pw # optional: standalone mock, Basic auth
@@ -125,8 +125,15 @@ shared discovery/start, no paid calls, no budget authorization.
   the target `user` message, then the next `user`/`synthetic` message, with the
   authoritative `idle` in between. An `idle` that belongs to an earlier or later
   turn never completes the target. States are `queued` (inbox-only),
-  `in_progress` (delivered, no correlated `idle` yet), `completed`, `failed`,
-  `interrupted`, and `unknown`; only `completed` is `is_complete`.
+  `in_progress` (delivered, no correlated `idle` yet and nothing shows the turn
+  died), `completed`, `failed`, `interrupted`, and `unknown`; only `completed` is
+  `is_complete`.
+* **Errored assistant ⇒ unknown (restart repair).** An assistant that ended in
+  error (`finish="error"`, or a structured `error` field) with **no** authoritative
+  `idle` is `unknown`, not `in_progress`: a live service persists exactly that
+  (user input + partial `assistant finish="error"`, no terminal) when a turn is torn
+  down, e.g. by a restart, and never writes an `idle`. It is never `completed` and
+  never a confident `failed`/`interrupted` without an authoritative terminal.
 * **Honest unknown.** If the timeline cannot be read far enough to be certain
   (paging bound reached, or a turn window open past the read boundary), the state
   is `unknown` with a `reason` — never success.
@@ -204,7 +211,7 @@ explicit token, and (for decisions) explicit budget authorization.
 | Requirement | Evidence |
 | --- | --- |
 | A queued/pending turn is not falsely completed by another turn's terminal | `test_second_queued_turn_not_falsely_complete`, `test_prior_idle_does_not_complete_later_turn`, `test_terminal_after_next_turn_does_not_complete_target` |
-| Failure/interrupted states are distinct and never `is_complete` | `test_failed_outcome_is_distinct_from_success`, `test_interrupted_outcome_is_distinct_from_success`, `test_assistant_error_without_idle_is_not_terminal`, `test_unrecognized_idle_outcome_is_unknown` |
+| Failure/interrupted states are distinct and never `is_complete` | `test_failed_outcome_is_distinct_from_success`, `test_interrupted_outcome_is_distinct_from_success`, `test_assistant_error_without_idle_is_unknown_not_terminal`, `test_unrecognized_idle_outcome_is_unknown` |
 | Older admitted IDs are found by paging; a paging bound returns `unknown` | `test_paging_finds_older_admission`, `test_paging_bound_returns_unknown_not_complete`, `test_paging_limit_never_reports_success` |
 | Missing/empty token fails closed | `test_missing_token_fails_closed`, `test_empty_token_fails_closed`, `test_from_env_requires_token` |
 | Non-loopback / bad-scheme / credential-in-URL refused | `test_non_loopback_url_rejected`, `test_loopback_urls_accepted` |
@@ -217,7 +224,15 @@ explicit token, and (for decisions) explicit budget authorization.
 | --- | --- |
 | Completed `assistant` with no correlated `idle` never means success | `test_tool_calls_assistant_without_idle_is_not_complete`, `test_completed_assistant_finish_stop_without_idle_is_not_complete`, `test_idle_succeeded_is_the_only_completion` |
 | `finish=tool-calls` loop step remains in_progress/unknown | `test_tool_calls_assistant_without_idle_is_not_complete` |
-| `finish=length` / `content-filter` / `error` without idle is not completion | `test_assistant_finish_length_without_idle_is_not_complete`, `test_assistant_finish_content_filter_without_idle_is_not_complete`, `test_assistant_error_without_idle_is_not_terminal` |
+| `finish=length` / `content-filter` / `error` without idle is not completion | `test_assistant_finish_length_without_idle_is_not_complete`, `test_assistant_finish_content_filter_without_idle_is_not_complete`, `test_assistant_error_without_idle_is_unknown_not_terminal` |
+
+### Repair 4 — errored assistant without an idle is `unknown` (restart)
+
+| Requirement | Evidence |
+| --- | --- |
+| An assistant that ended in error with no authoritative idle is `unknown`, not `in_progress` | `test_assistant_error_without_idle_is_unknown_not_terminal`, `test_restart_errored_assistant_without_idle_is_unknown` |
+| The observed real restart shape (user + `assistant finish="error"`, no idle) reconciles to `unknown`, never success | `test_restart_errored_assistant_without_idle_is_unknown` (and the integration run, `spikes/runtime/integration/`) |
+| Ordinary live in-flight turns stay `in_progress` | `test_tool_calls_assistant_without_idle_is_not_complete`, `test_completed_assistant_finish_stop_without_idle_is_not_complete`, `test_assistant_finish_length_without_idle_is_not_complete`, `test_assistant_finish_content_filter_without_idle_is_not_complete` |
 | Only `idle succeeded` yields `completed`; `failed`/`interrupted` stay explicit | `test_idle_succeeded_is_the_only_completion`, `test_failed_outcome_is_distinct_from_success`, `test_interrupted_outcome_is_distinct_from_success` |
 
 ### Repair 3 — strict typed Jev decision boundary
@@ -263,10 +278,14 @@ explicit token, and (for decisions) explicit budget authorization.
   deliberately not read or used (no paid calls).
 * Per-turn correlation uses positional timeline windowing because the published
   schemas expose no parent/linkage field; it assumes the server emits the terminal
-  `idle` within the turn's window. A turn whose terminal is missing is reported
-  `in_progress`; an unreadable window is reported `unknown`, never success.
+  `idle` within the turn's window. A turn whose terminal is missing and shows no
+  errored assistant is reported `in_progress`; an errored assistant without an
+  `idle`, or an unreadable window, is reported `unknown`, never success.
 * The mock keeps a delivered admission's inbox item as a simplification (real
   delivery removes it); reconciliation keys off the projected user message, so
   this does not change client behaviour.
-* Real server restart/recovery is not exercised; the mock models "accepted then
-  connection lost" and "unknown ID" only.
+* Real server restart/recovery of an in-flight turn is exercised by the combined
+  integration run (`spikes/runtime/integration/`), not by this mock: the mock
+  models "accepted then connection lost" and "unknown ID" only, and does not model
+  the persisted errored-assistant shape (covered by
+  `test_restart_errored_assistant_without_idle_is_unknown`).

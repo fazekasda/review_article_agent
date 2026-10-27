@@ -438,10 +438,10 @@ def restart_phase(runner: Runner, checks: Checks) -> dict[str, Any]:
             persisted.get("userInputsForId") == 1 and messages.get("count", 0) >= 2,
             f"userInputs={persisted.get('userInputsForId')} messages={messages.get('count')}",
         )
-        never_complete = resolution.get("state") not in ("succeeded", "completed")
+        explicit = resolution.get("state") in ("unknown", "interrupted")
         checks.record(
-            f"{proto}: restart did not silently declare success",
-            never_complete,
+            f"{proto}: restart yields explicit unknown/interrupted (not success, not 'still running')",
+            explicit,
             f"state={resolution.get('state')} reason={resolution.get('reason')}",
         )
     out["final"] = final

@@ -202,16 +202,37 @@ class TestPerTurnReconciliation(ClientTestCase):
         self.assertEqual(found.state, "interrupted")
         self.assertFalse(found.is_complete)
 
-    def test_assistant_error_without_idle_is_not_terminal(self) -> None:
-        # an assistant error is an intermediate loop failure, not a turn terminal
+    def test_assistant_error_without_idle_is_unknown_not_terminal(self) -> None:
+        # An errored assistant with no authoritative idle is not a terminal: the
+        # turn died (e.g. torn down by a restart) and no idle will follow, so the
+        # honest state is `unknown`, never `completed` and never a confident
+        # failed/interrupted.
         self.server.state.append_user(self.sid, "msg_aerr001", "x")
         self.server.state.append_assistant(
             self.sid, "boom", error={"message": "provider error"}, finish="error"
         )
         found = self.client.reconcile(self.sid, "msg_aerr001")
-        self.assertEqual(found.state, "in_progress")
+        self.assertEqual(found.state, "unknown")
         self.assertFalse(found.is_terminal)
         self.assertFalse(found.is_complete)
+        self.assertIn("no authoritative idle", found.reason)
+
+    def test_restart_errored_assistant_without_idle_is_unknown(self) -> None:
+        # Regression for the observed real restart: the server persists the user
+        # input plus a partial assistant with finish="error" (here with no
+        # `error` field, exactly as recorded live) and *no* idle, and never marks
+        # the outcome. Reconciliation must return unknown, not in_progress.
+        self.server.state.append_user(self.sid, "msg_restart_errored", "restart probe")
+        self.server.state.append_assistant(self.sid, "", finish="error")
+        found = self.client.reconcile(self.sid, "msg_restart_errored")
+        self.assertEqual(found.state, "unknown")
+        self.assertFalse(found.is_complete)
+        self.assertFalse(found.is_terminal)
+        self.assertIsNotNone(found.durable_receipt)  # the admitted input is still known
+        self.assertIn("errored turn", found.reason)
+        # a later authoritative idle still resolves the same admission
+        self.server.state.append_idle(self.sid, "succeeded")
+        self.assertEqual(self.client.reconcile(self.sid, "msg_restart_errored").state, "completed")
 
     def test_tool_calls_assistant_without_idle_is_not_complete(self) -> None:
         # realistic agent loop: user -> assistant(finish=tool-calls) with a tool

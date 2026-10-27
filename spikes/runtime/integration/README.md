@@ -58,7 +58,7 @@ Versions: `opencode` 2.2.0, Python 3.14.4, Node v24.22.1. 16/16 checks passed.
 | --- | --- | --- |
 | Closing the prototype CLI does not stop the server-owned task; a second client retrieves the result after missed events (16) | **PASS (real)** | Admission is submitted in a **separate OS process that exits**; a **different** process then reconciles over persisted state only (no event stream). Python `completed`, TS `succeeded`. `observations.<proto>.disconnect_resolution`. |
 | Retrying a client-supplied admission ID produces one accepted input; admission is not mistaken for completion (17) | **PASS (real)** | Retry returned HTTP **200** (idempotent, not `409`) and exactly **one** `user` message with that id; the receipt carries no `outcome`. No second model call (fixture request log unchanged). `observations.<proto>.retry*`. |
-| Restarting only the disposable service yields recoverable continuation or an explicit interrupted/unknown outcome; no lost work silently declared complete (18) | **PASS with a caveat (real)** | Both turns were in flight (fixture reached, `outcome` absent) when `harness.sh restart` replaced only the owned process. Persistence recovered (session + user input survive). **No continuation**: the server recorded no terminal `idle` and `outcome` stayed absent. TS reports `unknown` (explicit); the Python prototype reports `in_progress` (non-terminal, never success — but not the explicit `interrupted`/`unknown` the criterion names). `observations.restart`. |
+| Restarting only the disposable service yields recoverable continuation or an explicit interrupted/unknown outcome; no lost work silently declared complete (18) | **PASS (real)** | Both turns were in flight (fixture reached, `outcome` absent) when `harness.sh restart` replaced only the owned process. Persistence recovered (session + user input survive). **No continuation**: the server recorded no terminal `idle` and `outcome` stayed absent. **Both** prototypes report the explicit `unknown`. `observations.restart`. |
 | Typed Jev predicate/choice/score + per-question failures, or a documented direct fallback (19) | **NOT RUN here** | No paid calls in this task. The direct-OpenRouter fallback was verified separately ($0.00002037); the native `generate.decisions` route remains blocked. |
 | Fresh critic context and role/model pinning; a fork is not a clean critic (20) | **PASS (real, metadata)** | For both prototypes `session.create` returns a brand-new session with pinned `agent=plan`, `model=mockprov/critic-echo` (≠ writer model), **no `parentID`**, and **0 history** messages. `observations.<proto>.critic`. |
 | No access/config changes to ordinary coding sessions (21) | **PARTIAL** | The run uses a unique owned root, scrubbed child env, and owned-only restart; it never calls `opencode service …`. Isolation *risk* documentation and the client-guard tests live in the prototype/harness READMEs; this orchestrator adds an empirical owned-service run, not a proof of global config isolation. |
@@ -71,9 +71,10 @@ With the owned process stopped mid-turn (fixture streaming an 8–10 s reply):
 * a **partial assistant** message is persisted with `finish: "error"`;
 * **no `idle` terminal is written and `Session.Info.outcome` stays absent** — the
   turn does **not** continue, and it is not marked `interrupted` by the server;
-* therefore the correct client answer is *indeterminate*: TS returns `unknown`,
-  Python returns `in_progress`. Neither claims success. Re-reading after the
-  original delay elapsed changed nothing.
+* therefore the correct client answer is *indeterminate*: **both** prototypes
+  return the explicit `unknown` (the Python prototype treats an errored assistant
+  with no authoritative `idle` as `unknown`, not `in_progress`). Re-reading after
+  the original delay elapsed changed nothing.
 
 ## Honest caveats and stubs
 
@@ -83,11 +84,11 @@ With the owned process stopped mid-turn (fixture streaming an 8–10 s reply):
   matching user message (the fixture's request log shows no second turn). Both
   clients' windowed reconciliation still resolves correctly; the anomaly is the
   server's, not the clients'.
-* **Python restart state.** Python's `in_progress` for a post-restart turn is not
-  the explicit `interrupted`/`unknown` the criterion names. This was observed, not
-  patched (the prototype treats "delivered, no authoritative idle" as in progress
-  by design).
-* **Decisions route not exercised** live or natively here (budget).
+* **Decisions route not exercised** live or natively here (budget). Step
+  `00-runtime-spike.md` line 19 explicitly allows documenting a tested
+  direct-OpenRouter fallback in place of the native route, so the native route's
+  absence is not, by itself, an unmet mandatory criterion. Per-question decision
+  failures are exercised **mock-only** and must stay visible as such.
 * The fixture provider is only for this spike; it declares two models
   (`delayed-echo`, `critic-echo`) and ignores tool calls.
 
