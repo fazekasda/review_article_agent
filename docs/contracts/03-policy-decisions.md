@@ -1,10 +1,11 @@
 # 03 — Policy and architecture decision register (v1)
 
 > **Status: PROPOSED — awaiting the user. This document is not an approval, and it
-> is not Step 01 completion.** The user authorized preparing the Step 01 contracts
-> ("proceed preparing step01 contracts"); that instruction is **not** approval of
-> any outstanding scientific policy, of the SQLite schema, of IPC, of the package
-> layout, or of any architecture claim. Every policy item below is recorded as
+> is not Step 01 completion.** The user directed this session to proceed with
+> preparing the Step 01 contracts. That direction is a **scope instruction to draft
+> this register**; it is **not** approval of any outstanding scientific policy, of
+> the SQLite schema, of IPC, of the package layout, or of any architecture claim.
+> Every policy item below is recorded as
 > **OPEN (`proposed`) and owned by the user** until the user dispositions it with
 > the evidence and exact revision the register requires (sections 1 and 2). No
 > policy, schema, or architecture is ratified here; no behavior is unblocked by
@@ -30,7 +31,7 @@ proposals below cannot silently weaken them.
 | **Python core** with a supported, explicitly authenticated OpenCode V2 HTTP integration | [decision 001](../decisions/001-runtime-language.md); [spec line 15](../specification.md) | Accepted by user 2026-10-27 |
 | **One active project at a time** | [spec line 11](../specification.md) | Confirmed |
 | Approvals bind to **immutable artifact/dependency revisions**; agents cannot self-approve | [spec lines 54–55](../specification.md) | Confirmed |
-| Secondary attribution at a tracing limit is a **warned state requiring final human approval**, never verified primary support | [spec line 50](../specification.md) | Confirmed (mechanism) |
+| Secondary attribution at a tracing limit or unavailable upstream origin is a **warned state requiring final human approval**, never verified primary support | [spec line 50](../specification.md) | Confirmed (mechanism) |
 | **Max 3** critique/repair rounds (section review) | [spec line 38](../specification.md) | Confirmed numeric maximum |
 | **Max 2** original-source factual-check/repair rounds | [spec line 39](../specification.md) | Confirmed numeric maximum |
 | **Max 2** whole-manuscript repair rounds | [spec line 40](../specification.md) | Confirmed numeric maximum |
@@ -74,6 +75,18 @@ explicitly supplies it. A stage may not pass by inventing a numeric scientific
 threshold ([01-contracts acceptance](../implementation/01-contracts.md), line 18;
 [kickoff line 103](../implementation/kickoffs/01-contracts.md)).
 
+**Projections vs. records.** The fields above are **mandatory on every record**. The
+human-readable entries in sections 2–5 are **projections** of a full record, not the
+record itself: they state the fields that differ from the defaults and inherit the
+rest. Unless an entry says otherwise, every entry in sections 2–5 inherits:
+`status = proposed`, `owner = user`, `approval_required = true`,
+`user_evidence = null`, `decided_against_revision = null`,
+`numeric_value = UNSET`, with `id`/`title`/`baseline_excerpt`/`baseline_ref`/
+`recommendation`/`options`/`affected_stages`/`blocking_dependencies`/
+`fail_closed_behavior`/`notes` taken from the entry text. A validator can therefore
+materialize a complete record for any entry by combining its stated fields with these
+defaults; no entry may rely on an **unstated, non-default** value.
+
 ### 1.2 Status values and transitions
 
 ```text
@@ -112,6 +125,65 @@ threshold ([01-contracts acceptance](../implementation/01-contracts.md), line 18
 4. `modified` is a terminal acceptance variant; a later change is recorded as a new
    revision decision, not an in-place edit of the accepted text.
 5. No agent/model output may set any status; only explicit user evidence may.
+
+### 1.4 Complete record examples (valid and invalid)
+
+**Valid full record (still `proposed`, i.e. OPEN).** Every field present:
+
+```json
+{
+  "id": "POL-OPS-COST",
+  "title": "Cost and concurrency limits",
+  "status": "proposed",
+  "baseline_excerpt": "Bounded budgets/concurrency; no busy loop while waiting.",
+  "baseline_ref": "docs/specification.md lines 11, 13",
+  "recommendation": "Define per-project and per-stage cost ceilings and a within-project concurrency bound.",
+  "options": [
+    "explicit ceilings + concurrency bound",
+    "user-set per project with no default",
+    "defer but block all paid calls"
+  ],
+  "owner": "user",
+  "approval_required": true,
+  "user_evidence": null,
+  "decided_against_revision": null,
+  "affected_stages": ["03", "04"],
+  "blocking_dependencies": ["any new paid call", "concurrency above the bound"],
+  "fail_closed_behavior": "With unset ceilings, no new paid call is issued; unknown cost retains its reserve.",
+  "numeric_value": "UNSET",
+  "notes": "Distinct from the confirmed repair-round maxima."
+}
+```
+
+**Valid transitioned record.** The only legal change is a user-driven transition,
+which **must** carry evidence and an exact revision:
+
+```json
+{
+  "id": "POL-OPS-COST",
+  "status": "accepted",
+  "user_evidence": "<verbatim user statement>, 2026-10-27",
+  "decided_against_revision": "<40-char commit SHA>",
+  "numeric_value": "<user-supplied ceiling>"
+}
+```
+
+**Invalid record — accepted without evidence (rejected).**
+
+```json
+{ "id": "POL-P1", "status": "accepted", "user_evidence": null, "decided_against_revision": null }
+```
+
+Rejected: rule 1.3(2) requires `user_evidence` **and** `decided_against_revision`.
+
+**Invalid record — invented threshold (rejected).**
+
+```json
+{ "id": "POL-OPS-PILOT", "status": "proposed", "numeric_value": 0.95 }
+```
+
+Rejected: a coordinator/session may not set a numeric scientific threshold; only the
+user may, and only on an accepted/modified transition.
 
 ---
 
@@ -159,8 +231,10 @@ are recorded `proposed`, owner **user**, with dependent behavior blocked.
 - **Affected stages.** [09 §extraction](../implementation/README.md),
   [10 §synthesis](../implementation/README.md), [12 §review](../implementation/README.md),
   [13 §origin-tracing](../implementation/README.md).
-- **Blocking dependencies.** Causal/context-fidelity findings cannot be generated or
-  dispositioned; conclusions that depend on them cannot be approved.
+- **Blocking dependencies.** Only the **pass/approval** of conclusions that depend on
+  a fidelity dimension is blocked. Detection is **not** blocked: fidelity
+  findings/issues may still be **recorded as proposals** and surfaced for the user;
+  they simply cannot be auto-dispositioned to pass.
 - **Fail-closed.** An unchecked fidelity dimension is a **missing check**, not a pass
   ([spec line 57](../specification.md)); affected conclusions remain unapproved.
 - **numeric_value:** `UNSET`.
@@ -202,10 +276,12 @@ are recorded `proposed`, owner **user**, with dependent behavior blocked.
 - **Owner / approval.** User. `approval_required = true`.
 - **Affected stages.** [14 §delivery](../implementation/README.md),
   [15 §release](../implementation/README.md).
-- **Blocking dependencies.** The required reporting artifact cannot be declared
-  complete; export cannot claim the reporting requirement is satisfied.
-- **Fail-closed.** Without an agreed format, the export carries an explicit
-  "reporting requirement open" flag rather than omitting it.
+- **Blocking dependencies.** The **proposed** reporting artifact (not a baseline
+  mandate) cannot be declared complete; export cannot claim the reporting requirement
+  is satisfied.
+- **Fail-closed.** Without an agreed format, the export records an explicit
+  **proposed** marker that the reporting requirement is open, rather than silently
+  omitting a report. This marker is a proposal, not an accepted baseline requirement.
 - **numeric_value:** `UNSET`.
 
 ### POL-P5 — AI-use declaration, human accountability, provider terms, journal policies
@@ -226,8 +302,11 @@ are recorded `proposed`, owner **user**, with dependent behavior blocked.
 - **Blocking dependencies.** Hosted-model transfer authorization and any
   submission-facing AI declaration are blocked. (Hosted transfer is *also*
   independently gated by rights — section 5.)
-- **Fail-closed.** Hosted-model transfer defaults to **denied** until authorized
-  (sections 5.2–5.3); the declaration is a mandatory output, not optional.
+- **Fail-closed.** Hosted-model transfer defaults to **`unknown` → blocked** until
+  authorized (sections 5.2–5.3). The declaration's content/format is a **proposal**: the
+  baseline records the AI-use declaration as a P5 item **to be decided**
+  ([spec line 73](../specification.md)) and does not, by itself, mandate a specific
+  mandatory output. No unaccepted scope is asserted as a baseline requirement.
 - **numeric_value:** `UNSET`.
 
 ### POL-P6 — Optional target-venue constraints and submission-time verification
@@ -321,7 +400,7 @@ Proposed values may remain **unset**; each has an explicit fail-closed behavior.
   ([00 handoff](../implementation/handoffs/00-runtime-spike.md)).
 - **Recommendation (proposal only).** Define per-project and per-stage cost ceilings
   and the within-project concurrency bound; keep the global
-  **one-active-project** limit (section 4.6).
+  **one-active-project** limit (ARCH-ACTIVE-ENF).
 - **Options.** (a) explicit ceilings + concurrency bound; (b) user-set per project
   with no default; (c) defer but block all paid calls.
 - **Affected stages.** [03](../implementation/03-durable-worker.md),
@@ -330,7 +409,7 @@ Proposed values may remain **unset**; each has an explicit fail-closed behavior.
   blocked.
 - **Fail-closed.** With unset ceilings, **no new paid call** is issued; unknown cost
   retains its reserve and is never reported as zero
-  ([live-jev accounting](../implementation/README.md)).
+  ([live-jev accounting](../../spikes/runtime/live-jev/README.md)).
 - **numeric_value:** `UNSET` (currency ceilings and concurrency bound not agreed).
 
 ### POL-OPS-TRACE — Citation tracing hop/source/retry defaults
@@ -342,14 +421,18 @@ Proposed values may remain **unset**; each has an explicit fail-closed behavior.
   claim and per project, and resolution retries, with cycle detection. These are
   explicitly **distinct from** the confirmed repair budgets (section 0).
 - **Options.** (a) explicit numbers; (b) user-set per project with no default;
-  (c) defer but treat any limit as reached.
+  (c) defer the numbers but keep tracing in `configuration_required` (no remote work).
 - **Affected stages.** [13 §origin-tracing](../implementation/README.md).
-- **Blocking dependencies.** Tracing cannot run past an unset limit; a depth-0 claim
-  is not treated as trivially resolved.
-- **Fail-closed.** At an **unset** limit, the tracer behaves as if the limit is
-  reached: it stops and produces the **warned secondary-attribution state requiring
-  final human approval** ([spec line 50](../specification.md)) — never "verified
-  primary support".
+- **Blocking dependencies.** While the limits are unset, tracing enters
+  **`configuration_required`**: it performs **no remote/upstream tracing work** and
+  does **not** infer that any limit was reached. A depth-0 claim is not treated as
+  trivially resolved.
+- **Fail-closed.** An **unset** limit means **`configuration_required`**, not a
+  reached limit. The warned **secondary-attribution** state is entered **only** when a
+  source that was **actually read** supports the claim only secondarily **and** the
+  missing upstream origin has been **adjudicated** ([spec line 50](../specification.md));
+  it is never a stand-in for an unconfigured limit and never "verified primary
+  support".
 - **numeric_value:** `UNSET`.
 
 ### POL-OPS-SECONDARY — Explicit acceptance of secondary-origin warnings
@@ -375,7 +458,9 @@ Proposed values may remain **unset**; each has an explicit fail-closed behavior.
 - **Blocking dependencies.** Final approval of a claim reached only through a
   secondary source cannot be recorded as verified primary support.
 - **Fail-closed.** Every secondary-origin claim stays **warned and unapproved** until
-  a human approval is recorded against the exact revision.
+  a human approval is recorded against the exact revision. The warned state is entered
+  only from an **actually-read** supporting source plus an **adjudicated missing
+  upstream origin** — never from an unconfigured tracing limit (see POL-OPS-TRACE).
 - **numeric_value:** `UNSET` (not numeric).
 
 ---
@@ -401,8 +486,8 @@ approve any of the choices below, which Step 01 must present for the user's deci
   private database ([spec line 16](../specification.md)). The Step 00 harness
   persisted sessions across a real restart using SQLite at
   `$XDG_DATA_HOME/opencode/opencode.db`
-  ([harness README](../implementation/README.md)); the spike did **not** define an
-  application schema.
+  ([harness README](../../spikes/runtime/harness/README.md)); the spike did **not**
+  define an application schema.
 - **Limitations.** No schema is proposed here; the store must satisfy untested
   recovery/migration/backup criteria ([02 lines 20–21](../implementation/02-project-foundation.md)).
   A registry is an app-owned file, not an OpenCode database.
@@ -432,12 +517,15 @@ approve any of the choices below, which Step 01 must present for the user's deci
   worker; no root or public unauthenticated listener required; authentication rejects
   non-owner control ([03 lines 9, 22](../implementation/03-durable-worker.md)).
 - **Alternatives.** (a) authenticated loopback HTTP; (b) OS-owner-scoped socket/pipe;
-  (c) an embedded in-process worker.
+  (c) an **embedded in-process worker — excluded**: a worker embedded in the CLI
+  process cannot continue after the CLI closes, violating the durable-continuity
+  requirement ([spec line 12](../specification.md)).
 - **Evidence.** The accepted runtime decision's defaults: explicit endpoint and
   credential only, loopback-only, fail-closed, redirects refused
   ([decision 001](../decisions/001-runtime-language.md)); the harness binds
   `127.0.0.1` with a per-run password and refuses foreign control
-  (harness README). Step 03 requires authenticated local control.
+  ([harness README](../../spikes/runtime/harness/README.md)). Step 03 requires
+  authenticated local control.
 - **Limitations.** No IPC protocol is specified; the transport choice is untested as
   an application contract.
 - **User gate.** The user selects the IPC mechanism; nothing is bound to it yet.
@@ -465,7 +553,9 @@ approve any of the choices below, which Step 01 must present for the user's deci
   verifies artifact hashes and approvals
   ([02 lines 10, 20–21](../implementation/02-project-foundation.md)).
 - **Alternatives.** (a) SQLite online backup / snapshot API with versioned
-  migrations; (b) file-level copy of db+`-wal`+`-shm`; (c) export/import manifest.
+  migrations; (b) file-level copy of db+`-wal`+`-shm` — **rejected**: a live arbitrary
+  file copy is non-compliant with the baseline requirement to use SQLite's
+  snapshot/backup mechanism and to account for WAL state; (c) export/import manifest.
 - **Evidence.** Step 02 explicitly forbids copying "only the live database file and
   ignor[ing] WAL state" and requires using SQLite's snapshot/backup mechanism, not an
   arbitrary copy of a live WAL database
@@ -476,68 +566,108 @@ approve any of the choices below, which Step 01 must present for the user's deci
   during concurrent writes is a test obligation of Step 02, not proven here.
 - **User gate.** The user confirms migration/backup semantics alongside ARCH-STORE.
 
-### ARCH-ACTIVE — One global active-project invariant
+### ARCH-ACTIVE-ENF — Active-project enforcement mechanism (invariant already confirmed)
 
-- **Proposal.** Exactly **one** active project executes at a time globally; concurrent
-  activation attempts cannot execute two projects; a safe switch reconciles or drains
-  existing work before another project executes and cannot leave old-project jobs
-  committing into the new project
-  ([03 lines 11, 19](../implementation/03-durable-worker.md);
-  [README line 66](../implementation/README.md)). Waiting gates release execution
-  resources.
+- **Invariant status.** The **invariant** "exactly one active project at a time
+  globally" is **already confirmed baseline** ([spec line 11](../specification.md);
+  [README line 66](../implementation/README.md)) and is **not** reopened here. Only
+  the **enforcement mechanism** is `proposed`.
+- **Proposal (mechanism only).** Concurrent activation attempts cannot execute two
+  projects; a safe switch reconciles or drains existing work before another project
+  executes and cannot leave old-project jobs committing into the new project
+  ([03 lines 11, 19](../implementation/03-durable-worker.md)). Waiting gates release
+  execution resources.
 - **Alternatives.** (a) a single global lock/lease for the active project;
   (b) per-project locks with a global arbiter; (c) a single-worker model.
 - **Evidence.** Confirmed baseline "one active project at a time"
   ([spec line 11](../specification.md)); global definition of done "Exactly one
   project may execute at once"
   ([README line 66](../implementation/README.md)); the Step 00 harness used `flock`
-  to exclude concurrent mutation (harness README).
+  to exclude concurrent mutation ([harness README](../../spikes/runtime/harness/README.md)).
 - **Limitations.** **Within-project** concurrency may be bounded independently
   ([spec line 11](../specification.md)) and is not defined here; fencing protects
   accepted writes, not arbitrary external side effects
   ([03 line 20](../implementation/03-durable-worker.md)).
-- **User gate.** The user confirms the invariant's enforcement is contract-level; it
-  is not an accepted architecture until then.
+- **User gate (mechanism only).** The user selects how the confirmed invariant is
+  enforced; the invariant itself needs no new gate.
 
 ---
 
 ## 5. Rights and privacy model v1
 
-### 5.1 Mandatory record types
+### 5.1 RightsRecord v1 — mandatory, fully typed
 
-A rights/privacy record is mandatory for every acquired source and every use of it.
-At minimum a record carries:
+A `RightsRecord` v1 is mandatory for every acquired source and every use of it. The
+table below is the **type definition**; every field is required, and a record missing
+a required field is **invalid** and fail-closed (see the validity rules below and the
+examples in 5.6).
 
-| Type | Meaning |
-| --- | --- |
-| `source_id` | The acquired source/asset the rights attach to. |
-| `rights.acquisition` | Right to obtain the source by the chosen method. |
-| `rights.storage` | Right to store the source locally. |
-| `rights.redistribution` | Right to include/redistribute the source in output. |
-| `rights.hosted_transfer` | Right to send the source to a hosted model/provider. |
-| `rights_evidence` | The provenance/authority for each right (or `unknown`). |
-| `privacy_flags` | Confidentiality/personal-data constraints relevant to the source. |
-| `status` | `granted` \| `denied` \| `unknown` per right (default `unknown`). |
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `rights_id` | string | Stable id of this rights record, e.g. `RIGHTS-<source>`. |
+| `project_id` | string | App-owned **project** id this record belongs to. |
+| `source_revision` | string | Immutable **source revision** ref the rights bind to (content-addressed asset revision). |
+| `record_revision` | integer | Version of this rights record; bumped on change and bound by decisions. |
+| `authorizing_revision` | string \| null | Exact revision the authorization binds to; `null` until authorized. |
+| `operations` | object | Per-operation status map over the four operations (enum below). |
+| `basis` | object | Per-operation evidence/basis (shape below). |
+| `restrictions` | string[] | Declared limits, e.g. `no_redistribution`, `no_hosting`, `quote_limit`. |
+| `privacy` | object | `{personal_data: bool, confidentiality: enum}` where `confidentiality` ∈ `public` \| `confidential` \| `unknown`. |
+| `recorded_by` | string | Actor that recorded the record (user or agent id). |
+| `recorded_at` | string | ISO-8601 timestamp. |
+| `derived_status` | enum | `valid` \| `incomplete` \| `inconsistent` — **computed**, not hand-set. |
 
-The four rights are **separate**: "Acquisition, storage, redistribution, and
-hosted-model transfer rights are separate. Uploading a file is not proof of all
-rights." ([spec line 63](../specification.md)).
+**Operation enum (canonical).** Each of the four operations takes exactly one value:
+`allowed` | `not_allowed` | `unknown` | `not_applicable`. These are the canonical
+operation-status values used across the Step 01 contracts (sibling contract C01 uses
+the same four).
+
+**Operations (four, separate).** `acquisition`, `storage`, `redistribution`,
+`hosted_transfer`. The four rights are **separate**: "Acquisition, storage,
+redistribution, and hosted-model transfer rights are separate. Uploading a file is not
+proof of all rights." ([spec line 63](../specification.md)).
+
+**Basis (per operation).** `{kind, evidence_ref}` where `kind` ∈ `license` |
+`public_domain` | `statutory` | `publisher_permission` | `user_authorization` |
+`unknown`, and `evidence_ref` is a non-empty provenance pointer or `null`.
+
+**Validity rules.**
+
+1. `allowed` **requires** a `basis.kind` other than `unknown` **and** a non-`null`
+   `evidence_ref`; otherwise the record is `inconsistent` and **rejected**.
+2. A missing operation or missing field defaults to `unknown` and marks the record
+   `incomplete`.
+3. **A user cannot confer a nonexistent right.** `user_authorization` records the
+   user's own permission to act within the rights they hold; it **cannot** set
+   `redistribution` or `hosted_transfer` to `allowed` for a third-party copyrighted
+   source without a `license` / `publisher_permission` / `public_domain` basis.
+4. **Unknown storage retains metadata only.** When `storage` is `unknown`, only source
+   **metadata** is retained (identity/locator/provenance), pending a **lawful
+   quarantine disposition**; source **bytes are not unconditionally retained**.
+5. **Exports distinguish citation from redistribution.** A **bibliographic citation**
+   of a source in the manuscript is governed by attribution and is **not**
+   redistribution. Including source **content/excerpts** (redistribution) requires
+   `redistribution: allowed`.
 
 ### 5.2 Rights enforcement
 
 - **Unknown blocks the affected operation.** An operation whose required right is
-  `unknown` or `denied` is **blocked**, not attempted; the block is an explicit state.
+  `unknown` (or `not_allowed`) is **blocked**, not attempted; the block is an explicit
+  state. `not_applicable` never unblocks a real operation.
 - **Hosted tools default denied.** Sending source content to a hosted model/provider
-  defaults to **denied** until the user authorizes `hosted_transfer` for that source.
-  This is independent of, and additional to, the P5 gate (section 2, POL-P5).
+  defaults to **`unknown` → blocked** until the user authorizes `hosted_transfer` for
+  that source. This is independent of, and additional to, the P5 gate (POL-P5).
 
 ### 5.3 Logging, fixtures, and secrets
 
 - Logs and test fixtures must contain **no secrets and no licensed source text**
   ([01-contracts line 22](../implementation/01-contracts.md);
   [README line 58](../implementation/README.md)). The Step 00 reports record
-  endpoints/ports only and include no credential or paper text (handoff; live-jev
-  and integration READMEs). This register contains no licensed excerpts.
+  endpoints/ports only and include no credential or paper text
+  ([handoff](../implementation/handoffs/00-runtime-spike.md);
+  [live-jev README](../../spikes/runtime/live-jev/README.md);
+  [integration README](../../spikes/runtime/integration/README.md)). This register
+  contains no licensed excerpts.
 
 ### 5.4 Source content is untrusted
 
@@ -556,47 +686,89 @@ constraint), hosted-model transfer and submission-facing output stay gated
 (sections 5.2, POL-P5). "Uploading a file is not proof of all rights"
 ([spec line 63](../specification.md)).
 
-### 5.6 Synthetic rights examples (invalid / missing permissions)
+### 5.6 RightsRecord examples (complete valid; rejected missing/inconsistent)
 
 These examples are **synthetic**; they reference no licensed text.
 
-**Example A — mixed rights (redistribution unknown).** A synthetic source record:
+**Example A — valid record (public-domain source).** All four operations `allowed`,
+each with a real basis and non-`null` evidence:
 
 ```json
 {
-  "source_id": "syn-example-A",
-  "rights": {
-    "acquisition": "granted",
-    "storage": "granted",
-    "redistribution": "unknown",
-    "hosted_transfer": "denied"
+  "rights_id": "RIGHTS-syn-example-A",
+  "project_id": "proj-syn-1",
+  "source_revision": "asset:sha256:synA...",
+  "record_revision": 1,
+  "authorizing_revision": "commit:syn0001",
+  "operations": {
+    "acquisition": "allowed",
+    "storage": "allowed",
+    "redistribution": "allowed",
+    "hosted_transfer": "allowed"
   },
-  "privacy_flags": [],
-  "status": "partial"
+  "basis": {
+    "acquisition": {"kind": "public_domain", "evidence_ref": "lic:pd-syn-A"},
+    "storage": {"kind": "public_domain", "evidence_ref": "lic:pd-syn-A"},
+    "redistribution": {"kind": "public_domain", "evidence_ref": "lic:pd-syn-A"},
+    "hosted_transfer": {"kind": "public_domain", "evidence_ref": "lic:pd-syn-A"}
+  },
+  "restrictions": [],
+  "privacy": {"personal_data": false, "confidentiality": "public"},
+  "recorded_by": "user",
+  "recorded_at": "2026-10-27T00:00:00Z",
+  "derived_status": "valid"
 }
 ```
 
-Expected behavior: acquisition and storage are allowed; **redistribution is blocked**
-(output/export of the source content), and **hosted transfer is blocked** (denied).
-The pipeline proceeds only with operations permitted by granted rights,
-fail-closed.
+Expected: every operation permitted; `derived_status = valid`; a manuscript may both
+**cite** the source and **redistribute** its content.
 
-**Example B — missing permissions (no rights record).** A synthetic source with no
-rights record at all resolves every right to its default `unknown`. Expected
-behavior: **all four operations are blocked**; the source is retained as an explicit
-`rights_unknown` state and cannot be redistributed or transferred until the user
-supplies rights evidence.
+**Example B — rejected, inconsistent (grant without evidence / user overreach).**
 
-**Invalid-transition example.** An attempt to record `hosted_transfer: granted` with
-`rights_evidence: unknown` is **rejected**: a granted right requires provenance; a
-grant without evidence cannot unblock the operation.
+```json
+{
+  "rights_id": "RIGHTS-syn-example-B",
+  "project_id": "proj-syn-1",
+  "source_revision": "asset:sha256:synB...",
+  "record_revision": 1,
+  "authorizing_revision": null,
+  "operations": {
+    "acquisition": "allowed",
+    "storage": "allowed",
+    "redistribution": "unknown",
+    "hosted_transfer": "allowed"
+  },
+  "basis": {
+    "acquisition": {"kind": "statutory", "evidence_ref": "law:syn"},
+    "storage": {"kind": "statutory", "evidence_ref": "law:syn"},
+    "redistribution": {"kind": "unknown", "evidence_ref": null},
+    "hosted_transfer": {"kind": "user_authorization", "evidence_ref": null}
+  },
+  "restrictions": ["no_hosting"],
+  "privacy": {"personal_data": false, "confidentiality": "public"},
+  "recorded_by": "user",
+  "recorded_at": "2026-10-27T00:00:00Z",
+  "derived_status": "inconsistent"
+}
+```
+
+Rejected: `hosted_transfer: allowed` has a `null` `evidence_ref` (rule 1), and a
+`user_authorization` basis cannot confer `hosted_transfer` on a third-party source
+(rule 3). Expected behavior: the record is **inconsistent/rejected**;
+`hosted_transfer` and `redistribution` stay **blocked**, while acquisition/storage
+proceed.
+
+**Example C — missing record (incomplete).** A synthetic source with **no**
+`RightsRecord` resolves every operation to its default `unknown`. Only source
+**metadata** is retained pending a lawful quarantine disposition (rule 4); **all four
+operations are blocked** until the user supplies rights evidence.
 
 ---
 
 ## 6. Exact questions the user can answer next
 
 Answer any subset; each answer is a producer of `user_evidence` + a target revision
-for section 1.2. Short answers are enough; no long prose required.
+for sections 1.2–1.3. Short answers are enough; no long prose required.
 
 1. **P1:** Accept, modify, or defer the framework-contribution/concept criteria
    (POL-P1)? If modify, what must the criteria add or drop?
@@ -620,10 +792,11 @@ for section 1.2. Short answers are enough; no long prose required.
 12. **Secondary warnings:** Confirm the warning record type/severity and where final
     human approval binds (POL-OPS-SECONDARY).
 13. **Technical direction:** Accept, modify, or defer ARCH-STORE, ARCH-ASSETS,
-    ARCH-IPC, ARCH-PKG, ARCH-MIGRATE, ARCH-ACTIVE (section 4) — and, if accepted,
-    against which exact revision?
-14. **Rights:** Confirm the mandatory rights fields (section 5.1) and that unknown
-    rights block the affected operation.
+    ARCH-IPC, ARCH-PKG, ARCH-MIGRATE, ARCH-ACTIVE-ENF (section 4; the one-active-project
+    **invariant** is already confirmed — only its enforcement mechanism is open) — and,
+    if accepted, against which exact revision?
+14. **Rights:** Confirm the mandatory `RightsRecord` v1 fields (section 5.1) and that
+    `unknown`/`not_allowed` block the affected operation.
 
 ---
 
@@ -648,8 +821,8 @@ for section 1.2. Short answers are enough; no long prose required.
 | ARCH-IPC | Local authenticated IPC | user | **proposed (OPEN)** | — | 03 |
 | ARCH-PKG | Python package layout | user | **proposed (OPEN)** | — | 02–04 |
 | ARCH-MIGRATE | Migrations + backup/WAL consistency | user | **proposed (OPEN)** | — | 02 |
-| ARCH-ACTIVE | One global active-project invariant | user | **proposed (OPEN)** | — | 02, 03 |
-| RIGHTS-* | Rights/privacy record types and enforcement | user | **proposed (OPEN)** | — | 04, 06, 09, 14 |
+| ARCH-ACTIVE-ENF | Active-project enforcement mechanism (invariant confirmed) | user | **proposed (OPEN)** | — | 02, 03 |
+| RIGHTS-v1 | `RightsRecord` v1 types and enforcement | user | **proposed (OPEN)** | — | 04, 06, 09, 14 |
 
 **No record above is accepted. No dependent behavior is unblocked. Step 01 is not
 complete.**
