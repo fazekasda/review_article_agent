@@ -1,0 +1,7 @@
+{
+  "name": "opencode-runtime-spike-integration",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Step-00 integration harness: both prototypes against one real disposable OpenCode V2 service, with a deterministic local fixture model provider."
+}

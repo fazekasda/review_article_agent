@@ -1,0 +1,22 @@
+{
+  "name": "opencode-runtime-spike-typescript",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal official OpenCode V2 @opencode/client lifecycle prototype (spike 00, TypeScript side).",
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.ts",
+    "cli": "node src/cli.ts"
+  },
+  "dependencies": {
+    "@opencode/client": "2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

@@ -1,0 +1,114 @@
+{
+  "answers": {
+    "confidence_level": {
+      "confidence": 0.0,
+      "legend": {
+        "0": "low",
+        "1": "moderate",
+        "2": "high"
+      },
+      "probabilities": {
+        "0": 0.43,
+        "1": 0.05,
+        "2": 0.52
+      },
+      "score": 1.09,
+      "type": "score",
+      "wire_type": "score"
+    },
+    "is_original_report": {
+      "probability": 0.83,
+      "type": "predicate",
+      "wire_type": "noul"
+    },
+    "study_design": {
+      "choice": "randomised",
+      "confidence": 0.36,
+      "probabilities": {
+        "observational": 0.0,
+        "other": 0.43,
+        "randomised": 0.5700000000000001
+      },
+      "type": "choice",
+      "wire_type": "choice"
+    }
+  },
+  "api_key_loaded": true,
+  "api_key_source": "env-file",
+  "authorized": true,
+  "calls_allowed": 1,
+  "calls_attempted": 1,
+  "ceiling_usd": 0.25,
+  "cost_bound": {
+    "ceiling_usd": 0.25,
+    "cost_upper_bound_usd": 3.8682e-05,
+    "input_tokens_upper_bound": 921,
+    "usd_per_million_input_tokens": 0.042,
+    "usd_per_million_output_tokens": 0.0,
+    "within_ceiling": true
+  },
+  "cost_status": "provider_reported",
+  "cost_usd": 2.037e-05,
+  "endpoint": "https://openrouter.ai/api/alpha/decisions",
+  "error_answer_count": 0,
+  "http_status": 200,
+  "model": "typesafe/jev-1.14",
+  "notes": [
+    "provider reported cost"
+  ],
+  "per_question_errors": {},
+  "provider": "TypeSafe",
+  "request": {
+    "model": "typesafe/jev-1.14",
+    "provider": {
+      "max_price": {
+        "request": "0.250000"
+      }
+    },
+    "questions": {
+      "confidence_level": {
+        "criteria": [
+          "low",
+          "moderate",
+          "high"
+        ],
+        "instructions": "How confident is this classification?",
+        "type": "score"
+      },
+      "is_original_report": {
+        "criteria": {
+          "false": "It only summarises or cites another source.",
+          "true": "It reports its own data, analysis, or result."
+        },
+        "instructions": "Does the passage report its own original result rather than summarising another source?",
+        "type": "noul"
+      },
+      "study_design": {
+        "criteria": {
+          "observational": "An observational or cohort study.",
+          "other": "Neither of the above, or unclear from the passage.",
+          "randomised": "A randomised or otherwise controlled experiment."
+        },
+        "instructions": "Which design best matches the passage?",
+        "type": "choice"
+      }
+    },
+    "state": {
+      "fixture": "synthetic-spike-fixture-not-a-real-paper",
+      "passage": "In this synthetic record the intervention reduced the primary endpoint at 12 weeks."
+    }
+  },
+  "request_bytes": 921,
+  "request_sha256": "fad8bbfe19fb9e4469a935bcec046b5480e4d7d097273aad796ff72704b545fa",
+  "reserve_retained": false,
+  "response_id": "gen-dec-1793135284-yZeR6el7cx7kX8CAhObQ",
+  "response_model": "typesafe/jev-1.14-20261014",
+  "status": "completed",
+  "usage": {
+    "cost_status": "provider_reported",
+    "cost_usd": 2.037e-05,
+    "input_tokens": 485,
+    "output_tokens": 76
+  },
+  "valid_answer_count": 3
+}

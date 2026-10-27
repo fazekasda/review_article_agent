@@ -1,0 +1,11 @@
+# This spike is self-contained: dependencies are installed locally and never committed.
+node_modules/
+npm-debug.log*
+
+# TypeScript build output (the spike runs .ts directly via Node's type stripping).
+dist/
+*.tsbuildinfo
+
+# Local runtime artifacts from a live smoke run.
+*.local.json
+tmp/

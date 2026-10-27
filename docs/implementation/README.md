@@ -2,7 +2,7 @@
 
 ## Steps
 
-- [ ] [00 — OpenCode integration and language spike](00-runtime-spike.md)
+- [x] [00 — OpenCode integration and language spike](00-runtime-spike.md) — **complete**. All six acceptance criteria are evidenced on one real disposable OpenCode v2.2.0 service (real HTTP Basic auth, session create with pinned role/model, durable admission, SQLite persistence, and an owned-service restart). Criteria 1, 2, 3, and 5 are verified for **both** prototypes with only the model transport a deterministic local fixture; criterion 4 is met through the direct-OpenRouter fallback that `00-runtime-spike.md` line 19 explicitly allows (the native route is unexercised and per-question failures stay mock-only); criterion 6 is met as written — no change to ordinary coding sessions (ordinary endpoint/registration unchanged, child env/config contained) with global/ancestor inheritance risks documented and an ancestor-config root refused. The user accepted the runtime-language decision on 2026-10-27 (**Python core** with a supported, explicitly authenticated OpenCode V2 HTTP integration; TypeScript retained as reference). See the [step 00 handoff](handoffs/00-runtime-spike.md), [decision 001](../decisions/001-runtime-language.md), and the [step 01 kickoff](kickoffs/01-contracts.md).
 - [ ] [01 — Ratify scientific contracts and technical decisions](01-contracts.md)
 - [ ] [02 — CLI, project registry, artifacts, and backups](02-project-foundation.md)
 - [ ] [03 — Background worker, durable jobs, and recovery](03-durable-worker.md)
@@ -23,7 +23,7 @@
 
 Each numbered step is a separately assignable implementation unit. Prefer one step per session; a step may need several sessions if its acceptance criteria are not met. Do not call it complete merely because its code was written. The step documents specify dependencies, scope, deliverables, verification, acceptance, and handoff requirements.
 
-The [scientific/product baseline](../specification.md) governs all steps. The stack is intentionally unresolved until step 00. The steps describe behavior, not speculative framework-specific code. No feature is implemented by writing these documents.
+The [scientific/product baseline](../specification.md) governs all steps. The stack was resolved at step 00: the runtime language is **Python core** (accepted 2026-10-27). The steps describe behavior, not speculative framework-specific code. No feature is implemented by writing these documents.
 
 ### Dependency order
 
