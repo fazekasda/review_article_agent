@@ -15,6 +15,7 @@ from mock_server import MockServer
 from opencode_v2 import (
     Admission,
     DecisionError,
+    DecisionProtocolError,
     OpenCodeApiError,
     OpenCodeTransportError,
     OpenCodeV2Client,
@@ -22,6 +23,7 @@ from opencode_v2 import (
     first_decision_error,
     raise_on_decision_errors,
     summarize_decisions,
+    validate_decision_questions,
     validate_decision_result,
 )
 
@@ -401,28 +403,58 @@ class TestTypedDecisions(ClientTestCase):
         self.server.state.decision_answers = [
             {"type": "predicate", "name": "is_review", "probability": 0.5},
             {"type": "error", "name": "study_design", "reason": "refusal"},
-            {"type": "score", "name": "quality", "score": 1.0, "probabilities": [], "confidence": 0.2},
+            {
+                "type": "score",
+                "name": "quality",
+                "score": 1.0,
+                "probabilities": [
+                    {"value": 0, "label": "low", "probability": 0.4},
+                    {"value": 1, "label": "medium", "probability": 0.6},
+                ],
+                "confidence": 0.2,
+            },
         ]
         result = self.client.generate_decisions(
             model=CRITIC_MODEL,
             input_parts=[{"type": "text", "text": "x"}],
             questions=self.QUESTIONS,
         )
-        errors = validate_decision_result(result)
+        errors = validate_decision_result(result, self.QUESTIONS)
         self.assertEqual([e["name"] for e in errors], ["study_design"])
+        # a valid per-question error is preserved, not converted to an exclusion
         self.assertIsInstance(first_decision_error(result), DecisionError)
         with self.assertRaises(DecisionError):
             raise_on_decision_errors(result)
         rows = summarize_decisions(result)
         self.assertEqual([r["failed"] for r in rows], [False, True, False])
+        # the error answer is a well-formed error answer, not a protocol failure
+        error_answer = errors[0]
+        self.assertEqual(error_answer["type"], "error")
+        self.assertEqual(error_answer["reason"], "refusal")
+
+    def test_generate_decisions_validates_at_the_boundary(self) -> None:
+        # the default mock answers are valid: they must survive the boundary
+        result = self.client.generate_decisions(
+            model=CRITIC_MODEL,
+            input_parts=[{"type": "text", "text": "abstract..."}],
+            questions=self.QUESTIONS,
+        )
+        self.assertEqual(
+            [a["name"] for a in result["answers"]],
+            ["is_review", "study_design", "quality"],
+        )
+        self.assertEqual(validate_decision_result(result, self.QUESTIONS), [])
 
     def test_malformed_answer_rejected(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(DecisionProtocolError):
             validate_decision_result({"answers": [{"type": "predicate", "name": "x"}]})
-        with self.assertRaises(ValueError):
+        with self.assertRaises(DecisionProtocolError):
             validate_decision_result(
                 {"answers": [{"type": "predicate", "name": "x", "probability": 2}]}
             )
+        # a protocol failure is still a ValueError (backwards compatible)
+        with self.assertRaises(ValueError):
+            validate_decision_result({"answers": [{"type": "predicate", "name": "x"}]})
         with self.assertRaises(ValueError):
             self.client.generate_decisions(
                 model=CRITIC_MODEL, input_parts=[], questions=self.QUESTIONS
@@ -436,6 +468,296 @@ class TestTypedDecisions(ClientTestCase):
                     {"type": "predicate", "name": "d", "instructions": "b"},
                 ],
             )
+
+    # -- strict numeric bounds (finite, never bool) --------------------------
+    def test_probability_rejects_bool_nan_and_infinity(self) -> None:
+        for bad in (True, False, float("nan"), float("inf"), -0.1, 1.1, "0.5", None):
+            with self.assertRaises(DecisionProtocolError, msg=repr(bad)):
+                validate_decision_result(
+                    {"answers": [{"type": "predicate", "name": "x", "probability": bad}]}
+                )
+        # finite inclusive bounds are accepted, and 0/1 ints are numbers
+        self.assertEqual(
+            validate_decision_result(
+                {"answers": [{"type": "predicate", "name": "x", "probability": 0}]}
+            ),
+            [],
+        )
+
+    def test_confidence_and_probabilities_reject_non_finite(self) -> None:
+        for bad in (True, float("nan"), float("inf"), 2):
+            with self.assertRaises(DecisionProtocolError, msg=f"confidence={bad!r}"):
+                validate_decision_result(
+                    {
+                        "answers": [
+                            {
+                                "type": "choice",
+                                "name": "x",
+                                "choice": "a",
+                                "probabilities": [{"value": "a", "probability": 0.5}],
+                                "confidence": bad,
+                            }
+                        ]
+                    }
+                )
+        with self.assertRaises(DecisionProtocolError):
+            validate_decision_result(
+                {
+                    "answers": [
+                        {
+                            "type": "choice",
+                            "name": "x",
+                            "choice": "a",
+                            "probabilities": [{"value": "a", "probability": float("nan")}],
+                            "confidence": 0.5,
+                        }
+                    ]
+                }
+            )
+
+    def test_unknown_and_extra_fields_rejected(self) -> None:
+        with self.assertRaises(DecisionProtocolError):
+            validate_decision_result(
+                {
+                    "answers": [
+                        {"type": "predicate", "name": "x", "probability": 0.5, "bogus": 1}
+                    ]
+                }
+            )
+        with self.assertRaises(DecisionProtocolError):
+            validate_decision_result({"answers": [], "bogus": 1})
+        with self.assertRaises(DecisionProtocolError):
+            validate_decision_result({"answers": [], "cost": True})
+        with self.assertRaises(DecisionProtocolError):
+            validate_decision_result({"answers": [], "tokens": {"input": "12"}})
+
+    def test_missing_or_non_dict_response_is_protocol_failure(self) -> None:
+        for payload in ({}, {"data": None}, {"data": []}, [{"answers": []}]):
+            self.server.state.decision_response = payload
+            with self.assertRaises(DecisionProtocolError, msg=repr(payload)):
+                self.client.generate_decisions(
+                    model=CRITIC_MODEL,
+                    input_parts=[{"type": "text", "text": "x"}],
+                    questions=self.QUESTIONS,
+                )
+
+    def test_answer_cardinality_missing_duplicate_and_unknown_names(self) -> None:
+        cases = {
+            "too_few": [
+                {"type": "predicate", "name": "is_review", "probability": 0.5},
+            ],
+            "too_many": [
+                {"type": "predicate", "name": "is_review", "probability": 0.5},
+                {"type": "error", "name": "study_design", "reason": "r"},
+                {
+                    "type": "score",
+                    "name": "quality",
+                    "score": 1.0,
+                    "probabilities": [
+                        {"value": 0, "label": "low", "probability": 0.5},
+                        {"value": 1, "label": "medium", "probability": 0.5},
+                    ],
+                    "confidence": 0.5,
+                },
+                {"type": "predicate", "name": "extra", "probability": 0.5},
+            ],
+            "unknown_name": [
+                {"type": "predicate", "name": "is_review", "probability": 0.5},
+                {"type": "error", "name": "not_a_question", "reason": "r"},
+                {"type": "score", "name": "quality", "score": 1.0,
+                 "probabilities": [{"value": 0, "label": "low", "probability": 0.5},
+                                   {"value": 1, "label": "medium", "probability": 0.5}],
+                 "confidence": 0.5},
+            ],
+            "wrong_order": [
+                {"type": "error", "name": "study_design", "reason": "r"},
+                {"type": "predicate", "name": "is_review", "probability": 0.5},
+                {"type": "score", "name": "quality", "score": 1.0,
+                 "probabilities": [{"value": 0, "label": "low", "probability": 0.5},
+                                   {"value": 1, "label": "medium", "probability": 0.5}],
+                 "confidence": 0.5},
+            ],
+            "duplicate_name": [
+                {"type": "predicate", "name": "is_review", "probability": 0.5},
+                {"type": "predicate", "name": "is_review", "probability": 0.5},
+                {"type": "score", "name": "quality", "score": 1.0,
+                 "probabilities": [{"value": 0, "label": "low", "probability": 0.5},
+                                   {"value": 1, "label": "medium", "probability": 0.5}],
+                 "confidence": 0.5},
+            ],
+        }
+        for label, answers in cases.items():
+            with self.assertRaises(DecisionProtocolError, msg=label):
+                validate_decision_result({"answers": answers}, self.QUESTIONS)
+
+    def test_answer_type_mismatch_rejected(self) -> None:
+        # a predicate question answered as a choice is a protocol failure
+        answers = [
+            {"type": "choice", "name": "is_review", "choice": "rct",
+             "probabilities": [{"value": "rct", "probability": 0.5},
+                               {"value": "cohort", "probability": 0.5}],
+             "confidence": 0.5},
+            {"type": "error", "name": "study_design", "reason": "r"},
+            {"type": "score", "name": "quality", "score": 1.0,
+             "probabilities": [{"value": 0, "label": "low", "probability": 0.5},
+                               {"value": 1, "label": "medium", "probability": 0.5}],
+             "confidence": 0.5},
+        ]
+        with self.assertRaises(DecisionProtocolError):
+            validate_decision_result({"answers": answers}, self.QUESTIONS)
+
+    def test_invalid_choice_selected_value_rejected(self) -> None:
+        answers = [
+            {"type": "predicate", "name": "is_review", "probability": 0.5},
+            {"type": "choice", "name": "study_design", "choice": "case-control",
+             "probabilities": [{"value": "rct", "probability": 0.5},
+                               {"value": "cohort", "probability": 0.5}],
+             "confidence": 0.5},
+            {"type": "score", "name": "quality", "score": 1.0,
+             "probabilities": [{"value": 0, "label": "low", "probability": 0.5},
+                               {"value": 1, "label": "medium", "probability": 0.5}],
+             "confidence": 0.5},
+        ]
+        with self.assertRaises(DecisionProtocolError):
+            validate_decision_result({"answers": answers}, self.QUESTIONS)
+
+    def test_choice_distribution_must_cover_declared_choices(self) -> None:
+        base = [
+            {"type": "predicate", "name": "is_review", "probability": 0.5},
+            None,  # placeholder for the choice answer
+            {"type": "score", "name": "quality", "score": 1.0,
+             "probabilities": [{"value": 0, "label": "low", "probability": 0.5},
+                               {"value": 1, "label": "medium", "probability": 0.5}],
+             "confidence": 0.5},
+        ]
+        bad_distributions = [
+            [{"value": "rct", "probability": 1.0}],  # BBC: missing cohort
+            [{"value": "rct", "probability": 0.5},
+             {"value": "case-control", "probability": 0.5}],  # unknown value
+            [{"value": "rct", "probability": 0.5},
+             {"value": "rct", "probability": 0.5}],  # duplicate value
+        ]
+        for probabilities in bad_distributions:
+            base[1] = {
+                "type": "choice", "name": "study_design", "choice": "rct",
+                "probabilities": probabilities, "confidence": 0.5,
+            }
+            with self.assertRaises(DecisionProtocolError, msg=repr(probabilities)):
+                validate_decision_result({"answers": list(base)}, self.QUESTIONS)
+
+    def test_typed_choice_values_distinguish_true_from_string(self) -> None:
+        questions = [
+            {
+                "type": "choice",
+                "name": "flag",
+                "instructions": "flag?",
+                "choices": [{"value": True}, {"value": "true"}],
+            }
+        ]
+        good = {
+            "answers": [
+                {"type": "choice", "name": "flag", "choice": True,
+                 "probabilities": [{"value": True, "probability": 0.6},
+                                   {"value": "true", "probability": 0.4}],
+                 "confidence": 0.6}
+            ]
+        }
+        self.assertEqual(validate_decision_result(good, questions), [])
+        # "true" (string) selected is a different, still-declared value
+        self.assertEqual(
+            validate_decision_result(
+                {
+                    "answers": [
+                        {"type": "choice", "name": "flag", "choice": "true",
+                         "probabilities": [{"value": True, "probability": 0.5},
+                                           {"value": "true", "probability": 0.5}],
+                         "confidence": 0.5}
+                    ]
+                },
+                questions,
+            ),
+            [],
+        )
+
+    def test_invalid_score_rejected(self) -> None:
+        base = [
+            {"type": "predicate", "name": "is_review", "probability": 0.5},
+            {"type": "error", "name": "study_design", "reason": "r"},
+            None,
+        ]
+        bad_scores = [
+            {  # an undeclared level label
+                "type": "score", "name": "quality", "score": 1.0,
+                "probabilities": [{"value": 0, "label": "low", "probability": 0.5},
+                                  {"value": 5, "label": "high", "probability": 0.5}],
+                "confidence": 0.5,
+            },
+            {  # label does not match the declared level
+                "type": "score", "name": "quality", "score": 1.0,
+                "probabilities": [{"value": 0, "label": "low", "probability": 0.5},
+                                  {"value": 1, "label": "high", "probability": 0.5}],
+                "confidence": 0.5,
+            },
+            {  # not a finite number
+                "type": "score", "name": "quality", "score": float("inf"),
+                "probabilities": [{"value": 0, "label": "low", "probability": 0.5},
+                                  {"value": 1, "label": "medium", "probability": 0.5}],
+                "confidence": 0.5,
+            },
+            {  # boolean is not a level index
+                "type": "score", "name": "quality", "score": 1.0,
+                "probabilities": [{"value": True, "label": "low", "probability": 0.5},
+                                  {"value": 1, "label": "medium", "probability": 0.5}],
+                "confidence": 0.5,
+            },
+            {  # duplicate level value
+                "type": "score", "name": "quality", "score": 1.0,
+                "probabilities": [{"value": 1, "label": "low", "probability": 0.5},
+                                  {"value": 1, "label": "medium", "probability": 0.5}],
+                "confidence": 0.5,
+            },
+            {  # missing a level
+                "type": "score", "name": "quality", "score": 1.0,
+                "probabilities": [{"value": 0, "label": "low", "probability": 1.0}],
+                "confidence": 0.5,
+            },
+        ]
+        for score in bad_scores:
+            base[2] = score
+            with self.assertRaises(DecisionProtocolError, msg=repr(score)):
+                validate_decision_result({"answers": list(base)}, self.QUESTIONS)
+
+    def test_question_shapes_validated_locally(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_decision_questions([])
+        with self.assertRaises(ValueError):
+            validate_decision_questions(
+                [{"type": "predicate", "name": "x"}]  # missing instructions
+            )
+        with self.assertRaises(ValueError):
+            validate_decision_questions(
+                [{"type": "choice", "name": "x", "instructions": "?", "choices": []}]
+            )
+        with self.assertRaises(ValueError):
+            validate_decision_questions(
+                [{"type": "score", "name": "x", "instructions": "?", "levels": []}]
+            )
+        with self.assertRaises(ValueError):
+            validate_decision_questions(
+                [{"type": "predicate", "name": "x", "instructions": "?", "bogus": 1}]
+            )
+        # a valid question set is returned unchanged
+        self.assertEqual(validate_decision_questions(self.QUESTIONS), self.QUESTIONS)
+
+    def test_decision_http_error_is_api_error_not_protocol_failure(self) -> None:
+        self.server.state.decision_status = 503
+        with self.assertRaises(OpenCodeApiError) as ctx:
+            self.client.generate_decisions(
+                model=CRITIC_MODEL,
+                input_parts=[{"type": "text", "text": "x"}],
+                questions=self.QUESTIONS,
+            )
+        self.assertEqual(ctx.exception.status, 503)
 
 
 class TestAuthAndTransport(ClientTestCase):

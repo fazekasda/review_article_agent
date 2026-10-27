@@ -3,7 +3,8 @@
 Minimal Python lifecycle prototype against the **official OpenCode V2 HTTP API**,
 plus deterministic tests. Scope: this directory only.
 
-Sources: `docs/implementation/00-runtime-spike.md` lines 5, 9, 15-18, 20 and
+Sources: `docs/implementation/00-runtime-spike.md` lines 5, 9, 15-20 (line 19 is
+the typed Jev predicate/choice/score + per-question-failure criterion) and
 `docs/specification.md` "Product and runtime". API shapes come from the published
 V2 OpenAPI document, `https://opencode.ai/v2/openapi.json`
 (`openapi 3.1.0`, `info.title = "opencode HttpApi"`, `info.version = "0.0.1"`,
@@ -16,7 +17,7 @@ No API field is invented.
 | --- | --- |
 | `opencode_v2.py` | Stdlib-only client: session create, admission, per-turn reconciliation, bounded wait, interrupt, fork, fresh critic, typed decisions. |
 | `mock_server.py` | Deterministic local mock of the used endpoints (incl. cursor paging and a redirect route). |
-| `test_opencode_v2.py` | 41 unittest cases (success, retry, reconciliation, paging, error, invalid input, endpoint safety). |
+| `test_opencode_v2.py` | 59 unittest cases (success, retry, reconciliation, paging, typed-decision boundary, error, invalid input, endpoint safety). |
 | `demo_lifecycle.py` | Two-client durability demo against the mock. |
 
 Python 3.14 (`python3`), standard library only. No third-party dependency.
@@ -25,7 +26,7 @@ Python 3.14 (`python3`), standard library only. No third-party dependency.
 
 ```sh
 cd spikes/runtime/python
-python3 -m unittest -v test_opencode_v2   # 46 tests, ~2s
+python3 -m unittest -v test_opencode_v2   # 59 tests, ~2s
 python3 demo_lifecycle.py                 # prints the two-client transcript
 python3 mock_server.py --token secret     # optional: standalone mock on a free port
 ```
@@ -115,9 +116,13 @@ shared discovery/start, no paid calls, no budget authorization.
   message (default 100 pages) so older admissions are not lost behind the first
   page.
 * **Idempotent admission.** The client-supplied admission ID (`Session.Message.ID`)
-  is the idempotency key. A retry returns `409 ConflictError`; `admit()` treats
-  that (or a transport failure) as "already admitted" and reconciles to the one
-  accepted input instead of resending under a new identity.
+  is the idempotency key. Exactly one input is accepted per ID. The mock returns
+  `409 ConflictError` on a repeat ID; the `2.2.0` harness observed the same ID
+  retried against a real service returning `200` (still one accepted input), so
+  `admit()` treats `409` (or a transport failure) as "already admitted" and
+  reconciles to the one persisted input, and a `200` repeat simply returns that
+  durable receipt. Neither is mistaken for completion or resent under a new
+  identity.
 * **Bounded wait.** `wait()` uses `experimental.session.wait`, retrying `503`
   and transport timeouts until a deadline, then raises `QuiescenceTimeout` — it
   never blocks forever.
@@ -125,9 +130,17 @@ shared discovery/start, no paid calls, no budget authorization.
   `session.create`, never forks writer history, and fails when the critic model
   equals the writer model. `fork()` is provided separately and is documented as
   *not* a clean critic.
-* **Typed decisions.** `generate_decisions()` sends predicate/choice/score
-  questions and validates the typed answers, surfacing per-question `error`
-  answers via `first_decision_error()` / `summarize_decisions()`.
+* **Typed decisions (strict boundary).** `generate_decisions()` sends
+  predicate/choice/score questions and, **at that boundary**, validates the
+  response against the published answer schemas and the exact questions sent:
+  required fields, no unknown fields, finite numeric bounds that exclude
+  booleans, typed choice values, and one answer per question in question order
+  with matching names/types and choice/score distributions over the declared
+  choices/levels. A malformed or missing response is a `DecisionProtocolError`
+  (a protocol failure); a valid per-question `error` answer is preserved (and is
+  *not* a scientific exclusion), surfaced via `first_decision_error()` /
+  `summarize_decisions()`. This is contract-level validation of client
+  behaviour, not the Jev route verified live.
 
 ## Mock vs live
 
@@ -136,7 +149,7 @@ shared discovery/start, no paid calls, no budget authorization.
 | Transport / auth | local HTTP, bearer checked | same shape, real token |
 | Endpoint safety | loopback + token enforced client-side; `302 /api/redirect` refused | same client-side enforcement |
 | Session create | returns a `Session.Info` | same |
-| Prompt idempotency | `409 ConflictError` on repeat ID | per OpenAPI contract (unverified live) |
+| Prompt idempotency | `409 ConflictError` on repeat ID | observed `200` on a same-ID retry (`2.2.0` harness), one input |
 | Message paging | honours `order`/`limit`/`cursor` | per OpenAPI `cursor` contract (unverified live) |
 | `wait` | `204` idle / `503` unavailable | per OpenAPI contract (unverified live) |
 | Completion | synthetic `assistant`/`idle` messages | real agent turn |
@@ -145,7 +158,9 @@ shared discovery/start, no paid calls, no budget authorization.
 **Not verified against a live server here:** real version strings, real
 `409`/`503` behaviour, real message projection, and paid decision calls. The
 tests prove client behaviour against the documented contract, not server
-conformance. A live smoke test requires an explicit loopback endpoint, an
+conformance. The only live observation recorded so far is from the `2.2.0`
+harness: retrying the same prompt ID returned `200` (one accepted input), not the
+mock's `409`. A live smoke test requires an explicit loopback endpoint, an
 explicit token, and (for decisions) explicit budget authorization.
 
 ## Acceptance criteria coverage (task C-python)
@@ -153,15 +168,15 @@ explicit token, and (for decisions) explicit budget authorization.
 | Requirement | Evidence |
 | --- | --- |
 | CLI/session create with explicit role/model | `test_create_session_pins_role_and_model`; `create_session(agent=, model=)` |
-| Explicit authenticated loopback endpoint, no discovery/start | `test_from_env_requires_explicit_base_url`, `test_unauthorized_error_tag`, `test_missing_token_unauthorized` |
+| Explicit authenticated loopback endpoint, no discovery/start | `test_from_env_requires_explicit_base_url`, `test_unauthorized_error_tag`, `test_missing_token_fails_closed` |
 | No private DB/credential parsing | `_headers`/`from_env` touch only explicit args/env; mock never reads files |
 | Durable receipt ≠ completion | `test_submit_returns_durable_receipt_not_completion`, `test_reconcile_distinguishes_admission_from_completion` |
 | Retry same admission ID → one input | `test_retry_same_admission_id_yields_single_input` |
 | Retrieve persisted inbox/messages after missed events | `test_missed_events_second_client_retrieves_persisted_state`, `demo_lifecycle.py` steps 1-3 |
 | Reconcile unknown/interrupted, bounded wait | `test_reconcile_recovers_admission_after_transport_drop`, `test_reconcile_unknown_never_reports_complete`, `test_bounded_wait_times_out` |
 | Fresh critic (not fork); role/model pinning | `test_critic_session_is_fresh_not_fork`, `test_fork_carries_writer_history`, `test_critic_model_must_differ` |
-| Typed decisions, per-question failure | `test_typed_answers_validate`, `test_per_question_failure_keeps_other_answers`, `test_malformed_answer_rejected` |
-| Invalid inputs rejected locally | `test_invalid_admission_id_and_text_rejected_locally`, `test_invalid_model_ref_is_rejected_locally`, `test_malformed_answer_rejected` |
+| Typed decisions, per-question failure | `test_typed_answers_validate`, `test_per_question_failure_keeps_other_answers`, `test_generate_decisions_validates_at_the_boundary` |
+| Invalid inputs rejected locally | `test_invalid_admission_id_and_text_rejected_locally`, `test_invalid_model_ref_is_rejected_locally`, `test_question_shapes_validated_locally` |
 
 ### Repair 1 — per-turn evidence and endpoint safety
 
@@ -184,13 +199,33 @@ explicit token, and (for decisions) explicit budget authorization.
 | `finish=length` / `content-filter` / `error` without idle is not completion | `test_assistant_finish_length_without_idle_is_not_complete`, `test_assistant_finish_content_filter_without_idle_is_not_complete`, `test_assistant_error_without_idle_is_not_terminal` |
 | Only `idle succeeded` yields `completed`; `failed`/`interrupted` stay explicit | `test_idle_succeeded_is_the_only_completion`, `test_failed_outcome_is_distinct_from_success`, `test_interrupted_outcome_is_distinct_from_success` |
 
+### Repair 3 — strict typed Jev decision boundary
+
+| Requirement | Evidence |
+| --- | --- |
+| Answers are validated automatically at the `generate_decisions` boundary | `test_generate_decisions_validates_at_the_boundary` |
+| Malformed/missing response is a distinct protocol failure, not a refusal | `test_missing_or_non_dict_response_is_protocol_failure`, `DecisionProtocolError` |
+| Finite numeric bounds, excluding booleans/NaN/Infinity | `test_probability_rejects_bool_nan_and_infinity`, `test_confidence_and_probabilities_reject_non_finite` |
+| Published schemas: required fields, no unknown fields | `test_unknown_and_extra_fields_rejected`, `_ANSWER_KEYS`/`_REJECT_EXTRA_FIELDS` |
+| Cardinality/names/order/types match the original questions | `test_answer_cardinality_missing_duplicate_and_unknown_names`, `test_answer_type_mismatch_rejected` |
+| Choice distribution/selected value over declared choices (typed) | `test_invalid_choice_selected_value_rejected`, `test_choice_distribution_must_cover_declared_choices`, `test_typed_choice_values_distinguish_true_from_string` |
+| Score distribution over declared levels | `test_invalid_score_rejected` |
+| Per-question `error` preserved (not an exclusion, not a protocol failure) | `test_per_question_failure_keeps_other_answers` |
+| An HTTP error stays an API error, not a protocol failure | `test_decision_http_error_is_api_error_not_protocol_failure` |
+
 ## Limitations
 
 * Spike only: not production, no agent framework, no UI, no persistent store.
 * Live API versions/behaviour and the Jev decision route are documented but not
   verified; the `typesafe/jev-1.14` decision call would be a paid call and is out
-  of scope without budget authorization. `OPENROUTER_API_KEY` presence was checked
-  as a boolean only and is deliberately not read or used (no paid calls).
+  of scope without budget authorization. The typed-decision validation in this
+  spike is against the published answer schemas and the sent questions, so it
+  proves the client boundary, not the live Jev route's real output. The published
+  `Generate.ScoreAnswer` probability entry gives an integer `value` with no stated
+  base, so score validation binds on the declared level `label`s and distinct
+  integer values rather than inventing an index convention. `OPENROUTER_API_KEY`
+  presence was checked as a boolean only (absent in this checkout) and is
+  deliberately not read or used (no paid calls).
 * Per-turn correlation uses positional timeline windowing because the published
   schemas expose no parent/linkage field; it assumes the server emits the terminal
   `idle` within the turn's window. A turn whose terminal is missing is reported

@@ -59,6 +59,9 @@ class MockState:
         self.rename: dict[str, str] = {}
         self.fail_conflict_instead = False  # retry returns 409 even if unseen
         self.decision_answers: list[dict[str, Any]] | None = None
+        # Full-response overrides so tests can drive malformed/missing payloads.
+        self.decision_response: Any = None  # when set, the whole response body
+        self.decision_status: int = 200  # non-200 to simulate an API error
         self.message_page_size: int | None = None  # None = one unpaged page
 
     # -- helpers -------------------------------------------------------------
@@ -328,6 +331,13 @@ class MockHandler(BaseHTTPRequestHandler):
 
         if method == "POST" and path == "/api/experimental/generate/decisions":
             body = self._read_body()
+            if self.state.decision_status != 200:
+                return self._json(
+                    self.state.decision_status,
+                    {"_tag": "ServiceUnavailableError", "message": "decisions unavailable"},
+                )
+            if self.state.decision_response is not None:
+                return self._json(200, self.state.decision_response)
             answers = self.state.decision_answers
             if answers is None:
                 answers = [

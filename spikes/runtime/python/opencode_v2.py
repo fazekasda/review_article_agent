@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 import re
 import time
@@ -115,6 +116,18 @@ class OpenCodeTransportError(OpenCodeError):
 
 class QuiescenceTimeout(OpenCodeError):
     """The bounded wait elapsed before the session became idle."""
+
+
+class DecisionProtocolError(OpenCodeError, ValueError):
+    """A decisions response is malformed or missing (a protocol failure).
+
+    Distinct from :class:`DecisionError`, which is a *valid* per-question
+    ``error`` answer (for example a refusal) that the contract allows alongside
+    the other answers. A protocol failure means the response cannot be trusted as
+    evidence at all, so it is surfaced as a client/protocol bug instead of being
+    silently treated as a refusal or a scientific exclusion. It subclasses
+    ``ValueError`` so existing ``ValueError`` handling keeps working.
+    """
 
 
 @dataclass
@@ -758,25 +771,37 @@ class OpenCodeV2Client:
     ) -> dict[str, Any]:
         """``experimental.generate.decisions`` — stateless typed decisions.
 
-        Stateless: nothing is stored. Per-question failures come back as
-        ``{"type": "error", ...}`` answers while the other answers still return;
-        that is *not* a scientific exclusion.
+        Stateless: nothing is stored. The response is validated **at this
+        boundary** against the published answer schemas and against the exact
+        ``questions`` sent (cardinality, names, order, types, choice/score
+        distributions), so an unchecked answer never leaves the client.
+
+        Per-question failures come back as ``{"type": "error", ...}`` answers
+        while the other answers still return; that is *not* a scientific
+        exclusion and is preserved. A malformed or missing response is a
+        :class:`DecisionProtocolError` (a protocol failure, not a refusal).
         """
         validate_model_ref(model)
-        if not input_parts:
+        if not isinstance(input_parts, list) or not input_parts:
             raise ValueError("input_parts must contain at least one part")
-        if not questions:
-            raise ValueError("questions must contain at least one question")
-        names = [q.get("name") for q in questions]
-        if len(set(names)) != len(names):
-            raise ValueError("question names must be unique")
-        for question in questions:
-            if question.get("type") not in ("predicate", "choice", "score"):
-                raise ValueError(f"unknown question type: {question.get('type')!r}")
-        body = {"model": model, "input": input_parts, "questions": questions}
-        return self._request(
+        normalized_questions = validate_decision_questions(questions)
+        body = {
+            "model": model,
+            "input": input_parts,
+            "questions": normalized_questions,
+        }
+        response = self._request(
             "POST", "/api/experimental/generate/decisions", body=body
-        )["data"]
+        )
+        if not isinstance(response, dict) or "data" not in response:
+            raise DecisionProtocolError(
+                "decisions response is missing the required 'data' object"
+            )
+        result = response["data"]
+        if not isinstance(result, dict):
+            raise DecisionProtocolError("decisions response 'data' must be an object")
+        validate_decision_result(result, normalized_questions)
+        return result
 
     # -- validation ----------------------------------------------------------
     @staticmethod
@@ -791,39 +816,373 @@ class OpenCodeV2Client:
 
 
 # --- typed decision helpers ---------------------------------------------------
+# Exact field sets from the published V2 OpenAPI (all schemas set
+# ``additionalProperties: false``), so an unknown field is a protocol failure.
+_ANSWER_KEYS = {
+    "predicate": frozenset({"type", "name", "probability"}),
+    "choice": frozenset({"type", "name", "choice", "probabilities", "confidence"}),
+    "score": frozenset({"type", "name", "score", "probabilities", "confidence"}),
+    "error": frozenset({"type", "name", "reason", "message"}),
+}
 _ANSWER_REQUIRED = {
     "predicate": ("name", "probability"),
     "choice": ("name", "choice", "probabilities", "confidence"),
     "score": ("name", "score", "probabilities", "confidence"),
     "error": ("name", "reason"),
 }
+_CHOICE_PROB_KEYS = frozenset({"value", "probability"})
+_SCORE_PROB_KEYS = frozenset({"value", "label", "probability"})
+_RESULT_KEYS = frozenset({"answers", "cost", "tokens", "native"})
+_USAGE_KEYS = frozenset({"input", "output"})
+_QUESTION_KEYS = {
+    "predicate": frozenset({"type", "name", "instructions"}),
+    "choice": frozenset({"type", "name", "instructions", "choices"}),
+    "score": frozenset({"type", "name", "instructions", "levels"}),
+}
+_QUESTION_REQUIRED = {
+    "predicate": ("name", "instructions"),
+    "choice": ("name", "instructions", "choices"),
+    "score": ("name", "instructions", "levels"),
+}
+_CHOICE_OPTION_KEYS = frozenset({"value", "description"})
+_SCORE_LEVEL_KEYS = frozenset({"label", "description"})
 
 
-def validate_decision_result(result: dict[str, Any]) -> list[dict[str, Any]]:
-    """Validate a ``Generate.DecisionResult`` answer list (fail closed).
+def _is_number(value: Any) -> bool:
+    """A JSON number: a finite ``int``/``float``, never a ``bool``.
 
-    Returns the per-question error answers (which are valid shapes). Raises
-    ``ValueError`` only for malformed evidence, so a refusal is distinguished
-    from a client/protocol bug.
+    JSON booleans are not numbers (the schema ``type: number``), and ``NaN`` /
+    ``Infinity`` are not valid JSON numbers.
     """
-    answers = result.get("answers")
-    if not isinstance(answers, list):
-        raise ValueError("decision result must have an 'answers' list")
-    errors: list[dict[str, Any]] = []
-    for index, answer in enumerate(answers):
-        if not isinstance(answer, dict):
-            raise ValueError(f"answer {index} is not an object")
-        kind = answer.get("type")
-        required = _ANSWER_REQUIRED.get(kind)
-        if required is None:
-            raise ValueError(f"answer {index} has unknown type {kind!r}")
-        missing = [key for key in required if key not in answer]
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _is_probability(value: Any) -> bool:
+    return _is_number(value) and 0 <= value <= 1
+
+
+def _is_choice_value(value: Any) -> bool:
+    """A ``Generate.ChoiceValue``: a string or a boolean (typed, not coerced)."""
+    return isinstance(value, str) or isinstance(value, bool)
+
+
+def _typed_key(value: Any) -> tuple[str, Any]:
+    """Typed identity so ``true`` and ``"true"`` are different choice values."""
+    return (type(value).__name__, value)
+
+
+def _reject_extra_fields(
+    obj: dict[str, Any], allowed: frozenset[str], label: str, error: type[Exception]
+) -> None:
+    extra = set(obj) - allowed
+    if extra:
+        raise error(f"{label} has unknown fields: {sorted(extra)}")
+
+
+def validate_decision_questions(
+    questions: Any,
+) -> list[dict[str, Any]]:
+    """Validate ``Generate.DecisionQuestion`` request shapes (fail closed).
+
+    Checks the published per-type required fields, rejects unknown fields, and
+    requires non-empty ``choices`` / ``levels`` and unique names. Returns the
+    questions unchanged for use as the expected answer contract.
+    """
+    if not isinstance(questions, list) or not questions:
+        raise ValueError("questions must be a non-empty list")
+    names: list[str] = []
+    for index, question in enumerate(questions):
+        if not isinstance(question, dict):
+            raise ValueError(f"question {index} is not an object")
+        kind = question.get("type")
+        allowed = _QUESTION_KEYS.get(kind)
+        if allowed is None:
+            raise ValueError(f"question {index} has unknown type {kind!r}")
+        missing = [key for key in _QUESTION_REQUIRED[kind] if key not in question]
         if missing:
-            raise ValueError(f"answer {index} ({kind}) missing {missing}")
-        if kind == "predicate":
-            probability = answer["probability"]
-            if not isinstance(probability, (int, float)) or not 0 <= probability <= 1:
-                raise ValueError(f"answer {index} probability out of [0,1]")
+            raise ValueError(f"question {index} ({kind}) missing {missing}")
+        _reject_extra_fields(question, allowed, f"question {index} ({kind})", ValueError)
+        name = question["name"]
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"question {index} name must be a non-empty string")
+        if not isinstance(question["instructions"], str):
+            raise ValueError(f"question {index} instructions must be a string")
+        if kind == "choice":
+            choices = question["choices"]
+            if not isinstance(choices, list) or not choices:
+                raise ValueError(f"question {index} choices must be a non-empty list")
+            seen: set[tuple[str, Any]] = set()
+            for option in choices:
+                if not isinstance(option, dict) or "value" not in option:
+                    raise ValueError(f"question {index} choice option needs a value")
+                _reject_extra_fields(option, _CHOICE_OPTION_KEYS, "choice option", ValueError)
+                if not _is_choice_value(option["value"]):
+                    raise ValueError(
+                        f"question {index} choice value must be a string or boolean"
+                    )
+                key = _typed_key(option["value"])
+                if key in seen:
+                    raise ValueError(f"question {index} has a duplicate choice value")
+                seen.add(key)
+        if kind == "score":
+            levels = question["levels"]
+            if not isinstance(levels, list) or not levels:
+                raise ValueError(f"question {index} levels must be a non-empty list")
+            labels: list[str] = []
+            for level in levels:
+                if not isinstance(level, dict) or not isinstance(level.get("label"), str):
+                    raise ValueError(f"question {index} level needs a string label")
+                _reject_extra_fields(level, _SCORE_LEVEL_KEYS, "score level", ValueError)
+                labels.append(level["label"])
+            if len(set(labels)) != len(labels):
+                raise ValueError(f"question {index} level labels must be unique")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError("question names must be unique")
+    return questions
+
+
+def _validate_choice_probability(index: int, position: int, entry: Any) -> None:
+    if not isinstance(entry, dict):
+        raise DecisionProtocolError(f"answer {index} probability {position} is not an object")
+    _reject_extra_fields(
+        entry, _CHOICE_PROB_KEYS, f"answer {index} probability {position}", DecisionProtocolError
+    )
+    missing = [key for key in ("value", "probability") if key not in entry]
+    if missing:
+        raise DecisionProtocolError(
+            f"answer {index} probability {position} missing {missing}"
+        )
+    if not _is_choice_value(entry["value"]):
+        raise DecisionProtocolError(
+            f"answer {index} probability {position} value must be a string or boolean"
+        )
+    if not _is_probability(entry["probability"]):
+        raise DecisionProtocolError(
+            f"answer {index} probability {position} must be a finite number in [0,1]"
+        )
+
+
+def _validate_score_probability(index: int, position: int, entry: Any) -> None:
+    if not isinstance(entry, dict):
+        raise DecisionProtocolError(f"answer {index} probability {position} is not an object")
+    _reject_extra_fields(
+        entry, _SCORE_PROB_KEYS, f"answer {index} probability {position}", DecisionProtocolError
+    )
+    missing = [key for key in ("value", "label", "probability") if key not in entry]
+    if missing:
+        raise DecisionProtocolError(
+            f"answer {index} probability {position} missing {missing}"
+        )
+    if not isinstance(entry["value"], int) or isinstance(entry["value"], bool):
+        raise DecisionProtocolError(
+            f"answer {index} probability {position} value must be an integer level index"
+        )
+    if not isinstance(entry["label"], str):
+        raise DecisionProtocolError(
+            f"answer {index} probability {position} label must be a string"
+        )
+    if not _is_probability(entry["probability"]):
+        raise DecisionProtocolError(
+            f"answer {index} probability {position} must be a finite number in [0,1]"
+        )
+
+
+def _validate_choice_against_question(
+    index: int, answer: dict[str, Any], question: dict[str, Any]
+) -> None:
+    declared = {_typed_key(option["value"]) for option in question["choices"]}
+    if _typed_key(answer["choice"]) not in declared:
+        raise DecisionProtocolError(
+            f"answer {index} choice {answer['choice']!r} is not one of the question's choices"
+        )
+    seen: set[tuple[str, Any]] = set()
+    for position, entry in enumerate(answer["probabilities"]):
+        key = _typed_key(entry["value"])
+        if key not in declared:
+            raise DecisionProtocolError(
+                f"answer {index} probability {position} value is not one of the question's choices"
+            )
+        if key in seen:
+            raise DecisionProtocolError(
+                f"answer {index} probability {position} duplicates a choice value"
+            )
+        seen.add(key)
+    if seen != declared:
+        raise DecisionProtocolError(
+            f"answer {index} probabilities do not cover the question's choices exactly once"
+        )
+
+
+def _validate_score_against_question(
+    index: int, answer: dict[str, Any], question: dict[str, Any]
+) -> None:
+    """The score distribution must cover the question's declared levels once each.
+
+    The published ``Generate.ScoreAnswer`` probability entry is
+    ``{value: integer, label: string, probability: number}``; the schema does not
+    state the integer's base, so this checks the documented bindings (labels are
+    the question's levels, each once, with distinct integer values) rather than
+    inventing an index convention.
+    """
+    levels = question["levels"]
+    declared = [level["label"] for level in levels]
+    if len(answer["probabilities"]) != len(levels):
+        raise DecisionProtocolError(
+            f"answer {index} probabilities must have one entry per level "
+            f"({len(levels)}), got {len(answer['probabilities'])}"
+        )
+    seen_labels: set[str] = set()
+    seen_values: set[int] = set()
+    for position, entry in enumerate(answer["probabilities"]):
+        label = entry["label"]
+        if label not in declared:
+            raise DecisionProtocolError(
+                f"answer {index} probability {position} label {label!r} is not one of the "
+                f"question's level labels"
+            )
+        if label in seen_labels:
+            raise DecisionProtocolError(
+                f"answer {index} probability {position} duplicates level label {label!r}"
+            )
+        seen_labels.add(label)
+        value = entry["value"]
+        if value in seen_values:
+            raise DecisionProtocolError(
+                f"answer {index} probability {position} duplicates level value {value!r}"
+            )
+        seen_values.add(value)
+    if seen_labels != set(declared):
+        raise DecisionProtocolError(
+            f"answer {index} probabilities do not cover the question's levels exactly once"
+        )
+
+
+def _validate_one_answer(index: int, answer: Any) -> str:
+    """Validate one ``Generate.DecisionAnswer`` shape; return its ``type``."""
+    if not isinstance(answer, dict):
+        raise DecisionProtocolError(f"answer {index} is not an object")
+    kind = answer.get("type")
+    allowed = _ANSWER_KEYS.get(kind)
+    if allowed is None:
+        raise DecisionProtocolError(f"answer {index} has unknown type {kind!r}")
+    missing = [key for key in _ANSWER_REQUIRED[kind] if key not in answer]
+    if missing:
+        raise DecisionProtocolError(f"answer {index} ({kind}) missing {missing}")
+    _reject_extra_fields(answer, allowed, f"answer {index} ({kind})", DecisionProtocolError)
+    name = answer["name"]
+    if not isinstance(name, str) or not name:
+        raise DecisionProtocolError(f"answer {index} name must be a non-empty string")
+    if kind == "predicate":
+        if not _is_probability(answer["probability"]):
+            raise DecisionProtocolError(
+                f"answer {index} probability must be a finite number in [0,1]"
+            )
+    elif kind == "choice":
+        if not _is_choice_value(answer["choice"]):
+            raise DecisionProtocolError(
+                f"answer {index} choice must be a string or boolean"
+            )
+        if not _is_probability(answer["confidence"]):
+            raise DecisionProtocolError(
+                f"answer {index} confidence must be a finite number in [0,1]"
+            )
+        if not isinstance(answer["probabilities"], list):
+            raise DecisionProtocolError(f"answer {index} probabilities must be a list")
+        for position, entry in enumerate(answer["probabilities"]):
+            _validate_choice_probability(index, position, entry)
+    elif kind == "score":
+        if not _is_number(answer["score"]):
+            raise DecisionProtocolError(f"answer {index} score must be a finite number")
+        if not _is_probability(answer["confidence"]):
+            raise DecisionProtocolError(
+                f"answer {index} confidence must be a finite number in [0,1]"
+            )
+        if not isinstance(answer["probabilities"], list):
+            raise DecisionProtocolError(f"answer {index} probabilities must be a list")
+        for position, entry in enumerate(answer["probabilities"]):
+            _validate_score_probability(index, position, entry)
+    elif kind == "error":
+        if not isinstance(answer["reason"], str) or not answer["reason"]:
+            raise DecisionProtocolError(
+                f"answer {index} error reason must be a non-empty string"
+            )
+        if "message" in answer and not isinstance(answer["message"], str):
+            raise DecisionProtocolError(f"answer {index} error message must be a string")
+    return kind
+
+
+def validate_decision_result(
+    result: Any, questions: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Validate a ``Generate.DecisionResult`` (fail closed).
+
+    Enforces the published answer schemas: required fields, no unknown fields,
+    finite numeric bounds excluding booleans, and typed choice values. When the
+    original ``questions`` are supplied (as ``generate_decisions`` does), it also
+    enforces cardinality, names, order, types, and the choice/score distributions
+    the contract describes (``answers`` are one per question, in question order).
+
+    Returns the per-question ``error`` answers, which are valid shapes and are
+    preserved: a refusal is **not** a protocol failure and is not an exclusion.
+    Raises :class:`DecisionProtocolError` (a ``ValueError``) for malformed
+    evidence.
+    """
+    if not isinstance(result, dict):
+        raise DecisionProtocolError("decision result must be an object")
+    _reject_extra_fields(result, _RESULT_KEYS, "decision result", DecisionProtocolError)
+    if "answers" not in result:
+        raise DecisionProtocolError("decision result is missing the required 'answers' list")
+    answers = result["answers"]
+    if not isinstance(answers, list):
+        raise DecisionProtocolError("decision result 'answers' must be a list")
+    if "cost" in result and not _is_number(result["cost"]):
+        raise DecisionProtocolError("decision result cost must be a finite number")
+    if "tokens" in result:
+        tokens = result["tokens"]
+        if not isinstance(tokens, dict):
+            raise DecisionProtocolError("decision result tokens must be an object")
+        _reject_extra_fields(tokens, _USAGE_KEYS, "tokens", DecisionProtocolError)
+        for field in ("input", "output"):
+            if field in tokens and not _is_number(tokens[field]):
+                raise DecisionProtocolError(f"token count {field} must be a finite number")
+    if "native" in result and not isinstance(result["native"], dict):
+        raise DecisionProtocolError("decision result native must be an object")
+
+    expected = None if questions is None else validate_decision_questions(questions)
+    if expected is not None and len(answers) != len(expected):
+        raise DecisionProtocolError(
+            f"expected one answer per question ({len(expected)}), got {len(answers)}"
+        )
+
+    errors: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for index, answer in enumerate(answers):
+        kind = _validate_one_answer(index, answer)
+        name = answer["name"]
+        if name in seen_names:
+            raise DecisionProtocolError(f"answer {index} duplicates name {name!r}")
+        seen_names.add(name)
+        if expected is not None:
+            question = expected[index]
+            if name != question["name"]:
+                raise DecisionProtocolError(
+                    f"answer {index} name {name!r} does not match question {index} "
+                    f"name {question['name']!r}"
+                )
+            if kind not in (question["type"], "error"):
+                raise DecisionProtocolError(
+                    f"answer {index} type {kind!r} does not answer the "
+                    f"{question['type']!r} question {name!r}"
+                )
+            if kind == "choice":
+                _validate_choice_against_question(index, answer, question)
+            elif kind == "score":
+                _validate_score_against_question(index, answer, question)
         if kind == "error":
             errors.append(answer)
     return errors
