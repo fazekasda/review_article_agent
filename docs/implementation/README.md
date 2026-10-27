@@ -2,7 +2,7 @@
 
 ## Steps
 
-- [ ] [00 — OpenCode integration and language spike](00-runtime-spike.md) — **partial** (not ticked): mock-level lifecycle prototypes only, no live lifecycle verified, and a **proposed** language decision only. See the [step 00 handoff](handoffs/00-runtime-spike.md) and [decision 001](../decisions/001-runtime-language.md); the native decision route is blocked and step 01 stays blocked until this passes or the user explicitly accepts the partial state.
+- [ ] [00 — OpenCode integration and language spike](00-runtime-spike.md) — **partial** (not ticked): both prototypes are now verified on one real disposable OpenCode v2.2.0 service (real auth, session create with pinned role/model, durable admission, SQLite persistence, and an owned-service restart; only the model transport is a deterministic local fixture), but criterion 4's native decision route is unverified, global config isolation is only documented, and the language decision is **proposed** only. See the [step 00 handoff](handoffs/00-runtime-spike.md) and [decision 001](../decisions/001-runtime-language.md); the native decision route is blocked and step 01 stays blocked until this passes or the user explicitly accepts the partial state.
 - [ ] [01 — Ratify scientific contracts and technical decisions](01-contracts.md)
 - [ ] [02 — CLI, project registry, artifacts, and backups](02-project-foundation.md)
 - [ ] [03 — Background worker, durable jobs, and recovery](03-durable-worker.md)

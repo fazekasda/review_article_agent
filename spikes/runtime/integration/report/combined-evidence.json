@@ -1,0 +1,413 @@
+{
+  "checks": [
+    {
+      "check": "python: create pins explicit role/model",
+      "detail": "agent=build model={'id': 'delayed-echo', 'providerID': 'mockprov', 'variant': 'default'}",
+      "ok": true
+    },
+    {
+      "check": "python: durable admission receipt is not a completion",
+      "detail": "status=True",
+      "ok": true
+    },
+    {
+      "check": "python: second process retrieves result after missed events",
+      "detail": "state=completed after 6 polls",
+      "ok": true
+    },
+    {
+      "check": "python: retried admission id yields exactly one input",
+      "detail": "status=False inputs=1",
+      "ok": true
+    },
+    {
+      "check": "python: critic is fresh, pinned, and not writer history",
+      "detail": "fresh=True history=0 agent=plan model={'id': 'critic-echo', 'providerID': 'mockprov', 'variant': 'default'}",
+      "ok": true
+    },
+    {
+      "check": "ts: create pins explicit role/model",
+      "detail": "agent=build model={'id': 'delayed-echo', 'providerID': 'mockprov', 'variant': 'default'}",
+      "ok": true
+    },
+    {
+      "check": "ts: durable admission receipt is not a completion",
+      "detail": "status=accepted",
+      "ok": true
+    },
+    {
+      "check": "ts: second process retrieves result after missed events",
+      "detail": "state=succeeded after 5 polls",
+      "ok": true
+    },
+    {
+      "check": "ts: retried admission id yields exactly one input",
+      "detail": "status=accepted inputs=1",
+      "ok": true
+    },
+    {
+      "check": "ts: critic is fresh, pinned, and not writer history",
+      "detail": "fresh=True history=0 agent=plan model={'id': 'critic-echo', 'providerID': 'mockprov', 'variant': 'default'}",
+      "ok": true
+    },
+    {
+      "check": "restart: both turns are in flight (provider reached, no outcome yet)",
+      "detail": "provider_requests=4 outcomes={'python': None, 'ts': None}",
+      "ok": true
+    },
+    {
+      "check": "restart: service replaced (new endpoint)",
+      "detail": "http://127.0.0.1:37429",
+      "ok": true
+    },
+    {
+      "check": "python: persistence recovered after restart (session + user input present)",
+      "detail": "userInputs=1 messages=2",
+      "ok": true
+    },
+    {
+      "check": "python: restart did not silently declare success",
+      "detail": "state=in_progress reason=no authoritative idle for this turn (assistant completion is not success)",
+      "ok": true
+    },
+    {
+      "check": "ts: persistence recovered after restart (session + user input present)",
+      "detail": "userInputs=1 messages=2",
+      "ok": true
+    },
+    {
+      "check": "ts: restart did not silently declare success",
+      "detail": "state=unknown reason=admission msg_restart_b053fda9bcee was delivered but no terminal outcome was recorded (in flight or interrupted by a restart)",
+      "ok": true
+    }
+  ],
+  "failed": [],
+  "fixtureDisclosure": "Model transport only is a deterministic local fixture (mock_provider.py). The OpenCode service, HTTP API, Basic auth, admission, persistence, restart, and the server-owned agent turn are REAL. No paid calls, no network egress.",
+  "generatedAt": "2026-10-27T21:32:13Z",
+  "observations": {
+    "mock_request_count": 12,
+    "python": {
+      "critic": {
+        "agent": "plan",
+        "fresh": true,
+        "historyLength": 0,
+        "id": "ses_e80b90fd7ffeVzY9scrM9dav20",
+        "model": {
+          "id": "critic-echo",
+          "providerID": "mockprov",
+          "variant": "default"
+        },
+        "parentID": null
+      },
+      "disconnect_admission": "msg_disc_478e16dcbed1",
+      "disconnect_resolution": {
+        "admissionId": "msg_disc_478e16dcbed1",
+        "hasCompletion": true,
+        "isComplete": true,
+        "isTerminal": true,
+        "outcome": "succeeded",
+        "polls": 6,
+        "prototype": "python",
+        "reason": null,
+        "state": "completed"
+      },
+      "prototype": "python",
+      "retry": {
+        "admissionId": "msg_disc_478e16dcbed1",
+        "duplicate": false,
+        "durableReceipt": true,
+        "prototype": "python",
+        "receipt": {
+          "delivery": "queue",
+          "id": "msg_disc_478e16dcbed1",
+          "payload": {
+            "text": "disconnect probe DELAY_MS=3000"
+          },
+          "sessionID": "ses_e80b922f2ffevT6x37ouTic58s",
+          "time": {
+            "created": 1793136714435
+          },
+          "type": "user"
+        },
+        "receiptHasOutcome": false,
+        "reconciled": false
+      },
+      "retry_messages": {
+        "count": 4,
+        "idleOutcomes": [
+          "succeeded",
+          "succeeded"
+        ],
+        "ids": [
+          "msg_disc_478e16dcbed1",
+          "msg_17f46e2dd001hjEkPRjlNhLriv",
+          "msg_17f46eeba001nu3v3chpRow86X",
+          "msg_17f46ef6a001rAtCjhp7vimdXG"
+        ],
+        "prototype": "python",
+        "truncated": false,
+        "types": [
+          "user",
+          "assistant",
+          "idle",
+          "idle"
+        ],
+        "userInputsForId": 1
+      },
+      "session": {
+        "agent": "build",
+        "id": "ses_e80b922f2ffevT6x37ouTic58s",
+        "model": {
+          "id": "delayed-echo",
+          "providerID": "mockprov",
+          "variant": "default"
+        }
+      },
+      "submit_receipt": {
+        "admissionId": "msg_disc_478e16dcbed1",
+        "duplicate": false,
+        "durableReceipt": true,
+        "prototype": "python",
+        "receipt": {
+          "delivery": "queue",
+          "id": "msg_disc_478e16dcbed1",
+          "payload": {
+            "text": "disconnect probe DELAY_MS=3000"
+          },
+          "sessionID": "ses_e80b922f2ffevT6x37ouTic58s",
+          "time": {
+            "created": 1793136714411
+          },
+          "type": "user"
+        },
+        "receiptHasOutcome": false,
+        "reconciled": false
+      }
+    },
+    "restart": {
+      "after": {
+        "python": {
+          "immediate": {
+            "admissionId": "msg_restart_d7d858d5a510",
+            "hasCompletion": false,
+            "isComplete": false,
+            "isTerminal": false,
+            "outcome": null,
+            "prototype": "python",
+            "reason": "no authoritative idle for this turn (assistant completion is not success)",
+            "state": "in_progress"
+          },
+          "persisted": {
+            "count": 2,
+            "idleOutcomes": [],
+            "ids": [
+              "msg_restart_d7d858d5a510",
+              "msg_17f4700f200102ZXIEwr530Nrd"
+            ],
+            "prototype": "python",
+            "truncated": false,
+            "types": [
+              "user",
+              "assistant"
+            ],
+            "userInputsForId": 1
+          }
+        },
+        "ts": {
+          "immediate": {
+            "admissionId": "msg_restart_b053fda9bcee",
+            "prototype": "typescript",
+            "reason": "admission msg_restart_b053fda9bcee was delivered but no terminal outcome was recorded (in flight or interrupted by a restart)",
+            "state": "unknown"
+          },
+          "persisted": {
+            "count": 2,
+            "idleOutcomes": [],
+            "ids": [
+              "msg_restart_b053fda9bcee",
+              "msg_17f47024400197ytqKBEwMxQni"
+            ],
+            "prototype": "typescript",
+            "types": [
+              "user",
+              "assistant"
+            ],
+            "userInputsForId": 1
+          }
+        }
+      },
+      "final": {
+        "python": {
+          "messages": {
+            "count": 2,
+            "idleOutcomes": [],
+            "ids": [
+              "msg_restart_d7d858d5a510",
+              "msg_17f4700f200102ZXIEwr530Nrd"
+            ],
+            "prototype": "python",
+            "truncated": false,
+            "types": [
+              "user",
+              "assistant"
+            ],
+            "userInputsForId": 1
+          },
+          "resolution": {
+            "admissionId": "msg_restart_d7d858d5a510",
+            "hasCompletion": false,
+            "isComplete": false,
+            "isTerminal": false,
+            "outcome": null,
+            "prototype": "python",
+            "reason": "no authoritative idle for this turn (assistant completion is not success)",
+            "state": "in_progress"
+          },
+          "sessionOutcome": null
+        },
+        "ts": {
+          "messages": {
+            "count": 2,
+            "idleOutcomes": [],
+            "ids": [
+              "msg_restart_b053fda9bcee",
+              "msg_17f47024400197ytqKBEwMxQni"
+            ],
+            "prototype": "typescript",
+            "types": [
+              "user",
+              "assistant"
+            ],
+            "userInputsForId": 1
+          },
+          "resolution": {
+            "admissionId": "msg_restart_b053fda9bcee",
+            "prototype": "typescript",
+            "reason": "admission msg_restart_b053fda9bcee was delivered but no terminal outcome was recorded (in flight or interrupted by a restart)",
+            "state": "unknown"
+          },
+          "sessionOutcome": null
+        }
+      },
+      "inflight": {
+        "outcome_before_restart": {
+          "python": null,
+          "ts": null
+        },
+        "python": {
+          "admission": "msg_restart_d7d858d5a510",
+          "session": "ses_e80b8ff8cffesUJkUkBWWN0xMn"
+        },
+        "requests_seen": 4,
+        "ts": {
+          "admission": "msg_restart_b053fda9bcee",
+          "session": "ses_e80b8fe7cffe4qnFOq0jLk3I6M"
+        }
+      },
+      "new_url": "http://127.0.0.1:37429"
+    },
+    "ts": {
+      "critic": {
+        "agent": "plan",
+        "fresh": true,
+        "historyLength": 0,
+        "id": "ses_e80b90025ffeudq82bRHJ8eZUM",
+        "model": {
+          "id": "critic-echo",
+          "providerID": "mockprov",
+          "variant": "default"
+        },
+        "parentID": null
+      },
+      "disconnect_admission": "msg_disc_4e08b2632bb8",
+      "disconnect_resolution": {
+        "admissionId": "msg_disc_4e08b2632bb8",
+        "polls": 5,
+        "prototype": "typescript",
+        "state": "succeeded"
+      },
+      "prototype": "ts",
+      "retry": {
+        "admissionId": "msg_disc_4e08b2632bb8",
+        "prototype": "typescript",
+        "receipt": {
+          "admissionId": "msg_disc_4e08b2632bb8",
+          "admittedAt": 1793136718221,
+          "delivery": "queue",
+          "kind": "admission",
+          "reconciled": false,
+          "serverVersion": "2.2.0",
+          "sessionId": "ses_e80b90f2bffeSVgGHlOh1gkheW",
+          "status": "accepted"
+        },
+        "reconciled": false,
+        "status": "accepted"
+      },
+      "retry_messages": {
+        "count": 4,
+        "idleOutcomes": [
+          "succeeded",
+          "succeeded"
+        ],
+        "ids": [
+          "msg_disc_4e08b2632bb8",
+          "msg_17f46f19c001Vdr0A6gdgBiKGk",
+          "msg_17f46fd6a001Y6XW7NZZpiuA92",
+          "msg_17f46fe42001kFQDnvJpJ09z0E"
+        ],
+        "prototype": "typescript",
+        "types": [
+          "user",
+          "assistant",
+          "idle",
+          "idle"
+        ],
+        "userInputsForId": 1
+      },
+      "session": {
+        "agent": "build",
+        "id": "ses_e80b90f2bffeSVgGHlOh1gkheW",
+        "model": {
+          "id": "delayed-echo",
+          "providerID": "mockprov",
+          "variant": "default"
+        }
+      },
+      "submit_receipt": {
+        "admissionId": "msg_disc_4e08b2632bb8",
+        "prototype": "typescript",
+        "receipt": {
+          "admissionId": "msg_disc_4e08b2632bb8",
+          "admittedAt": 1793136718212,
+          "delivery": "queue",
+          "kind": "admission",
+          "reconciled": false,
+          "serverVersion": "2.2.0",
+          "sessionId": "ses_e80b90f2bffeSVgGHlOh1gkheW",
+          "status": "accepted"
+        },
+        "reconciled": false,
+        "status": "accepted"
+      }
+    }
+  },
+  "provider": {
+    "id": "mockprov",
+    "kind": "fixture",
+    "models": [
+      "delayed-echo",
+      "critic-echo"
+    ]
+  },
+  "service": {
+    "descriptorKind": "app-owned-disposable",
+    "documentedRegistration": "/home/fazekasda/.local/state/opencode/service.json",
+    "url": "http://127.0.0.1:37429"
+  },
+  "spike": "step-00 runtime integration",
+  "versions": {
+    "node": "v24.22.1",
+    "opencode": "2.2.0",
+    "python": "3.14.4"
+  }
+}

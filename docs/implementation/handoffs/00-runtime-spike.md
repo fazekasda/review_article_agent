@@ -4,240 +4,272 @@ Status: **partial / blocked**. Step 00 is **not** complete and is **not** ticked
 in [`docs/implementation/README.md`](../README.md). This is a truthful handoff of
 the evidence that exists, plus a **proposed** (not approved) language decision in
 [`docs/decisions/001-runtime-language.md`](../../decisions/001-runtime-language.md).
-No completion is claimed beyond the evidence below; the native OpenCode decision
-route and the real client↔service lifecycle are unverified.
+No completion is claimed beyond the evidence below.
+
+The real client↔service lifecycle is now **verified for both prototypes on one
+real disposable service** (criteria 1, 2 and, with a stated caveat, 3).
+Criterion 4's native route stays blocked (no paid calls in this task), and the
+language decision stays **proposed**.
 
 ## Scope and baseline used
 
 - Step document: `docs/implementation/00-runtime-spike.md` (scope lines 5, 9;
   acceptance lines 16–21; go/no-go line 25). Baseline: `docs/specification.md`
   "Product and runtime".
-- This handoff records artefacts produced across the step-00 spike, consumed at
-  the integration baseline **`94fd89c`** (branch `task/spike-handoff`).
+- This handoff records artefacts produced across the step-00 spike at the
+  **integrated baseline on branch `task/spike-combined`** — the commit that adds
+  `spikes/runtime/integration/` and folds the previously separate service harness
+  and Basic-auth compatibility work into one checkout. The earlier
+  documentation-only handoff was consumed at `94fd89c`; that base is superseded.
 - **Decision revisions used:** the language decision is the *proposed*
-  `docs/decisions/001-runtime-language.md`; it is not accepted, so the stack is
-  **not ratified**. No other decision record applies.
-- This session changes **documentation only** (this file, the ADR, and the two
-  README annotations); no code and no tests were added or modified.
+  `docs/decisions/001-runtime-language.md`; it is **not accepted**, so the stack
+  is **not ratified**. No other decision record applies.
+- This session adds code under `spikes/runtime/integration/` and updates this
+  handoff, the ADR evidence, and the step-00 annotation. It changes **no**
+  prototype client code (no bug was found that required it).
 
 ## Files and interfaces changed in this handoff
 
 | Path | Change |
 | --- | --- |
-| `docs/implementation/handoffs/00-runtime-spike.md` | This report (new). |
-| `docs/decisions/001-runtime-language.md` | Proposed language/integration ADR (new). |
-| `README.md` | Corrected "implementation has not started" to state that step 00 produced prototypes but no production application features. |
-| `docs/implementation/README.md` | Annotated step 00 as **partial** (checkbox left **unticked**); step 01 remains blocked. |
+| `spikes/runtime/integration/run_lifecycle.py` | **New** orchestrator: both prototypes, one real service, recorded report, safe cleanup. |
+| `spikes/runtime/integration/mock_provider.py` | **New** deterministic loopback fixture model provider (model transport only). |
+| `spikes/runtime/integration/py_lifecycle.py` | **New** per-step worker for the Python prototype (separate process per step). |
+| `spikes/runtime/integration/ts_lifecycle.ts` | **New** per-step worker for the TypeScript prototype (real `@opencode/client`). |
+| `spikes/runtime/integration/test_mock_provider.py` | **New** 7 offline unit tests for the fixture helpers. |
+| `spikes/runtime/integration/report/combined-evidence.json` | **New** sanitized evidence from the real run. |
+| `spikes/runtime/integration/README.md`, `package.json`, `.gitignore` | **New** documentation and ESM/module config for the directory. |
+| `docs/implementation/handoffs/00-runtime-spike.md` | This report (rewritten for the integrated baseline). |
+| `docs/decisions/001-runtime-language.md` | ADR evidence/status updated (**still Proposed**). |
+| `docs/implementation/README.md` | Step-00 annotation updated (**checkbox left unticked**). |
 
 No public interface or migration is introduced. Compatibility implication: none —
 the step-00 code lives only under `spikes/runtime/` and is not wired into any
-application.
+application. No prototype client code, harness code, or test was modified.
 
 ## Prototype artefacts (where the evidence lives)
 
-| Artefact | Language/runtime | Tests | Live? |
+| Artefact | Language/runtime | Tests | Live service? |
 | --- | --- | --- | --- |
-| `spikes/runtime/python/` | Python 3.14.4, stdlib only | 59 `unittest` cases | **Mock only** |
-| `spikes/runtime/typescript/` | Node v24.22.1, `@opencode/client` 2.2.0, TypeScript 5.9.3 | 47 top-level `node --test` cases + strict `tsc --noEmit` | **Mock only** |
+| `spikes/runtime/integration/` | Python 3.14.4 + Node v24.22.1 orchestrator | 16 real checks + 7 offline fixture tests | **REAL service, fixture model** |
+| `spikes/runtime/python/` | Python 3.14.4, stdlib only | 78 `unittest` cases | Mock only |
+| `spikes/runtime/typescript/` | Node v24.22.1, `@opencode/client` 2.2.0, TypeScript 5.9.3 | 58 `node --test` cases + strict `tsc --noEmit` | Mock only |
+| `spikes/runtime/harness/` | bash + `curl` + `python3` | 28 smoke + 31 safety assertions | **REAL app-owned service** |
 | `spikes/runtime/live-jev/` | Python 3.14.4, stdlib only | 51 `unittest` cases | 1 authorized **live** call |
 
 Observed versions: `opencode` v2.2.0; published `opencode HttpApi` OpenAPI 3.1.0
 `version 0.0.1` (experimental); live Jev response model
-`typesafe/jev-1.14-20261014` from provider `TypeSafe`.
+`typesafe/jev-1.14-20261014` from provider `TypeSafe`; Node v24.22.1; Python
+3.14.4.
+
+**Fixture disclosure (do not over-read the evidence).** In the integration run
+only the **model transport** is a fixture (`mock_provider.py`, a loopback
+OpenAI-compatible server with a deterministic reply and a bounded delay). The
+service process, HTTP API, Basic auth, session create with explicit role/model,
+prompt admission, SQLite persistence, the server-owned agent turn, and the
+owned-service restart are **real** 2.2.0 behaviour. No paid call, no provider
+credential, no network egress.
 
 ## Commands run and actual results (this checkout)
 
-All commands below were run in `spike-handoff` at `94fd89c`, offline, with **no
-paid calls**:
+All commands below were run in this checkout, offline, with **no paid calls**:
 
 ```sh
-# Python lifecycle prototype — 59 tests
+# Combined integration: both prototypes on one real disposable service
+cd spikes/runtime/integration
+python3 run_lifecycle.py
+#   checks: 16/16 passed, 0 failed   (exit 0)   -> report/combined-evidence.json
+python3 -m unittest test_mock_provider
+#   Ran 7 tests — OK
+
+# Existing harness self-tests (real app-owned service)
+HARNESS_ROOT=/tmp/opencode/<unique> bash spikes/runtime/harness/harness.sh selftest
+#   == summary: 28 passed, 0 failed ==   (smoke)
+#   == summary: 31 passed, 0 failed ==   (safety)
+
+# Prototype suites (re-run in this checkout)
 cd spikes/runtime/python && python3 -m unittest test_opencode_v2
-#   Ran 59 tests in 1.961s — OK            (Python 3.14.4)
+#   Ran 78 tests in 2.368s — OK
+cd spikes/runtime/typescript && npm ci && npm run build && npm test
+#   tsc --noEmit clean; tests 58, pass 58, fail 0
 
-# Direct-OpenRouter Jev fallback (offline suite) — 51 tests
-cd spikes/runtime/live-jev && python3 -m unittest test_live_jev
-#   Ran 51 tests in 0.010s — OK
-
-# Environment probes
-node --version            # v24.22.1
-opencode --version        # 2.2.0
-python3 --version         # Python 3.14.4
+# Versions
+opencode --version ; node --version ; python3 --version   # v2.2.0 ; v24.22.1 ; 3.14.4
 ```
 
 **Unrun checks (explicitly not verified):**
 
-- TypeScript suite (`npm install && npm run build && npm test`): **not re-run** in
-  this checkout because `spikes/runtime/typescript/node_modules` is absent.
-  Installing it would require an npm fetch, outside this documentation-only
-  handoff. The "47 tests / strict tsc" figure is the integrator's reported result
-  and a static count (47 top-level `test(`/`it(` declarations) in this checkout.
-- Any live lifecycle against a real app-owned OpenCode service: **not run**.
-- Native OpenCode `generate.decisions` route: **not run**.
+- The native OpenCode `generate.decisions` route: **not run** (would be a paid
+  call; no budget authorization in this task).
+- Per-question decision failures against the live route: **not run**.
+- Global/ancestor configuration *isolation* against a real ordinary project:
+  documented as a risk; not empirically proven (only the harness's own
+  env-scrub/containment assertions cover it).
 - No CI is configured in this repository, so no pipeline result exists.
 
 ## Acceptance criteria — pass / partial / blocked
 
-`docs/implementation/00-runtime-spike.md` lines 16–21. "Partial" means the client
-behaviour is proven against a **mock** local transport but not against a real
-service.
+`docs/implementation/00-runtime-spike.md` lines 16–21.
 
-### 1. Closing the prototype CLI does not stop a bounded server-owned task; a second client retrieves its result after missed events — **PARTIAL**
+### 1. Closing the prototype CLI does not stop a bounded server-owned task; a second client retrieves its result after missed events — **PASS (real, both prototypes)**
 
-- Evidence: `spikes/runtime/python/demo_lifecycle.py` (two-client durability
-  demo) and `spikes/runtime/typescript/test/cli.integration.test.ts` (3 separate
-  CLI processes against a loopback listener), both against the **mock**.
-- Reconciliation reads persisted state only; no event stream is opened, so missed
-  events are irrelevant to retrieval.
-- **Honest limit:** the "server-owned task" is the mock, and the disconnected
-  "CLI" is a mock client process. This does **not** prove that closing a real
-  prototype CLI leaves a real app-owned OpenCode turn running. A mock CLI
-  disconnect is not a real task. The disposable-service harness that would prove
-  this is **not integrated** at this baseline (see "Not integrated / in progress").
+- Evidence: `spikes/runtime/integration/run_lifecycle.py` submits the prompt in a
+  **separate OS process that exits** (`py_lifecycle.py`/`ts_lifecycle.ts`
+  `submit`), then a **different** process (`reconcile`) recovers the outcome from
+  persisted inbox/message state only; no event stream is opened.
+- Observed against the real service: Python `completed` (`outcome=succeeded`),
+  TypeScript `succeeded`. The server-owned turn ran the fixture transport while no
+  client was connected.
+- Report keys: `observations.python.disconnect_resolution`,
+  `observations.ts.disconnect_resolution`.
 
-### 2. Retrying a client-supplied admission ID produces one accepted input; admission is not mistaken for completion — **PARTIAL**
+### 2. Retrying a client-supplied admission ID produces one accepted input; admission is not mistaken for completion — **PASS (real, both prototypes)**
 
-- Evidence: `test_retry_same_admission_id_yields_single_input` (Python);
-  `test/submit-reconcile.test.ts`, `test/wait-bounds.test.ts` (TS). The
-  client-supplied admission id is the idempotency key; the receipt has no
-  `outcome` field, so a receipt is never a completion.
-- Duplicate semantics: the mock answers a repeat with `409 ConflictError`; a live
-  `2.2.0` harness retry was observed returning `200` (idempotent, one input). Both
-  paths are handled and never enqueue a second input. The `200` variant is
-  indistinguishable from a first accept in the response alone.
-- **Honest limit:** mock-only in this checkout; the single live `200` observation
-  comes from the harness work that is not integrated here.
+- Evidence: retrying the same id against the real 2.2.0 service returned HTTP
+  **200** (idempotent — *not* `409`), and the session timeline contained exactly
+  **one** `user` message with that id for each prototype. The durable receipt has
+  no `outcome` field, so it is never a completion.
+- The fixture request log shows **no second model call** for the retry: one
+  accepted input, no re-execution.
+- **Anomaly observed (server-side):** the retry emitted an **extra `idle`
+  message** with no matching user message. Both clients' windowed reconciliation
+  still resolves correctly; this is noted, not attributed to the clients.
+- Report keys: `observations.<proto>.retry`, `.retry_messages`.
 
-### 3. Restarting only the disposable service yields recoverable continuation or an explicit interrupted/unknown outcome; no lost work silently declared complete — **BLOCKED (live) / PARTIAL (client logic)**
+### 3. Restarting only the disposable service yields recoverable continuation or an explicit interrupted/unknown outcome; no lost work is silently declared complete — **PASS with a caveat (real)**
 
-- Evidence (client logic): `test/reconcile-window.test.ts` (prior/later terminal,
-  next-user and synthetic boundaries, assistant-shortcut rejection, pagination,
-  repeated-cursor bound, page cap), `test/submit-reconcile.test.ts`
-  (`interrupted`/`failed`/`unknown`), `test_bounded_wait_times_out`. Only an
-  authoritative `idle` inside the target window means `succeeded`; anything
-  absent/unreadable/truncated/ambiguous resolves to `unknown`.
-- **Blocked part:** no real disposable service was restarted, and no in-flight
-  turn was observed surviving (or not surviving) a real restart. This is the
-  central empirical question the step document flags (line 12) and it is
-  **unanswered**. Mock connection-loss/unknown-ID paths do not substitute for it.
+- Evidence: two turns (Python + TypeScript) were in flight (fixture reached, no
+  session `outcome`) when `harness.sh restart` replaced **only** the owned
+  process. After restart, persistence was recovered (session + admitted user
+  message present) and no terminal `idle` was written; `Session.Info.outcome`
+  stayed absent.
+- **Finding (the step's central question).** The in-flight turn does **not**
+  continue across a restart, and the server does **not** mark it `interrupted`; a
+  partial `assistant` (`finish: "error"`) is persisted with no terminal. Re-reading
+  after the original delay elapsed changed nothing.
+- **Caveat.** The TypeScript prototype reports the explicit **`unknown`** the
+  criterion asks for. The Python prototype reports **`in_progress`** — non-terminal
+  and never success, but not the explicit `interrupted`/`unknown` the criterion
+  names. This was observed, not patched (it follows the prototype's documented
+  "delivered, no authoritative idle ⇒ in progress" rule).
+- Report keys: `observations.restart`.
 
-### 4. Typed Jev predicate/choice/score handling and per-question failures via the selected route, or a documented direct-OpenRouter fallback with an accounting boundary — **PARTIAL**
+### 4. Typed Jev predicate/choice/score handling and per-question failures via the selected route, or a documented direct-OpenRouter fallback with an accounting boundary — **PARTIAL (unchanged)**
 
 - **Native OpenCode `generate.decisions` route: BLOCKED.** Exercised against the
-  mock only (`test/decisions-critic.test.ts`, Python strict boundary); never
-  called live. No native-route acceptance is claimed.
+  mock only; never called live in this task.
 - **Direct-OpenRouter fallback: PASSED for that route.** One authorized live call
   (`spikes/runtime/live-jev/report/live-evidence.json`): HTTP 200, model
-  `typesafe/jev-1.14-20261014` / `TypeSafe`, three valid typed answers —
-  predicate (`is_original_report`) `0.83`; choice (`study_design`) `randomised`,
-  confidence `0.36`; score (`confidence_level`) `1.09`, legend
+  `typesafe/jev-1.14-20261014` / `TypeSafe`, three valid typed answers — predicate
+  (`is_original_report`) `0.83`; choice (`study_design`) `randomised`, confidence
+  `0.36`; score (`confidence_level`) `1.09`, legend
   `{0:"low",1:"moderate",2:"high"}`. `per_question_errors` empty; cost
-  **`$0.00002037`** (provider-reported), against a `$0.25` ceiling.
+  **`$0.00002037`** (provider-reported), against a `$0.25` ceiling. Verified
+  separately; this task made **no** paid calls.
 - **Per-question failures: BLOCKED live / mock-only.** The published Decisions
-  `answers` union is `noul|choice|score|box` with **no per-question `error`
-  variant**, so a per-question failure cannot be induced safely against the live
-  API; the missing/error paths are exercised offline only and are labelled
-  mock-only.
-- **Honest limit:** a passing direct call does **not** prove the native OpenCode
-  route works; direct calls are accounted separately from OpenCode session
-  statistics (`docs/implementation/04-agent-runtime.md` line 22).
+  `answers` union is `noul|choice|score|box` with no per-question `error` variant,
+  so a live per-question failure cannot be induced safely.
 
-### 5. Fresh critic context and role/model pinning; a writer-history fork is not a clean critic — **PARTIAL**
+### 5. Fresh critic context and role/model pinning; a writer-history fork is not a clean critic — **PASS (real metadata, both prototypes)**
 
-- Evidence: `test_critic_session_is_fresh_not_fork`, `test_fork_carries_writer_history`,
-  `test_critic_model_must_differ` (Python); `test/decisions-critic.test.ts` (TS —
-  `createCriticSession` pins `agent` + `model.Ref` on a brand-new session, no
-  `parentID`, no fork). Mock-only; role/model pinning was not verified on a live
-  service.
+- Evidence: for both prototypes, `session.create` returned a brand-new session
+  with pinned `agent=plan`, `model=mockprov/critic-echo` (different from the writer
+  model `mockprov/delayed-echo`), **no `parentID`**, and **0 history** messages —
+  a real server-side session, not a fork of writer history. Fork vs fresh is still
+  contrasted only in the mock unit tests (`test_critic_session_is_fresh_not_fork`,
+  `test/decisions-critic.test.ts`).
+- Report keys: `observations.<proto>.critic`.
 
 ### 6. No access/config changes to ordinary coding sessions; document global/ancestor configuration inheritance risks — **PARTIAL**
 
-- Evidence: `test/client-guard.test.ts` proves the client never imports
-  `@opencode/client/service` and never calls `Service.ensure`/`discover`/`stop`,
-  and reads no `service.json`, database, or state path. Both prototypes require
-  an explicit endpoint and token, fail closed, enforce loopback, and refuse
-  redirects; the Python client ignores `OPENROUTER_API_KEY` (a provider key is
-  not an endpoint token). No private DB or credential parsing anywhere.
-- **Global/ancestor config inheritance risk (documented):** OpenCode merges
-  discovered `opencode.json(c)` and `.opencode/opencode.json(c)` from the current
-  directory through every ancestor, with global filesystem config at lower
-  precedence. A disposable server started from an ordinary project directory
-  would inherit that project's configuration. The spike only *avoids* the shared
-  service; it does not by itself prove configuration isolation. The harness that
-  would (env scrub, isolated `HOME`/`XDG`) is **not integrated** here.
+- Evidence: the integration run uses a **unique owned `HARNESS_ROOT`**, the
+  harness's scrubbed child environment, and **owned-only** stop/restart; it never
+  calls `opencode service …` and never reads `~/.local/state/opencode/service.json`.
+  The harness `safety.sh` (31 assertions) proves the ownership/process-identity
+  guards; `test/client-guard.test.ts` proves the TS client never imports
+  `@opencode/client/service`. The Python client ignores `OPENROUTER_API_KEY`.
+- **Global/ancestor config inheritance risk (documented, not proven isolated).**
+  OpenCode merges discovered `opencode.json(c)` and `.opencode/opencode.json(c)`
+  from the current directory through every ancestor. The harness starts the child
+  in `$HARNESS_ROOT/cwd` and refuses roots whose ancestors contain config, which
+  *avoids* the risk; it does not prove isolation against an arbitrary project
+  tree.
 
 ### Step-00 deliverables
 
 - Submit / durable admission receipt / completion retrieval / disconnect-reconnect
-  / typed decisions: present for both languages, **mock-level**.
-- Tested client/server/API versions, discovery/auth, configuration, isolation:
-  recorded in the two prototype READMEs; live isolation not yet demonstrated.
+  / typed decisions: present for both languages; the first four now **verified on
+  one real service**; typed decisions remain mock-level for the native route.
+- Tested client/server/API versions, supported discovery/auth, effective
+  configuration, isolation: recorded in the prototype and integration READMEs;
+  owned-service isolation demonstrated; global config isolation still documented
+  as a risk.
 - Language decision: **proposed** in the ADR; not accepted.
 - Written restart findings: which state persists / whether an in-flight turn
-  continues / interruption detection — **open**, mock-only evidence; the real
-  question is unanswered.
+  continues / interruption detection — **now answered empirically**: sessions and
+  admitted user inputs (and a partial assistant) persist; an in-flight turn does
+  **not** continue; the server records **no** terminal outcome, so the honest
+  client answer is indeterminate (`unknown`/`in_progress`), never success.
 
 ## Stubs, limitations, open decisions
 
-- **Stubs (disclosed, will not be presented as production):** the TypeScript and
-  Python lifecycle prototypes run against a deterministic local mock
-  (`spikes/runtime/python/mock_server.py`, TS test transport). The mock models
-  "accepted then connection lost" and "unknown ID" only; real restart/recovery is
-  not modelled.
-- **Not integrated at this baseline (`94fd89c`):** the disposable app-owned
-  service harness (branch `task/spike-harness`) and Basic-auth compatibility work
-  (branch `task/spike-compat`). They are separate branches, not in this base.
-  Therefore there is **no real client↔service combined proof** and **no in-flight
-  restart/disconnect proof**. The step-00 acceptance cannot be marked passed until
-  those are integrated and a live run is recorded.
+- **Stubs (disclosed, not production):** the integration model transport is a
+  deterministic local fixture (`spikes/runtime/integration/mock_provider.py`); the
+  reply content is a stub. The service/admission/persistence/restart under it are
+  real. The Python and TypeScript prototype suites still run against their local
+  mocks (`spikes/runtime/python/mock_server.py`, TS test transport).
+- **Retry anomaly:** a same-id retry produced an extra server-side `idle` with no
+  user message (no second model call). Recorded as an observation, not a client
+  fix.
+- **Python restart state:** `in_progress` rather than explicit
+  `interrupted`/`unknown` (see criterion 3).
 - **Open decision:** the language/integration choice (ADR `001`, **Proposed**).
   Stack not ratified. Step 01 stays blocked until step 00 passes or the user
   explicitly accepts the partial state and the decision.
-- The native OpenCode `generate.decisions` route, real server versions and
-  `409`/`503`/paging behaviour, and per-question failures on the live route remain
-  unverified.
+- The native OpenCode `generate.decisions` route, real `409`/`503`/paging
+  behaviour, per-question failures on the live route, and global config isolation
+  remain unverified.
 
 ## Security, cost, cleanup
 
 - **Security:** no shared/ordinary OpenCode service was touched, started, or
-  restarted by any step-00 prototype; no private database, service registration,
-  or credential file was read or parsed. Endpoints are explicit, loopback-only,
-  fail-closed; redirects are refused so the bearer token is never forwarded. The
-  live Jev key was read from one explicit file/env name and is never printed,
-  logged, or committed; `gitignore` covers `.env*` except `.env.example`. This
-  handoff and the ADR contain no secrets and no licensed source text.
-- **Cost incurred:** **$0.00002037** total — the single authorized Jev call
-  (ceiling `$0.25`). All lifecycle tests are offline and free. No further paid
-  calls are implied.
-- **Safe cleanup:** the prototypes write nothing outside `spikes/runtime/`.
-  Remove generated artefacts with
-  `rm -rf spikes/runtime/typescript/node_modules` and any
-  `spikes/runtime/typescript/*.local.json`. The scratch harness tree, when used,
-  lives under `${TMPDIR:-/tmp}/opencode/spike-harness` and is removed by its own
-  `bash harness.sh cleanup`. Restore any edit to the ordinary service's
-  configuration only if one was made; none was.
+  restarted by any step-00 prototype. The integration run owns a unique root under
+  `/tmp/opencode`, injects exactly one fixture provider into that root's config,
+  and uses the harness's guarded lifecycle. No private database, service
+  registration, or credential file was read or parsed. Endpoints are explicit,
+  loopback-only, fail-closed; redirects are refused so the credential is never
+  forwarded. No secret is printed, logged, or committed; the committed report
+  records endpoints/ports only.
+- **Cost incurred:** **$0.00002037** total across step 00 — the single authorized
+  Jev call (ceiling `$0.25`). This task made **no** paid calls; all integration and
+  prototype tests are offline and free.
+- **Safe cleanup:** the integration run always calls `harness.sh cleanup` and
+  removes its own `.lock`. With `--keep`, remove the printed root with
+  `bash spikes/runtime/harness/harness.sh cleanup` under the same `HARNESS_ROOT`.
+  The prototype suites write nothing outside their directories; restore any edit
+  to the ordinary service's configuration only if one was made — none was.
 
 ## Exact next actions
 
-1. **Integrate** the service harness and Basic-auth compatibility work into a
-   single checkout, then run a **real** client↔app-owned-service lifecycle:
-   submit → close CLI → second client retrieves → restart the disposable service
-   → confirm recoverable continuation or an explicit interrupted/unknown outcome.
-   Record it in this handoff. Step 00 criterion 1 and 3 depend on this.
-2. Decide criterion 4 explicitly: either verify the native OpenCode
-   `generate.decisions` route on the disposable service, or record acceptance of
-   the direct-OpenRouter fallback plus its accounting boundary as the chosen route.
+1. Decide criterion 4 explicitly: either verify the native OpenCode
+   `generate.decisions` route on the disposable service (paid, needs budget), or
+   record acceptance of the direct-OpenRouter fallback plus its accounting boundary
+   as the chosen route.
+2. Decide whether the Python prototype's post-restart `in_progress` should be
+   tightened to `unknown`/`interrupted` (a small, targeted client change), or
+   accept the divergence with the TypeScript `unknown`.
 3. Obtain user disposition of the **proposed** language ADR `001`. Do **not**
    ratify a stack before that.
 4. Only after step 00 passes (or the user explicitly accepts this partial state)
    may step 01 (`01-contracts.md`) begin storage/IPC/package-layout decisions.
-   Until then step 01 stays blocked.
 
 ## Commits
 
-No code was committed by this step-00 handoff; it changes documentation only. The
-integration baseline is `94fd89c`. Prototype commits on other branches:
+The integration code, this handoff, and the ADR/step-00 evidence updates are the
+commit(s) on branch `task/spike-combined` that add
+`spikes/runtime/integration/` and update these docs; the coordinator records the
+integration-log entry. Predecessor commits on this branch:
+`2682f4a` (Basic-auth compatibility), `0394d17` (earlier handoff), `94da0ca`
+(harness repair 1), `cb3ca70` (harness). Prototype commits on other branches:
 `5cdbbe1`, `71e0633`, `00c3c46`, `cf99a6b` (Python), `1567b8a`, `cbf79be`
-(TypeScript), `683177d`, `94fd89c` (live-jev), `6531a6f` (harness, not
-integrated). The documentation commit for this handoff is recorded in the
-integration log by the coordinator.
+(TypeScript), `683177d`, `94fd89c` (live-jev).

@@ -7,8 +7,16 @@ nothing here is ratified and no stack-specific work may start until this record
 is accepted (step 01 gate). A recommendation is not approval. This record is the
 step-00 language/integration decision deliverable
 (`docs/implementation/00-runtime-spike.md` line 11) and does **not** by itself
-pass step 00: the acceptance criteria remain partial/blocked
-(see [the step-00 handoff](../implementation/handoffs/00-runtime-spike.md)).
+pass step 00: the acceptance criteria remain partial (criterion 4's native route
+is blocked; criterion 6's global-config isolation is documented, not proven). See
+[the step-00 handoff](../implementation/handoffs/00-runtime-spike.md).
+
+**Evidence update (integrated baseline, branch `task/spike-combined`).** Criteria
+1 (disconnect + second-client retrieval), 2 (idempotent admission), and 5 (fresh
+critic) are now verified against a **real** disposable app-owned OpenCode v2.2.0
+service for **both** prototypes, and criterion 3 (restart) is verified with a
+stated caveat. Only the model transport was a deterministic local fixture. The
+language recommendation below is unchanged and still **not ratified**.
 
 ## Context and constraints
 
@@ -26,42 +34,56 @@ pass step 00: the acceptance criteria remain partial/blocked
   precondition.
 - Evidence base (all in this repository): the Python HTTP prototype
   (`spikes/runtime/python/`), the TypeScript official-client prototype
-  (`spikes/runtime/typescript/`), and the direct-OpenRouter Jev fallback
-  (`spikes/runtime/live-jev/`). Versions actually observed in this checkout:
+  (`spikes/runtime/typescript/`), the direct-OpenRouter Jev fallback
+  (`spikes/runtime/live-jev/`), the disposable service harness
+  (`spikes/runtime/harness/`), and the combined integration run
+  (`spikes/runtime/integration/`). Versions actually observed in this checkout:
   Python 3.14.4; Node v24.22.1; `opencode` v2.2.0; `@opencode/client` 2.2.0;
   TypeScript 5.9.3; published `opencode HttpApi` OpenAPI 3.1.0, `version 0.0.1`
   (experimental surface); live Jev snapshot `typesafe/jev-1.14-20261014`.
-- **Evidence ceiling.** Both lifecycle prototypes were exercised against a
-  **mock local transport only**. No live app-owned OpenCode service was started
-  and no lifecycle acceptance was proven against a real server. The only live
-  network evidence is the single authorized direct-OpenRouter Jev call. The
-  disposable service harness and the real client↔service combination are **not
-  integrated** in this record's baseline (`94fd89c`); see "Unknowns".
+- **Evidence ceiling (updated).** Both lifecycle prototypes are now exercised
+  against a **real disposable app-owned OpenCode 2.2.0 service** on one integrated
+  baseline (`spikes/runtime/integration/`, 16/16 checks): real HTTP Basic auth,
+  real `session.create` with pinned role/model, real durable admission and SQLite
+  persistence, a real server-owned agent turn, and a real owned-service restart.
+  The **model transport only** is a deterministic loopback fixture
+  (`mock_provider.py`) — no paid call, no credential, no egress — so model output
+  content is a stub. Criterion 4's native `generate.decisions` route is still not
+  exercised (paid); the only live network evidence remains the single authorized
+  direct-OpenRouter Jev call. Global/ancestor configuration isolation is avoided
+  by the harness but not proven against an arbitrary project tree.
 
 ## Options and evidence
 
 ### Option A — Python core plus a hand-written OpenCode HTTP integration
 
 - Implemented in `spikes/runtime/python/` (`opencode_v2.py`, stdlib-only).
-- 59 `unittest` cases pass (Python 3.14.4): session create with pinned
+- 78 `unittest` cases pass (Python 3.14.4): session create with pinned
   `agent`/`model.Ref`, admission as durable receipt, per-turn positional
   reconciliation, bounded wait, redirect/loopback/token safety, fresh critic vs
   fork, and a strict typed decision boundary validated against the published
   answer schemas.
+- Verified against the real disposable service: create with pinned role/model,
+  disconnect + second-process retrieval (`completed`), idempotent retry (one
+  input), and a fresh pinned critic. On the in-flight **restart** it reports
+  `in_progress` (non-terminal, never success).
 - Pros: the language of the scientific/data tooling; the only live-verified model
   path (Jev) is already Python; stdlib-only, no dependency surface.
 - Cons: it **re-implements the HTTP contract by hand**. Every field must track the
   experimental OpenAPI; the official client's envelope unwrapping, generated
-  error `_tag`s, and descriptors are not reused, so drift risk is on us. Live
-  server behaviour (paging, `409`/`503`, message projection) is unverified here.
+  error `_tag`s, and descriptors are not reused, so drift risk is on us. It also
+  does not distinguish a post-restart turn from a merely slow one
+  (`in_progress` vs the explicit `unknown` the criterion prefers).
 
 ### Option B — TypeScript core using the official `@opencode/client`
 
 - Implemented in `spikes/runtime/typescript/` against `@opencode/client` 2.2.0.
-- 47 top-level `node --test` cases and a strict `tsc --noEmit` compile; not
-  re-executed in the step-00 handoff checkout because `node_modules` is absent
-  (the count is a static count of test declarations; the integrator reports 47
-  passing).
+- 58 top-level `node --test` cases pass and `tsc --noEmit` is clean (re-run in
+  this checkout after `npm ci`).
+- Verified against the real disposable service: create with pinned role/model,
+  disconnect + second-process retrieval (`succeeded`), idempotent retry (one
+  input), and a fresh pinned critic. On the in-flight **restart** it reports the
+  explicit `unknown`.
 - Pros: uses the **official** client, so the envelope handling, generated error
   types (`ConflictError`, `SessionNotFoundError`, …), and descriptors follow the
   published package rather than a private re-implementation; fewer places to
@@ -76,6 +98,13 @@ pass step 00: the acceptance criteria remain partial/blocked
 - Both prototypes agree on the lifecycle semantics that matter
   (admission ≠ completion; only an authoritative `idle` completes a turn;
   unknown/interrupted are explicit; fresh critic is a new session, never a fork).
+- **Both prototypes now agree on a real service too** (`spikes/runtime/integration/`,
+  16/16 checks): same service, real Basic auth, pinned create, real disconnect +
+  second-process retrieval, idempotent retry (one input, HTTP `200`), and a fresh
+  pinned critic. On the in-flight **restart** the server wrote no terminal
+  outcome; **TypeScript reported `unknown`, Python reported `in_progress`** — a
+  real, observed divergence (Python is non-terminal but not the explicit
+  `interrupted`/`unknown` the criterion names).
 - **Native OpenCode `generate.decisions` route is unverified.** Only the
   documented **direct-OpenRouter fallback** was exercised live, and it is
   accounted separately from OpenCode session statistics
@@ -115,8 +144,9 @@ decided — **all pending user acceptance**:
   writer-history fork is not a clean critic; direct calls are not covered by
   session statistics and are accounted separately.
 - **Explicitly not decided:** the native OpenCode `generate.decisions` route
-  (still unverified), the disposable-service isolation model (harness work is not
-  integrated), and any production architecture.
+  (still unverified), whether the Python prototype's post-restart `in_progress`
+  should be tightened to `unknown`/`interrupted`, and any production
+  architecture.
 
 ## Consequences and verification
 
@@ -127,11 +157,12 @@ decided — **all pending user acceptance**:
   different option (Python core) would not invalidate the Python spike; accepting
   Option B makes the TypeScript prototype the base and keeps the Python Jev client
   as a tool.
-- Verification that must still happen before this is more than "proposed": a real
-  client↔app-owned-service lifecycle run (submit, disconnect, second-client
-  retrieval, restart/interruption), and either the native decision route or an
-  explicit acceptance of the direct fallback boundary. No tests were added by
-  this record; it changes documentation only.
+- Verification that must still happen before this is more than "proposed": decide
+  criterion 4 — either the native decision route on the disposable service (paid)
+  or explicit acceptance of the direct-fallback boundary — and decide the
+  Python post-restart `in_progress` divergence. The real client↔service lifecycle
+  (submit, disconnect, second-client retrieval, restart) is **now recorded**
+  (`spikes/runtime/integration/report/combined-evidence.json`).
 - Conditions for revisiting: a live lifecycle failure, a decision to use the
   native decision route instead of the fallback, or a user preference for a
   Python core.
@@ -141,9 +172,12 @@ decided — **all pending user acceptance**:
 - Step-00 evidence and per-criterion status:
   [`docs/implementation/handoffs/00-runtime-spike.md`](../implementation/handoffs/00-runtime-spike.md).
 - Prototype sources: `spikes/runtime/python/README.md`,
-  `spikes/runtime/typescript/README.md`, `spikes/runtime/live-jev/README.md`.
+  `spikes/runtime/typescript/README.md`, `spikes/runtime/live-jev/README.md`,
+  `spikes/runtime/harness/README.md`, `spikes/runtime/integration/README.md`.
 - Live Jev evidence (sanitized, no credential, no paper text):
   `spikes/runtime/live-jev/report/live-evidence.json`.
-- Unresolved follow-up: real client↔service lifecycle and restart/interruption;
-  native `generate.decisions`; harness isolation integration. No secrets or
-  licensed full text are included here.
+- Combined real-service evidence (sanitized, fixture model disclosed):
+  `spikes/runtime/integration/report/combined-evidence.json`.
+- Unresolved follow-up: native `generate.decisions`; global config isolation;
+  Python post-restart `in_progress`. No secrets or licensed full text are included
+  here.
