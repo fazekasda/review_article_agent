@@ -105,7 +105,6 @@ class MockState:
 
     def add_assistant(self, sid: str, text: str = "done", *, error: Any = None) -> dict[str, Any]:
         return self.append_assistant(sid, text, error=error)
-
     # -- ordered turn builders (newer repair tests) --------------------------
     def append_user(self, sid: str, mid: str, text: str = "") -> dict[str, Any]:
         """Project a delivered user message with the given admission ID."""
@@ -132,7 +131,15 @@ class MockState:
         self.inbox[sid].append(item)
         return item
 
-    def append_assistant(self, sid: str, text: str = "done", *, error: Any = None) -> dict[str, Any]:
+    def append_assistant(
+        self,
+        sid: str,
+        text: str = "done",
+        *,
+        error: Any = None,
+        finish: str | None = None,
+        content: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         created = self._next_time()
         message = {
             "id": self.new_message_id(),
@@ -140,8 +147,11 @@ class MockState:
             "type": "assistant",
             "agent": self.sessions[sid].get("agent", "build"),
             "model": self.sessions[sid].get("model", {"id": "m", "providerID": "p"}),
-            "content": [{"type": "text", "text": text}],
+            "content": content if content is not None else [{"type": "text", "text": text}],
         }
+        if finish is not None:
+            message["finish"] = finish
+            message["rawFinish"] = finish
         if error is not None:
             message["error"] = error
         self.messages[sid].append(message)

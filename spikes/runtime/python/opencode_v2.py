@@ -69,7 +69,7 @@ UNAUTHORIZED_TAG = "UnauthorizedError"
 # Message types that open a new turn in the projected timeline. The published
 # schemas (Session.Message.*) carry no parent/linkage field, so a turn can only
 # be delimited positionally: its ``user`` message, then the next user/synthetic
-# message, with the terminal ``idle``/completed ``assistant`` in between.
+# message, with the authoritative ``idle`` terminal in between.
 TURN_OPENING_TYPES = ("user", "synthetic")
 LOOPBACK_HOSTS = ("localhost",)
 
@@ -146,14 +146,15 @@ class ReconcileResult:
     * ``queued`` — the ID is enqueued in the session inbox and not yet delivered
       (no projected user message yet).
     * ``in_progress`` — the user message is projected but its turn has no
-      terminal marker yet.
-    * ``completed`` — the terminal marker for *this* turn succeeded.
-    * ``failed`` / ``interrupted`` — the terminal marker for *this* turn ended
-      without success.
+      authoritative ``idle`` terminal yet. A completed ``assistant`` message does
+      not end the turn.
+    * ``completed`` — the correlated ``idle`` terminal for *this* turn succeeded.
+    * ``failed`` / ``interrupted`` — the correlated ``idle`` terminal for *this*
+      turn ended without success.
     * ``unknown`` — no reliable trace; ``reason`` explains why. Never success.
 
-    ``completion`` is the terminal marker (``idle`` or completed ``assistant``)
-    *for this turn only*, or ``None``.
+    ``completion`` is the correlation evidence (the ``idle`` message for *this*
+    turn only), or ``None``.
     """
 
     admission_id: str
@@ -596,14 +597,17 @@ class OpenCodeV2Client:
         """Reconstruct per-turn state for one admission from durable server data.
 
         The durable receipt (inbox item or projected user message) proves the
-        input was accepted, and a terminal ``idle``/completed ``assistant``
-        proves a turn ended — but only the terminal that belongs to **this**
-        turn. The published message schemas expose no parent/linkage field, so a
-        turn is delimited positionally: the target user message, then the next
-        user/synthetic message, with the terminal marker in between. A terminal
-        from an earlier (or later) turn never completes the target. If the
-        timeline cannot be read far enough to be certain, the state is
-        ``unknown``, never ``completed``.
+        input was accepted. A turn ends only at its correlated **authoritative
+        ``idle``** message — a ``Session.Message.Idle`` whose ``outcome`` is
+        ``succeeded``, ``failed``, or ``interrupted``. A completed ``assistant``
+        message is *not* a terminal: with ``finish=tool-calls`` the agent loop
+        continues, and even ``finish=stop`` is not task success because more loop
+        steps may follow. The published message schemas expose no parent/linkage
+        field, so a turn is delimited positionally: the target user message, then
+        the next user/synthetic message, with the idle in between. An idle from an
+        earlier (or later) turn never completes the target. If the timeline cannot
+        be read far enough to be certain, the state is ``unknown``, never
+        ``completed``.
         """
         self._require_message_id(admission_id)
         inbox = self.list_inbox(session_id)
@@ -649,7 +653,7 @@ class OpenCodeV2Client:
         user_message = messages[start]
         durable = receipt if receipt is not None else user_message
 
-        # Window: (start, next user/synthetic message). A terminal outside the
+        # Window: (start, next user/synthetic message). An idle outside the
         # window belongs to another turn and must not complete this one.
         window_end = len(messages)
         for index in range(start + 1, len(messages)):
@@ -659,21 +663,19 @@ class OpenCodeV2Client:
         window_open_to_eof = window_end == len(messages)
         window = messages[start + 1 : window_end]
 
+        # Only an ``idle`` message is the authoritative terminal for a turn. A
+        # completed ``assistant`` is an intermediate agent-loop step and never
+        # completes the target on its own:
+        #   * finish=tool-calls -> the loop continues with tool execution;
+        #   * finish=stop        -> still not task success (more steps may follow);
+        #   * finish=length/content-filter/error -> truncated or failed step.
+        # A terminal from another turn, or an assistant with no correlated idle,
+        # must not be read as success.
         idle = next((m for m in window if m.get("type") == "idle"), None)
-        assistant = next(
-            (
-                m
-                for m in window
-                if m.get("type") == "assistant"
-                and m.get("time", {}).get("completed") is not None
-            ),
-            None,
-        )
-        terminal = idle if idle is not None else assistant
 
-        if terminal is None:
+        if idle is None:
             if truncated and window_open_to_eof:
-                # the terminal could be on an unread page: do not guess
+                # the idle could be on an unread page: do not guess
                 return ReconcileResult(
                     admission_id,
                     "unknown",
@@ -681,21 +683,30 @@ class OpenCodeV2Client:
                     None,
                     reason="turn window not fully read (message paging limit)",
                 )
-            return ReconcileResult(admission_id, "in_progress", durable, None)
+            return ReconcileResult(
+                admission_id,
+                "in_progress",
+                durable,
+                None,
+                reason="no authoritative idle for this turn (assistant completion is not success)",
+            )
 
-        if terminal.get("type") == "idle":
-            outcome = terminal.get("outcome")
-            state = {
-                "succeeded": "completed",
-                "failed": "failed",
-                "interrupted": "interrupted",
-            }.get(outcome, "unknown")
-            reason = None if state != "unknown" else f"unrecognized idle outcome {outcome!r}"
-        else:
-            state = "failed" if terminal.get("error") else "completed"
-            reason = None
-        completion = {"outcome": terminal.get("outcome", "succeeded" if state == "completed" else state), "message": terminal}
-        return ReconcileResult(admission_id, state, durable, completion, reason=reason)
+        outcome = idle.get("outcome")
+        state = {
+            "succeeded": "completed",
+            "failed": "failed",
+            "interrupted": "interrupted",
+        }.get(outcome, "unknown")
+        completion = {"outcome": outcome, "message": idle}
+        if state == "unknown":
+            return ReconcileResult(
+                admission_id,
+                "unknown",
+                durable,
+                completion,
+                reason=f"unrecognized idle outcome {outcome!r}",
+            )
+        return ReconcileResult(admission_id, state, durable, completion)
 
     # -- bounded wait --------------------------------------------------------
     def wait(

@@ -197,13 +197,73 @@ class TestPerTurnReconciliation(ClientTestCase):
         self.assertEqual(found.state, "interrupted")
         self.assertFalse(found.is_complete)
 
-    def test_assistant_error_is_failed(self) -> None:
+    def test_assistant_error_without_idle_is_not_terminal(self) -> None:
+        # an assistant error is an intermediate loop failure, not a turn terminal
         self.server.state.append_user(self.sid, "msg_aerr001", "x")
-        self.server.state.append_assistant(self.sid, "boom", error={"message": "provider error"})
+        self.server.state.append_assistant(
+            self.sid, "boom", error={"message": "provider error"}, finish="error"
+        )
         found = self.client.reconcile(self.sid, "msg_aerr001")
-        self.assertEqual(found.state, "failed")
+        self.assertEqual(found.state, "in_progress")
+        self.assertFalse(found.is_terminal)
         self.assertFalse(found.is_complete)
 
+    def test_tool_calls_assistant_without_idle_is_not_complete(self) -> None:
+        # realistic agent loop: user -> assistant(finish=tool-calls) with a tool
+        # part -> tool execution / next assistant -> no idle yet.
+        self.server.state.append_user(self.sid, "msg_tools01", "do the work")
+        self.server.state.append_assistant(
+            self.sid,
+            "",
+            finish="tool-calls",
+            content=[
+                {
+                    "type": "tool",
+                    "id": "call_1",
+                    "name": "read_file",
+                    "state": {"status": "completed", "input": {"path": "a.txt"}, "content": []},
+                    "time": {"created": 1, "completed": 2},
+                }
+            ],
+        )
+        self.server.state.add_assistant(self.sid, "still working")  # next loop step
+        found = self.client.reconcile(self.sid, "msg_tools01")
+        self.assertFalse(found.is_complete)
+        self.assertIn(found.state, ("in_progress", "unknown"))
+        # only a later authoritative idle may complete it
+        self.server.state.append_idle(self.sid, "succeeded")
+        self.assertEqual(self.client.reconcile(self.sid, "msg_tools01").state, "completed")
+
+    def test_completed_assistant_finish_stop_without_idle_is_not_complete(self) -> None:
+        # even finish=stop is not task success: more loop steps may follow
+        self.server.state.append_user(self.sid, "msg_stop001", "x")
+        self.server.state.append_assistant(self.sid, "partial", finish="stop")
+        found = self.client.reconcile(self.sid, "msg_stop001")
+        self.assertEqual(found.state, "in_progress")
+        self.assertFalse(found.is_complete)
+
+    def test_assistant_finish_length_without_idle_is_not_complete(self) -> None:
+        self.server.state.append_user(self.sid, "msg_len0001", "x")
+        self.server.state.append_assistant(self.sid, "truncated", finish="length")
+        found = self.client.reconcile(self.sid, "msg_len0001")
+        self.assertEqual(found.state, "in_progress")
+        self.assertFalse(found.is_complete)
+
+    def test_assistant_finish_content_filter_without_idle_is_not_complete(self) -> None:
+        self.server.state.append_user(self.sid, "msg_cf00001", "x")
+        self.server.state.append_assistant(self.sid, "", finish="content-filter")
+        found = self.client.reconcile(self.sid, "msg_cf00001")
+        self.assertEqual(found.state, "in_progress")
+        self.assertFalse(found.is_complete)
+
+    def test_idle_succeeded_is_the_only_completion(self) -> None:
+        self.server.state.append_user(self.sid, "msg_ok00001", "x")
+        self.server.state.append_assistant(self.sid, "done", finish="stop")
+        self.assertFalse(self.client.reconcile(self.sid, "msg_ok00001").is_complete)
+        self.server.state.append_idle(self.sid, "succeeded")
+        found = self.client.reconcile(self.sid, "msg_ok00001")
+        self.assertTrue(found.is_complete)
+        self.assertEqual(found.outcome, "succeeded")
     def test_unrecognized_idle_outcome_is_unknown(self) -> None:
         self.server.state.append_user(self.sid, "msg_weird01", "x")
         self.server.state.append_idle(self.sid, "vanished")

@@ -25,7 +25,7 @@ Python 3.14 (`python3`), standard library only. No third-party dependency.
 
 ```sh
 cd spikes/runtime/python
-python3 -m unittest -v test_opencode_v2   # 41 tests, ~1.5s
+python3 -m unittest -v test_opencode_v2   # 46 tests, ~2s
 python3 demo_lifecycle.py                 # prints the two-client transcript
 python3 mock_server.py --token secret     # optional: standalone mock on a free port
 ```
@@ -91,14 +91,22 @@ shared discovery/start, no paid calls, no budget authorization.
 ## Lifecycle semantics demonstrated
 
 * **Durable admission vs completion.** `admit()` returns a `Session.Inbox.User`
-  receipt: the input is persisted and scheduled. Completion is a separate
-  terminal marker for the *same turn*, found by `reconcile()`.
+  receipt: the input is persisted and scheduled. Completion is a separate,
+  correlated terminal for the *same turn*, found by `reconcile()`.
+* **Only an authoritative `idle` completes a turn.** A turn ends only at its
+  correlated `Session.Message.Idle`. A completed `assistant` message is an
+  intermediate agent-loop step and **never** task success on its own — not with
+  `finish=tool-calls` (more tools/loop steps follow), and not even with
+  `finish=stop` (more steps may still run); `finish=length`/`content-filter`/
+  `error` are truncated or failed steps, not completion. `idle` with
+  `outcome=succeeded` → `completed`; `outcome=failed`/`interrupted` stay explicit
+  and are never `is_complete`.
 * **Per-turn reconciliation (never a false completion).** The published message
   schemas expose no parent/linkage field, so a turn is delimited positionally:
   the target `user` message, then the next `user`/`synthetic` message, with the
-  terminal `idle`/completed `assistant` in between. A terminal that belongs to an
-  earlier or later turn never completes the target. States are `queued`
-  (inbox-only), `in_progress` (delivered, no terminal yet), `completed`, `failed`,
+  authoritative `idle` in between. An `idle` that belongs to an earlier or later
+  turn never completes the target. States are `queued` (inbox-only),
+  `in_progress` (delivered, no correlated `idle` yet), `completed`, `failed`,
   `interrupted`, and `unknown`; only `completed` is `is_complete`.
 * **Honest unknown.** If the timeline cannot be read far enough to be certain
   (paging bound reached, or a turn window open past the read boundary), the state
@@ -160,12 +168,21 @@ explicit token, and (for decisions) explicit budget authorization.
 | Requirement | Evidence |
 | --- | --- |
 | A queued/pending turn is not falsely completed by another turn's terminal | `test_second_queued_turn_not_falsely_complete`, `test_prior_idle_does_not_complete_later_turn`, `test_terminal_after_next_turn_does_not_complete_target` |
-| Failure/interrupted states are distinct and never `is_complete` | `test_failed_outcome_is_distinct_from_success`, `test_interrupted_outcome_is_distinct_from_success`, `test_assistant_error_is_failed`, `test_unrecognized_idle_outcome_is_unknown` |
+| Failure/interrupted states are distinct and never `is_complete` | `test_failed_outcome_is_distinct_from_success`, `test_interrupted_outcome_is_distinct_from_success`, `test_assistant_error_without_idle_is_not_terminal`, `test_unrecognized_idle_outcome_is_unknown` |
 | Older admitted IDs are found by paging; a paging bound returns `unknown` | `test_paging_finds_older_admission`, `test_paging_bound_returns_unknown_not_complete`, `test_paging_limit_never_reports_success` |
 | Missing/empty token fails closed | `test_missing_token_fails_closed`, `test_empty_token_fails_closed`, `test_from_env_requires_token` |
 | Non-loopback / bad-scheme / credential-in-URL refused | `test_non_loopback_url_rejected`, `test_loopback_urls_accepted` |
 | Redirects refused (no token forwarding) | `test_redirect_blocked_without_token_forwarding` |
 | Provider key is not a substitute for endpoint/token | `test_from_env_ignores_openrouter_key` |
+
+### Repair 2 — a completed assistant is not a completion
+
+| Requirement | Evidence |
+| --- | --- |
+| Completed `assistant` with no correlated `idle` never means success | `test_tool_calls_assistant_without_idle_is_not_complete`, `test_completed_assistant_finish_stop_without_idle_is_not_complete`, `test_idle_succeeded_is_the_only_completion` |
+| `finish=tool-calls` loop step remains in_progress/unknown | `test_tool_calls_assistant_without_idle_is_not_complete` |
+| `finish=length` / `content-filter` / `error` without idle is not completion | `test_assistant_finish_length_without_idle_is_not_complete`, `test_assistant_finish_content_filter_without_idle_is_not_complete`, `test_assistant_error_without_idle_is_not_terminal` |
+| Only `idle succeeded` yields `completed`; `failed`/`interrupted` stay explicit | `test_idle_succeeded_is_the_only_completion`, `test_failed_outcome_is_distinct_from_success`, `test_interrupted_outcome_is_distinct_from_success` |
 
 ## Limitations
 
