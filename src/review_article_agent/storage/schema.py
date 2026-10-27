@@ -36,7 +36,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 1
+STORE_SCHEMA_VERSION = 2
 
 #: Registry maps project IDs to names and locations and records the single
 #: selected project. It is *not* a cache of project data.
@@ -70,8 +70,172 @@ def _store_v1(conn: sqlite3.Connection) -> None:
     )
 
 
+#: Statuses an :class:`ArtifactRecord` identity row may hold (C01 §5.1). Lifecycle
+#: only; it never alters revision immutability.
+ARTIFACT_STATUSES = ("active", "superseded", "withdrawn")
+
+
+def _store_v2(conn: sqlite3.Connection) -> None:
+    """Add the immutable artifact/revision/rights/dependency/import tables.
+
+    This migration only *adds* tables and triggers; it never rewrites v1 rows, so
+    a store created at version 1 keeps its ``project``/``meta`` identity metadata
+    (``ARCH-ASSETS``; step doc line 21).
+
+    Immutability is enforced **at the database**, not only in the Python API: a
+    revision's content, hash, provenance, dependency set, and pinned rights key
+    can never be rewritten by an ``UPDATE``, and a written row can never be
+    ``DELETE``d. A change is therefore always a **new** revision row. Composite
+    foreign keys keep every dependency pinned to existing same-project revisions
+    and every revision pinned to an existing rights record, so a failed
+    transaction can leave no dangling reference (all rows are written together).
+    """
+    conn.execute(
+        """
+        CREATE TABLE artifact (
+            project_id     TEXT NOT NULL,
+            artifact_id    TEXT NOT NULL,
+            kind           TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            created_by     TEXT NOT NULL,
+            label          TEXT,
+            status         TEXT NOT NULL DEFAULT 'active',
+            PRIMARY KEY (project_id, artifact_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE rights_record (
+            project_id          TEXT NOT NULL,
+            rights_id           TEXT NOT NULL,
+            record_revision     INTEGER NOT NULL,
+            subject_kind        TEXT NOT NULL,
+            subject_project_id  TEXT NOT NULL,
+            subject_artifact_id TEXT NOT NULL,
+            subject_revision_id TEXT,
+            canonical           BLOB NOT NULL,
+            content_sha256      TEXT NOT NULL,
+            recorded_at_utc     TEXT NOT NULL,
+            PRIMARY KEY (project_id, rights_id, record_revision)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE revision (
+            project_id                   TEXT NOT NULL,
+            artifact_id                  TEXT NOT NULL,
+            revision_id                  TEXT NOT NULL,
+            parent_revision_id           TEXT,
+            content                      BLOB NOT NULL,
+            content_sha256               TEXT NOT NULL,
+            byte_size                    INTEGER NOT NULL,
+            media_type                   TEXT,
+            origin_locator               TEXT NOT NULL,
+            acquired_at_utc              TEXT NOT NULL,
+            acquired_by                  TEXT NOT NULL,
+            provenance_method            TEXT NOT NULL,
+            provenance_actor             TEXT NOT NULL,
+            provenance_performed_at_utc  TEXT NOT NULL,
+            rights_project_id            TEXT NOT NULL,
+            rights_id                    TEXT NOT NULL,
+            rights_record_revision       INTEGER NOT NULL,
+            immutable                    INTEGER NOT NULL DEFAULT 1
+                                         CHECK (immutable = 1),
+            PRIMARY KEY (project_id, artifact_id, revision_id),
+            FOREIGN KEY (project_id, artifact_id)
+                REFERENCES artifact (project_id, artifact_id),
+            FOREIGN KEY (project_id, artifact_id, parent_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id),
+            FOREIGN KEY (rights_project_id, rights_id, rights_record_revision)
+                REFERENCES rights_record (project_id, rights_id, record_revision)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE dependency (
+            project_id        TEXT NOT NULL,
+            from_artifact_id  TEXT NOT NULL,
+            from_revision_id  TEXT NOT NULL,
+            dependency_id     TEXT NOT NULL,
+            role              TEXT NOT NULL,
+            to_project_id     TEXT NOT NULL,
+            to_artifact_id    TEXT NOT NULL,
+            to_revision_id    TEXT NOT NULL,
+            created_at_utc    TEXT NOT NULL,
+            PRIMARY KEY (project_id, from_artifact_id, from_revision_id, dependency_id),
+            FOREIGN KEY (project_id, from_artifact_id, from_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id),
+            FOREIGN KEY (to_project_id, to_artifact_id, to_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE import_request (
+            project_id     TEXT NOT NULL,
+            request_id     TEXT NOT NULL,
+            fingerprint    TEXT NOT NULL,
+            artifact_id    TEXT NOT NULL,
+            revision_id    TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            PRIMARY KEY (project_id, request_id)
+        )
+        """
+    )
+
+    # Identity columns of a logical artifact are fixed at creation; only the
+    # lifecycle ``status``/``label`` may change, and the row is never deleted.
+    conn.execute(
+        """
+        CREATE TRIGGER artifact_identity_immutable
+        BEFORE UPDATE ON artifact
+        WHEN NEW.project_id <> OLD.project_id
+          OR NEW.artifact_id <> OLD.artifact_id
+          OR NEW.kind <> OLD.kind
+          OR NEW.created_at_utc <> OLD.created_at_utc
+          OR NEW.created_by <> OLD.created_by
+        BEGIN
+            SELECT RAISE(ABORT, 'artifact identity rows are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER artifact_no_delete
+        BEFORE DELETE ON artifact
+        BEGIN
+            SELECT RAISE(ABORT, 'artifact identity rows are immutable');
+        END
+        """
+    )
+    for table in ("revision", "rights_record", "dependency", "import_request"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
+    2: _store_v2,
 }
 
 

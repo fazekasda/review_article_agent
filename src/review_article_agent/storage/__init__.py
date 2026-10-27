@@ -14,12 +14,28 @@ Public surface for later workers (artifact repository, approvals, backup, CLI):
 
 from __future__ import annotations
 
+from .artifacts import (
+    Artifact,
+    ArtifactConflictError,
+    ArtifactRepository,
+    ArtifactRepositoryError,
+    DependencyRef,
+    Revision,
+    RightsRef,
+)
 from .registry import ProjectInfo, Registry
 from .store import ProjectStore, transaction
 
 __all__ = [
+    "Artifact",
+    "ArtifactConflictError",
+    "ArtifactRepository",
+    "ArtifactRepositoryError",
+    "DependencyRef",
     "Registry",
     "ProjectInfo",
     "ProjectStore",
+    "Revision",
+    "RightsRef",
     "transaction",
 ]
