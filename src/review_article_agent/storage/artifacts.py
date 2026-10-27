@@ -684,28 +684,44 @@ class ArtifactRepository:
                 ) = self._resolve_rights_ref_for_import(
                     ref_for_import, artifact_id, revision_id
                 )
-            rights_digest = sha256_digest(rights_canonical)
+            # Immutable rights identity: same
+            # {project_id, rights_id, record_revision} with **different canonical
+            # bytes** is a conflict — detected BEFORE any duplicate shortcut so a
+            # changed rights record is never silently reused under the old key.
+            existing_rights = self._rights_row(rights_ref)
+            if (
+                existing_rights is not None
+                and bytes(existing_rights["canonical"]) != rights_canonical
+            ):
+                raise ArtifactConflictError(
+                    f"rights record {rights_ref.rights_id!r} revision "
+                    f"{rights_ref.record_revision} already exists with different "
+                    f"content; a change must be a new record_revision."
+                )
 
-            # Idempotency fingerprint covers the *normalized full payload*,
-            # including the canonical rights digest and declared provenance, so a
-            # same-request replay with changed rights/provenance conflicts.
-            fingerprint = self._fingerprint(
+            # The full normalized payload (content hash, parent, dependencies,
+            # canonical rights digest, media, origin, acquisition and declared
+            # provenance) — everything an exact retry must reproduce. Declared
+            # provenance is never silently dropped; only generated timestamps
+            # (acquired_at / performed_at) are intentionally excluded.
+            signature = self._payload_signature(
                 artifact_id=artifact_id,
-                revision_id=revision_id,
                 parent_revision_id=parent_revision_id,
-                content_sha256=content_sha,
-                rights_digest=rights_digest,
-                rights_ref=rights_ref.as_dict(),
-                dependencies=[d.as_dict() for d in deps],
+                content_sha=content_sha,
+                rights_canonical=rights_canonical,
+                rights_ref=rights_ref,
+                deps=deps,
                 media_type=resolved_media,
-                origin_locator=prov_origin,
+                origin_locator=origin_locator,
                 acquired_by=acquired_by,
                 provenance_method=prov_method,
                 provenance_actor=prov_actor,
             )
+            fingerprint = self._fingerprint(**signature, provenance_origin=prov_origin)
 
-            # Idempotent replay runs BEFORE the head-freshness check: a retry
-            # returns the prior historical result; a divergent payload conflicts.
+            # (1) request-key idempotency — runs BEFORE the head-freshness check:
+            # a retry returns the prior historical result; a divergent payload
+            # under the same key conflicts.
             if request_id is not None:
                 prior = self._import_request_row(request_id)
                 if prior is not None:
@@ -720,27 +736,36 @@ class ArtifactRepository:
                     if existing is not None:
                         return self._revision_with_deps(existing)
 
-            # A repeated *identical* import (no request id) safely reuses the
-            # prior result — even historical, after a later head — without
-            # disturbing the head.
-            duplicate = self._find_duplicate(
-                artifact_id, content_sha, parent_revision_id, rights_ref, deps
-            )
-            if duplicate is not None:
-                return duplicate
+            # (2) resolve to an existing identical revision: by explicit id, else
+            # by full-payload duplicate search. Both run before the head check, so
+            # an exact replay after a later head still returns the historical row.
+            matched: sqlite3.Row | None = None
+            if revision_id is not None:
+                row = self._revision_row(artifact_id, revision_id)
+                if row is not None:
+                    if self._stored_signature(row) != signature:
+                        raise ArtifactConflictError(
+                            f"revision_id {revision_id!r} already exists for "
+                            f"artifact {artifact_id!r} with different content, "
+                            f"origin, provenance, dependencies, or rights."
+                        )
+                    matched = row
+            else:
+                matched = self._find_duplicate(artifact_id, content_sha, signature)
 
-            # A genuinely new revision must name the CURRENT head (or none for a
-            # first revision); this prevents a stale/lost edit.
+            if matched is not None:
+                # A NEW request key that resolves to an existing identical
+                # revision must be bound atomically, so a later divergent reuse
+                # of that key is rejected (never silently accepted).
+                if request_id is not None:
+                    self._insert_import_request(
+                        request_id, fingerprint, artifact_id, matched["revision_id"]
+                    )
+                return self._revision_with_deps(matched)
+
+            # (3) a genuinely new revision must name the CURRENT head (or none for
+            # a first revision); this prevents a stale/lost edit.
             self._enforce_parent_freshness(artifact_id, parent_revision_id)
-
-            if (
-                revision_id is not None
-                and self._revision_row(artifact_id, revision_id) is not None
-            ):
-                raise ArtifactConflictError(
-                    f"revision_id {revision_id!r} already exists for artifact "
-                    f"{artifact_id!r} with a different payload."
-                )
 
             # persist/confirm the rights record, pinned to this revision.
             if rights_raw is not None:
@@ -790,18 +815,8 @@ class ArtifactRepository:
             for dep in deps:
                 self._insert_dependency(artifact_id, revision_id, dep)
             if request_id is not None:
-                conn.execute(
-                    "INSERT INTO import_request "
-                    "(project_id, request_id, fingerprint, artifact_id, "
-                    " revision_id, created_at_utc) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        self.project_id,
-                        request_id,
-                        fingerprint,
-                        artifact_id,
-                        revision_id,
-                        _utc_now(),
-                    ),
+                self._insert_import_request(
+                    request_id, fingerprint, artifact_id, revision_id
                 )
             return self._revision_with_deps(
                 self._revision_row(artifact_id, revision_id)
@@ -1019,41 +1034,103 @@ class ArtifactRepository:
             (self.project_id, artifact_id, revision_id),
         ).fetchone()
 
-    def _find_duplicate(
+    def _payload_signature(
         self,
+        *,
         artifact_id: str,
-        content_sha: str,
         parent_revision_id: str | None,
+        content_sha: str,
+        rights_canonical: bytes,
         rights_ref: RightsRef,
         deps: list[DependencyRef],
-    ) -> Revision | None:
-        """Return an existing equivalent revision, or ``None``.
+        media_type: str | None,
+        origin_locator: str,
+        acquired_by: str,
+        provenance_method: str,
+        provenance_actor: str,
+    ) -> dict:
+        """The normalized *persisted* payload used for duplicate/idempotency.
 
-        Scoped to one artifact: equal bytes in a *different* logical artifact are
-        deliberately **not** merged.
+        Includes every meaningful, durable argument (never a generated
+        timestamp), so a reused revision id or request key with changed
+        content, origin, dependencies, rights bytes, or declared provenance is
+        detected as a conflict rather than silently returning stale success.
+        """
+        return {
+            "artifact_id": artifact_id,
+            "parent_revision_id": parent_revision_id,
+            "content_sha256": content_sha,
+            "rights_digest": sha256_digest(rights_canonical),
+            "rights_ref": rights_ref.as_dict(),
+            "dependencies": sorted(
+                (d.as_dict() for d in deps),
+                key=lambda d: (d["project_id"], d["artifact_id"], d["revision_id"], d["role"]),
+            ),
+            "media_type": media_type,
+            "origin_locator": origin_locator,
+            "acquired_by": acquired_by,
+            "provenance_method": provenance_method,
+            "provenance_actor": provenance_actor,
+        }
+
+    def _stored_signature(self, row: sqlite3.Row) -> dict:
+        """Reconstruct the persisted payload signature of a stored revision."""
+        rights_row = self._rights_row(
+            RightsRef(row["project_id"], row["rights_id"], row["rights_record_revision"])
+        )
+        rights_digest = (
+            None if rights_row is None else sha256_digest(bytes(rights_row["canonical"]))
+        )
+        return {
+            "artifact_id": row["artifact_id"],
+            "parent_revision_id": row["parent_revision_id"],
+            "content_sha256": row["content_sha256"],
+            "rights_digest": rights_digest,
+            "rights_ref": {
+                "project_id": row["rights_project_id"],
+                "rights_id": row["rights_id"],
+                "record_revision": row["rights_record_revision"],
+            },
+            "dependencies": sorted(
+                (d.as_dict() for d in self._dependency_rows(row["artifact_id"], row["revision_id"])),
+                key=lambda d: (d["project_id"], d["artifact_id"], d["revision_id"], d["role"]),
+            ),
+            "media_type": row["media_type"],
+            "origin_locator": row["origin_locator"],
+            "acquired_by": row["acquired_by"],
+            "provenance_method": row["provenance_method"],
+            "provenance_actor": row["provenance_actor"],
+        }
+
+    def _insert_import_request(
+        self, request_id: str, fingerprint: str, artifact_id: str, revision_id: str
+    ) -> None:
+        """Bind a request key to its revision (caller ensures it is absent)."""
+        self._assert_open().execute(
+            "INSERT INTO import_request "
+            "(project_id, request_id, fingerprint, artifact_id, revision_id, "
+            " created_at_utc) VALUES (?, ?, ?, ?, ?, ?)",
+            (self.project_id, request_id, fingerprint, artifact_id, revision_id, _utc_now()),
+        )
+
+    def _find_duplicate(
+        self, artifact_id: str, content_sha: str, signature: dict
+    ) -> sqlite3.Row | None:
+        """Return an existing revision whose full signature equals ``signature``.
+
+        Scoped to one artifact and compared on the complete persisted payload, so
+        equal bytes with a different origin, dependencies, rights, or provenance
+        are **not** merged (and equal bytes in a *different* logical artifact are
+        never merged).
         """
         rows = self._assert_open().execute(
             "SELECT * FROM revision WHERE project_id = ? AND artifact_id = ? "
-            "AND content_sha256 = ? AND rights_id = ? AND rights_record_revision = ? "
-            "ORDER BY rowid",
-            (
-                self.project_id,
-                artifact_id,
-                content_sha,
-                rights_ref.rights_id,
-                rights_ref.record_revision,
-            ),
+            "AND content_sha256 = ? ORDER BY rowid",
+            (self.project_id, artifact_id, content_sha),
         ).fetchall()
-        want = sorted(_dependency_key(d) for d in deps)
         for row in rows:
-            row_parent = row["parent_revision_id"]
-            if (row_parent or None) != (parent_revision_id or None):
-                continue
-            existing_deps = sorted(
-                _dependency_key(d) for d in self._dependency_rows(artifact_id, row["revision_id"])
-            )
-            if existing_deps == want:
-                return self._revision_with_deps(row)
+            if self._stored_signature(row) == signature:
+                return row
         return None
 
     def _dependency_rows(

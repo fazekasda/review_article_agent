@@ -238,13 +238,14 @@ class RevisionEditTest(ArtifactTestBase):
                     origin_locator="import:x",
                     rights=RightsRef(store.project_id, "RIGHTS-rev-1", 1),
                 )
-            # invalid dependency (unknown target revision)
+            # invalid dependency (unknown target revision), as a *new* revision
             with self.assertRaises(RecordValidationError):
                 repo.import_revision(
                     artifact_id=art.artifact_id,
                     content=b"bad",
                     origin_locator="import:x",
-                    rights=RightsRef(store.project_id, "RIGHTS-rev-1", 1),
+                    rights=_valid_rights(store.project_id, art.artifact_id, "rev-dep"),
+                    revision_id="rev-dep",
                     dependencies=[
                         {"project_id": store.project_id, "artifact_id": art.artifact_id,
                          "revision_id": "rev-missing"}
@@ -811,6 +812,113 @@ class IdempotencyFingerprintTest(ArtifactTestBase):
                                 "performed_at": "2026-10-27T00:00:00Z", "origin": "synthetic"},
                 )
             self.assertEqual(len(repo.list_revisions("a")), 1)
+
+
+class IdempotencyBoundaryTest(ArtifactTestBase):
+    """Duplicate/replay shortcuts must compare ALL meaningful inputs."""
+
+    def _counts(self, store):
+        c = store.connection
+        return (
+            c.execute("SELECT COUNT(*) FROM revision").fetchone()[0],
+            c.execute("SELECT COUNT(*) FROM rights_record").fetchone()[0],
+            c.execute("SELECT COUNT(*) FROM import_request").fetchone()[0],
+        )
+
+    def test_changed_origin_same_revision_conflicts(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            self.import_document(
+                repo, "a", b"synthetic", rights_revision="r1"
+            )  # origin default import:synthetic
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"synthetic",
+                    origin_locator="changed",
+                    rights=_valid_rights(store.project_id, "a", "r1"),
+                )
+            self.assertEqual(len(repo.list_revisions("a")), 1)
+            self.assertEqual(repo.current_revision("a").origin_locator, "import:synthetic")
+
+    def test_changed_rights_same_identity_conflicts(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            self.import_document(repo, "a", b"x", rights_revision="r1")
+            changed = _valid_rights(store.project_id, "a", "r1")
+            changed["restrictions"] = ["new-restriction"]
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="import:synthetic", rights=changed,
+                )
+            self.assertEqual(len(repo.list_revisions("a")), 1)
+            stored = repo.get_rights_record(RightsRef(store.project_id, "RIGHTS-r1", 1))
+            self.assertEqual(stored["restrictions"], [])
+
+    def test_new_request_key_binds_existing_identical_revision(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            r1 = self.import_document(repo, "a", b"x", rights_revision="r1")
+            # A NEW request key that resolves to the identical revision is bound.
+            again = self.import_document(
+                repo, "a", b"x", rights_revision="r1", request_id="new-request"
+            )
+            self.assertEqual(again.revision_id, r1.revision_id)
+            self.assertIsNotNone(repo._import_request_row("new-request"))
+            # A later divergent reuse of that key is rejected, not accepted.
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="changed",
+                    rights=_valid_rights(store.project_id, "a", "r1"),
+                    request_id="new-request",
+                )
+            self.assertEqual(len(repo.list_revisions("a")), 1)
+
+    def test_exact_duplicate_returns_stable_revision_no_new_head(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            r1 = self.import_document(repo, "a", b"x", rights_revision="r1")
+            again = self.import_document(repo, "a", b"x", rights_revision="r1")
+            self.assertEqual(again.revision_id, r1.revision_id)
+            self.assertEqual(len(repo.list_revisions("a")), 1)
+            self.assertEqual(repo.current_revision("a").revision_id, r1.revision_id)
+
+    def test_conflict_leaves_no_new_rows_or_rights(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            self.import_document(repo, "a", b"x", rights_revision="r1")
+            before = self._counts(store)
+            # Conflicting content under an existing (pinned) revision id.
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"different",
+                    origin_locator="import:synthetic",
+                    rights=_valid_rights(store.project_id, "a", "r1"),
+                    request_id="req-conflict",
+                )
+            self.assertEqual(self._counts(store), before)
+            self.assertIsNone(repo._import_request_row("req-conflict"))
+
+    def test_rights_divergence_conflict_leaves_no_rows(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            self.import_document(repo, "a", b"x", rights_revision="r1")
+            before = self._counts(store)
+            changed = _valid_rights(store.project_id, "a", "r1")
+            changed["restrictions"] = ["new-restriction"]
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="import:synthetic", rights=changed,
+                )
+            self.assertEqual(self._counts(store), before)
 
 
 class ReturnedDependenciesTest(ArtifactTestBase):
