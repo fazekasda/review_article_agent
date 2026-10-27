@@ -6,10 +6,13 @@ Design constraints (see ``docs/implementation/00-runtime-spike.md`` lines 5, 9,
 15-18, 20 and ``docs/specification.md`` "Product and runtime"):
 
 * Python standard library only (``urllib``), no third-party HTTP client.
-* Explicit, authenticated loopback endpoint. The base URL and bearer token are
-  passed in by the caller; there is **no** shared-service discovery or start and
-  **no** reading of private databases, registration files, or credentials.
-  ``from_env`` is the only convenience and it refuses to guess a default.
+* Explicit, authenticated **loopback** endpoint. The base URL and bearer token
+  are passed in by the caller and both are required: a non-loopback host or a
+  missing token fails closed, redirects are refused so the token is never
+  forwarded, and there is **no** shared-service discovery or start and **no**
+  reading of private databases, registration files, or credentials.
+  ``from_env`` is the only convenience; it refuses to guess a default and
+  deliberately ignores ``OPENROUTER_API_KEY``.
 * Only request/response shapes taken from the published V2 OpenAPI document
   (``https://opencode.ai/v2/openapi.json``, openapi 3.1.0, HttpApi 0.0.1) are
   used. Nothing is invented.
@@ -34,23 +37,25 @@ Admission vs completion (the point of the spike):
   (``Session.Inbox.User``): the input is persisted and scheduled. This is **not**
   a completion.
 * ``reconcile`` reconstructs state from durable state (inbox + messages) so a
-  second client recovers after missed events. It distinguishes the durable
-  receipt from the completion (idle/assistant message).
+  second client recovers after missed events. It correlates the durable receipt
+  with the terminal marker **of the same turn only** (positional windowing, since
+  the schemas expose no parent link); a terminal from another turn never
+  completes the target, and an uncertain read returns ``unknown``, not success.
 * ``wait`` is a bounded wait for the agent loop to become idle, so the CLI is
   never required to stay open for the task to finish.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
-import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 # --- exact patterns from the OpenAPI schemas ---------------------------------
@@ -60,6 +65,25 @@ MESSAGE_ID_RE = re.compile(r"^msg_")
 # Response tags from the published error schemas (*ErrorEncoded).
 CONFLICT_TAG = "ConflictError"
 UNAUTHORIZED_TAG = "UnauthorizedError"
+
+# Message types that open a new turn in the projected timeline. The published
+# schemas (Session.Message.*) carry no parent/linkage field, so a turn can only
+# be delimited positionally: its ``user`` message, then the next user/synthetic
+# message, with the terminal ``idle``/completed ``assistant`` in between.
+TURN_OPENING_TYPES = ("user", "synthetic")
+LOOPBACK_HOSTS = ("localhost",)
+
+
+class _RedirectRejectedHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect so the bearer token is never forwarded.
+
+    ``redirect_request`` returning ``None`` makes urllib raise the redirect as an
+    ``HTTPError`` instead of following it. This blocks credential leakage to a
+    redirect target (cross-origin or otherwise).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
 
 
 class OpenCodeError(Exception):
@@ -115,20 +139,79 @@ class Admission:
 
 @dataclass
 class ReconcileResult:
-    """State reconstructed from durable server state."""
+    """State reconstructed from durable server state for one admission.
+
+    ``state`` is one of:
+
+    * ``queued`` — the ID is enqueued in the session inbox and not yet delivered
+      (no projected user message yet).
+    * ``in_progress`` — the user message is projected but its turn has no
+      terminal marker yet.
+    * ``completed`` — the terminal marker for *this* turn succeeded.
+    * ``failed`` / ``interrupted`` — the terminal marker for *this* turn ended
+      without success.
+    * ``unknown`` — no reliable trace; ``reason`` explains why. Never success.
+
+    ``completion`` is the terminal marker (``idle`` or completed ``assistant``)
+    *for this turn only*, or ``None``.
+    """
 
     admission_id: str
-    state: str  # "admitted" | "delivered" | "completed" | "unknown"
+    state: str
     durable_receipt: dict[str, Any] | None
     completion: dict[str, Any] | None
+    reason: str | None = None
+
+    _TERMINAL_OK = ("completed", "failed", "interrupted")
+    _DURABLE = ("queued", "in_progress", "completed", "failed", "interrupted")
 
     @property
     def is_durable(self) -> bool:
-        return self.state in ("admitted", "delivered", "completed")
+        return self.state in self._DURABLE
 
     @property
     def is_complete(self) -> bool:
         return self.state == "completed"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state in self._TERMINAL_OK
+
+    @property
+    def outcome(self) -> str | None:
+        return (self.completion or {}).get("outcome")
+
+
+def assert_explicit_loopback_url(base_url: str) -> str:
+    """Return ``base_url`` only if it is an explicit loopback HTTP(S) endpoint.
+
+    Fails closed for a non-loopback host, a non-HTTP scheme, an embedded
+    credential, or a missing host. The spike must never talk to a remote or
+    shared service, and must never carry a token off-host.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ValueError("base_url must be an explicit, non-empty URL")
+    parsed = urllib.parse.urlsplit(base_url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"base_url scheme must be http or https, got {parsed.scheme!r}")
+    if parsed.username or parsed.password:
+        raise ValueError("credentials must not be embedded in the endpoint URL")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("base_url must include a host")
+    if host in LOOPBACK_HOSTS:
+        return base_url
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        raise ValueError(
+            f"base_url host must be a loopback address or localhost, got {host!r}"
+        ) from None
+    if not address.is_loopback:
+        raise ValueError(
+            f"base_url host must be loopback (127.0.0.0/8 or ::1), got {host}"
+        )
+    return base_url
 
 
 def validate_model_ref(model: dict[str, Any]) -> dict[str, Any]:
@@ -151,11 +234,13 @@ def validate_model_ref(model: dict[str, Any]) -> dict[str, Any]:
 class OpenCodeV2Client:
     """Small, explicit client for the OpenCode V2 HTTP API.
 
-    :param base_url: explicit endpoint, e.g. ``http://127.0.0.1:4096``. No
-        discovery is performed.
-    :param token: explicit bearer token (sent as ``Authorization: Bearer``).
-        Optional because a disposable loopback server may run unauthenticated.
+    :param base_url: explicit **loopback** endpoint, e.g.
+        ``http://127.0.0.1:4096``. Non-loopback hosts are refused. No discovery.
+    :param token: explicit bearer token (``Authorization: Bearer``). Required:
+        the client fails closed without one.
     :param directory: absolute location directory pinned on session create.
+
+    Redirects are refused so the bearer token is never forwarded off-origin.
     """
 
     def __init__(
@@ -166,23 +251,32 @@ class OpenCodeV2Client:
         timeout: float = 30.0,
         directory: str | None = None,
         extra_headers: dict[str, str] | None = None,
+        max_message_pages: int = 100,
     ):
-        if not isinstance(base_url, str) or not base_url.strip():
-            raise ValueError("base_url must be an explicit, non-empty URL")
+        assert_explicit_loopback_url(base_url)
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError(
+                "an explicit bearer token is required; refusing unauthenticated access"
+            )
+        if not isinstance(max_message_pages, int) or max_message_pages < 1:
+            raise ValueError("max_message_pages must be a positive integer")
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = float(timeout)
         self.directory = directory
         self.extra_headers = dict(extra_headers or {})
+        self.max_message_pages = max_message_pages
+        # A private opener that refuses redirects (defends the token).
+        self._opener = urllib.request.build_opener(_RedirectRejectedHandler)
 
     # -- construction helpers ------------------------------------------------
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "OpenCodeV2Client":
         """Build a client from explicit environment variables only.
 
-        Required: ``OPENCODE_SPIKE_BASE_URL``. Optional: ``OPENCODE_SPIKE_TOKEN``,
-        ``OPENCODE_SPIKE_DIRECTORY``. Refuses to fall back to any shared-service
-        discovery or default port.
+        Required: ``OPENCODE_SPIKE_BASE_URL`` and ``OPENCODE_SPIKE_TOKEN``.
+        Optional: ``OPENCODE_SPIKE_DIRECTORY``. Refuses a default endpoint and
+        never reads provider keys: ``OPENROUTER_API_KEY`` is deliberately ignored.
         """
         env = os.environ if env is None else env
         base_url = env.get("OPENCODE_SPIKE_BASE_URL")
@@ -190,9 +284,14 @@ class OpenCodeV2Client:
             raise ValueError(
                 "OPENCODE_SPIKE_BASE_URL is required; no default endpoint is used"
             )
+        token = env.get("OPENCODE_SPIKE_TOKEN")
+        if not token:
+            raise ValueError(
+                "OPENCODE_SPIKE_TOKEN is required; refusing unauthenticated access"
+            )
         return cls(
             base_url,
-            token=env.get("OPENCODE_SPIKE_TOKEN"),
+            token=token,
             directory=env.get("OPENCODE_SPIKE_DIRECTORY"),
         )
 
@@ -201,8 +300,7 @@ class OpenCodeV2Client:
         headers = {"Accept": "application/json"}
         if has_body:
             headers["Content-Type"] = "application/json"
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        headers["Authorization"] = f"Bearer {self.token}"
         headers.update(self.extra_headers)
         return headers
 
@@ -224,7 +322,7 @@ class OpenCodeV2Client:
             method=method,
         )
         try:
-            with urllib.request.urlopen(
+            with self._opener.open(
                 request, timeout=self.timeout if timeout is None else timeout
             ) as response:
                 raw = response.read()
@@ -233,6 +331,14 @@ class OpenCodeV2Client:
                 raw = exc.read()
             finally:
                 exc.close()
+            if 300 <= exc.code < 400:
+                location = exc.headers.get("Location") if exc.headers else None
+                raise OpenCodeApiError(
+                    exc.code,
+                    None,
+                    f"redirect blocked (Location={location}); token not forwarded",
+                    None,
+                ) from None
             payload = self._decode(raw)
             tag = payload.get("_tag") if isinstance(payload, dict) else None
             message = (
@@ -448,55 +554,148 @@ class OpenCodeV2Client:
             "GET", f"/api/session/{session_id}/message/{message_id}"
         )["data"]
 
-    def reconcile(self, session_id: str, admission_id: str) -> ReconcileResult:
-        """Reconstruct admission/completion state from durable server state.
+    def collect_messages(
+        self,
+        session_id: str,
+        *,
+        type: str | None = None,  # noqa: A002 - documented query name
+        order: str = "asc",
+        max_pages: int | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Read the projected timeline, following ``cursor.next`` when needed.
 
-        The durable receipt (an inbox item or a persisted user message) proves the
-        input was accepted. A separate completion (idle or completed assistant
-        message) proves the turn ended. ``unknown`` means the server holds no
-        trace of the ID — it is never reported as complete.
+        Older admissions can fall off the first page, so reconciliation pages
+        from the oldest message forward. Returns ``(messages, truncated)`` where
+        ``truncated`` is true when the page bound was reached before the server
+        exhausted its cursor; a truncated read is never treated as complete.
+        """
+        self._require_session_id(session_id)
+        bound = self.max_message_pages if max_pages is None else int(max_pages)
+        if bound < 1:
+            raise ValueError("max_pages must be a positive integer")
+        messages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        pages = 0
+        seen_cursors: set[str] = set()
+        while True:
+            page = self.list_messages(session_id, type=type, order=order, cursor=cursor)
+            messages.extend(page.get("data", []))
+            pages += 1
+            next_cursor = (page.get("cursor") or {}).get("next")
+            if not next_cursor:
+                return messages, False
+            if next_cursor in seen_cursors:
+                # a repeating cursor cannot make progress; stop honestly
+                return messages, True
+            seen_cursors.add(next_cursor)
+            if pages >= bound:
+                return messages, True
+            cursor = next_cursor
+
+    def reconcile(self, session_id: str, admission_id: str) -> ReconcileResult:
+        """Reconstruct per-turn state for one admission from durable server data.
+
+        The durable receipt (inbox item or projected user message) proves the
+        input was accepted, and a terminal ``idle``/completed ``assistant``
+        proves a turn ended — but only the terminal that belongs to **this**
+        turn. The published message schemas expose no parent/linkage field, so a
+        turn is delimited positionally: the target user message, then the next
+        user/synthetic message, with the terminal marker in between. A terminal
+        from an earlier (or later) turn never completes the target. If the
+        timeline cannot be read far enough to be certain, the state is
+        ``unknown``, never ``completed``.
         """
         self._require_message_id(admission_id)
         inbox = self.list_inbox(session_id)
         receipt = next((i for i in inbox if i.get("id") == admission_id), None)
 
-        messages = self.list_messages(session_id)["data"]
-        user_message = next(
+        messages, truncated = self.collect_messages(session_id, order="asc")
+        start = next(
             (
-                m
-                for m in messages
-                if m.get("type") == "user" and m.get("id") == admission_id
+                index
+                for index, message in enumerate(messages)
+                if message.get("type") == "user" and message.get("id") == admission_id
             ),
             None,
         )
+
+        if start is None:
+            # No projected user message: either still enqueued, or the timeline
+            # could not be read far enough to be sure.
+            if receipt is not None:
+                return ReconcileResult(
+                    admission_id, "queued", receipt, None, reason="enqueued, not delivered"
+                )
+            if truncated:
+                return ReconcileResult(
+                    admission_id,
+                    "unknown",
+                    None,
+                    None,
+                    reason=f"message paging limit ({self.max_message_pages} pages) reached",
+                )
+            return ReconcileResult(admission_id, "unknown", None, None, reason="no server trace")
+
+        return self._reconcile_turn(messages, start, admission_id, receipt, truncated)
+
+    @staticmethod
+    def _reconcile_turn(
+        messages: list[dict[str, Any]],
+        start: int,
+        admission_id: str,
+        receipt: dict[str, Any] | None,
+        truncated: bool,
+    ) -> ReconcileResult:
+        user_message = messages[start]
         durable = receipt if receipt is not None else user_message
 
-        completion: dict[str, Any] | None = None
-        idle = next((m for m in messages if m.get("type") == "idle"), None)
+        # Window: (start, next user/synthetic message). A terminal outside the
+        # window belongs to another turn and must not complete this one.
+        window_end = len(messages)
+        for index in range(start + 1, len(messages)):
+            if messages[index].get("type") in TURN_OPENING_TYPES:
+                window_end = index
+                break
+        window_open_to_eof = window_end == len(messages)
+        window = messages[start + 1 : window_end]
+
+        idle = next((m for m in window if m.get("type") == "idle"), None)
         assistant = next(
             (
                 m
-                for m in messages
+                for m in window
                 if m.get("type") == "assistant"
                 and m.get("time", {}).get("completed") is not None
             ),
             None,
         )
-        if idle is not None:
-            completion = {"outcome": idle.get("outcome"), "message": idle}
-        elif assistant is not None:
-            outcome = "failed" if assistant.get("error") else "succeeded"
-            completion = {"outcome": outcome, "message": assistant}
+        terminal = idle if idle is not None else assistant
 
-        if durable is None:
-            state = "unknown"
-        elif completion is not None:
-            state = "completed"
-        elif receipt is not None:
-            state = "admitted"
+        if terminal is None:
+            if truncated and window_open_to_eof:
+                # the terminal could be on an unread page: do not guess
+                return ReconcileResult(
+                    admission_id,
+                    "unknown",
+                    durable,
+                    None,
+                    reason="turn window not fully read (message paging limit)",
+                )
+            return ReconcileResult(admission_id, "in_progress", durable, None)
+
+        if terminal.get("type") == "idle":
+            outcome = terminal.get("outcome")
+            state = {
+                "succeeded": "completed",
+                "failed": "failed",
+                "interrupted": "interrupted",
+            }.get(outcome, "unknown")
+            reason = None if state != "unknown" else f"unrecognized idle outcome {outcome!r}"
         else:
-            state = "delivered"
-        return ReconcileResult(admission_id, state, durable, completion)
+            state = "failed" if terminal.get("error") else "completed"
+            reason = None
+        completion = {"outcome": terminal.get("outcome", "succeeded" if state == "completed" else state), "message": terminal}
+        return ReconcileResult(admission_id, state, durable, completion, reason=reason)
 
     # -- bounded wait --------------------------------------------------------
     def wait(

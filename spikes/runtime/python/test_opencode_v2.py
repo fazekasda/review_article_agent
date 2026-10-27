@@ -79,7 +79,8 @@ class TestAdmission(ClientTestCase):
         self.assertEqual(receipt["delivery"], "queue")
         # the receipt is admission only; the turn has not completed
         found = self.client.reconcile(self.session["id"], "msg_admit0001")
-        self.assertEqual(found.state, "admitted")
+        self.assertEqual(found.state, "in_progress")
+        self.assertTrue(found.is_durable)
         self.assertFalse(found.is_complete)
 
     def test_retry_same_admission_id_yields_single_input(self) -> None:
@@ -92,6 +93,10 @@ class TestAdmission(ClientTestCase):
         inbox = self.client.list_inbox(self.session["id"])
         matching = [i for i in inbox if i["id"] == "msg_retry0001"]
         self.assertEqual(len(matching), 1)  # exactly one accepted input
+        messages = self.client.list_messages(self.session["id"])["data"]
+        self.assertEqual(
+            [m["id"] for m in messages if m["type"] == "user"], ["msg_retry0001"]
+        )
 
     def test_missed_events_second_client_retrieves_persisted_state(self) -> None:
         first_client = self.client
@@ -137,6 +142,118 @@ class TestAdmission(ClientTestCase):
             self.client.admit(self.session["id"], "   ", "msg_bad0001")
         with self.assertRaises(ValueError):
             self.client.admit(self.session["id"], "hi", "msg_bad0002", delivery="urgent")
+
+
+class TestPerTurnReconciliation(ClientTestCase):
+    """A terminal must belong to the target turn; other turns never complete it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.session = self.client.create_session(agent="writer", model=WRITER_MODEL)
+        self.sid = self.session["id"]
+
+    def test_second_queued_turn_not_falsely_complete(self) -> None:
+        # turn 1 delivered and completed
+        self.server.state.append_user(self.sid, "msg_turn1a", "first")
+        self.server.state.append_assistant(self.sid, "first done")
+        self.server.state.append_idle(self.sid, "succeeded")
+        # turn 2 enqueued but not delivered
+        self.server.state.enqueue(self.sid, "msg_turn2a", "second")
+        found = self.client.reconcile(self.sid, "msg_turn2a")
+        self.assertEqual(found.state, "queued")
+        self.assertFalse(found.is_complete)  # the old any-idle bug returned completed
+        self.assertTrue(found.is_durable)
+
+    def test_prior_idle_does_not_complete_later_turn(self) -> None:
+        self.server.state.append_user(self.sid, "msg_turn1b", "first")
+        self.server.state.append_idle(self.sid, "succeeded")
+        # a later turn is delivered but still running
+        self.server.state.append_user(self.sid, "msg_turn2b", "second")
+        found = self.client.reconcile(self.sid, "msg_turn2b")
+        self.assertEqual(found.state, "in_progress")
+        self.assertFalse(found.is_complete)
+
+    def test_terminal_after_next_turn_does_not_complete_target(self) -> None:
+        self.server.state.append_user(self.sid, "msg_turn1c", "first")
+        self.server.state.append_user(self.sid, "msg_turn2c", "second")
+        self.server.state.append_assistant(self.sid, "second done")
+        self.server.state.append_idle(self.sid, "succeeded")
+        found = self.client.reconcile(self.sid, "msg_turn1c")
+        self.assertEqual(found.state, "in_progress")  # turn 1 has no terminal yet
+
+    def test_failed_outcome_is_distinct_from_success(self) -> None:
+        self.server.state.append_user(self.sid, "msg_fail001", "x")
+        self.server.state.append_idle(self.sid, "failed")
+        found = self.client.reconcile(self.sid, "msg_fail001")
+        self.assertEqual(found.state, "failed")
+        self.assertTrue(found.is_terminal)
+        self.assertFalse(found.is_complete)
+        self.assertEqual(found.outcome, "failed")
+
+    def test_interrupted_outcome_is_distinct_from_success(self) -> None:
+        self.server.state.append_user(self.sid, "msg_intr001", "x")
+        self.server.state.append_idle(self.sid, "interrupted")
+        found = self.client.reconcile(self.sid, "msg_intr001")
+        self.assertEqual(found.state, "interrupted")
+        self.assertFalse(found.is_complete)
+
+    def test_assistant_error_is_failed(self) -> None:
+        self.server.state.append_user(self.sid, "msg_aerr001", "x")
+        self.server.state.append_assistant(self.sid, "boom", error={"message": "provider error"})
+        found = self.client.reconcile(self.sid, "msg_aerr001")
+        self.assertEqual(found.state, "failed")
+        self.assertFalse(found.is_complete)
+
+    def test_unrecognized_idle_outcome_is_unknown(self) -> None:
+        self.server.state.append_user(self.sid, "msg_weird01", "x")
+        self.server.state.append_idle(self.sid, "vanished")
+        found = self.client.reconcile(self.sid, "msg_weird01")
+        self.assertEqual(found.state, "unknown")
+        self.assertFalse(found.is_complete)
+
+    def _fill_turns(self, count: int) -> None:
+        for index in range(count):
+            self.server.state.append_user(self.sid, f"msg_fill{index:04d}", "filler")
+            self.server.state.append_assistant(self.sid, "filler done")
+            self.server.state.append_idle(self.sid, "succeeded")
+
+    def test_paging_finds_older_admission(self) -> None:
+        self._fill_turns(30)  # ~90 messages before the target
+        self.server.state.append_user(self.sid, "msg_target01", "target")
+        self.server.state.append_assistant(self.sid, "target done")
+        self.server.state.append_idle(self.sid, "succeeded")
+        self.server.state.message_page_size = 20
+        found = self.client.reconcile(self.sid, "msg_target01")
+        self.assertEqual(found.state, "completed")  # required paging to find it
+        self.assertTrue(found.is_complete)
+
+    def test_paging_bound_returns_unknown_not_complete(self) -> None:
+        self._fill_turns(30)
+        self.server.state.append_user(self.sid, "msg_target02", "target")
+        self.server.state.append_assistant(self.sid, "target done")
+        self.server.state.append_idle(self.sid, "succeeded")
+        self.server.state.message_page_size = 20
+        bounded = OpenCodeV2Client(
+            self.server.base_url, token="test-token", max_message_pages=1
+        )
+        found = bounded.reconcile(self.sid, "msg_target02")
+        self.assertEqual(found.state, "unknown")
+        self.assertFalse(found.is_complete)
+        self.assertIn("paging limit", found.reason)
+
+    def test_paging_limit_never_reports_success(self) -> None:
+        # target on the first page, its turn window open past the read bound
+        self.server.state.append_user(self.sid, "msg_target03", "target")
+        for _ in range(40):
+            self.server.state.append_system(self.sid, "padding")
+        self.server.state.message_page_size = 20
+        bounded = OpenCodeV2Client(
+            self.server.base_url, token="test-token", max_message_pages=1
+        )
+        found = bounded.reconcile(self.sid, "msg_target03")
+        self.assertEqual(found.state, "unknown")
+        self.assertFalse(found.is_complete)
+        self.assertIn("not fully read", found.reason)
 
 
 class TestWaitInterrupt(ClientTestCase):
@@ -269,14 +386,38 @@ class TestAuthAndTransport(ClientTestCase):
         self.assertEqual(ctx.exception.status, 401)
         self.assertEqual(ctx.exception.tag, "UnauthorizedError")
 
-    def test_missing_token_unauthorized(self) -> None:
-        anon = OpenCodeV2Client(self.server.base_url)
+    def test_missing_token_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client(self.server.base_url)
+
+    def test_empty_token_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client(self.server.base_url, token="   ")
+
+    def test_non_loopback_url_rejected(self) -> None:
+        for url in (
+            "http://example.com:443",
+            "https://10.1.2.3:1234",
+            "http://0.0.0.0:1",
+            "ftp://127.0.0.1:1",
+            "http://user:pass@127.0.0.1:1",
+        ):
+            with self.assertRaises(ValueError, msg=url):
+                OpenCodeV2Client(url, token="t")
+
+    def test_loopback_urls_accepted(self) -> None:
+        for url in ("http://127.0.0.1:1", "http://localhost:4096", "http://[::1]:1"):
+            client = OpenCodeV2Client(url, token="t")
+            self.assertTrue(client.token)
+
+    def test_redirect_blocked_without_token_forwarding(self) -> None:
         with self.assertRaises(OpenCodeApiError) as ctx:
-            anon.info()
-        self.assertEqual(ctx.exception.status, 401)
+            self.client._request("GET", "/api/redirect")
+        self.assertEqual(ctx.exception.status, 302)
+        self.assertIn("redirect blocked", ctx.exception.message)
 
     def test_unreachable_endpoint_is_transport_error(self) -> None:
-        dead = OpenCodeV2Client("http://127.0.0.1:1", timeout=1.0)
+        dead = OpenCodeV2Client("http://127.0.0.1:1", token="t", timeout=1.0)
         with self.assertRaises(OpenCodeTransportError):
             dead.info()
 
@@ -290,6 +431,10 @@ class TestExplicitConfiguration(unittest.TestCase):
         with self.assertRaises(ValueError):
             OpenCodeV2Client.from_env({})  # no default endpoint, no discovery
 
+    def test_from_env_requires_token(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client.from_env({"OPENCODE_SPIKE_BASE_URL": "http://127.0.0.1:9999"})
+
     def test_from_env_uses_given_values(self) -> None:
         client = OpenCodeV2Client.from_env(
             {
@@ -301,6 +446,11 @@ class TestExplicitConfiguration(unittest.TestCase):
         self.assertEqual(client.base_url, "http://127.0.0.1:9999")
         self.assertEqual(client.token, "t")
         self.assertEqual(client.directory, "/tmp/x")
+
+    def test_from_env_ignores_openrouter_key(self) -> None:
+        # A provider key must not substitute for the explicit spike endpoint/token.
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client.from_env({"OPENROUTER_API_KEY": "present-but-not-used"})
 
 
 if __name__ == "__main__":

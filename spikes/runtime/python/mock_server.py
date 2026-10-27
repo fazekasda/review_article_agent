@@ -50,6 +50,7 @@ class MockState:
         self.messages: dict[str, list[dict[str, Any]]] = {}
         self.seen_admission: dict[str, str] = {}  # admission id -> session id
         self._counter = 0
+        self._tick = 1_700_000_000_000
         # failure tunables
         self.prompt_drops = 0  # drop the connection N times, after accepting
         self.wait_status = 204  # 204 = idle; 503 = service unavailable
@@ -58,6 +59,7 @@ class MockState:
         self.rename: dict[str, str] = {}
         self.fail_conflict_instead = False  # retry returns 409 even if unseen
         self.decision_answers: list[dict[str, Any]] | None = None
+        self.message_page_size: int | None = None  # None = one unpaged page
 
     # -- helpers -------------------------------------------------------------
     def new_session_id(self) -> str:
@@ -67,6 +69,10 @@ class MockState:
     def new_message_id(self) -> str:
         self._counter += 1
         return f"msg_mock{self._counter:04d}"
+
+    def _next_time(self) -> int:
+        self._tick += 1_000
+        return self._tick
 
     def create_session(self, body: dict[str, Any]) -> dict[str, Any]:
         sid = body.get("id") or self.new_session_id()
@@ -93,27 +99,74 @@ class MockState:
         self.messages.setdefault(sid, [])
         return info
 
-    def complete(self, sid: str, *, outcome: str = "succeeded") -> None:
+    def complete(self, sid: str, *, outcome: str = "succeeded") -> dict[str, Any]:
         """Mark a session complete and append the terminating idle message."""
-        self.sessions[sid]["outcome"] = outcome
-        self.sessions[sid]["time"]["idle"] = 1_700_000_001_000
-        self.messages[sid].append(
-            {
-                "id": self.new_message_id(),
-                "time": {"created": 1_700_000_001_000},
-                "type": "idle",
-                "outcome": outcome,
-            }
-        )
+        return self.append_idle(sid, outcome)
 
-    def add_assistant(self, sid: str, text: str = "done") -> dict[str, Any]:
+    def add_assistant(self, sid: str, text: str = "done", *, error: Any = None) -> dict[str, Any]:
+        return self.append_assistant(sid, text, error=error)
+
+    # -- ordered turn builders (newer repair tests) --------------------------
+    def append_user(self, sid: str, mid: str, text: str = "") -> dict[str, Any]:
+        """Project a delivered user message with the given admission ID."""
+        message = {
+            "id": mid,
+            "time": {"created": self._next_time()},
+            "text": text,
+            "type": "user",
+        }
+        self.messages[sid].append(message)
+        return message
+
+    def enqueue(self, sid: str, mid: str, text: str = "") -> dict[str, Any]:
+        """Enqueue work durably in the inbox without delivering it."""
+        item = {
+            "id": mid,
+            "sessionID": sid,
+            "time": {"created": self._next_time()},
+            "type": "user",
+            "payload": {"text": text},
+            "delivery": "queue",
+        }
+        self.seen_admission[mid] = sid
+        self.inbox[sid].append(item)
+        return item
+
+    def append_assistant(self, sid: str, text: str = "done", *, error: Any = None) -> dict[str, Any]:
+        created = self._next_time()
         message = {
             "id": self.new_message_id(),
-            "time": {"created": 1_700_000_000_500, "completed": 1_700_000_000_900},
+            "time": {"created": created, "completed": created + 1},
             "type": "assistant",
             "agent": self.sessions[sid].get("agent", "build"),
             "model": self.sessions[sid].get("model", {"id": "m", "providerID": "p"}),
             "content": [{"type": "text", "text": text}],
+        }
+        if error is not None:
+            message["error"] = error
+        self.messages[sid].append(message)
+        return message
+
+    def append_idle(self, sid: str, outcome: str = "succeeded") -> dict[str, Any]:
+        created = self._next_time()
+        message = {
+            "id": self.new_message_id(),
+            "time": {"created": created},
+            "type": "idle",
+            "outcome": outcome,
+        }
+        self.messages[sid].append(message)
+        self.sessions[sid]["outcome"] = outcome
+        self.sessions[sid]["time"]["idle"] = created
+        return message
+
+    def append_system(self, sid: str, text: str = "") -> dict[str, Any]:
+        """Append a projected ``system`` message (neither turn-opening nor terminal)."""
+        message = {
+            "id": self.new_message_id(),
+            "time": {"created": self._next_time()},
+            "type": "system",
+            "text": text,
         }
         self.messages[sid].append(message)
         return message
@@ -189,6 +242,14 @@ class MockHandler(BaseHTTPRequestHandler):
                 {"version": "mock-0.0.1", "pid": 1, "urls": ["http://127.0.0.1"], "paths": {"tmp": "/tmp"}},
             )
 
+        if method == "GET" and path == "/api/redirect":
+            # used to prove the client refuses redirects (no token forwarding)
+            self.send_response(302)
+            self.send_header("Location", "http://example.com/stolen-token")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         if method == "POST" and path == "/api/session":
             return self._json(200, {"data": self.state.create_session(self._read_body())})
 
@@ -208,11 +269,7 @@ class MockHandler(BaseHTTPRequestHandler):
             sid = match.group(1)
             if sid not in self.state.sessions:
                 return self._not_found(sid)
-            items = list(self.state.messages[sid])
-            wanted = query.get("type", [None])[0]
-            if wanted:
-                items = [m for m in items if m.get("type") == wanted]
-            return self._json(200, {"data": items, "cursor": {"previous": None, "next": None}})
+            return self._json(200, self._message_page(sid, query))
 
         match = MESSAGE_RE.match(path)
         if method == "GET" and match:
@@ -291,6 +348,25 @@ class MockHandler(BaseHTTPRequestHandler):
         return self._json(404, {"_tag": "InvalidRequestError", "message": f"no route {method} {path}"})
 
     # -- admission -----------------------------------------------------------
+    def _message_page(self, sid: str, query: dict[str, list[str]]) -> dict[str, Any]:
+        """Cursor-paged message list honouring order/limit/cursor."""
+        items = list(self.state.messages[sid])
+        wanted = query.get("type", [None])[0]
+        if wanted:
+            items = [m for m in items if m.get("type") == wanted]
+        if query.get("order", ["asc"])[0] == "desc":
+            items = list(reversed(items))
+        raw_limit = query.get("limit", [None])[0]
+        limit = int(raw_limit) if raw_limit else self.state.message_page_size
+        raw_cursor = query.get("cursor", [None])[0]
+        start = int(raw_cursor) if raw_cursor else 0
+        total = len(items)
+        end = min(total, start + limit) if limit else total
+        page = items[start:end]
+        next_cursor = str(end) if limit and end > start and end < total else None
+        previous_cursor = str(max(0, start - limit)) if limit and start > 0 else None
+        return {"data": page, "cursor": {"previous": previous_cursor, "next": next_cursor}}
+
     def _prompt(self, sid: str) -> None:
         if sid not in self.state.sessions:
             return self._not_found(sid)
@@ -308,16 +384,17 @@ class MockHandler(BaseHTTPRequestHandler):
         if self.state.fail_conflict_instead and admission_id:
             return self._json(409, {"_tag": "ConflictError", "message": "forced", "resource": admission_id})
 
+        created = self.state._next_time()
         message = {
             "id": admission_id or self.state.new_message_id(),
-            "time": {"created": 1_700_000_000_200},
+            "time": {"created": created},
             "text": body.get("text", ""),
             "type": "user",
         }
         item = {
             "id": message["id"],
             "sessionID": sid,
-            "time": {"created": 1_700_000_000_200},
+            "time": {"created": created},
             "type": "user",
             "payload": {"text": body.get("text", "")},
             "delivery": body.get("delivery") or "queue",

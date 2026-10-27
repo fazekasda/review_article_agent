@@ -14,9 +14,9 @@ No API field is invented.
 
 | File | Purpose |
 | --- | --- |
-| `opencode_v2.py` | Stdlib-only client: session create, admission, reconciliation, bounded wait, interrupt, fork, fresh critic, typed decisions. |
-| `mock_server.py` | Deterministic local mock of the used endpoints. |
-| `test_opencode_v2.py` | 25 unittest cases (success, retry, reconciliation, error, invalid input). |
+| `opencode_v2.py` | Stdlib-only client: session create, admission, per-turn reconciliation, bounded wait, interrupt, fork, fresh critic, typed decisions. |
+| `mock_server.py` | Deterministic local mock of the used endpoints (incl. cursor paging and a redirect route). |
+| `test_opencode_v2.py` | 41 unittest cases (success, retry, reconciliation, paging, error, invalid input, endpoint safety). |
 | `demo_lifecycle.py` | Two-client durability demo against the mock. |
 
 Python 3.14 (`python3`), standard library only. No third-party dependency.
@@ -25,7 +25,7 @@ Python 3.14 (`python3`), standard library only. No third-party dependency.
 
 ```sh
 cd spikes/runtime/python
-python3 -m unittest -v test_opencode_v2   # 25 tests, ~1s
+python3 -m unittest -v test_opencode_v2   # 41 tests, ~1.5s
 python3 demo_lifecycle.py                 # prints the two-client transcript
 python3 mock_server.py --token secret     # optional: standalone mock on a free port
 ```
@@ -71,12 +71,19 @@ routes, so authentication is not part of the schema. The V2 client guide shows a
 explicit endpoint plus `authorization: Bearer <token>` headers
 (`Service.headers(endpoint)` in the Node service API). This prototype therefore:
 
-* Requires an **explicit** `base_url` (constructor or `OPENCODE_SPIKE_BASE_URL`);
-  `from_env` refuses to guess a default and performs **no** service discovery or
-  start.
-* Sends an **explicit** bearer token (`OPENCODE_SPIKE_TOKEN`) when provided; the
-  disposable mock enforces it and returns `UnauthorizedError` otherwise.
-* Never reads OpenCode's private database, service registration, or credentials.
+* **Requires** an explicit `base_url` (constructor or `OPENCODE_SPIKE_BASE_URL`)
+  and **requires** an explicit bearer token (`OPENCODE_SPIKE_TOKEN`); the client
+  fails closed with `ValueError` if either is missing or empty. `from_env`
+  refuses to guess a default and performs **no** service discovery or start.
+* **Enforces loopback.** The host must be `localhost`, a `127.0.0.0/8` address,
+  or `::1`; any other host, a non-HTTP(S) scheme, or an embedded credential is
+  refused. The spike never talks to a remote or shared service.
+* **Refuses redirects.** A private opener rejects every redirect, so the bearer
+  token is never forwarded to a redirect target (`OpenCodeApiError` with the 3xx
+  status and a "redirect blocked" message).
+* Never reads OpenCode's private database, service registration, or credentials,
+  and deliberately ignores `OPENROUTER_API_KEY` (a provider key is not an
+  endpoint or a service token).
 
 A live run against the ordinary shared service is **not** part of this spike: no
 shared discovery/start, no paid calls, no budget authorization.
@@ -85,14 +92,24 @@ shared discovery/start, no paid calls, no budget authorization.
 
 * **Durable admission vs completion.** `admit()` returns a `Session.Inbox.User`
   receipt: the input is persisted and scheduled. Completion is a separate
-  `idle` (with `outcome`) or completed `assistant` message, found by
-  `reconcile()`.
+  terminal marker for the *same turn*, found by `reconcile()`.
+* **Per-turn reconciliation (never a false completion).** The published message
+  schemas expose no parent/linkage field, so a turn is delimited positionally:
+  the target `user` message, then the next `user`/`synthetic` message, with the
+  terminal `idle`/completed `assistant` in between. A terminal that belongs to an
+  earlier or later turn never completes the target. States are `queued`
+  (inbox-only), `in_progress` (delivered, no terminal yet), `completed`, `failed`,
+  `interrupted`, and `unknown`; only `completed` is `is_complete`.
+* **Honest unknown.** If the timeline cannot be read far enough to be certain
+  (paging bound reached, or a turn window open past the read boundary), the state
+  is `unknown` with a `reason` — never success.
+* **Bounded paging.** `collect_messages()` follows `cursor.next` from the oldest
+  message (default 100 pages) so older admissions are not lost behind the first
+  page.
 * **Idempotent admission.** The client-supplied admission ID (`Session.Message.ID`)
   is the idempotency key. A retry returns `409 ConflictError`; `admit()` treats
   that (or a transport failure) as "already admitted" and reconciles to the one
   accepted input instead of resending under a new identity.
-* **Missed events.** `reconcile()` rebuilds state from durable `inbox` and
-  `message` reads. `unknown` (no server trace) is never reported as complete.
 * **Bounded wait.** `wait()` uses `experimental.session.wait`, retrying `503`
   and transport timeouts until a deadline, then raises `QuiescenceTimeout` — it
   never blocks forever.
@@ -109,8 +126,10 @@ shared discovery/start, no paid calls, no budget authorization.
 | Aspect | Mock (`mock_server.py`) | Live |
 | --- | --- | --- |
 | Transport / auth | local HTTP, bearer checked | same shape, real token |
+| Endpoint safety | loopback + token enforced client-side; `302 /api/redirect` refused | same client-side enforcement |
 | Session create | returns a `Session.Info` | same |
 | Prompt idempotency | `409 ConflictError` on repeat ID | per OpenAPI contract (unverified live) |
+| Message paging | honours `order`/`limit`/`cursor` | per OpenAPI `cursor` contract (unverified live) |
 | `wait` | `204` idle / `503` unavailable | per OpenAPI contract (unverified live) |
 | Completion | synthetic `assistant`/`idle` messages | real agent turn |
 | Decisions | fixed answers incl. an `error` answer | real `typesafe/jev-1.14` call (paid, not run) |
@@ -136,13 +155,31 @@ explicit token, and (for decisions) explicit budget authorization.
 | Typed decisions, per-question failure | `test_typed_answers_validate`, `test_per_question_failure_keeps_other_answers`, `test_malformed_answer_rejected` |
 | Invalid inputs rejected locally | `test_invalid_admission_id_and_text_rejected_locally`, `test_invalid_model_ref_is_rejected_locally`, `test_malformed_answer_rejected` |
 
+### Repair 1 — per-turn evidence and endpoint safety
+
+| Requirement | Evidence |
+| --- | --- |
+| A queued/pending turn is not falsely completed by another turn's terminal | `test_second_queued_turn_not_falsely_complete`, `test_prior_idle_does_not_complete_later_turn`, `test_terminal_after_next_turn_does_not_complete_target` |
+| Failure/interrupted states are distinct and never `is_complete` | `test_failed_outcome_is_distinct_from_success`, `test_interrupted_outcome_is_distinct_from_success`, `test_assistant_error_is_failed`, `test_unrecognized_idle_outcome_is_unknown` |
+| Older admitted IDs are found by paging; a paging bound returns `unknown` | `test_paging_finds_older_admission`, `test_paging_bound_returns_unknown_not_complete`, `test_paging_limit_never_reports_success` |
+| Missing/empty token fails closed | `test_missing_token_fails_closed`, `test_empty_token_fails_closed`, `test_from_env_requires_token` |
+| Non-loopback / bad-scheme / credential-in-URL refused | `test_non_loopback_url_rejected`, `test_loopback_urls_accepted` |
+| Redirects refused (no token forwarding) | `test_redirect_blocked_without_token_forwarding` |
+| Provider key is not a substitute for endpoint/token | `test_from_env_ignores_openrouter_key` |
+
 ## Limitations
 
 * Spike only: not production, no agent framework, no UI, no persistent store.
 * Live API versions/behaviour and the Jev decision route are documented but not
   verified; the `typesafe/jev-1.14` decision call would be a paid call and is out
-  of scope without budget authorization.
-* Restart/recovery of a real server is not exercised; the mock models
-  "accepted then connection lost" and "unknown ID" only.
-* `reconcile()` treats any terminal `idle`/completed `assistant` message in the
-  session as completion; per-turn completion correlation is a later concern.
+  of scope without budget authorization. `OPENROUTER_API_KEY` presence was checked
+  as a boolean only and is deliberately not read or used (no paid calls).
+* Per-turn correlation uses positional timeline windowing because the published
+  schemas expose no parent/linkage field; it assumes the server emits the terminal
+  `idle` within the turn's window. A turn whose terminal is missing is reported
+  `in_progress`; an unreadable window is reported `unknown`, never success.
+* The mock keeps a delivered admission's inbox item as a simplification (real
+  delivery removes it); reconciliation keys off the projected user message, so
+  this does not change client behaviour.
+* Real server restart/recovery is not exercised; the mock models "accepted then
+  connection lost" and "unknown ID" only.

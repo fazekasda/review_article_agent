@@ -21,6 +21,7 @@ import time
 
 from mock_server import MockServer
 from opencode_v2 import (
+    OpenCodeApiError,
     OpenCodeV2Client,
     first_decision_error,
     summarize_decisions,
@@ -106,6 +107,20 @@ def main() -> None:
         error = first_decision_error(result)
         print(f"   per-question failure: {error.question_name!r} reason={error.reason!r} "
               f"(other answers still present, not an exclusion)")
+
+        # --- repair evidence: per-turn reconciliation and endpoint safety --
+        server.state.enqueue(writer["id"], "msg_demo0002", "second turn")
+        queued = client2.reconcile(writer["id"], "msg_demo0002")
+        print(f"7. queued second turn: state={queued.state} complete={queued.is_complete} "
+              f"(a prior idle does not complete it)")
+        try:
+            OpenCodeV2Client("http://example.com", token="t")
+        except ValueError as exc:
+            print(f"8. non-loopback endpoint refused: {exc}")
+        try:
+            client2._request("GET", "/api/redirect")
+        except OpenCodeApiError as exc:
+            print(f"9. redirect blocked: HTTP {exc.status} ({exc.message})")
 
 
 if __name__ == "__main__":
