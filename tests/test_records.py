@@ -136,6 +136,49 @@ class CanonicalJsonTest(unittest.TestCase):
         with self.assertRaises(RecordValidationError):
             canonical_json(object())
 
+    def test_rejects_surrogate_in_string(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json("x\ud800")
+
+    def test_rejects_surrogate_in_dict_key(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"a\ud800": 1})
+
+    def test_rejects_cyclic_dict(self):
+        cyclic = {}
+        cyclic["self"] = cyclic
+        with self.assertRaises(RecordValidationError):
+            canonical_json(cyclic)
+
+    def test_rejects_cyclic_list(self):
+        cyclic = []
+        cyclic.append(cyclic)
+        with self.assertRaises(RecordValidationError):
+            canonical_json(cyclic)
+
+    def test_rejects_deeply_nested(self):
+        payload = []
+        node = payload
+        for _ in range(500):
+            child = []
+            node.append(child)
+            node = child
+        with self.assertRaises(RecordValidationError):
+            canonical_json(payload)
+
+    def test_accepts_moderately_nested(self):
+        payload = [1]
+        for _ in range(30):
+            payload = [payload]
+        self.assertIsInstance(canonical_json(payload), bytes)
+
+    def test_allows_shared_non_cyclic_reference(self):
+        shared = [1, 2]
+        self.assertEqual(
+            canonical_json({"a": shared, "b": shared}),
+            b'{"a":[1,2],"b":[1,2]}',
+        )
+
 
 class IdentifierTest(unittest.TestCase):
     def test_accepts_opaque_id(self):
@@ -580,6 +623,102 @@ class StorageGateTest(unittest.TestCase):
         validated = validate_rights_record(rec, "proj-1")
         self.assertEqual(validated["operations"]["redistribution"], "unknown")
         self.assertEqual(validated["operations"]["storage"], "allowed")
+
+
+class MalformedInputBoundaryTest(unittest.TestCase):
+    """Malformed/domain inputs must always raise RecordValidationError, never a raw
+    TypeError/UnicodeEncodeError/RecursionError."""
+
+    def _rve(self, fn):
+        with self.assertRaises(RecordValidationError):
+            fn()
+
+    def test_ref_non_string_key(self):
+        self._rve(
+            lambda: validate_ref(
+                {1: "bad", "project_id": "p", "artifact_id": "a", "revision_id": "r"},
+                "p",
+            )
+        )
+
+    def test_ref_mixed_unknown_key_types_no_crash(self):
+        self._rve(
+            lambda: validate_ref(
+                {
+                    "zzz": "x",
+                    5: "y",
+                    "project_id": "p",
+                    "artifact_id": "a",
+                    "revision_id": "r",
+                },
+                "p",
+            )
+        )
+
+    def test_rights_non_string_top_level_key(self):
+        self._rve(lambda: validate_rights_record({3: "x"}, "proj-1"))
+
+    def test_rights_non_string_nested_key(self):
+        rec = build_valid()
+        rec["privacy"][4] = "x"
+        self._rve(lambda: validate_rights_record(rec, "proj-1"))
+
+    def test_whitespace_only_evidence_rejected_for_allowed(self):
+        rec = build_valid()
+        rec["basis"]["storage"]["evidence"] = {"ref": "  ", "provenance": "\t"}
+        self._rve(lambda: validate_rights_record(rec, "proj-1"))
+
+    def test_non_allowed_empty_evidence_allowed(self):
+        rec = build_valid()
+        rec["operations"]["redistribution"] = "unknown"
+        rec["basis"]["redistribution"] = {
+            "kind": "unknown",
+            "evidence": {"ref": "", "provenance": ""},
+        }
+        rec["authorization"] = None
+        validate_rights_record(rec, "proj-1")
+
+    def test_unhashable_basis_kind(self):
+        for bad in ([], {}, 3, None):
+            rec = build_valid()
+            rec["basis"]["storage"]["kind"] = bad
+            self._rve(lambda rec=rec: validate_rights_record(rec, "proj-1"))
+
+    def test_unhashable_operation_status(self):
+        rec = build_valid()
+        rec["operations"]["acquisition"] = []
+        self._rve(lambda: validate_rights_record(rec, "proj-1"))
+
+    def test_unhashable_confidentiality(self):
+        rec = build_valid()
+        rec["privacy"]["confidentiality"] = []
+        self._rve(lambda: validate_rights_record(rec, "proj-1"))
+
+    def test_unhashable_subject_kind(self):
+        rec = build_valid()
+        rec["subject"]["kind"] = []
+        self._rve(lambda: validate_rights_record(rec, "proj-1"))
+
+    def test_unhashable_authorization_basis_kind(self):
+        rec = build_valid()
+        rec["authorization"]["basis"]["kind"] = []
+        self._rve(lambda: validate_rights_record(rec, "proj-1"))
+
+    def test_only_record_validation_error_escapes(self):
+        cases = [
+            lambda: validate_ref({1: "x"}, "p"),
+            lambda: validate_ref("not a dict", "p"),
+            lambda: validate_rights_record({2: "x"}, "p"),
+            lambda: canonical_json("x\ud800"),
+            lambda: canonical_json({1: "x"}),
+        ]
+        for case in cases:
+            try:
+                case()
+            except RecordValidationError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - the point of the test
+                self.fail(f"raw {type(exc).__name__} escaped instead of RecordValidationError")
 
 
 class RoundtripImmutabilityTest(unittest.TestCase):

@@ -145,6 +145,12 @@ def _require_positive_int(value, field):
 
 
 def _reject_unknown_keys(obj, allowed, field):
+    # Validate key types before any set()/sorted()/join so malformed inputs (int,
+    # bool, or otherwise non-string keys) raise RecordValidationError rather than a
+    # raw TypeError from sorting or joining mixed types.
+    for key in obj:
+        if not isinstance(key, str):
+            _raise(field, f"object keys must be strings (found {type(key).__name__})")
     extra = sorted(set(obj) - set(allowed))
     if extra:
         _raise(field, f"unknown field(s) not permitted: {', '.join(extra)}")
@@ -163,22 +169,51 @@ def _validate_timestamp(value, field):
     return value
 
 
-def _check_jsonable(value, label):
-    if value is None or isinstance(value, (bool, int, str)):
+def _has_surrogate(text):
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
+#: Maximum accepted nesting depth for canonical JSON.  Bounded so a deeply nested
+#: (or adversarial) payload is rejected cleanly instead of exhausting the stack with
+#: an uncontrolled RecursionError.
+_MAX_JSON_DEPTH = 64
+
+
+def _check_jsonable(value, label, _depth=0, _seen=None):
+    if _depth > _MAX_JSON_DEPTH:
+        _raise(label, "JSON value nests too deeply")
+    if value is None or isinstance(value, (bool, int)):
+        return
+    if isinstance(value, str):
+        if _has_surrogate(value):
+            _raise(label, "string contains an invalid Unicode surrogate")
         return
     if isinstance(value, float):
         if not math.isfinite(value):
             _raise(label, "NaN and Infinity are not permitted in canonical JSON")
         return
-    if isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _check_jsonable(item, f"{label}[{index}]")
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                _raise(label, f"object key {key!r} is not a string")
-            _check_jsonable(item, f"{label}.{key}")
+    if isinstance(value, (list, tuple, dict)):
+        if _seen is None:
+            _seen = set()
+        if id(value) in _seen:
+            _raise(label, "circular reference is not permitted in canonical JSON")
+        _seen.add(id(value))
+        try:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if not isinstance(key, str):
+                        _raise(
+                            label,
+                            f"object key is not a string (found {type(key).__name__})",
+                        )
+                    if _has_surrogate(key):
+                        _raise(label, "object key contains an invalid Unicode surrogate")
+                    _check_jsonable(item, f"{label}.{key}", _depth + 1, _seen)
+            else:
+                for index, item in enumerate(value):
+                    _check_jsonable(item, f"{label}[{index}]", _depth + 1, _seen)
+        finally:
+            _seen.discard(id(value))
         return
     _raise(label, f"value of type {type(value).__name__} is not JSON-serializable")
 
@@ -195,7 +230,9 @@ def canonical_json(value):
 
     Strictly rejects anything that is not portable JSON: ``NaN``/``Infinity``
     (and non-finite floats), non-string object keys, dict keys that JSON would
-    silently coerce, and any unserializable value.  Never mutates ``value``.
+    silently coerce, strings containing invalid Unicode surrogates, values that
+    nest too deeply, circular references, and any unserializable value.  Every
+    rejection is a :class:`RecordValidationError`; never mutates ``value``.
     """
     _check_jsonable(value, "canonical_json")
     try:
@@ -206,9 +243,11 @@ def canonical_json(value):
             ensure_ascii=False,
             allow_nan=False,
         )
-    except (TypeError, ValueError) as exc:  # defensive: _check_jsonable covers these
-        raise RecordValidationError(f"canonical_json: not serializable: {exc}") from exc
-    return text.encode("utf-8")
+        return text.encode("utf-8")
+    except (TypeError, ValueError, RecursionError, UnicodeError) as exc:  # defensive
+        raise RecordValidationError(
+            f"canonical_json: value is not serializable ({type(exc).__name__})"
+        ) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +318,8 @@ def _validate_subject(subject, project_id):
     if not isinstance(subject, dict):
         _raise("subject", "must be an object")
     kind = subject.get("kind")
+    if not isinstance(kind, str):
+        _raise("subject", "kind must be a string")
     if kind == "source_revision":
         _reject_unknown_keys(subject, ("kind", *_REF_KEYS), "subject")
         for key in _REF_KEYS:
@@ -323,8 +364,11 @@ def _validate_evidence(evidence, field, require_nonempty):
     provenance = evidence["provenance"]
     if not isinstance(ref, str) or not isinstance(provenance, str):
         _raise(field, "'ref' and 'provenance' must be strings")
-    if require_nonempty and (ref == "" or provenance == ""):
-        _raise(field, "an 'allowed' operation needs non-empty 'ref' and 'provenance'")
+    if require_nonempty and (ref.strip() == "" or provenance.strip() == ""):
+        _raise(
+            field,
+            "an 'allowed' operation needs non-empty (non-whitespace) 'ref' and 'provenance'",
+        )
     return {"ref": ref, "provenance": provenance}
 
 
@@ -336,6 +380,8 @@ def _validate_basis_entry(basis, operation, status):
     if "kind" not in basis:
         _raise(field, "missing 'kind'")
     kind = basis["kind"]
+    if not isinstance(kind, str):
+        _raise(field, "kind must be a string")
     if kind not in BASIS_KINDS:
         _raise(field, f"kind {kind!r} is not a canonical basis kind")
     require_nonempty = status == "allowed"
@@ -385,9 +431,12 @@ def _validate_authorization(auth, subject, record_revision):
     if not isinstance(basis, dict):
         _raise("authorization.basis", "must be a typed object {kind, evidence}")
     _reject_unknown_keys(basis, ("kind", "evidence"), "authorization.basis")
-    if basis.get("kind") not in BASIS_KINDS:
-        _raise("authorization.basis", f"kind {basis.get('kind')!r} is not canonical")
-    if basis.get("kind") == "unknown":
+    auth_kind = basis.get("kind")
+    if not isinstance(auth_kind, str):
+        _raise("authorization.basis", "kind must be a string")
+    if auth_kind not in BASIS_KINDS:
+        _raise("authorization.basis", f"kind {auth_kind!r} is not canonical")
+    if auth_kind == "unknown":
         _raise("authorization.basis", "an authorization basis cannot be 'unknown'")
     evidence = _validate_evidence(
         basis.get("evidence"), "authorization.basis.evidence", True
@@ -398,7 +447,7 @@ def _validate_authorization(auth, subject, record_revision):
         "authorized_at": authorized_at,
         "against_subject": against_subject,
         "against_rights_revision": against_revision,
-        "basis": {"kind": basis["kind"], "evidence": evidence},
+        "basis": {"kind": auth_kind, "evidence": evidence},
     }
 
 
@@ -462,6 +511,8 @@ def validate_rights_record(record, project_id, subject=None):
         if op not in operations:
             _raise("operations", f"missing operation {op!r}")
         status = operations[op]
+        if not isinstance(status, str):
+            _raise("operations", f"{op!r} status must be a string")
         if status not in OPERATION_STATUSES:
             _raise("operations", f"{op!r} status {status!r} is not canonical")
         norm_operations[op] = status
@@ -493,6 +544,8 @@ def validate_rights_record(record, project_id, subject=None):
             _raise("privacy", f"missing {key!r}")
     personal_data = _require_bool(privacy["personal_data"], "privacy.personal_data")
     confidentiality = privacy["confidentiality"]
+    if not isinstance(confidentiality, str):
+        _raise("privacy", "confidentiality must be a string")
     if confidentiality not in CONFIDENTIALITY_VALUES:
         _raise("privacy", f"confidentiality {confidentiality!r} is not canonical")
     denial = _require_bool(privacy["denial"], "privacy.denial")
