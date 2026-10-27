@@ -780,7 +780,7 @@ the accepted direction and the interview amendment.
 - **User evidence.** `"Approve semantics (Recommended)"` — 2026-10-27.
 - **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Note.** The behavioral contract lives in
-  [`02-gates-and-runtime.md`](02-gates-and-runtime.md) (v3.1); this record ratifies
+  [`02-gates-and-runtime.md`](02-gates-and-runtime.md) (v3.2); this record ratifies
   the described semantics and does not restate or weaken that contract.
 
 ---
@@ -845,7 +845,7 @@ proof of all rights." ([spec line 63](../specification.md)).
 be non-empty for `allowed`.
 
 **C01 reference/projection mapping.** C01
-([`01-identities.md` §5.6](01-identities.md#56-rightsreference--projection-of-the-canonical-rights-record-i9-p5-open),
+([`01-identities.md` §5.6](01-identities.md#56-rightsreference--projection-of-the-canonical-rights-record-i9-p5-accepted),
 part of this coordinated contract set) holds a **read-only projection**; its
 per-operation fields map by name onto the canonical record:
 `acquisition_right -> operations.acquisition`,

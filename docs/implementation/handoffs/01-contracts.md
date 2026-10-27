@@ -36,9 +36,11 @@ proof — the completion statement is this handoff.
     — **accepted by the user 2026-10-27 against reviewed revision
     `ee7f7eafca80baa6c1aaca278361e56a663493c3`**, with the verbatim interview
     amendments. This is the Step 01 policy/technical decision deliverable.
-- **Integrated base for this task:** `cedf8b0` (`cedf8b0a652e18ad1cd278e5aed9a2f01a6c9217`),
-  which contains the policy ratification (`a6b451d`) and the C01/C02 behavioral
-  alignment. Branch for this task: `task/step01-completion`.
+- **Integrated base for this proof repair:** `dcb56c4`
+  (`dcb56c476f50574c3f571b2c238fb6f35196193f`), which contains the policy
+  ratification (`a6b451d`), the C01/C02 behavioral alignment (`cedf8b0`), the F03
+  finalization (`dcb56c4`), and the F04 bounded ratification-checker coverage
+  (`5e9c73c`). This proof-repair branch is `task/step01-final-proof`.
 - **History vs. current authority.** Earlier partial artifacts (the pre-ratification
   `proposed` contract statuses, the "partial / awaiting user ratification" index
   wording, and the earlier "Step 02 is blocked" handoff) are **historical**. Current
@@ -74,12 +76,22 @@ the contract documents.
 | 3 | Distinguish rubric, framework, outline, report, document version, study/dataset, experiment, finding | C01 §3.2, §4, §6.2 | C01 §7.7 (study/document distinction); the §4 kind table's "explicitly **not**" column | Met |
 | 4 | Approvals reference exact artifact/dependency revisions; a model edit cannot replenish budgets | C01 §3.2; C02 §2.1–§2.2, §3, §5.3, §5.4 | C02 §11.0 valid `Approval`; C02 §11.3 (stale approval / model-edited budget: valid-stale, valid-budget, invalid-reset, missing-snapshot) | Met |
 | 5 | At a tracing limit, secondary attribution stays warned + final human approval, never verified primary support | C02 §7.1–§7.2; C03 POL-OPS-SECONDARY; C01 §5.4 (`secondary_warning`) | C02 §11.4 (valid warned / invalid primary_verified / missing) | Met |
-| 6 | Rights/privacy boundaries; whether tools may use hosted models; no secret/source-text leakage in fixtures/logs | C03 §5.1–§5.5; C01 §5.6; C02 §10 | C03 §5.6 examples A–D; C01 §7.0 scoped-batch/rights pinning | Met |
+| 6 | Rights/privacy boundaries; whether tools may use hosted models; no secret/source-text leakage in fixtures/logs | C03 §5.1–§5.5 (separate operations; scoped hosted-transfer batch §5.2); C01 §5.6 (operation-scoped provider/journal gates; pinned `RightsRecordRef` projection); C02 §10 | C03 §5.6 rights examples A–D (valid / invalid / raw-incomplete); C01 §7.0 rights-pinning example (immutable `RightsRecordRef`) | Met |
 | 7 | The user reviews scientific policy choices; architecture does not silently override confirmed requirements | C03 §0, §2–§4; C01 §8; C02 §12; ADR 002 | Decision 002 "Explicitly not decided / not claimed"; register §6.1 vs. §6.2 | Met |
 
 **All seven acceptance criteria are met.** No dense numeric scientific threshold is
 invented; confirmed baseline invariants (repair maxima 3/2/2, immutability,
 no-self-approval, warned secondary attribution) are preserved and not weakened.
+
+Two evidence-scope notes to avoid overclaim:
+
+- **AC6** is documented **normatively** — the scoped hosted-transfer authorization is
+  defined in C01 §5.6 / C03 §5.2. The C01 §7.0 example is a **rights-pinning**
+  example (immutable `RightsRecordRef`), not a scoped-batch run; **no tested runtime
+  batch authorization is asserted** (there is no runtime).
+- **AC1** is achieved by the typed definitions plus the complete valid record set
+  (C01 §7.0) and the invalid/missing examples **overall** — **not** by every named
+  example carrying all three variants (see §4).
 
 ## 4. Seven named worked examples — exact sections
 
@@ -93,10 +105,23 @@ no-self-approval, warned secondary attribution) are preserved and not weakened.
 | False critic objection | C02 [§11.2](../../contracts/02-gates-and-runtime.md#112-false-critic-objection) (valid / invalid / missing) |
 | Secondary-origin warning | C02 [§11.4](../../contracts/02-gates-and-runtime.md#114-secondary-origin-warning) (valid / invalid / missing) |
 
-All seven are present with valid **and** invalid/missing cases, plus C01 §7.0 (a
-complete, machine-parsed conforming record set) and C01 §7.7 (multiple reports of
-one dataset). The offline checker parses the §7.0 set and the C02 §11.0/C03 §5.6
-JSON examples.
+Evidence variety is as each document actually frames it — **not** every named example
+carries all three variants:
+
+- **paired valid + invalid/missing walkthroughs:** duplicate PDF (C01 §7.1 valid /
+  §7.2 invalid-missing), alternate version (C01 §7.3 valid / §7.4 invalid-missing),
+  uncertain Jev decision (C02 §11.1 valid / invalid / missing), false critic
+  objection (C02 §11.2 valid / invalid / missing), secondary-origin warning
+  (C02 §11.4 valid / invalid / missing);
+- **single-variant walkthroughs:** missing full text (C01 §7.5) is one explicit
+  **blocked**/missing-state walkthrough; omitted result (C01 §7.6) is one single
+  audit-found example.
+
+C01 §7.0 is a complete, machine-parsed conforming record set and C01 §7.7 is the
+one-dataset case. The offline checker parses the §7.0 set and the C02 §11.0 / C03
+§5.6 JSON examples. AC1's "invalid and missing examples" is satisfied by the typed
+definitions and the invalid/missing examples **overall**, not by each named example
+carrying every variant.
 
 ## 5. Decisions, ownership, and future project gates
 
@@ -116,41 +141,51 @@ JSON examples.
 
 ## 6. Verification — exact commands run and results
 
-Environment: `Python 3.14.4`, run in this checkout on branch `task/step01-completion`,
-**offline, no network, no paid calls**.
+Environment: `Python 3.14.4`, run in this checkout on branch
+`task/step01-final-proof` (integrated base `dcb56c4`), **offline, no network, no
+paid calls**. All commands below run **from the repository root**.
 
 ```sh
 # Documentation validator (bundle self-consistency + embedded C01 validator)
 python3 scripts/check_contract_docs.py
-#   checks: 12 ok, 0 failed
+#   checks: 15 ok, 0 failed
 #   OK: Step 01 contract docs are self-consistent
 
 # Negative-mutation self-tests (all must be rejected)
 python3 scripts/check_contract_docs.py --self-test
-#   checks: 21 ok, 0 failed
+#   checks: 29 ok, 0 failed
 #   OK: Step 01 contract docs are self-consistent (including self-test)
+
+# Checker's own unit tests (F04)
+python3 -m unittest discover -s scripts -p 'test_*.py'
+#   Ran 20 tests — OK
 
 # Whitespace/conflict hygiene
 git diff --check
 #   (no output)
 
-# Existing offline prototype suites (re-run here; no paid call)
-cd spikes/runtime/python       && python3 -m unittest test_opencode_v2    # Ran 79 tests — OK
-cd spikes/runtime/live-jev     && python3 -m unittest test_live_jev      # Ran 51 tests — OK
-cd spikes/runtime/integration  && python3 -m unittest test_mock_provider # Ran 7 tests — OK
+# Existing offline prototype suites (re-run from the repo root; no paid call)
+python3 -m unittest discover -s spikes/runtime/python      -p 'test_*.py'  # Ran 79 tests — OK
+python3 -m unittest discover -s spikes/runtime/live-jev    -p 'test_*.py'  # Ran 51 tests — OK
+python3 -m unittest discover -s spikes/runtime/integration -p 'test_*.py'  # Ran 7 tests — OK
 ```
 
-The checker verifies, at minimum: local markdown links/fragments exist; every fenced
-`json` block parses; the **embedded** C01 §7.0 validator (extracted from the document
-markers) passes; the three C02 §11.0 complete examples are type/range/enum/digest
-checked; and the eight C03 examples are checked with distinguished expectations
-(valid rights A/C; valid full record and illustrative patch; deliberately invalid
-rights B/D and rejected decisions), including the canonical rights identity
-`{project_id, rights_id, record_revision}` and the subject/authorization bindings.
-`--self-test` mutates the real examples and asserts rejection of a bad hash, a
-missing required field, a `known` state without a value, a cross-project rights
-subject, an `allowed` operation without basis evidence, an unknown cost recorded as
-`0`, and wrong typed answers.
+The checker verifies, at minimum: local markdown links/fragments exist (including the
+ADR-002, baseline, step, kickoff, handoff and root-README targets added by F04); every
+fenced `json` block parses; the **embedded** C01 §7.0 validator (extracted from the
+document markers) passes; the three C02 §11.0 complete examples are
+type/range/enum/digest checked; and the eight C03 examples are checked with
+distinguished expectations (valid rights A/C; valid full record and illustrative
+patch; deliberately invalid rights B/D and rejected decisions), including the
+canonical rights identity `{project_id, rights_id, record_revision}` and the
+subject/authorization bindings. F04 adds bounded ratification-evidence checks:
+ADR-002's accepted scope anchored to `ee7f7ea`, register status rows for every
+accepted record id, register/C02 agreement on the USD 25 / USD 10 / 2 defaults, and
+per-project pilot/coverage/tracing `numeric_value` staying `UNSET`. `--self-test`
+mutates the real examples and asserts rejection of a bad hash, a missing required
+field, a `known` state without a value, a cross-project rights subject, an `allowed`
+operation without basis evidence, an unknown cost recorded as `0`, wrong typed
+answers, and a fabricated numeric cutoff.
 
 ### Pre-existing test-hygiene warning (disclosed, not introduced here)
 
@@ -171,8 +206,15 @@ test-hygiene warning, recorded honestly, not fixed by this task.
   (not fenced JSON), so the checker does not machine-parse them; only §7.0 and the
   C02/C03 fenced examples are machine-checked. Markdown fragments are checked with a
   best-effort GitHub-style slug (disclosed in the checker docstring).
-- A newer parallel checker worker (F04) may change the final counts; the coordinator
-  final PR includes the combined latest checks.
+- **The doc checks are bounded, stable-anchor checks** — link/fragment existence,
+  counted records, selected field/value equality, and negative mutations. They are
+  **not** a full semantic proof of the contracts; the criterion-by-criterion
+  walkthrough (§3–§4) is **manual** and remains required. No runtime behavior is
+  exercised by these checks.
+- **Disclosed explicitly and unchanged:** no CI is configured; no live or paid call
+  was made; no real service was re-run; and **no scientific guarantee** is claimed by
+  this task. The F04 checker coverage is now present and included above (it is no
+  longer a future/parallel worker).
 
 ## 7. Stubs, migrations, and next step
 
@@ -196,12 +238,15 @@ test-hygiene warning, recorded honestly, not fixed by this task.
 
 - Reviewed decision revision (anchor): `ee7f7ea` (`ee7f7eafca80baa6c1aaca278361e56a663493c3`).
 - Policy ratification: `a6b451d`.
-- **Integrated base for this task:** `cedf8b0` (`cedf8b0a652e18ad1cd278e5aed9a2f01a6c9217`).
-- This task's scoped changes are committed on `task/step01-completion` (see the branch
-  tip; the coordinator records the ledger/PR). Files changed here:
-  `README.md`, `docs/contracts/README.md`,
-  `docs/implementation/{README.md,handoffs/01-contracts.md,kickoffs/01-contracts.md}`,
-  `docs/contracts/{01-identities.md,02-gates-and-runtime.md}`, and
-  `docs/decisions/002-step01-contracts-and-policies.md` (portability wording only).
-  No baseline invariant, no step-acceptance criterion, no register, no script, and no
-  production code were changed.
+- C01/C02 behavioral alignment: `cedf8b0`.
+- F03 finalization / stale-status cleanup: `dcb56c4`.
+- F04 bounded ratification-checker coverage: `5e9c73c`.
+- **Integrated base for this proof repair:** `dcb56c4`
+  (`dcb56c476f50574c3f571b2c238fb6f35196193f`); this proof-repair branch is
+  `task/step01-final-proof`.
+- This proof repair's scoped changes (status/crossref fixes + handoff evidence) are
+  committed on `task/step01-final-proof` (see the branch tip; the coordinator records
+  the ledger/PR). Files changed here:
+  `docs/contracts/{01-identities.md,03-policy-decisions.md}` and
+  `docs/implementation/handoffs/01-contracts.md`. No baseline invariant,
+  step-acceptance criterion, register policy, script, or production code changed.

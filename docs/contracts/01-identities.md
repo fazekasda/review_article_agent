@@ -39,7 +39,8 @@
 > - [Step 01 step document](../implementation/01-contracts.md) — deliverables,
 >   acceptance criteria, and the required worked examples.
 > - [Step 01 kickoff](../implementation/kickoffs/01-contracts.md) — runtime
->   invariants and the "still open" list (P1–P6).
+>   invariants; its "still open" P1–P6 list is now historical (all resolved by
+>   decision 002, 2026-10-27).
 > - [Runtime language decision 001](../decisions/001-runtime-language.md) —
 >   accepted runtime decision; it approves **no** scientific policy, schema, IPC,
 >   or framework.
@@ -395,7 +396,7 @@ Rules:
 | `created_by` | enum[user\|agent\|import] | Req | Actor class. |
 | `state` | §2.2 token | Req | Overall resolution state. |
 
-### 5.6 `RightsReference` — projection of the canonical rights record (I9; P5 open)
+### 5.6 `RightsReference` — projection of the canonical rights record (I9; P5 accepted)
 
 C01 does **not** define a canonical rights schema. The canonical record is
 `RightsRecord` v1 in the sibling policy contract
