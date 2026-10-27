@@ -84,32 +84,33 @@ class _ReadonlyIdentity:
 def _read_identity_readonly(
     db_path: str, *, expected_project_id: str | None
 ) -> _ReadonlyIdentity:
-    """Read schema version and project identity **without writing**.
+    """Read schema version and project identity **read-only**.
 
-    Prefers a true read-only URI connection; falls back to a plain connection
-    guarded by ``PRAGMA query_only = ON`` when a read-only open cannot attach to
-    WAL shared memory. Neither path issues a ``journal_mode`` change, runs a
-    migration, or creates a table, so a rejected target is left byte-identical.
+    Uses a read-only URI (``mode=ro``) **exclusively** — there is deliberately
+    no writable fallback. If the read-only open fails, this raises a clean
+    :class:`StoreError` rather than silently reopening writable and risking
+    creating or modifying a foreign file; a path that is absent stays absent.
+
+    Honest scope of "read-only": SQLite may create read-only **shared-memory
+    sidecars** (``-shm``/``-wal``) in the database's directory as part of WAL
+    read access. These are not library-driven writes. This call never changes
+    ``journal_mode``, never runs a migration, never ``CREATE``s a table, and
+    never chmods the file — so a rejected target's database file is left
+    byte-identical and its journal mode unchanged.
 
     Raises :class:`UnsupportedSchemaVersion` for a newer schema,
     :class:`ProjectPathError` for an ID mismatch against ``expected_project_id``,
-    and :class:`StoreError` for a foreign or corrupt file.
+    and :class:`StoreError` for a foreign, corrupt, or unreadable file.
     """
-    conn: sqlite3.Connection
     read_only_uri = "file:" + quote(db_path) + "?mode=ro"
     try:
         conn = sqlite3.connect(read_only_uri, uri=True, isolation_level=None)
-    except sqlite3.Error:
-        try:
-            conn = sqlite3.connect(db_path, isolation_level=None)
-        except sqlite3.Error as exc:
-            raise StoreError(
-                f"could not open the local database at {db_path!r} for reading."
-            ) from exc
-        try:
-            conn.execute("PRAGMA query_only = ON")
-        except sqlite3.Error:
-            pass
+    except sqlite3.Error as exc:
+        raise StoreError(
+            f"could not open the local database at {db_path!r} read-only "
+            f"({exc.__class__.__name__}); refusing to fall back to a writable "
+            f"open."
+        ) from exc
     conn.row_factory = sqlite3.Row
     try:
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])

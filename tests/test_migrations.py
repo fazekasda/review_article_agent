@@ -10,6 +10,8 @@ from __future__ import annotations
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -140,6 +142,103 @@ class MigrationTest(unittest.TestCase):
             conn.close()
         with self.assertRaises(UnsupportedSchemaVersion):
             ProjectStore.open_at(str(app_dir))
+
+    def test_concurrent_applied_migration_is_not_reapplied(self) -> None:
+        """A second connection must not re-run an already-applied step.
+
+        Deterministic two-connection version: conn1 applies v1 and commits
+        (simulating a concurrent migrator that finished); conn2 must observe the
+        advanced version and skip the step rather than hitting a duplicate
+        ``CREATE TABLE``.
+        """
+        db = self.tmp / "concurrent.sqlite3"
+        calls: list[int] = []
+
+        def step(conn: sqlite3.Connection) -> None:
+            calls.append(1)
+            conn.execute("CREATE TABLE fixture (id INTEGER PRIMARY KEY, v TEXT)")
+            conn.execute("INSERT INTO fixture (v) VALUES ('x')")
+
+        conn1 = schema.open_connection(str(db))
+        conn2 = schema.open_connection(str(db))
+        try:
+            self.assertEqual(
+                schema.migrate(
+                    conn1, target_version=1, migrations={1: step}, label="fixture"
+                ),
+                1,
+            )
+            # conn2 starts fresh against the same now-v1 database.
+            self.assertEqual(
+                schema.migrate(
+                    conn2, target_version=1, migrations={1: step}, label="fixture"
+                ),
+                1,
+            )
+            self.assertEqual(len(calls), 1)  # no stale-version attempt
+            self.assertEqual(schema.read_user_version(conn2), 1)
+            rows = conn2.execute("SELECT v FROM fixture").fetchall()
+            self.assertEqual([r[0] for r in rows], ["x"])
+        finally:
+            conn1.close()
+            conn2.close()
+
+    def test_threaded_dual_migrate_applies_exactly_once(self) -> None:
+        """Two threads racing at a barrier both succeed; step runs once.
+
+        Both connections open the same fresh fixture database, synchronise on a
+        barrier *before* acquiring the migration write lock, and migrate. The
+        loser must wait, then re-read the version under the lock and skip the
+        step — no duplicate ``CREATE TABLE``, one data row, same final version.
+        """
+        db = self.tmp / "threaded.sqlite3"
+        schema.open_connection(str(db)).close()  # pre-create the file (WAL)
+
+        barrier = threading.Barrier(2)
+        counter = {"n": 0}
+        counter_lock = threading.Lock()
+
+        def step(conn: sqlite3.Connection) -> None:
+            with counter_lock:
+                counter["n"] += 1
+            time.sleep(0.25)  # hold the write lock to force the loser to wait
+            conn.execute("CREATE TABLE fixture (id INTEGER PRIMARY KEY, v TEXT)")
+            conn.execute("INSERT INTO fixture (v) VALUES ('x')")
+
+        errors: list[BaseException] = []
+        results: list[int] = []
+
+        def worker() -> None:
+            conn = schema.open_connection(str(db))
+            try:
+                barrier.wait(timeout=10)
+                results.append(
+                    schema.migrate(
+                        conn, target_version=1, migrations={1: step}, label="fixture"
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded for assertion
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertFalse(any(t.is_alive() for t in threads), "migration deadlocked")
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [1, 1])
+        self.assertEqual(counter["n"], 1)  # exactly one stale-free attempt
+        conn = schema.open_connection(str(db))
+        try:
+            self.assertEqual(schema.read_user_version(conn), 1)
+            rows = conn.execute("SELECT v FROM fixture").fetchall()
+            self.assertEqual([r[0] for r in rows], ["x"])
+        finally:
+            conn.close()
 
     def test_registry_refuses_newer_schema(self) -> None:
         data_dir = self.tmp / "state"

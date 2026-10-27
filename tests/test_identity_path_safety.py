@@ -29,6 +29,7 @@ if str(SRC) not in sys.path:
 
 from review_article_agent.domain.errors import (  # noqa: E402
     ProjectPathError,
+    StoreError,
 )
 from review_article_agent.storage import ProjectStore, Registry  # noqa: E402
 from review_article_agent.storage import paths, schema  # noqa: E402
@@ -182,6 +183,37 @@ class IdentityPathSafetyTest(unittest.TestCase):
             reg.create_project(self.tmp / "a", name="A")  # idempotent path
         with self.assertRaises(ProjectPathError):
             reg.register_restored(self.tmp / "a")
+
+    def test_read_only_probe_absent_file_stays_absent(self) -> None:
+        absent = self.tmp / "missing.sqlite3"
+        with self.assertRaises(StoreError):
+            schema.read_only_probe(str(absent))
+        self.assertFalse(absent.exists())
+        # The read-only identity path likewise refuses rather than creating.
+        app_dir = self.tmp / "empty-app"
+        app_dir.mkdir(mode=0o700)
+        with self.assertRaises(ProjectPathError):
+            ProjectStore.open_at(str(app_dir))  # no store file at all
+        self.assertFalse((app_dir / paths.STORE_FILENAME).exists())
+
+    def test_no_writable_fallback_on_readonly_open_failure(self) -> None:
+        reg = Registry(self.data_dir)
+        a = reg.create_project(self.tmp / "a", name="A")
+        before = Path(a.store_path).read_bytes()
+
+        # Inject a read-only open failure; a writable fallback would call
+        # sqlite3.connect a second time. It must not.
+        with mock.patch(
+            "sqlite3.connect", side_effect=sqlite3.OperationalError("injected")
+        ) as connect_mock:
+            with self.assertRaises(StoreError):
+                ProjectStore.open_at(paths.app_dir_for(a.root_path))
+
+        self.assertEqual(connect_mock.call_count, 1)
+        self.assertIs(connect_mock.call_args.kwargs.get("uri"), True)
+        self.assertIn("mode=ro", connect_mock.call_args.args[0])
+        # Nothing was created or modified.
+        self.assertEqual(Path(a.store_path).read_bytes(), before)
 
     def test_project_id_pattern_has_no_version_specific_escape(self) -> None:
         # ``\z`` (3.14-only) must not appear; ``fullmatch`` is used instead.

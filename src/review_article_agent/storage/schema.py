@@ -287,16 +287,24 @@ def migrate(
     Returns the resulting version. Raises :class:`UnsupportedSchemaVersion` if
     the database is newer than ``target_version`` and :class:`MigrationError`
     if any step fails (that step is rolled back; earlier applied steps remain).
-    """
-    current = read_user_version(conn)
-    if current > target_version:
-        raise UnsupportedSchemaVersion(
-            label=label, found=current, supported=target_version
-        )
-    if current == target_version:
-        return current
 
-    for version in range(current + 1, target_version + 1):
+    Concurrency: the version is re-read **under the ``BEGIN IMMEDIATE`` write
+    lock** before each step. Two connections that both observed an old version
+    therefore do not both run the same step: the loser, once it holds the lock,
+    sees the step already applied and skips it (and refuses a version newer than
+    ``target_version`` that appeared while waiting). This keeps a single
+    transactional migration path without a duplicate-``CREATE TABLE`` failure.
+    """
+    while True:
+        current = read_user_version(conn)
+        if current > target_version:
+            raise UnsupportedSchemaVersion(
+                label=label, found=current, supported=target_version
+            )
+        if current == target_version:
+            return current
+
+        version = current + 1
         step = migrations.get(version)
         if step is None:
             raise MigrationError(
@@ -311,11 +319,22 @@ def migrate(
                 label=label, target=version, reason="could not begin transaction"
             ) from exc
         try:
-            step(conn)
-            # ``PRAGMA`` does not accept bound parameters; ``version`` is an
-            # int from our own closed range, never caller text.
-            conn.execute(f"PRAGMA user_version = {int(version)}")
+            # Re-read under the write lock: a concurrent migrator may have
+            # applied this step (or advanced past it) while we waited to begin.
+            locked = read_user_version(conn)
+            if locked > target_version:
+                conn.execute("ROLLBACK")
+                raise UnsupportedSchemaVersion(
+                    label=label, found=locked, supported=target_version
+                )
+            if locked < version:
+                step(conn)
+                # ``PRAGMA`` does not accept bound parameters; ``version`` is an
+                # int from our own closed range, never caller text.
+                conn.execute(f"PRAGMA user_version = {int(version)}")
             conn.execute("COMMIT")
+        except UnsupportedSchemaVersion:
+            raise
         except Exception as exc:
             try:
                 conn.execute("ROLLBACK")
@@ -324,7 +343,8 @@ def migrate(
             raise MigrationError(
                 label=label, target=version, reason=_summarise(exc)
             ) from exc
-    return target_version
+        # Loop re-reads the committed version and either applies the next step
+        # or returns.
 
 
 def _summarise(exc: BaseException) -> str:
@@ -337,29 +357,27 @@ def _summarise(exc: BaseException) -> str:
 
 
 def read_only_probe(db_path: str) -> tuple[int, set[str]]:
-    """Return ``(user_version, user_table_names)`` without writing.
+    """Return ``(user_version, user_table_names)`` **read-only**.
 
     Used to classify an existing file (registry or store) as empty, ours, or
-    foreign *before* any pragma/migration is applied. Prefers a true read-only
-    URI connection and falls back to a plain ``query_only`` connection if the
-    read-only open cannot attach to WAL shared memory.
+    foreign *before* any pragma/migration is applied. Opens with ``mode=ro``
+    **only** — there is no writable fallback; a read-only open failure raises a
+    clean :class:`StoreError` and an absent path stays absent.
+
+    As with any WAL read, SQLite may create read-only ``-shm``/``-wal``
+    shared-memory sidecars in the directory; the database file itself is not
+    modified and no ``journal_mode`` change or migration occurs.
     """
-    conn: sqlite3.Connection
     try:
-        conn = sqlite3.connect(
+        conn: sqlite3.Connection = sqlite3.connect(
             "file:" + quote(db_path) + "?mode=ro", uri=True, isolation_level=None
         )
-    except sqlite3.Error:
-        try:
-            conn = sqlite3.connect(db_path, isolation_level=None)
-        except sqlite3.Error as exc:
-            raise StoreError(
-                f"could not open the local database at {db_path!r} for reading."
-            ) from exc
-        try:
-            conn.execute("PRAGMA query_only = ON")
-        except sqlite3.Error:
-            pass
+    except sqlite3.Error as exc:
+        raise StoreError(
+            f"could not open the local database at {db_path!r} read-only "
+            f"({exc.__class__.__name__}); refusing to fall back to a writable "
+            f"open."
+        ) from exc
     try:
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         tables = {
