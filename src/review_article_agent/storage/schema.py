@@ -36,7 +36,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 2
+STORE_SCHEMA_VERSION = 3
 
 #: Registry maps project IDs to names and locations and records the single
 #: selected project. It is *not* a cache of project data.
@@ -233,9 +233,102 @@ def _store_v2(conn: sqlite3.Connection) -> None:
         )
 
 
+def _store_v3(conn: sqlite3.Connection) -> None:
+    """Add the immutable *local storage-fixture approval* tables.
+
+    These tables back ``storage/approvals.py``: a deliberately local, synthetic
+    approval/check layer that records an exact target revision plus its full
+    transitive dependency closure. It is **not** a scientific approval and can
+    never authorize execution or export (``authorizes_execution`` is pinned to
+    ``0`` and ``scope`` to ``'storage_fixture'`` by ``CHECK`` constraints).
+
+    Only tables and triggers are added; migration 1/2 rows (project identity,
+    artifacts, revisions, rights, dependencies, import requests) are never
+    rewritten, so their exact bytes/refs are preserved across the upgrade
+    (``ARCH-ASSETS``; step doc line 21). Immutability is enforced at the
+    database: an approval row and its snapshot entries can never be ``UPDATE``d
+    or ``DELETE``d, so a change is always a **new** approval row. Composite
+    foreign keys pin every approval and every snapshot entry to an existing
+    same-project revision, so a failed transaction can leave no dangling
+    approval.
+    """
+    conn.execute(
+        """
+        CREATE TABLE fixture_approval (
+            project_id             TEXT NOT NULL,
+            approval_id            TEXT NOT NULL,
+            target_artifact_id     TEXT NOT NULL,
+            target_revision_id     TEXT NOT NULL,
+            gate_kind              TEXT NOT NULL,
+            gate_id                TEXT NOT NULL,
+            decision               TEXT NOT NULL,
+            scope                  TEXT NOT NULL DEFAULT 'storage_fixture'
+                                   CHECK (scope = 'storage_fixture'),
+            authorizes_execution   INTEGER NOT NULL DEFAULT 0
+                                   CHECK (authorizes_execution = 0),
+            actor_label            TEXT NOT NULL,
+            actor_authenticated    INTEGER NOT NULL DEFAULT 0
+                                   CHECK (actor_authenticated = 0),
+            rationale              TEXT NOT NULL,
+            granted_at_utc         TEXT NOT NULL,
+            snapshot_id            TEXT NOT NULL,
+            snapshot_digest        TEXT NOT NULL,
+            storage_schema_version INTEGER NOT NULL,
+            context_kind           TEXT NOT NULL,
+            context_note           TEXT,
+            created_at_utc         TEXT NOT NULL,
+            PRIMARY KEY (project_id, approval_id),
+            FOREIGN KEY (project_id, target_artifact_id, target_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE fixture_approval_entry (
+            project_id             TEXT NOT NULL,
+            approval_id            TEXT NOT NULL,
+            entry_index            INTEGER NOT NULL,
+            artifact_id            TEXT NOT NULL,
+            revision_id            TEXT NOT NULL,
+            content_sha256         TEXT NOT NULL,
+            role                   TEXT NOT NULL,
+            rights_id              TEXT NOT NULL,
+            rights_record_revision INTEGER NOT NULL,
+            byte_size              INTEGER NOT NULL,
+            PRIMARY KEY (project_id, approval_id, entry_index),
+            FOREIGN KEY (project_id, approval_id)
+                REFERENCES fixture_approval (project_id, approval_id),
+            FOREIGN KEY (project_id, artifact_id, revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+    for table in ("fixture_approval", "fixture_approval_entry"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
+    3: _store_v3,
 }
 
 

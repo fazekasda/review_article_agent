@@ -521,9 +521,9 @@ class MigrationTest(ArtifactTestBase):
         finally:
             conn.close()
 
-        # Opening migrates v1 -> v2 without rewriting the v1 rows.
+        # Opening migrates v1 -> current schema without rewriting the v1 rows.
         with ProjectStore.open_at(str(app_dir)) as store:
-            self.assertEqual(store.schema_version, 2)
+            self.assertEqual(store.schema_version, schema.STORE_SCHEMA_VERSION)
             meta = store.metadata()
             self.assertEqual(meta["created_at_utc"], "2026-01-01T00:00:00+00:00")
             self.assertEqual(meta["project_id"], "prj_" + "c" * 32)
