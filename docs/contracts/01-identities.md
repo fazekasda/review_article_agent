@@ -1,11 +1,11 @@
-# 01 — Identity and evidence contract (v1.2, **proposed**)
+# 01 — Identity and evidence contract (v1.3, **proposed**)
 
 > **Status: PROPOSED — approval pending.** No part of this document is ratified
 > science, an approved schema, or a claim of production completion. It drafts the
 > identity/evidence contract for review; only the user approves scientific policy
 > and the baseline decisions (§8).
 >
-> **Document version:** `v1.2` (proposal revision of `v1`; see §9 change log).
+> **Document version:** `v1.3` (proposal revision of `v1`; see §9 change log).
 > Versioning rule and change log in §9.
 >
 > **This is not Step 01 completion.** This contract is one of several Step 01
@@ -161,6 +161,7 @@ the field N/A-eligible.
 | `ModelRef` | `{agent: string, model: string, instructions_revision: string}` | `ProvenanceRecord.model_ref` |
 | `EvidenceRef` | `{target_finding_revision: RefRevision, evidence_id?: string}` — the compared unit is a **finding revision** (which MUST be kind `finding`); `evidence_id` names a specific `EvidenceRecord` when needed and is optional | `IndependenceRecord.evidence_a`/`evidence_b` |
 | `ActorRef` | `{actor_kind: enum[user\|agent], actor_id: string, confirmation_ref: stated<RefRevision>}` — who; `confirmation_ref` MUST be `known` (a human-confirmation revision) when `actor_kind` is `agent`, and `not_applicable` (with reason) for a human | `IndependenceRecord.adjudicated_by` |
+| `RightsRecordRef` | `{project_id: string, rights_id: string, record_revision: int}` — pinned reference to a **canonical** policy `RightsRecord`; all three parts are the record's immutable identity, so a stale reference does not resolve after the rights record is revised | `RevisionRecord.rights_ref`; `ImportOccurrenceRecord.rights_ref`; `EvidenceRecord.rights_reference` |
 
 ---
 
@@ -292,7 +293,7 @@ revision to stand in for missing full text.
 | `acquired_by` | enum[user\|agent\|import] | Req | Actor class. |
 | `dependencies` | list<ref<DependencyReference>> | Req (may be empty) | **Immutable dependency set** this revision was produced under (e.g., `version_of`, `extracted_from`, `reports`). This is the set approvals bind to (I1); each entry MUST reference a `DependencyReference`. It MAY later gain entries only by creating a **new** revision, never by mutation. |
 | `provenance_id` | ref<ProvenanceRecord> | Req | How this revision came to exist (§5.3). |
-| `rights_id` | ref<RightsReference> | Req | Projection of the **canonical** policy `RightsRecord` (§5.6; `docs/contracts/03-policy-decisions.md` §5). Every revision MUST reference one, including our own reports that embed or derive from third-party content. **No blanket own-work N/A:** derived "own" artifacts still inherit the source's restrictions on storage/redistribution/hosted transfer (§5.6). |
+| `rights_ref` | `RightsRecordRef` (§2.4) | Req | Pinned reference to the **canonical** policy `RightsRecord` ([`03-policy-decisions.md` §5](03-policy-decisions.md#51-rightsrecord-v1--canonical-immutable-identity-and-typing); §5.6). Every revision MUST reference one, including our own reports that embed or derive from third-party content. **No blanket own-work N/A:** derived "own" artifacts still inherit the source's restrictions on storage/redistribution/hosted transfer (§5.6). |
 | `immutable` | bool (constant `true`) | Req | Declaration that this revision is immutable (I1/I2). |
 | `notes` | string | Opt | Free text. |
 
@@ -327,7 +328,7 @@ limitations, source assets, a rights reference, and revision linkage.
 | `attribution` | stated<enum[direct_observation\|author_interpretation\|secondary_account\|mixed\|unclear\|proposed_synthesis]> | Req | Attribution class (I8). |
 | `limitations` | stated<string> | Req | Known limits/caveats; "none identified" must be explicit. |
 | `source_assets` | list<`AssetRef`> | Req (may be empty) | Figures/tables/supplements that are inputs (line 19; §2.4). |
-| `rights_reference` | stated<ref<RightsReference>> | Req | Rights record for the asset(s) read (I9). |
+| `rights_reference` | stated<`RightsRecordRef`> | Req | Pinned rights record for the asset(s) read (I9; §5.6). |
 | `numeric_details` | Opt<object> | Opt | Numbers/units where relevant (line 32). |
 | `extraction_provenance` | ref<ProvenanceRecord> | Req | Who/what/how extracted. |
 | `secondary_warning` | stated<bool> | Req | `known:true` when attribution is limited by a tracing limit; then final human approval is required and this MUST NOT be presented as verified primary support (I10). |
@@ -348,26 +349,43 @@ limitations, source assets, a rights reference, and revision linkage.
 ### 5.6 `RightsReference` — projection of the canonical rights record (I9; P5 open)
 
 C01 does **not** define a canonical rights schema. The canonical record is
-`RightsRecord` v1 in the policy contract **`docs/contracts/03-policy-decisions.md`
-§5** (sibling C03; not merged into this branch, so it is named by path here rather
-than linked — C04 reconciles the final full field mapping). C01's `rights_id` MUST
-reference a canonical `RightsRecord`; the fields below are a **read-only
-projection** of it for identity/evidence references. The shared operation enum is
-`allowed | not_allowed | unknown | not_applicable`.
+`RightsRecord` v1 in the sibling policy contract
+[`03-policy-decisions.md` §5.1](03-policy-decisions.md#51-rightsrecord-v1--canonical-immutable-identity-and-typing)
+(C03, part of this coordinated proposal bundle). C01 holds a **read-only
+projection** of that canonical record and never re-decides rights. The shared
+operation enum is `allowed | not_allowed | unknown | not_applicable`.
+
+**Pinned reference — `RightsRecordRef` (§2.4).** A reference from C01 to a
+canonical rights record MUST be pinned to the record's **immutable identity**,
+never a mutable bare `rights_id`:
+
+```
+RightsRecordRef = {project_id: string, rights_id: string, record_revision: int}
+```
+
+All three components MUST match the canonical record's identity
+(`{project_id, rights_id, record_revision}`; C03 §5.1). `record_revision` is
+immutable, so editing a rights record produces a **new** `record_revision` that a
+stale reference does not resolve (I1). A reference used by a record MUST be
+**same-project** as that record.
+
+The fields below are the **read-only projection** C01 keeps for identity/evidence
+references:
 
 | Projection field (C01) | Type | Req | Canonical `RightsRecord` field |
 | --- | --- | --- | --- |
 | `rights_id` | string | Req | `rights_id` (same id) |
 | `project_id` | string | Req | `project_id` |
-| `subject` | RefRevision | Req | `source_revision` |
+| `record_revision` | int | Req | `record_revision` (immutable identity pin) |
+| `subject` | object (canonical `subject`) | Req | `subject` — the canonical **discriminated union** (`kind` ∈ `source_revision` \| `subject_artifact_ref`), **not** a bare `source_revision` |
 | `acquisition_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | `operations.acquisition` |
 | `storage_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | `operations.storage` |
 | `redistribution_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | `operations.redistribution` |
 | `hosted_model_transfer_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | `operations.hosted_transfer` |
-| `basis` | stated<string> | Req | summary of the per-operation `basis.<operation>.{kind, evidence_ref}` |
+| `basis` | stated<string> | Req | summary of the per-operation `basis.<operation>.{kind, evidence:{ref, provenance}}` |
 | `restrictions` | stated<string> | Req | `restrictions[]` |
 | `decided_by`,`decided_at` | string, timestamp | Req | `recorded_by`, `recorded_at` |
-| — (canonical-only, not projected here) | — | — | `record_revision`, `authorizing_revision`, `privacy`, `derived_status` |
+| — (canonical-only, not projected here) | — | — | `authorization`, `privacy`, `derived_status` |
 
 Rules (the projection adds no rights; the policy record is authoritative):
 
@@ -422,7 +440,7 @@ an occurrence may have no bytes (e.g., missing full text).
 | `acquired_by` | enum[user\|agent\|import] | Req | Actor class. |
 | `disposition` | enum[created_new_revision\|duplicate_bytes_of_existing_revision\|no_full_text_acquired\|rejected] | Req | What happened. |
 | `result_revision_id` | stated<ref<RevisionRecord>> | Req | The revision created (disposition `created_new_revision`) or **matched** (disposition `duplicate_bytes_of_existing_revision`); `missing` when `no_full_text_acquired`. |
-| `rights_id` | ref<RightsReference> | Req | Projection of the canonical policy `RightsRecord` (§5.6); no blanket own-work N/A. |
+| `rights_ref` | `RightsRecordRef` (§2.4) | Req | Pinned reference to the canonical policy `RightsRecord` (§5.6); no blanket own-work N/A. |
 | `provenance_id` | ref<ProvenanceRecord> | Req | Provenance of the occurrence. |
 
 Invariant: a `duplicate_bytes_of_existing_revision` occurrence MUST NOT create a
@@ -550,14 +568,14 @@ values, and record-reference resolution.
      "hash_algorithm": "sha256", "byte_size": 812345, "media_type": "application/pdf",
      "origin_locator": "import:batch-1/a.pdf", "acquired_at": "2026-10-27T10:00:01Z",
      "acquired_by": "import", "dependencies": [], "provenance_id": "PV1",
-     "rights_id": "RT1", "immutable": true},
+     "rights_ref": {"project_id": "P-0001", "rights_id": "RT1", "record_revision": 1}, "immutable": true},
     {"project_id": "P-0001", "artifact_id": "F1", "revision_id": "f1",
      "parent_revision_id": {"state": "not_applicable", "reason": "first content revision"},
      "content_hash": {"state": "known", "value": "sha256:9d88eb16b7efd644083b219334f91c6fc8524f933c2db92295da2b6d7c5bd09b"},
      "hash_algorithm": "sha256", "byte_size": 2048, "media_type": "application/json",
      "origin_locator": "store:finding/F1/f1", "acquired_at": "2026-10-27T11:00:00Z",
      "acquired_by": "agent", "dependencies": ["DP1"], "provenance_id": "PV2",
-     "rights_id": "RT2", "immutable": true}
+     "rights_ref": {"project_id": "P-0001", "rights_id": "RT2", "record_revision": 1}, "immutable": true}
   ],
   "import_occurrence_records": [
     {"import_id": "IM1", "project_id": "P-0001", "artifact_id": "A1",
@@ -567,7 +585,7 @@ values, and record-reference resolution.
      "acquired_at": "2026-10-27T10:00:01Z", "acquired_by": "import",
      "disposition": "created_new_revision",
      "result_revision_id": {"state": "known", "value": "R1"},
-     "rights_id": "RT1", "provenance_id": "PV1"}
+     "rights_ref": {"project_id": "P-0001", "rights_id": "RT1", "record_revision": 1}, "provenance_id": "PV1"}
   ],
   "provenance_records": [
     {"provenance_id": "PV1", "project_id": "P-0001",
@@ -602,20 +620,20 @@ values, and record-reference resolution.
      "attribution": {"state": "known", "value": "author_interpretation"},
      "limitations": {"state": "known", "value": "single synthetic condition; no in vivo analogue"},
      "source_assets": [],
-     "rights_reference": {"state": "known", "value": "RT1"},
+     "rights_reference": {"state": "known", "value": {"project_id": "P-0001", "rights_id": "RT1", "record_revision": 1}},
      "extraction_provenance": "PV2",
      "secondary_warning": {"state": "known", "value": false}}
   ],
   "rights_references": [
-    {"rights_id": "RT1", "project_id": "P-0001",
-     "subject": {"project_id": "P-0001", "artifact_id": "A1", "revision_id": "R1"},
+    {"rights_id": "RT1", "project_id": "P-0001", "record_revision": 1,
+     "subject": {"kind": "source_revision", "project_id": "P-0001", "artifact_id": "A1", "revision_id": "R1"},
      "acquisition_right": "allowed", "storage_right": "allowed",
      "redistribution_right": "not_allowed", "hosted_model_transfer_right": "unknown",
      "basis": {"state": "known", "value": "synthetic human grant (grant:syn-grant-1): local processing only"},
      "restrictions": {"state": "known", "value": "local_processing_only; no_redistribution; no_hosting"},
      "decided_by": "user", "decided_at": "2026-10-27T10:05:00Z"},
-    {"rights_id": "RT2", "project_id": "P-0001",
-     "subject": {"project_id": "P-0001", "artifact_id": "F1", "revision_id": "f1"},
+    {"rights_id": "RT2", "project_id": "P-0001", "record_revision": 1,
+     "subject": {"kind": "source_revision", "project_id": "P-0001", "artifact_id": "F1", "revision_id": "f1"},
      "acquisition_right": "not_applicable", "storage_right": "allowed",
      "redistribution_right": "not_allowed", "hosted_model_transfer_right": "unknown",
      "basis": {"state": "known", "value": "derived finding; inherits RT1 restrictions"},
@@ -637,9 +655,9 @@ REQUIRED = {
  "artifact_records": {"project_id","artifact_id","kind","created_at","created_by","revision_ids"},
  "revision_records": {"project_id","artifact_id","revision_id","parent_revision_id","content_hash",
    "hash_algorithm","byte_size","origin_locator","acquired_at","acquired_by","dependencies",
-   "provenance_id","rights_id","immutable"},
+   "provenance_id","rights_ref","immutable"},
  "import_occurrence_records": {"import_id","project_id","artifact_id","origin_locator","content_hash",
-   "acquired_at","acquired_by","disposition","result_revision_id","rights_id","provenance_id"},
+   "acquired_at","acquired_by","disposition","result_revision_id","rights_ref","provenance_id"},
  "provenance_records": {"provenance_id","project_id","subject","method","actor","inputs",
    "performed_at","limitations"},
  "dependency_references": {"dependency_id","project_id","from_revision","target","role",
@@ -647,7 +665,7 @@ REQUIRED = {
  "evidence_records": {"evidence_id","project_id","target_finding_revision","source_revision",
    "original_locator","passage","context","attribution","limitations","source_assets",
    "rights_reference","extraction_provenance","secondary_warning"},
- "rights_references": {"rights_id","project_id","subject","acquisition_right","storage_right",
+ "rights_references": {"rights_id","project_id","record_revision","subject","acquisition_right","storage_right",
    "redistribution_right","hosted_model_transfer_right","basis","restrictions","decided_by","decided_at"},
 }
 KINDS = {"rubric","framework","outline","report","document","study","dataset","experiment","finding"}
@@ -680,6 +698,8 @@ def walk(obj, path=""):
 
 def refrev(r): return (r["project_id"], r["artifact_id"], r["revision_id"])
 
+def refrights(r): return (r["project_id"], r["rights_id"], r["record_revision"])
+
 def main(path):
     doc = open(path, encoding="utf-8").read()
     m = re.search(r"<!--\s*C7\.0-JSON-BEGIN\s*-->(.*?)<!--\s*C7\.0-JSON-END\s*-->", doc, re.S)
@@ -696,23 +716,30 @@ def main(path):
     for k in ("revision_records", "import_occurrence_records"):
         for i, r in enumerate(data[k]):
             h = r["content_hash"]
-            if h.get("state") == "known" and not HASH.match(h["value"]):
+            if h.get("state") == "known" and not HASH.match(str(h.get("value", ""))):
                 errors.append(f"{k}[{i}].content_hash is not 64-hex sha256")
             if "hash_algorithm" in r and r["hash_algorithm"] not in ("sha256","sha512"):
                 errors.append(f"{k}[{i}].hash_algorithm invalid")
     for i, r in enumerate(data["rights_references"]):
         for op in ("acquisition_right","storage_right","redistribution_right","hosted_model_transfer_right"):
             if r[op] not in OPS: errors.append(f"rights_references[{i}].{op} invalid enum {r[op]!r}")
+        if not isinstance(r["record_revision"], int) or isinstance(r["record_revision"], bool):
+            errors.append(f"rights_references[{i}].record_revision must be an int identity pin")
+        subj = r["subject"]
+        if not isinstance(subj, dict) or subj.get("kind") not in ("source_revision","subject_artifact_ref"):
+            errors.append(f"rights_references[{i}].subject is not the canonical discriminated union")
+        elif subj.get("project_id") != r["project_id"]:
+            errors.append(f"rights_references[{i}].subject cross-project {subj.get('project_id')!r}")
 
     prov  = {p["provenance_id"] for p in data["provenance_records"]}
-    rights= {r["rights_id"] for r in data["rights_references"]}
+    rights= {refrights(r) for r in data["rights_references"]}
     deps  = {d["dependency_id"] for d in data["dependency_references"]}
     revs  = {refrev(r) for r in data["revision_records"]}
     arts  = {(a["project_id"], a["artifact_id"]) for a in data["artifact_records"]}
 
     for i, r in enumerate(data["revision_records"]):
         if r["provenance_id"] not in prov: errors.append(f"revision_records[{i}].provenance_id unresolved")
-        if r["rights_id"] not in rights: errors.append(f"revision_records[{i}].rights_id unresolved")
+        if refrights(r["rights_ref"]) not in rights: errors.append(f"revision_records[{i}].rights_ref unresolved")
         for d in r["dependencies"]:
             if d not in deps: errors.append(f"revision_records[{i}].dependencies {d!r} unresolved")
     for i, r in enumerate(data["artifact_records"]):
@@ -720,7 +747,7 @@ def main(path):
             if (r["project_id"], r["artifact_id"], rid) not in revs:
                 errors.append(f"artifact_records[{i}].revision_ids {rid!r} unresolved")
     for i, o in enumerate(data["import_occurrence_records"]):
-        if o["rights_id"] not in rights: errors.append(f"import_occurrence_records[{i}].rights_id unresolved")
+        if refrights(o["rights_ref"]) not in rights: errors.append(f"import_occurrence_records[{i}].rights_ref unresolved")
         if o["provenance_id"] not in prov: errors.append(f"import_occurrence_records[{i}].provenance_id unresolved")
         rv = o["result_revision_id"]
         if rv.get("state") == "known" and (o["project_id"], o["artifact_id"], rv["value"]) not in revs:
@@ -738,7 +765,7 @@ def main(path):
         if sr.get("state") == "known" and refrev(sr["value"]) not in revs:
             errors.append(f"evidence_records[{i}].source_revision unresolved")
         rr = e["rights_reference"]
-        if rr.get("state") == "known" and rr["value"] not in rights:
+        if rr.get("state") == "known" and refrights(rr["value"]) not in rights:
             errors.append(f"evidence_records[{i}].rights_reference unresolved")
         if e["extraction_provenance"] not in prov: errors.append(f"evidence_records[{i}].extraction_provenance unresolved")
 
@@ -879,7 +906,7 @@ ImportOccurrenceRecord{ import_id:"IM4", project_id:"P-0001", artifact_id:"A2",
   acquired_at:"2026-10-27T12:00:00Z", acquired_by:"agent",
   disposition:"no_full_text_acquired",
   result_revision_id:{state:"missing", reason:"no full text acquired"},
-  rights_id:"RT3", provenance_id:"PV3" }      # RT3/PV3 omitted here (abridged)
+  rights_ref:RefRights{P-0001,RT3,1}, provenance_id:"PV3" }  # RT3/PV3 omitted here (abridged)
 EvidenceRecord{ project_id:"P-0001",
   target_finding_revision:RefRevision{F1,r1},
   source_revision:{state:"missing", reason:"no full text acquired for A2 (frozen candidate)"},
@@ -888,7 +915,7 @@ EvidenceRecord{ project_id:"P-0001",
   context:{state:"unknown", reason:"only abstract-derived, provisional context"},
   attribution:{state:"known", value:"author_interpretation"},
   limitations:{state:"known", value:"abstract-derived; provisional (line 25)"},
-  source_assets:[], rights_reference:{state:"known", value:"RT3"},
+  source_assets:[], rights_reference:{state:"known", value:RefRights{P-0001,RT3,1}},
   extraction_provenance:"PV3",
   secondary_warning:{state:"known", value:false} }
 DependencyReference{ dependency_id:"DP2", project_id:"P-0001",
@@ -986,7 +1013,7 @@ threshold is invented to let a stage proceed.
 
 ## 9. Versioning and change log
 
-- This is document version **`v1.2`** (`docs/contracts/01-identities.md`).
+- This is document version **`v1.3`** (`docs/contracts/01-identities.md`).
 - Because the contract itself is versioned, a change to any mandatory field,
   type, state, or rule MUST increment the document version and record the change
   below with its date and approver. Field/record semantics are immutable within a
@@ -998,6 +1025,7 @@ threshold is invented to let a stage proceed.
 | v1 | 2026-10-27 | Initial proposed identity/evidence contract; open items recorded in §8. | **pending (user)** |
 | v1.1 | 2026-10-27 | Repair: separate import occurrence from scientific revision (§5.8), coherent missing-full-text representation (no fake revision), `stated<T>`/subtype grammar and a complete conforming record set (§2.4, §7.0), `known` = availability not verification, affirmative `IndependenceRecord` (§5.9), report/scientific-report terminology, no blanket rights N/A (§5.2/§5.6), mandatory revision `dependencies`+`provenance_id` (§5.2). Still **proposed**. | **pending (user)** |
 | v1.2 | 2026-10-27 | Repair: §7.0 now parseable JSON with 64-hex synthetic digests, matching synthetic passage/locator/context, empty `source_assets`, and an inline Python validator (required keys, `stated` shapes, hash format, enum values, reference resolution); `IndependenceRecord` uses typed `EvidenceRef` and structured `ActorRef` with mandatory human confirmation for agent conclusions (§2.4, §5.9); `shared` underlying data is a hard no-independence rule (§6.1 R4, §6.2); `reports`→`study`, `uses_dataset`→`dataset` targets fixed (§4, §5.5); `RightsReference` is a **projection** of the canonical `RightsRecord` (`docs/contracts/03-policy-decisions.md` §5) with an explicit field mapping and no blanket own-work N/A (§5.2, §5.6); synthetic rights sample is local-processing-only with an explicit synthetic grant. Still **proposed**; not Step 01 completion. | **pending (user)** |
+| v1.3 | 2026-10-27 | Integration alignment: `RightsReference` projection corrected to the canonical fields (`subject` discriminated union, per-operation `basis.<operation>.{kind, evidence:{ref, provenance}}`, `authorization`) — the earlier map named nonexistent `source_revision`/`evidence_ref`/`authorizing_revision` (§5.6); typed pinned **`RightsRecordRef`** `{project_id, rights_id, record_revision}` replaces the mutable bare `rights_id` on `RevisionRecord`/`ImportOccurrenceRecord` and on `EvidenceRecord.rights_reference`, `record_revision` added to the projection, and §7.0 examples + the inline validator resolve the pinned refs and reject cross-project/ill-typed rights refs (§2.4, §5.2, §5.4, §5.6, §5.8, §7.0). Still **proposed**. | **pending (user)** |
 
 ---
 

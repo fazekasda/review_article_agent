@@ -45,20 +45,14 @@ SQLite schema, IPC, package layout, or an agent framework.
 
 ## Checkout base — read this before branching
 
-The step documents are on `origin/main`, but the **spike is not**: it lives on the
-`feat/runtime-spike` branch, which is a **draft/unmerged pull request**. A fresh
-checkout from `main` alone therefore lacks `spikes/`, the step-00 handoff, and
-decision 001, and step 01 would be missing the evidence it must build on.
+The spike pull request (PR #2, `feat/runtime-spike`) was **merged into `main` at
+`3ef5bf9`**; `main` now contains `spikes/`, the step-00 handoff, and decision 001
+alongside the step documents. A fresh checkout from `main` at or after `3ef5bf9`
+therefore already carries the evidence step 01 builds on.
 
-Do **one** of the following — never assume `main` contains the spike:
-
-- the **user merges** the spike pull request into `main` first, then the session
-  branches from the updated `main`; or
-- the session branches **explicitly from the `feat/runtime-spike` tip**.
-
-The coordinator will give the exact base SHA for the step-01 session. Confirm the
-base contains both `docs/implementation/01-contracts.md` and `spikes/runtime/`
-before starting.
+The coordinator gives the exact base SHA for the step-01 session. Confirm the base
+contains both `docs/implementation/01-contracts.md` and `spikes/runtime/` before
+starting.
 
 ## Session shape — contracts and decisions before code
 

@@ -641,7 +641,7 @@ reference used by a record must be **same-project** as that record. Sibling cont
 | `subject` | object | Discriminated union above (`kind` ∈ `source_revision` \| `subject_artifact_ref`). |
 | `operations` | object | Map over the four operations → `allowed` \| `not_allowed` \| `unknown` \| `not_applicable`. |
 | `basis` | object | Per-operation typed evidence (shape below). |
-| `authorization` | object \| null | Exact auth provenance `{actor, method, authorized_at, against_revision, basis}`; `null` until authorized. |
+| `authorization` | object \| null | Exact **out-of-band** auth provenance `{actor: string, method: enum[out_of_band_authenticated], authorized_at: timestamp, against_subject: <this record's subject>, against_rights_revision: int, basis: {kind, evidence: {ref, provenance}}}` — binds **both** the exact source `subject` **and** the exact immutable rights `record_revision`; `null` until authorized. |
 | `restrictions` | string[] | Declared limits, e.g. `no_redistribution`, `no_hosting`, `quote_limit`. |
 | `privacy` | object | `{personal_data: bool, confidentiality: public \| confidential \| unknown, denial: bool}`. |
 | `recorded_by` | string | Actor that recorded the record. **Not** an authorization. |
@@ -662,13 +662,20 @@ proof of all rights." ([spec line 63](../specification.md)).
 "evidence": {"ref": string, "provenance": string}}`; both `ref` and `provenance` must
 be non-empty for `allowed`.
 
-**C01 reference/projection mapping.** C01's per-operation reference fields map by name
-onto the canonical record: `acquisition_right -> operations.acquisition`,
+**C01 reference/projection mapping.** C01
+([`01-identities.md` §5.6](01-identities.md#56-rightsreference--projection-of-the-canonical-rights-record-i9-p5-open),
+part of this coordinated proposal bundle) holds a **read-only projection**; its
+per-operation fields map by name onto the canonical record:
+`acquisition_right -> operations.acquisition`,
 `storage_right -> operations.storage`,
 `redistribution_right -> operations.redistribution`,
-`hosted_transfer_right -> operations.hosted_transfer`; a C01 `reference` maps onto
-`subject`, and a C01 `projection` maps onto a read-only view of these fields. (C01 is
-not present in this checkout; this mapping is the contract it must satisfy.)
+`hosted_model_transfer_right -> operations.hosted_transfer`. C01's projected
+`subject` maps onto the canonical `subject` **discriminated union**, and C01's
+`basis` is a read-only summary of the canonical per-operation
+`basis.<operation>.{kind, evidence:{ref, provenance}}`. A C01 reference pins the
+canonical record to its **immutable identity** `{project_id, rights_id,
+record_revision}` (C01 typed `RightsRecordRef`); a mutable bare `rights_id` MUST
+NOT be used as the reference.
 
 **Status semantics (raw-incomplete vs. valid, with no contradiction).**
 
@@ -704,8 +711,10 @@ not present in this checkout; this mapping is the contract it must satisfy.)
   rights status is `allowed`.
 - **Hosted transfer needs out-of-band authorization.** `recorded_by` (in-band recording)
   **cannot** grant `hosted_transfer`. Hosted-model transfer requires an **out-of-band
-  authenticated human authorization** recorded in `authorization` against the exact
-  revision; no in-band recorded grant confers it. This is additional to the P5 gate.
+  authenticated human authorization** recorded in `authorization` that binds **both** the
+  exact source `subject` **and** the exact immutable `record_revision` of this rights
+  record (not merely a mutable `rights_id`); no in-band recorded grant confers it. This is
+  additional to the P5 gate.
 - **Unknown/not_allowed block; not_applicable never unblocks.** An operation whose right
   is `unknown` or `not_allowed` is **blocked**, not attempted; `not_applicable` never
   unblocks a real operation.
@@ -741,8 +750,12 @@ constraint), hosted-model transfer and submission-facing output stay gated
 ### 5.6 RightsRecord examples (structural/type-checked; illustrative, not authorizations)
 
 All examples are **synthetic** (no licensed text) and are **not** authorizations. A
-structural validator checks field **types** and the **same-project** invariant on the
-subject and on each operation's evidence; a mismatch makes the record invalid.
+structural validator checks field **types**, the immutable identity
+`{project_id, rights_id, record_revision}`, and the **same-project** invariant on
+the subject and on each operation's evidence; it also checks that, when
+`authorization` is present, it binds **both** the record's `subject` **and** this
+record's exact `record_revision` with `method = out_of_band_authenticated`. A
+mismatch makes the record invalid.
 
 **Example A — valid record (public-domain source; content revision exists).** Subject
 is the canonical tuple `{project_id, artifact_id, revision_id}`; every operation has
@@ -770,7 +783,8 @@ typed evidence; hosted transfer carries an **out-of-band** human authorization.
     "actor": "human:user",
     "method": "out_of_band_authenticated",
     "authorized_at": "2026-10-27T00:00:00Z",
-    "against_revision": {"project_id": "proj-syn-1", "artifact_id": "art-syn-A", "revision_id": "rev-syn-A"},
+    "against_subject": {"kind": "source_revision", "project_id": "proj-syn-1", "artifact_id": "art-syn-A", "revision_id": "rev-syn-A"},
+    "against_rights_revision": 1,
     "basis": {"kind": "public_domain", "evidence": {"ref": "lic:pd-syn-A", "provenance": "publisher:pd-list"}}
   },
   "restrictions": [],

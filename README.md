@@ -15,6 +15,8 @@ its [kickoff](docs/implementation/kickoffs/01-contracts.md).
 - [Scientific and product baseline](docs/specification.md)
 - [Session-by-session implementation plan](docs/implementation/README.md)
 - [Step 00 handoff](docs/implementation/handoffs/00-runtime-spike.md)
+- [Step 01 contracts — proposal bundle (reading map)](docs/contracts/README.md)
+- [Step 01 handoff (partial, awaiting user ratification)](docs/implementation/handoffs/01-contracts.md)
 - [Runtime language decision 001 (accepted)](docs/decisions/001-runtime-language.md)
 - [Step 01 kickoff](docs/implementation/kickoffs/01-contracts.md)
 - [Implementation decision record template](docs/implementation/decision-template.md)
