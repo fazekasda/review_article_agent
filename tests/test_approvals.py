@@ -24,7 +24,11 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from review_article_agent.domain.records import RecordValidationError  # noqa: E402
+from review_article_agent.domain.records import (  # noqa: E402
+    RecordValidationError,
+    canonical_json,
+    validate_rights_record,
+)
 from review_article_agent.storage import (  # noqa: E402
     ApprovalRepository,
     ArtifactRepository,
@@ -90,13 +94,19 @@ class ApprovalTestBase(unittest.TestCase):
         root = self.tmp / name
         return ProjectStore.create_at(paths.app_dir_for(str(root)), paths.new_project_id())
 
-    def import_revision(self, repo, artifact_id, content, *, revision_id, dependencies=None):
+    def import_revision(
+        self, repo, artifact_id, content, *, revision_id,
+        dependencies=None, parent_revision_id=None, rights=None,
+    ):
         return repo.import_revision(
             artifact_id=artifact_id,
             content=content,
             origin_locator="import:synthetic",
-            rights=_valid_rights(repo.project_id, artifact_id, revision_id),
+            rights=rights if rights is not None else _valid_rights(
+                repo.project_id, artifact_id, revision_id
+            ),
             revision_id=revision_id,
+            parent_revision_id=parent_revision_id,
             dependencies=dependencies or [],
         )
 
@@ -360,12 +370,12 @@ class StalenessTest(ApprovalTestBase):
                 gate_kind="fixture_review", gate_id="g", decision="approved", rationale="r",
             )
             self.assertEqual(approvals.evaluate(appr.approval_id).status, "active")
-            # Edit the target: a new revision; the old approval becomes stale.
+            # Edit the target: a new revision based on the current head; the old
+            # approval becomes stale (T3-R1 requires naming the exact parent).
             r2 = self.import_revision(
                 repo, art.artifact_id, b"v2", revision_id="rev-2",
-                dependencies=None,
+                parent_revision_id=r1.revision_id,
             )
-            # parent link to express an edit of the same artifact.
             self.assertNotEqual(r1.revision_id, r2.revision_id)
             status = approvals.evaluate(appr.approval_id)
             self.assertEqual(status.status, "stale")
@@ -413,9 +423,10 @@ class StalenessTest(ApprovalTestBase):
             self.assertEqual(approvals.evaluate(m_approval.approval_id).status, "active")
             self.assertEqual(approvals.evaluate(u_approval.approval_id).status, "active")
 
-            # Edit the deepest dependency.
+            # Edit the deepest dependency (based on its current head).
             self.import_revision(
-                repo, base.artifact_id, b"base-v2", revision_id="rev-base-2"
+                repo, base.artifact_id, b"base-v2", revision_id="rev-base-2",
+                parent_revision_id=base_rev.revision_id,
             )
             self.assertEqual(approvals.evaluate(t_approval.approval_id).status, "stale")
             self.assertEqual(approvals.evaluate(m_approval.approval_id).status, "stale")
@@ -488,7 +499,10 @@ class StalenessTest(ApprovalTestBase):
                 target=self.target(store, art.artifact_id, rev.revision_id),
                 gate_kind="fixture_batch", gate_id="g", decision="approved", rationale="r",
             )
-            self.import_revision(repo, art.artifact_id, b"v2", revision_id="rev-2")
+            self.import_revision(
+                repo, art.artifact_id, b"v2", revision_id="rev-2",
+                parent_revision_id=rev.revision_id,
+            )
             self.assertEqual(approvals.evaluate(appr.approval_id).status, "stale")
             # A valid historical (stale) row still verifies structurally.
             verification = approvals.verify_snapshot(appr.approval_id)
@@ -538,6 +552,210 @@ class StalenessTest(ApprovalTestBase):
             )
             status = approvals.evaluate(appr.approval_id)
             self.assertEqual(status.status, "invalidated")
+
+
+class PinnedStructureTest(ApprovalTestBase):
+    def _doc_with_approval(self):
+        store = self.new_store()
+        self.addCleanup(store.close)
+        repo = ArtifactRepository(store)
+        art = repo.create_artifact(kind="document")
+        rev = self.import_revision(repo, art.artifact_id, b"bytes", revision_id="rev-1")
+        approvals = ApprovalRepository(store)
+        appr = approvals.record_fixture_approval(
+            target=self.target(store, art.artifact_id, rev.revision_id),
+            gate_kind="fixture_batch", gate_id="g", decision="approved", rationale="r",
+        )
+        return store, repo, art, rev, approvals, appr
+
+    def test_recorded_schema_version_stable_across_later_bump(self) -> None:
+        store, repo, art, rev, approvals, appr = self._doc_with_approval()
+        before = approvals.snapshot_structure(appr.approval_id)
+        self.assertEqual(before["storage_schema_version"], appr.storage_schema_version)
+        # Simulate a *later* store schema bump: the recorded version must be used
+        # on reconstruction, so honest history stays structurally stable.
+        store._schema_version = schema.STORE_SCHEMA_VERSION + 7
+        self.assertEqual(approvals.snapshot_structure(appr.approval_id), before)
+        verification = approvals.verify_snapshot(appr.approval_id)
+        self.assertTrue(verification.ok)
+        self.assertEqual(verification.stored_digest, verification.recomputed_digest)
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "active")
+
+    def test_corrupt_rights_canonical_invalidates(self) -> None:
+        store, repo, art, rev, approvals, appr = self._doc_with_approval()
+        store.connection.execute("DROP TRIGGER rights_record_no_update")
+        store.connection.execute(
+            "UPDATE rights_record SET canonical = ? WHERE project_id = ? AND "
+            "rights_id = ? AND record_revision = ?",
+            (b'{"tampered":true}', store.project_id, "RIGHTS-rev-1", 1),
+        )
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "invalidated")
+        self.assertFalse(approvals.verify_snapshot(appr.approval_id).ok)
+
+    def test_unknown_storage_rights_record_never_accepted(self) -> None:
+        store, repo, art, rev, approvals, appr = self._doc_with_approval()
+        # A canonically valid record whose storage is `unknown` (and whose stored
+        # digest is kept consistent) must still be refused as a content pin.
+        unknown = _valid_rights(
+            store.project_id, art.artifact_id, "rev-1", rights_id="RIGHTS-rev-1"
+        )
+        unknown["operations"]["storage"] = "unknown"
+        unknown["basis"]["storage"] = {
+            "kind": "unknown", "evidence": {"ref": "", "provenance": ""}
+        }
+        canonical = canonical_json(validate_rights_record(unknown, store.project_id))
+        store.connection.execute("DROP TRIGGER rights_record_no_update")
+        store.connection.execute(
+            "UPDATE rights_record SET canonical = ?, content_sha256 = ? "
+            "WHERE project_id = ? AND rights_id = ? AND record_revision = ?",
+            (canonical, _sha(canonical), store.project_id, "RIGHTS-rev-1", 1),
+        )
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "invalidated")
+        self.assertFalse(approvals.verify_snapshot(appr.approval_id).ok)
+
+    def test_corrupt_entry_rights_key_invalidates(self) -> None:
+        store, repo, art, rev, approvals, appr = self._doc_with_approval()
+        store.connection.execute("DROP TRIGGER fixture_approval_entry_no_update")
+        store.connection.execute(
+            "UPDATE fixture_approval_entry SET rights_id = 'OTHER' WHERE approval_id = ?",
+            (appr.approval_id,),
+        )
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "invalidated")
+        self.assertFalse(approvals.verify_snapshot(appr.approval_id).ok)
+
+    def test_corrupt_entry_byte_size_invalidates(self) -> None:
+        store, repo, art, rev, approvals, appr = self._doc_with_approval()
+        store.connection.execute("DROP TRIGGER fixture_approval_entry_no_update")
+        store.connection.execute(
+            "UPDATE fixture_approval_entry SET byte_size = 999 WHERE approval_id = ?",
+            (appr.approval_id,),
+        )
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "invalidated")
+        self.assertFalse(approvals.verify_snapshot(appr.approval_id).ok)
+
+    def test_tampered_fixture_constants_invalidate(self) -> None:
+        store, repo, art, rev, approvals, appr = self._doc_with_approval()
+        # Defense in depth: the database CHECK refuses a scope/authority change...
+        store.connection.execute("DROP TRIGGER fixture_approval_no_update")
+        with self.assertRaises(sqlite3.IntegrityError):
+            store.connection.execute(
+                "UPDATE fixture_approval SET authorizes_execution = 1 WHERE "
+                "approval_id = ?",
+                (appr.approval_id,),
+            )
+        # ...and the read-side verifier independently rejects a row whose exact
+        # fixture constants are not intact.
+        raw = store.connection.execute(
+            "SELECT * FROM fixture_approval WHERE approval_id = ?", (appr.approval_id,)
+        ).fetchone()
+        for field, bad_value in (
+            ("scope", "approved"),
+            ("context_kind", "model_authored"),
+            ("authorizes_execution", 1),
+            ("actor_authenticated", 1),
+        ):
+            tampered = dict(raw)
+            tampered[field] = bad_value
+            problems = approvals._fixture_invariant_problems(tampered)
+            self.assertTrue(
+                any(field in p for p in problems),
+                f"expected a {field!r} problem, got {problems!r}",
+            )
+
+    def test_rights_record_amendment_stales_current_use(self) -> None:
+        store, repo, art, rev, approvals, appr = self._doc_with_approval()
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "active")
+        # A new immutable rights revision for the same rights_id: a material
+        # policy amendment that reopens the local approval.
+        amended = _valid_rights(
+            store.project_id, art.artifact_id, "rev-1",
+            rights_id="RIGHTS-rev-1", record_revision=2,
+        )
+        repo.store_rights_record(amended)
+        status = approvals.evaluate(appr.approval_id)
+        self.assertEqual(status.status, "stale")
+        self.assertFalse(status.authorizes_execution)
+        # The historical structure is intact: the old pinned record still verifies.
+        self.assertTrue(approvals.verify_snapshot(appr.approval_id).ok)
+
+
+class LineageSnapshotTest(ApprovalTestBase):
+    def _lineage_setup(self):
+        store = self.new_store()
+        self.addCleanup(store.close)
+        repo = ArtifactRepository(store)
+        doc = repo.create_artifact(kind="document")
+        doc_rev = self.import_revision(repo, doc.artifact_id, b"doc", revision_id="rev-doc")
+        rep = repo.create_artifact(kind="report")
+        r1 = self.import_revision(
+            repo, rep.artifact_id, b"r1", revision_id="rev-1",
+            dependencies=[self.target(store, doc.artifact_id, doc_rev.revision_id)],
+        )
+        self.import_revision(
+            repo, rep.artifact_id, b"r2", revision_id="rev-2",
+            parent_revision_id=r1.revision_id,
+            dependencies=[{
+                "project_id": store.project_id, "artifact_id": rep.artifact_id,
+                "revision_id": r1.revision_id, "role": "version_of",
+            }],
+        )
+        approvals = ApprovalRepository(store)
+        appr = approvals.record_fixture_approval(
+            target=self.target(store, rep.artifact_id, "rev-2"),
+            gate_kind="fixture_review", gate_id="g", decision="approved", rationale="r",
+        )
+        return store, repo, doc, doc_rev, rep, r1, approvals, appr
+
+    def test_version_of_lineage_not_spuriously_stale(self) -> None:
+        store, repo, doc, doc_rev, rep, r1, approvals, appr = self._lineage_setup()
+        entries = {e.revision_id: e.role for e in approvals.snapshot_entries(appr.approval_id)}
+        self.assertEqual(entries["rev-2"], "target")
+        self.assertEqual(entries["rev-1"], "version_lineage")
+        self.assertEqual(entries["rev-doc"], "source_document")
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "active")
+        self.assertTrue(approvals.verify_snapshot(appr.approval_id).ok)
+
+    def test_head_edit_after_lineage_stales(self) -> None:
+        store, repo, doc, doc_rev, rep, r1, approvals, appr = self._lineage_setup()
+        self.import_revision(
+            repo, rep.artifact_id, b"r3", revision_id="rev-3",
+            parent_revision_id="rev-2",
+        )
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "stale")
+
+    def test_live_input_edit_after_lineage_stales(self) -> None:
+        store, repo, doc, doc_rev, rep, r1, approvals, appr = self._lineage_setup()
+        self.import_revision(
+            repo, doc.artifact_id, b"doc-v2", revision_id="rev-doc-2",
+            parent_revision_id=doc_rev.revision_id,
+        )
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "stale")
+
+    def test_live_edge_overrides_ancestry_role(self) -> None:
+        # Same revision reachable through a live edge and a version_of edge: the
+        # live role wins conservatively (so it *is* head-compared).
+        with self.new_store() as store:
+            repo = ArtifactRepository(store)
+            rep = repo.create_artifact(kind="report")
+            r1 = self.import_revision(repo, rep.artifact_id, b"r1", revision_id="rev-1")
+            self.import_revision(
+                repo, rep.artifact_id, b"r2", revision_id="rev-2",
+                parent_revision_id=r1.revision_id,
+                dependencies=[
+                    {"project_id": store.project_id, "artifact_id": rep.artifact_id,
+                     "revision_id": r1.revision_id, "role": "version_of"},
+                    {"project_id": store.project_id, "artifact_id": rep.artifact_id,
+                     "revision_id": r1.revision_id, "role": "derived_from"},
+                ],
+            )
+            approvals = ApprovalRepository(store)
+            appr = approvals.record_fixture_approval(
+                target=self.target(store, rep.artifact_id, "rev-2"),
+                gate_kind="fixture_review", gate_id="g", decision="approved", rationale="r",
+            )
+            roles = {e.revision_id: e.role for e in approvals.snapshot_entries(appr.approval_id)}
+            self.assertNotEqual(roles["rev-1"], "version_lineage")
+            self.assertEqual(approvals.evaluate(appr.approval_id).status, "stale")
 
 
 class TransactionFaultTest(ApprovalTestBase):

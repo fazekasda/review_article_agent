@@ -31,15 +31,27 @@ What it guarantees
   entry pinned by ``{project_id, artifact_id, revision_id}`` plus the revision's
   canonical ``content_sha256`` digest, the pinned rights key, and byte size. The
   target is always entry 0, so an artifact with no dependencies still produces a
-  non-empty, exact snapshot.
+  non-empty, exact snapshot. A same-artifact ``version_of`` ancestor is captured
+  as a historical ``version_lineage`` pin: its exact digest is verified but it is
+  never compared against the artifact's current head.
+* **Structural verification of every pin (C02 §2.2).** Verification re-checks,
+  for each entry, the content digest, the byte size against both the row and the
+  stored bytes, the pinned rights key against the revision's ``rights_ref``, and
+  the pinned rights record's identity/subject/canonical digest — refusing an
+  unknown or unauthorized record. The approval's own ``scope``/``actor_authenticated``/
+  ``authorizes_execution`` values must be the exact fixture constants.
+* **Historical schema stability.** Reconstruction always re-uses the
+  ``storage_schema_version`` recorded *inside* the approval, not the store's
+  current version, so a later schema bump does not invalidate honest history.
 * **Immutable rows + recomputed status (C02 §3).** Approval and snapshot rows are
   immutable at the database (never ``UPDATE``d/``DELETE``d). Status is
-  **computed** on every read: if any pinned artifact's current revision moved, the
-  approval is ``stale``; if a stored digest no longer matches the recomputed
-  digest (or a pinned revision is missing), it is ``invalidated``; if a newer
-  approval exists for the same local gate instance, the older one is
-  ``superseded``; otherwise ``active``. Re-approval creates a **new** row and
-  never flips an old row back to ``active``.
+  **computed** on every read: if any pinned *live* artifact's current revision
+  moved, the approval is ``stale``; a newer ``record_revision`` of a pinned
+  rights record also makes it ``stale``; if a stored digest no longer matches the
+  recomputed digest (or a pinned revision/rights record is missing/inconsistent),
+  it is ``invalidated``; if a newer approval exists for the same local gate
+  instance, the older one is ``superseded``; otherwise ``active``. Re-approval
+  creates a **new** row and never flips an old row back to ``active``.
 * **Verifiable for backup.** :meth:`ApprovalRepository.verify_snapshot` and
   :meth:`ApprovalRepository.snapshot_structure` let a backup verifier reconstruct
   and check the structural snapshot of **any** row — including valid historical
@@ -48,6 +60,7 @@ What it guarantees
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -57,8 +70,10 @@ from ..domain.errors import StoreError
 from ..domain.records import (
     RecordValidationError,
     canonical_json,
+    require_storage_allowed,
     validate_identifier,
     validate_ref,
+    validate_rights_record,
 )
 from .artifacts import ArtifactRepository, sha256_digest
 
@@ -83,8 +98,14 @@ FIXTURE_STATUSES = ("active", "stale", "invalidated", "superseded")
 
 #: Snapshot entry roles. ``target`` marks the approved revision itself, so an
 #: artifact with no dependencies still has one exact entry (C02 §2.2).
+#: ``version_lineage`` marks a same-artifact historical ancestor reached through a
+#: ``version_of`` edge: its exact digest is still pinned and verified, but it is
+#: *not* independently compared against the artifact's current head (an ancestor
+#: being older is expected, not a change). The role string carries this history
+#: semantics, so no schema column and no prior-snapshot mutation is needed.
 SNAPSHOT_ENTRY_ROLES = (
     "target",
+    "version_lineage",
     "source_document",
     "summary",
     "finding",
@@ -96,6 +117,12 @@ SNAPSHOT_ENTRY_ROLES = (
     "question_def",
     "other",
 )
+
+#: Role carried by a historical (``version_of``) ancestor entry.
+VERSION_LINEAGE_ROLE = "version_lineage"
+
+#: Dependency role that denotes same-artifact ancestry rather than a live input.
+_ANCESTRY_ROLE = "version_of"
 
 #: Maps an artifact kind (C01 §4) to a snapshot entry role.
 _KIND_TO_ROLE = {
@@ -338,22 +365,25 @@ class ApprovalRepository:
             else _require_timestamp(granted_at_utc, "granted_at_utc")
         )
 
-        # Build (and thereby validate) the exact snapshot before any write, so a
-        # missing/cross-project reference raises with nothing persisted.
-        entries = self._build_snapshot(ref)
-        snapshot_id = "snap_" + uuid.uuid4().hex
-        structure = self._snapshot_structure(
-            target=ref,
-            gate_kind=gate_kind,
-            gate_id=gate_id,
-            decision=decision,
-            context_note=context_note,
-            entries=entries,
-        )
-        snapshot_digest = _digest_of_content(canonical_json(structure))
-        created = _utc_now()
-
+        # Build (and thereby validate) the exact snapshot **inside** the write
+        # transaction, so the pinned reads and the row write are one coherent
+        # unit: a missing/cross-project reference, or a concurrent change, cannot
+        # leave a half-written or inconsistent approval.
         with self._store.transaction():
+            entries = self._build_snapshot(ref)
+            snapshot_id = "snap_" + uuid.uuid4().hex
+            structure = self._snapshot_structure(
+                storage_schema_version=self._store.schema_version,
+                target=ref,
+                gate_kind=gate_kind,
+                gate_id=gate_id,
+                decision=decision,
+                context_note=context_note,
+                entries=entries,
+            )
+            snapshot_digest = _digest_of_content(canonical_json(structure))
+            created = _utc_now()
+
             self._conn().execute(
                 "INSERT INTO fixture_approval "
                 "(project_id, approval_id, target_artifact_id, target_revision_id, "
@@ -419,24 +449,53 @@ class ApprovalRepository:
         The target is entry 0 (role ``target``); an artifact with no dependencies
         therefore still yields a non-empty exact snapshot. Every referenced
         revision must exist in this project.
+
+        A revision reached only through ``version_of`` ancestry edges is captured
+        with the historical :data:`VERSION_LINEAGE_ROLE`; if the same revision is
+        also reachable through any non-ancestry (live-input) edge, the live role
+        wins conservatively. The full exact closure is always preserved.
         """
-        entries: list[FixtureSnapshotEntry] = []
+        target_key = (target_ref["artifact_id"], target_ref["revision_id"])
+        order: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
-        queue: list[tuple[str, str, str]] = [
-            (target_ref["artifact_id"], target_ref["revision_id"], "target")
-        ]
+        edges: list[tuple[str, str]] = []  # roles of every reached edge
+        live_keys: set[tuple[str, str]] = {target_key}
+        queue: list[tuple[str, str]] = [target_key]
         while queue:
-            artifact_id, revision_id, role = queue.pop(0)
-            key = (artifact_id, revision_id)
+            key = queue.pop(0)
             if key in seen:
                 continue
             seen.add(key)
-            revision = self._artifacts.get_revision(artifact_id, revision_id)
-            if revision is None:
+            order.append(key)
+            artifact_id, revision_id = key
+            if self._artifacts.get_revision(artifact_id, revision_id) is None:
                 raise RecordValidationError(
                     f"approval snapshot: revision {artifact_id!r}/{revision_id!r} "
                     f"does not exist in this project"
                 )
+            dependencies = sorted(
+                self._artifacts.list_dependencies(artifact_id, revision_id),
+                key=lambda d: (d.artifact_id, d.revision_id, d.role),
+            )
+            for dep in dependencies:
+                child = (dep.artifact_id, dep.revision_id)
+                if dep.role != _ANCESTRY_ROLE:
+                    # Any live (non-ancestry) edge marks the child as a live input,
+                    # even if it is also named as an ancestor ("live wins").
+                    live_keys.add(child)
+                if child not in seen:
+                    queue.append(child)
+        entries: list[FixtureSnapshotEntry] = []
+        for key in order:
+            artifact_id, revision_id = key
+            revision = self._artifacts.get_revision(artifact_id, revision_id)
+            assert revision is not None  # validated during traversal above
+            if key == target_key:
+                role = "target"
+            elif key in live_keys:
+                role = self._role_for(artifact_id)
+            else:
+                role = VERSION_LINEAGE_ROLE
             entries.append(
                 FixtureSnapshotEntry(
                     project_id=self.project_id,
@@ -449,14 +508,6 @@ class ApprovalRepository:
                     byte_size=revision.byte_size,
                 )
             )
-            dependencies = sorted(
-                self._artifacts.list_dependencies(artifact_id, revision_id),
-                key=lambda d: (d.artifact_id, d.revision_id, d.role),
-            )
-            for dep in dependencies:
-                queue.append(
-                    (dep.artifact_id, dep.revision_id, self._role_for(dep.artifact_id))
-                )
         return entries
 
     def _role_for(self, artifact_id: str) -> str:
@@ -467,6 +518,7 @@ class ApprovalRepository:
     def _snapshot_structure(
         self,
         *,
+        storage_schema_version: int,
         target: dict[str, str],
         gate_kind: str,
         gate_id: str,
@@ -474,10 +526,16 @@ class ApprovalRepository:
         context_note: str | None,
         entries: list[FixtureSnapshotEntry],
     ) -> dict[str, object]:
-        """Return the canonical structural snapshot object (source of the digest)."""
+        """Return the canonical structural snapshot object (source of the digest).
+
+        ``storage_schema_version`` is the version recorded **inside** the
+        approval: the current store version only when first recording, and the
+        row's stored version when reconstructing/verifying, so a later schema bump
+        never invalidates honest history.
+        """
         return {
             "snapshot_schema_version": STORAGE_SNAPSHOT_SCHEMA_VERSION,
-            "storage_schema_version": self._store.schema_version,
+            "storage_schema_version": storage_schema_version,
             "project_id": self.project_id,
             "target": {
                 "project_id": target["project_id"],
@@ -583,44 +641,116 @@ class ApprovalRepository:
         return None if row is None else self._row_to_approval(row)
 
     # -- verification / status ----------------------------------------------- #
-    def snapshot_structure(
-        self, approval_id: str
-    ) -> dict[str, object]:
-        """Reconstruct the canonical structural snapshot from stored rows.
+    def _fixture_invariant_problems(self, row: sqlite3.Row) -> list[str]:
+        """The approval's own scope/authority columns must be the exact constants."""
+        problems: list[str] = []
+        if row["scope"] != SCOPE_STORAGE_FIXTURE:
+            problems.append("scope is not the exact storage_fixture constant")
+        if row["context_kind"] != CONTEXT_KIND_HUMAN_AUTHORED:
+            problems.append("context_kind is not the exact human_authored constant")
+        if row["authorizes_execution"] != 0:
+            problems.append("authorizes_execution is not the exact fixture constant 0")
+        if row["actor_authenticated"] != 0:
+            problems.append("actor_authenticated is not the exact fixture constant 0")
+        return problems
 
-        Exposed so a backup verifier can rebuild and check the exact snapshot of
-        any row, including historical ``stale``/``superseded`` rows.
+    def _rights_record_problems(
+        self, entry: FixtureSnapshotEntry, label: str
+    ) -> list[str]:
+        """Structurally verify one entry's pinned canonical rights record.
+
+        Checks the stored canonical digest, identity ``{project_id, rights_id,
+        record_revision}``, that the subject binds the *exact* pinned revision,
+        and that the record is a fully valid, storage-allowed ``RightsRecord`` —
+        so an ``unknown``/unauthorized record is never accepted as a pin.
         """
-        row = self._approval_row(approval_id)
+        problems: list[str] = []
+        row = self._conn().execute(
+            "SELECT canonical, content_sha256 FROM rights_record WHERE project_id = ? "
+            "AND rights_id = ? AND record_revision = ?",
+            (self.project_id, entry.rights_id, entry.rights_record_revision),
+        ).fetchone()
         if row is None:
-            raise RecordValidationError(f"approval {approval_id!r} does not exist")
-        entries = self._entry_rows(row["approval_id"])
-        return self._snapshot_structure(
-            target={
-                "project_id": row["project_id"],
-                "artifact_id": row["target_artifact_id"],
-                "revision_id": row["target_revision_id"],
-            },
-            gate_kind=row["gate_kind"],
-            gate_id=row["gate_id"],
-            decision=row["decision"],
-            context_note=row["context_note"],
-            entries=entries,
-        )
+            problems.append(
+                f"pinned rights record {entry.rights_id!r}@"
+                f"{entry.rights_record_revision} is missing for {label}"
+            )
+            return problems
+        canonical = bytes(row["canonical"])
+        if sha256_digest(canonical) != row["content_sha256"]:
+            problems.append(
+                f"rights record {entry.rights_id!r}@"
+                f"{entry.rights_record_revision} canonical digest mismatch for {label}"
+            )
+        try:
+            record = json.loads(canonical.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            problems.append(f"rights record for {label} is not decodable JSON")
+            return problems
+        if not isinstance(record, dict):
+            problems.append(f"rights record for {label} is not an object")
+            return problems
+        if (
+            record.get("project_id") != self.project_id
+            or record.get("rights_id") != entry.rights_id
+            or record.get("record_revision") != entry.rights_record_revision
+        ):
+            problems.append(f"rights record identity mismatch for {label}")
+        subject = record.get("subject")
+        if not (
+            isinstance(subject, dict)
+            and subject.get("kind") == "source_revision"
+            and subject.get("project_id") == entry.project_id
+            and subject.get("artifact_id") == entry.artifact_id
+            and subject.get("revision_id") == entry.revision_id
+        ):
+            problems.append(
+                f"rights record subject does not bind the pinned revision for {label}"
+            )
+        try:
+            validated = validate_rights_record(record, self.project_id)
+            require_storage_allowed(validated)
+        except RecordValidationError as exc:
+            problems.append(
+                f"rights record for {label} is not a valid storage-allowed "
+                f"record: {exc}"
+            )
+        return problems
 
-    def verify_snapshot(self, approval_id: str) -> SnapshotVerification:
-        """Structurally verify one approval's snapshot (staleness-agnostic).
+    def _entry_pin_problems(self, entries: list[FixtureSnapshotEntry]) -> list[str]:
+        """Structurally verify every entry's content, size, and rights pins."""
+        problems: list[str] = []
+        for entry in entries:
+            label = f"{entry.artifact_id!r}/{entry.revision_id!r}"
+            revision = self._artifacts.get_revision(entry.artifact_id, entry.revision_id)
+            if revision is None:
+                problems.append(f"pinned revision {label} is missing")
+                continue
+            if revision.content_sha256 != entry.content_sha256:
+                problems.append(f"stored content digest mismatch for {label}")
+            if revision.byte_size != entry.byte_size:
+                problems.append(f"byte size mismatch for {label}")
+            content = self._artifacts.read_content(entry.artifact_id, entry.revision_id)
+            if len(content) != entry.byte_size:
+                problems.append(
+                    f"content length does not match the pinned byte size for {label}"
+                )
+            if _digest_of_content(content) != entry.content_sha256:
+                problems.append(f"recomputed content digest mismatch for {label}")
+            if (
+                revision.rights_ref.rights_id != entry.rights_id
+                or revision.rights_ref.record_revision != entry.rights_record_revision
+            ):
+                problems.append(f"rights key mismatch for {label}")
+            problems.extend(self._rights_record_problems(entry, label))
+        return problems
 
-        Checks that the stored ``snapshot_digest`` matches the digest recomputed
-        from the stored entries, and that each entry's recorded digest still
-        matches the revision's actual stored content. A valid stale/superseded
-        historical row verifies ``ok`` — honest history is never rejected.
-        """
-        row = self._approval_row(approval_id)
-        if row is None:
-            raise RecordValidationError(f"approval {approval_id!r} does not exist")
-        entries = self._entry_rows(row["approval_id"])
+    def _structure_recomputed_and_problems(
+        self, row: sqlite3.Row, entries: list[FixtureSnapshotEntry]
+    ) -> tuple[dict[str, object], str, list[str]]:
+        """Reconstruct the structure (recorded schema version) and check all pins."""
         structure = self._snapshot_structure(
+            storage_schema_version=row["storage_schema_version"],
             target={
                 "project_id": row["project_id"],
                 "artifact_id": row["target_artifact_id"],
@@ -638,22 +768,41 @@ class ApprovalRepository:
             problems.append(
                 "stored snapshot digest does not match the recomputed structural digest"
             )
-        for entry in entries:
-            try:
-                content = self._artifacts.read_content(
-                    entry.artifact_id, entry.revision_id
-                )
-            except RecordValidationError:
-                problems.append(
-                    f"pinned revision {entry.artifact_id!r}/{entry.revision_id!r} "
-                    f"is missing"
-                )
-                continue
-            if _digest_of_content(content) != entry.content_sha256:
-                problems.append(
-                    f"content digest mismatch for "
-                    f"{entry.artifact_id!r}/{entry.revision_id!r}"
-                )
+        problems.extend(self._fixture_invariant_problems(row))
+        problems.extend(self._entry_pin_problems(entries))
+        return structure, recomputed, problems
+
+    def snapshot_structure(self, approval_id: str) -> dict[str, object]:
+        """Reconstruct the canonical structural snapshot from stored rows.
+
+        Uses the ``storage_schema_version`` recorded inside the approval (never
+        the store's current version), so a later schema bump does not change the
+        reconstructed structure or its digest. Exposed so a backup verifier can
+        rebuild and check the exact snapshot of any row, including historical
+        ``stale``/``superseded`` rows.
+        """
+        row = self._approval_row(approval_id)
+        if row is None:
+            raise RecordValidationError(f"approval {approval_id!r} does not exist")
+        entries = self._entry_rows(row["approval_id"])
+        structure, _, _ = self._structure_recomputed_and_problems(row, entries)
+        return structure
+
+    def verify_snapshot(self, approval_id: str) -> SnapshotVerification:
+        """Structurally verify one approval's snapshot (staleness-agnostic).
+
+        Checks the stored snapshot digest against the recomputed structural digest
+        (using the recorded schema version), every entry's content digest, byte
+        size, and rights key, the canonical rights record's identity/subject/
+        digest/validity, and the exact fixture scope/authority constants. A valid
+        stale/superseded historical row verifies ``ok`` — honest history is never
+        rejected.
+        """
+        row = self._approval_row(approval_id)
+        if row is None:
+            raise RecordValidationError(f"approval {approval_id!r} does not exist")
+        entries = self._entry_rows(row["approval_id"])
+        _, recomputed, problems = self._structure_recomputed_and_problems(row, entries)
         return SnapshotVerification(
             approval_id=row["approval_id"],
             ok=not problems,
@@ -665,64 +814,28 @@ class ApprovalRepository:
     def evaluate(self, approval_id: str) -> FixtureApprovalStatus:
         """Compute the current lifecycle status/effect of one approval (C02 §3).
 
-        Recomputes the snapshot digest and every pinned artifact's current head on
-        every call, so a new revision of *any* transitive dependency (or of the
-        target) makes the affected approval ``stale`` while unrelated approvals
-        stay ``active``; a corrupt/mismatched stored digest ``invalidates`` it;
-        and a newer approval for the same gate instance ``supersedes`` the older
-        one. The returned effect never authorizes execution or export.
+        Recomputes the snapshot digest (recorded schema version) and every pinned
+        pin on every call, so:
+        * a corrupt/mismatched stored digest, content, size, or rights pin, or a
+          non-fixture scope/authority value, makes it ``invalidated``;
+        * a new revision of any pinned *live* input or of the target makes it
+          ``stale`` (a ``version_of`` historical ancestor is *not* head-compared,
+          so valid lineage is not spuriously stale);
+        * a newer ``record_revision`` of a pinned rights record (a material policy
+          amendment) makes it ``stale``;
+        * a newer approval for the same gate instance ``supersedes`` the older one.
+
+        The returned effect never authorizes execution or export.
         """
         row = self._approval_row(approval_id)
         if row is None:
             raise RecordValidationError(f"approval {approval_id!r} does not exist")
         entries = self._entry_rows(row["approval_id"])
-        reasons: list[str] = []
+        _, _, structural_problems = self._structure_recomputed_and_problems(row, entries)
 
-        # 1) Structural / digest integrity first (invalidated wins).
-        structure = self._snapshot_structure(
-            target={
-                "project_id": row["project_id"],
-                "artifact_id": row["target_artifact_id"],
-                "revision_id": row["target_revision_id"],
-            },
-            gate_kind=row["gate_kind"],
-            gate_id=row["gate_id"],
-            decision=row["decision"],
-            context_note=row["context_note"],
-            entries=entries,
-        )
-        invalidated = False
-        if _digest_of_content(canonical_json(structure)) != row["snapshot_digest"]:
-            invalidated = True
-            reasons.append("snapshot digest mismatch; the stored snapshot is corrupt")
-        for entry in entries:
-            revision = self._artifacts.get_revision(
-                entry.artifact_id, entry.revision_id
-            )
-            if revision is None:
-                invalidated = True
-                reasons.append(
-                    f"pinned revision {entry.artifact_id!r}/{entry.revision_id!r} "
-                    f"is missing"
-                )
-                continue
-            if revision.content_sha256 != entry.content_sha256:
-                invalidated = True
-                reasons.append(
-                    f"stored content digest mismatch for "
-                    f"{entry.artifact_id!r}/{entry.revision_id!r}"
-                )
-                continue
-            content = self._artifacts.read_content(entry.artifact_id, entry.revision_id)
-            if _digest_of_content(content) != entry.content_sha256:
-                invalidated = True
-                reasons.append(
-                    f"recomputed content digest mismatch for "
-                    f"{entry.artifact_id!r}/{entry.revision_id!r}"
-                )
-
+        reasons: list[str] = list(structural_problems)
         superseded_by: str | None = None
-        if invalidated:
+        if structural_problems:
             status = "invalidated"
         else:
             newer = self._conn().execute(
@@ -748,6 +861,10 @@ class ApprovalRepository:
             else:
                 stale = False
                 for entry in entries:
+                    if entry.role == VERSION_LINEAGE_ROLE:
+                        # Historical ancestry: exact digest already verified above;
+                        # being older than the head is expected, not a change.
+                        continue
                     current = self._artifacts.current_revision(entry.artifact_id)
                     if current is None or current.revision_id != entry.revision_id:
                         stale = True
@@ -755,6 +872,20 @@ class ApprovalRepository:
                         reasons.append(
                             f"current revision of {entry.artifact_id!r} is "
                             f"{current_id!r}, not the approved {entry.revision_id!r}"
+                        )
+                for entry in entries:
+                    newer_rights = self._conn().execute(
+                        "SELECT record_revision FROM rights_record WHERE project_id = ? "
+                        "AND rights_id = ? AND record_revision > ? "
+                        "ORDER BY record_revision LIMIT 1",
+                        (self.project_id, entry.rights_id, entry.rights_record_revision),
+                    ).fetchone()
+                    if newer_rights is not None:
+                        stale = True
+                        reasons.append(
+                            f"rights record {entry.rights_id!r} has a newer revision "
+                            f"{newer_rights['record_revision']}; the pinned policy is "
+                            f"amended"
                         )
                 status = "stale" if stale else "active"
 
@@ -786,4 +917,5 @@ __all__ = [
     "SNAPSHOT_ENTRY_ROLES",
     "STORAGE_SNAPSHOT_SCHEMA_VERSION",
     "SnapshotVerification",
+    "VERSION_LINEAGE_ROLE",
 ]
