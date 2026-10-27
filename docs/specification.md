@@ -13,7 +13,7 @@ Confirmed requirements below must not be silently weakened. Technical choices re
 - Initial scope does not require automatic startup after logout/reboot or remote execution while the local machine is off. It must retain state across such interruptions and reconcile on restart.
 - Use an **app-owned OpenCode V2 service**, separate from ordinary coding sessions. OpenCode executes bounded agent work; our application owns projects, state, artifacts, approvals, budgets, and recovery.
 - Decide TypeScript core plus Python tools versus Python core plus supported OpenCode HTTP integration in a small spike. Neither is approved in advance. **Decided 2026-10-27 (step-00 spike): Python core plus a supported, explicitly authenticated OpenCode V2 HTTP integration.** TypeScript with the official OpenCode V2 client was implemented and compared and remains a reference, not the selected runtime; see `docs/decisions/001-runtime-language.md`.
-- SQLite is the proposed local store, not an approved schema. Prefer the simplest design that passes the recovery tests. Do not depend on OpenCode's private database or manually parse private credentials.
+- SQLite is the accepted local store direction — one app-owned **per-project store plus a minimal atomic app-level registry** ([decision 002](decisions/002-step01-contracts-and-policies.md)); the exact schema remains an **implementation-facing, versioned contract**, not an approved scientific artifact. Prefer the simplest design that passes the recovery tests. Do not depend on OpenCode's private database or manually parse private credentials.
 - Target approximately 1,000–10,000 candidates per project. Do not create an autonomous session for every deterministic paper operation.
 - Initially export Markdown, BibTeX, and RIS. No generated manuscript figures/tables, web frontend, statistical meta-analysis, or complete formal systematic-review implementation.
 - Source figures, tables, and supplements **are inputs** when a decision or finding depends on them. Unreadable necessary evidence requires human review.
@@ -45,7 +45,7 @@ Confirmed requirements below must not be silently weakened. Technical choices re
 
 Find direct support for an atomic claim, not the earliest historical discovery. Classify own results/analysis, original conceptual contributions, secondary accounts, mixed, or unclear. Follow claim-relevant in-text citations into resolved bibliography entries and acquired upstream papers. Nearby citations and absence of markers do not prove attribution or originality.
 
-The initially cited source is depth 0. Configure maximum citation hops, new sources per claim/project, and resolution retries; detect cycles. Numerical defaults are **not yet agreed**. These are not the writer's repair budgets.
+The initially cited source is depth 0. Configure maximum citation hops, new sources per claim/project, and resolution retries; detect cycles. **No universal numerical default** is adopted: explicit per-project limits are required before any upstream tracing work ([decision 002](decisions/002-step01-contracts-and-policies.md), [register](contracts/03-policy-decisions.md) POL-OPS-TRACE). These are not the writer's repair budgets.
 
 At a limit or unavailable upstream origin, the user chose **explicit secondary attribution with a visible warning and final human approval**. Cite the source actually read; never substitute an unread original or claim direct verification. This exception does not permit wording unsupported even by the secondary source. Conceptual reviews can originate frameworks; new analyses can directly support their own results even when reusing data.
 
@@ -62,18 +62,28 @@ At a limit or unavailable upstream origin, the user chose **explicit secondary a
 - Treat documents/model outputs as untrusted data. No arbitrary source instructions, authoritative database edits by agents, hidden approvals, public unauthenticated services, or credential leakage.
 - Acquisition, storage, redistribution, and hosted-model transfer rights are separate. Uploading a file is not proof of all rights.
 
-## Pending decisions: must be resolved explicitly
+## Pending decisions: dispositioned by decision 002 (2026-10-27)
 
-Step 01 must record accept/modify/defer decisions on the independent-review recommendations:
+Step 01 must record accept/modify/defer decisions on the independent-review
+recommendations. On **2026-10-27** the user dispositioned all of them in the recorded
+Step 01 interview: **P1–P6 are accepted**, each with the concrete interview
+amendments, against the reviewed revision
+`ee7f7eafca80baa6c1aaca278361e56a663493c3`. The authoritative record is
+[decision 002](decisions/002-step01-contracts-and-policies.md) and the
+[policy register](contracts/03-policy-decisions.md). The recommendation text below is
+preserved verbatim; each item is now annotated with its disposition. The approval
+covers the **described behavior and direction**, not every field-level schema
+spelling, and is **not** independent scientific validation; no scientific feature is
+implemented.
 
-- P1: explicit framework contribution, concept-admission/support/revision criteria and testable implications where applicable.
-- P2: detailed downstream causal/context-fidelity checks.
-- P3: integrity-status checks for retractions, expressions of concern, corrections, and adjudication of affected uses. Do not treat non-replication as retraction or automatically prohibit historical discussion.
-- P4: public selection/synthesis and limitations reporting alongside the manuscript.
-- P5: AI-use declaration, human accountability, applicable provider terms and journal policies.
-- P6: optional target-venue constraint capture and submission-time verification; retain venue-neutral output.
+- P1: explicit framework contribution, concept-admission/support/revision criteria and testable implications where applicable. — **Accepted 2026-10-27** (evidence-led synthesis with mandatory concept safeguards: definition, role, original support, counterevidence, applicability limits; never force a novel framework).
+- P2: detailed downstream causal/context-fidelity checks. — **Accepted 2026-10-27** (structured applicable-context/causal-limits capture at extraction, preserved through synthesis, checked at review; consequential missing context blocks the affected claim).
+- P3: integrity-status checks for retractions, expressions of concern, corrections, and adjudication of affected uses. Do not treat non-replication as retraction or automatically prohibit historical discussion. — **Accepted 2026-10-27** (entry and final checks with status/provenance/date and human review; unknown is not clean; correction/non-replication/retraction not automatically conflated).
+- P4: public selection/synthesis and limitations reporting alongside the manuscript. — **Accepted 2026-10-27** (detailed methods/limitations companion plus a concise manuscript-ready summary; publication user-controlled).
+- P5: AI-use declaration, human accountability, applicable provider terms and journal policies. — **Accepted 2026-10-27** (record actual AI use/versions, editable disclosure, human accountability; provider terms verified before hosted use, journal policy before submission-facing approval).
+- P6: optional target-venue constraint capture and submission-time verification; retain venue-neutral output. — **Accepted 2026-10-27** (optional venue profile applied only when a venue is selected; venue-neutral output retained; an unknown venue is not a blanket prohibition).
 
-Also decide pilot/audit samples and acceptance rules, issue severities, coverage/stopping rules, cost/concurrency limits, tracing defaults, and explicit acceptance of secondary-origin warnings. These are not permission to redesign already-confirmed choices.
+Also decide pilot/audit samples and acceptance rules, issue severities, coverage/stopping rules, cost/concurrency limits, tracing defaults, and explicit acceptance of secondary-origin warnings. These are not permission to redesign already-confirmed choices. — **Dispositioned 2026-10-27** (see [decision 002](decisions/002-step01-contracts-and-policies.md)); the accepted operational policies are recorded there and in the [register](contracts/03-policy-decisions.md). Numeric pilot/audit and tracing values remain **per-project setup gates** (set explicitly per project before the affected work), not Step 01 blockers; the cost/concurrency defaults are USD-25 cumulative per project, USD-10 cumulative per stage, and at most 2 simultaneous external-model calls.
 
 ## Scientific anchors
 
