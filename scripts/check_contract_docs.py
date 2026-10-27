@@ -23,10 +23,35 @@ What it checks
   against the canonical identity `{project_id, rights_id, record_revision}`, the
   subject discriminated union, per-operation typed evidence, and the
   `authorization` binding of both subject and rights revision.
+- **Ratification evidence** (added 2026-10-27): the finalized 2026-10-27 interview
+  dispositions are checked as *document evidence*, distinct from the historical
+  synthetic `proposed`/invalid fixtures. The check requires the ADR-002 acceptance
+  record to state the accepted behavioral scope against the reviewed revision
+  `ee7f7eafca80baa6c1aaca278361e56a663493c3`, requires the register to carry the
+  reviewed revision, the per-record `Interview amendment` evidence, an
+  ACCEPTED/RATIFIED banner, and an `accepted` status-summary row for every
+  policy/technical record id. It is a **stable-id / section-level** check: it does
+  not compare headings or long prose strings.
+- **Cost/concurrency default agreement**: the normative `$25 / $10 / 2` defaults
+  must agree between the authoritative register (`03-policy-decisions.md`, the
+  structured caps object and the status-summary row) and C02
+  (`02-gates-and-runtime.md`, §5.6 / §12). The check reads only the normative text
+  and status table, **never** the synthetic fixtures, so an invalid fixture cannot
+  satisfy it.
+- **No invented per-project cutoff**: the pilot/coverage/tracing (and the
+  categorical P1–P6) records keep `numeric_value = UNSET`; a numeric pilot/tracing
+  threshold appearing as a *disposition* is rejected.
+- **Link scope** (added 2026-10-27): local link targets are also checked in the
+  acceptance record, the baseline, the step document, the kickoff, the Step 01
+  handoff, and the root `README.md`, in addition to the three contracts and the
+  bundle map.
 - `--self-test`: applies negative mutations to the real examples (bad hash,
   missing required/state value, cross-project ref, allowed rights without basis,
   unknown cost recorded as zero, wrong typed answer) and asserts the validators
-  reject each one.
+  reject each one. It also mutates the **ratification/default evidence** (a removed
+  reviewed revision, a drifted cap, a numeric pilot cutoff stood up as a
+  disposition, and an `accepted` row reverted to `proposed`) and asserts each is
+  rejected.
 
 DISCLOSURE / limits
 -------------------
@@ -35,6 +60,13 @@ DISCLOSURE / limits
 - C01 `§7.1`–`§7.7` invalid/missing examples are illustrative pseudo-JSON in prose
   (not fenced JSON), so they are **not** machine-parsed; only their valid anchors
   (§7.0) and the C02/C03 examples are machine-checked.
+- The ratification/default checks read **specific stable anchors**: record ids, the
+  status-summary table, the structured caps object, the reviewed-revision string,
+  the interview-amendment count (a bounded range, not an exact prose match), and
+  short normative phrases in C02 §5.6/§12. They deliberately do **not** parse or
+  compare full prose, headings, or field-level schema spellings; a prose rewrite
+  that keeps the ids/anchors and the normative values still passes, and a
+  wholesale removal of the anchors is reported rather than silently accepted.
 - No scientific numeric value is asserted or checked; no production schema is
   generated.
 """
@@ -56,6 +88,28 @@ DOCS = {
 }
 README = "docs/contracts/README.md"
 HANDOFF = "docs/implementation/handoffs/01-contracts.md"
+ADR002 = "docs/decisions/002-step01-contracts-and-policies.md"
+BASELINE = "docs/specification.md"
+STEP = "docs/implementation/01-contracts.md"
+KICKOFF = "docs/implementation/kickoffs/01-contracts.md"
+ROOT_README = "README.md"
+
+# Finalized 2026-10-27 interview decisions bind to this reviewed revision.
+REVIEWED_REVISION = "ee7f7eafca80baa6c1aaca278361e56a663493c3"
+
+# The policy/technical record ids the register must carry as `accepted`.
+ACCEPTED_POLICY_IDS = ["POL-P1", "POL-P2", "POL-P3", "POL-P4", "POL-P5", "POL-P6"]
+ACCEPTED_OPS_IDS = ["POL-OPS-PILOT", "POL-OPS-SEVERITY", "POL-OPS-COVERAGE",
+                    "POL-OPS-COST", "POL-OPS-TRACE", "POL-OPS-SECONDARY"]
+ACCEPTED_ARCH_IDS = ["ARCH-STORE", "ARCH-ASSETS", "ARCH-IPC", "ARCH-PKG",
+                     "ARCH-MIGRATE", "ARCH-ACTIVE-ENF", "ARCH-RECOVERY"]
+ACCEPTED_RIGHTS_IDS = ["RIGHTS-v1"]
+ACCEPTED_IDS = (ACCEPTED_POLICY_IDS + ACCEPTED_OPS_IDS + ACCEPTED_ARCH_IDS
+                + ACCEPTED_RIGHTS_IDS)
+# Records whose representative numeric value stays UNSET (no invented cutoff):
+# every policy/operational record except the accepted cost/concurrency default.
+UNSET_NUMERIC_IDS = ACCEPTED_POLICY_IDS + [i for i in ACCEPTED_OPS_IDS
+                                           if i != "POL-OPS-COST"]
 
 OPS = {"allowed", "not_allowed", "unknown", "not_applicable"}
 BASIS_KINDS = {"license", "public_domain", "statutory", "publisher_permission",
@@ -211,6 +265,8 @@ def run_c01_on_data(src, data):
 # --------------------------------------------------------------------------- #
 def rights_violations(obj, label):
     v = []
+    if not isinstance(obj, dict):
+        return [f"{label}: malformed record is not a JSON object"]
 
     def need(field, ok):
         if field not in obj:
@@ -336,6 +392,8 @@ def version_violations(vers, label):
 
 def cost_violations(c, label):
     v = []
+    if not isinstance(c, dict):
+        return [f"{label}: malformed cost record is not a JSON object"]
     st = c.get("state")
     if st not in {"known", "estimated", "unknown", "not_incurred"}:
         v.append(f"{label}: cost.state invalid")
@@ -360,6 +418,8 @@ def cost_violations(c, label):
 
 def decision_c02_violations(obj, label):
     v = []
+    if not isinstance(obj, dict):
+        return [f"{label}: malformed decision record is not a JSON object"]
     for f in ("decision_id", "question_id", "question_def_ref", "target",
               "outcome", "versions", "route"):
         if f not in obj:
@@ -416,6 +476,8 @@ def decision_c02_violations(obj, label):
 
 def approval_violations(obj, label):
     v = []
+    if not isinstance(obj, dict):
+        return [f"{label}: malformed approval record is not a JSON object"]
     for f in ("approval_id", "granted_by", "project_id", "target", "decision",
               "gate_kind", "gate_id", "dependency_snapshot", "granted_at", "status",
               "rationale"):
@@ -492,10 +554,150 @@ def decision_c03_violations(obj, label):
 
 
 # --------------------------------------------------------------------------- #
+# finalized-interview ratification evidence (distinct from synthetic fixtures)
+# --------------------------------------------------------------------------- #
+SUMMARY_ID_RE = re.compile(r"^(POL-[\w-]+|ARCH-[\w-]+|RIGHTS-v1)$")
+
+
+def summary_rows(text):
+    """Parse the register's status-summary table into {id: [cells]}.
+
+    Keyed by the stable record id in the first cell; tolerant of status markup
+    changes (bold, dates) elsewhere in the row.
+    """
+    rows = {}
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if cells and SUMMARY_ID_RE.match(cells[0]):
+            rows[cells[0]] = cells
+    return rows
+
+
+def mutate_summary_cell(text, rid, index, value):
+    """Return text with the summary row `rid`'s cell `index` replaced by `value`.
+
+    Test helper for the self-test drift mutations; tolerant of surrounding markup.
+    """
+    out = []
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip("\n")
+        if bare.strip().startswith("|"):
+            cells = [c.strip() for c in bare.strip().strip("|").split("|")]
+            if cells and cells[0] == rid and index < len(cells):
+                cells[index] = value
+                bare = "| " + " | ".join(cells) + " |"
+                line = bare + ("\n" if line.endswith("\n") else "")
+        out.append(line)
+    return "".join(out)
+
+
+def ratification_violations(adr_text=None, reg_text=None):
+    """Evidence that the finalized 2026-10-27 interview was ratified.
+
+    Checks stable anchors (accepted-scope phrase, reviewed revision, per-record
+    status rows, an amendment count range), not headings or long prose.
+    """
+    adr = read(ADR002) if adr_text is None else adr_text
+    reg = read(DOCS["c03"]) if reg_text is None else reg_text
+    v = []
+
+    if not re.search(r"Accepted by the user", adr):
+        v.append("ADR002: does not declare 'Accepted by the user'")
+    if "2026-10-27" not in adr:
+        v.append("ADR002: missing acceptance date 2026-10-27")
+    if not re.search(r"described behavior", adr):
+        v.append("ADR002: does not state the accepted behavioral scope "
+                 "('described behavior')")
+    if REVIEWED_REVISION not in adr:
+        v.append(f"ADR002: reviewed revision {REVIEWED_REVISION} missing")
+    if REVIEWED_REVISION not in reg:
+        v.append(f"register: reviewed revision {REVIEWED_REVISION} missing")
+
+    # A bounded range, not an exact prose match: the register states one
+    # interview amendment per accepted policy/technical record.
+    n_amend = len(re.findall(r"Interview amendment", reg))
+    if n_amend < 10:
+        v.append(f"register: too few 'Interview amendment' records ({n_amend} < 10)")
+
+    if not re.search(r"\b(ACCEPTED|RATIFIED)\b", reg):
+        v.append("register: no ACCEPTED/RATIFIED status banner")
+
+    rows = summary_rows(reg)
+    for rid in ACCEPTED_IDS:
+        row = rows.get(rid)
+        if row is None:
+            v.append(f"register status summary: record {rid} missing")
+        elif "accepted" not in " ".join(row).lower():
+            v.append(f"register status summary: {rid} not marked accepted")
+    return v
+
+
+def defaults_violations(reg_text=None, c02_text=None):
+    """The normative $25 / $10 / 2 cost/concurrency defaults must agree.
+
+    Reads the register's structured caps object and status-summary row and C02's
+    normative §5.6/§12 text; the synthetic fixtures never satisfy this.
+    """
+    reg = read(DOCS["c03"]) if reg_text is None else reg_text
+    c02 = read(DOCS["c02"]) if c02_text is None else c02_text
+    v = []
+
+    if not re.search(r"project_cap_usd:\s*25\b", reg):
+        v.append("register: project_cap_usd 25 missing from the structured caps")
+    if not re.search(r"stage_cap_usd:\s*10\b", reg):
+        v.append("register: stage_cap_usd 10 missing from the structured caps")
+    if not re.search(r"max_concurrent_external_model_calls:\s*2\b", reg):
+        v.append("register: max_concurrent_external_model_calls 2 missing "
+                 "from the structured caps")
+
+    cost_row = summary_rows(reg).get("POL-OPS-COST")
+    if cost_row is None:
+        v.append("register status summary: POL-OPS-COST row missing")
+    elif not re.search(r"25\s*/\s*10\s*/\s*2", " ".join(cost_row)):
+        v.append("register status summary: POL-OPS-COST numeric column is not "
+                 "'25 / 10 / 2'")
+
+    if not re.search(r"USD\s*25\b", c02):
+        v.append("C02: USD 25 cumulative project cap missing")
+    if not re.search(r"USD\s*10\b", c02):
+        v.append("C02: USD 10 cumulative stage cap missing")
+    if not re.search(r"at most\s*2\b", c02):
+        v.append("C02: 'at most 2' concurrent external model calls missing")
+    return v
+
+
+def no_invented_cutoff_violations(reg_text=None):
+    """Per-project/categorical records must keep numeric_value = UNSET.
+
+    Detects a numeric pilot/coverage/tracing threshold (or a numeric P1–P6
+    value) recorded as a disposition in the register's status summary. It does
+    not scan the intentional invalid fixtures, which stay historical examples.
+    """
+    reg = read(DOCS["c03"]) if reg_text is None else reg_text
+    v = []
+    rows = summary_rows(reg)
+    for rid in UNSET_NUMERIC_IDS:
+        row = rows.get(rid)
+        if row is None:
+            v.append(f"register status summary: record {rid} missing")
+            continue
+        numeric = row[4].strip("* ").strip() if len(row) > 4 else ""
+        if numeric != "UNSET":
+            v.append(f"register status summary: {rid} numeric_value is "
+                     f"{numeric!r}, expected UNSET (no invented cutoff)")
+    return v
+
+
+# --------------------------------------------------------------------------- #
 # main checks
 # --------------------------------------------------------------------------- #
 def check_bundle():
-    for path in (DOCS["c01"], DOCS["c02"], DOCS["c03"], README):
+    link_docs = (DOCS["c01"], DOCS["c02"], DOCS["c03"], README, ADR002,
+                 BASELINE, STEP, HANDOFF, KICKOFF, ROOT_README)
+    for path in link_docs:
         for problem in check_links(path):
             fail(problem)
 
@@ -613,6 +815,23 @@ def check_bundle():
         if dec_seen.get(key, 0) != 1:
             fail(f"C03: expected exactly one decision block {key}, found {dec_seen.get(key, 0)}")
 
+    # Finalized-interview ratification evidence and normative default agreement.
+    for _group, violations, ok_note in (
+        ("ratification", ratification_violations(),
+         "ratification: ADR002 accepted behavioral scope + register statuses "
+         "anchored to the reviewed revision"),
+        ("cost defaults", defaults_violations(),
+         "cost defaults: register and C02 agree on USD 25 / USD 10 / 2"),
+        ("per-project cutoffs", no_invented_cutoff_violations(),
+         "per-project policies: pilot/coverage/tracing numeric values stay UNSET "
+         "(no invented cutoff)"),
+    ):
+        if violations:
+            for x in violations:
+                fail(x)
+        else:
+            note(ok_note)
+
 
 # --------------------------------------------------------------------------- #
 # self-test: negative mutations must be rejected
@@ -689,6 +908,33 @@ def self_test():
     d["answer"]["score"] = 9.0  # outside declared levels 0..2
     expect_reject("C02 score outside declared levels",
                   bool(decision_c02_violations(d, "st")))
+
+    # 7. ratification / normative-default evidence drift
+    adr = read(ADR002)
+    reg = read(DOCS["c03"])
+    c02_text = read(DOCS["c02"])
+
+    expect_reject("ratification drift: ADR002 reviewed revision removed",
+                  bool(ratification_violations(
+                      adr_text=adr.replace(REVIEWED_REVISION, "0" * 40),
+                      reg_text=reg)))
+    expect_reject("ratification drift: accepted record reverted to proposed",
+                  bool(ratification_violations(
+                      adr_text=adr,
+                      reg_text=mutate_summary_cell(reg, "POL-P1", 3, "proposed"))))
+    expect_reject("default drift: register project cap changed",
+                  bool(defaults_violations(
+                      reg_text=reg.replace("project_cap_usd: 25",
+                                           "project_cap_usd: 30"),
+                      c02_text=c02_text)))
+    expect_reject("default drift: C02 stage cap changed",
+                  bool(defaults_violations(
+                      reg_text=reg,
+                      c02_text=c02_text.replace("USD 10", "USD 20"))))
+    expect_reject("cutoff drift: pilot numeric cutoff stood up as a disposition",
+                  bool(no_invented_cutoff_violations(
+                      reg_text=mutate_summary_cell(reg, "POL-OPS-PILOT", 4,
+                                                   "0.95"))))
 
 
 # --------------------------------------------------------------------------- #
