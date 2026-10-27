@@ -1,16 +1,20 @@
 # Handoff — step 00: OpenCode integration and language spike
 
-Status: **partial / blocked**. Step 00 is **not** complete and is **not** ticked
-in [`docs/implementation/README.md`](../README.md). This is a truthful handoff of
-the evidence that exists, plus a **proposed** (not approved) language decision in
+Status: **complete**. Step 00 is **ticked** in
+[`docs/implementation/README.md`](../README.md) after a reassessment against the
+six original acceptance criteria (see "Reassessment against the original six
+criteria" below). On 2026-10-27 the user accepted the runtime-language decision
+(**Python core** with a supported, explicitly authenticated OpenCode V2 HTTP
+integration) — see
 [`docs/decisions/001-runtime-language.md`](../../decisions/001-runtime-language.md).
 No completion is claimed beyond the evidence below.
 
-The real client↔service lifecycle is now **verified for both prototypes on one
-real disposable service** (criteria 1, 2 and 3). Criterion 4 is met through the
+The real client↔service lifecycle is **verified for both prototypes on one real
+disposable service** (criteria 1, 2, 3 and 5). Criterion 4 is met through the
 **direct-OpenRouter fallback that step line 19 explicitly allows**; the native
-route is unexercised and per-question failures remain mock-only. The language
-decision stays **proposed**, and the application stays unbuilt — step 00 is a
+route is unexercised and per-question failures remain mock-only. Criterion 6 is
+met as written (no change to ordinary coding sessions; global/ancestor
+inheritance risks documented). The application stays unbuilt — step 00 is a
 spike, not production.
 
 ## Scope and baseline used
@@ -23,12 +27,15 @@ spike, not production.
   `spikes/runtime/integration/` and folds the previously separate service harness
   and Basic-auth compatibility work into one checkout. The earlier
   documentation-only handoff was consumed at `94fd89c`; that base is superseded.
-- **Decision revisions used:** the language decision is the *proposed*
-  `docs/decisions/001-runtime-language.md`; it is **not accepted**, so the stack
-  is **not ratified**. No other decision record applies.
+- **Decision revisions used:** at the time of the spike the language decision
+  (`docs/decisions/001-runtime-language.md`) was *proposed*; the user **accepted**
+  it on 2026-10-27 (**Python core**), so the runtime language is now ratified. No
+  other decision record applies.
 - This session adds code under `spikes/runtime/integration/` and updates this
-  handoff, the ADR evidence, and the step-00 annotation. It changes **no**
-  prototype client code (no bug was found that required it).
+  handoff, the ADR evidence, and the step-00 annotation. It also makes the small
+  Python **repair 4** (`opencode_v2.py` and its test) so an errored assistant with
+  no authoritative `idle` reconciles to `unknown`. No other prototype client code
+  and no harness code was changed.
 
 ## Files and interfaces changed in this handoff
 
@@ -45,12 +52,13 @@ spike, not production.
 | `spikes/runtime/python/test_opencode_v2.py` | Updated the errored-assistant expectation and **added a restart regression** (79 cases now). |
 | `spikes/runtime/integration/run_lifecycle.py` | Restart assertion now requires the **explicit** `unknown`/`interrupted`, not merely "≠ success". |
 | `docs/implementation/handoffs/00-runtime-spike.md` | This report (rewritten for the integrated baseline). |
-| `docs/decisions/001-runtime-language.md` | ADR evidence/status updated (**still Proposed**). |
-| `docs/implementation/README.md` | Step-00 annotation updated (**checkbox left unticked**). |
+| `docs/decisions/001-runtime-language.md` | ADR evidence updated (status was *Proposed* at spike time; **accepted** by the user on 2026-10-27 — Python core). |
+| `docs/implementation/README.md` | Step-00 annotation updated (the checkbox was left unticked at spike time; it is ticked after the reassessment below). |
 
 No public interface or migration is introduced. Compatibility implication: none —
 the step-00 code lives only under `spikes/runtime/` and is not wired into any
-application. No prototype client code, harness code, or test was modified.
+application. The only prototype change is the Python **repair 4** above; no other
+prototype client code, no harness code, and no other test was modified.
 
 ## Prototype artefacts (where the evidence lives)
 
@@ -196,20 +204,33 @@ opencode --version ; node --version ; python3 --version   # v2.2.0 ; v24.22.1 ; 
   `test/decisions-critic.test.ts`).
 - Report keys: `observations.<proto>.critic`.
 
-### 6. No access/config changes to ordinary coding sessions; document global/ancestor configuration inheritance risks — **PARTIAL**
+### 6. No access/config changes to ordinary coding sessions; document global/ancestor configuration inheritance risks — **PASS (as written)**
 
-- Evidence: the integration run uses a **unique owned `HARNESS_ROOT`**, the
-  harness's scrubbed child environment, and **owned-only** stop/restart; it never
-  calls `opencode service …` and never reads `~/.local/state/opencode/service.json`.
-  The harness `safety.sh` (31 assertions) proves the ownership/process-identity
-  guards; `test/client-guard.test.ts` proves the TS client never imports
-  `@opencode/client/service`. The Python client ignores `OPENROUTER_API_KEY`.
-- **Global/ancestor config inheritance risk (documented, not proven isolated).**
-  OpenCode merges discovered `opencode.json(c)` and `.opencode/opencode.json(c)`
-  from the current directory through every ancestor. The harness starts the child
-  in `$HARNESS_ROOT/cwd` and refuses roots whose ancestors contain config, which
-  *avoids* the risk; it does not prove isolation against an arbitrary project
-  tree.
+This criterion has two parts: demonstrate no access/config changes to ordinary
+coding sessions, and **document** global/ancestor configuration inheritance
+risks. It does **not** require proving isolation against an arbitrary project
+tree.
+
+- **No ordinary-service change (demonstrated).** `tests/smoke.sh` records the
+  ordinary shared-service state before the run and asserts it is unchanged
+  afterwards: "ordinary service endpoint unchanged" (`opencode service status`)
+  and "ordinary service registration unchanged" (sha256 of
+  `~/.local/state/opencode/service.json`). The integration run uses a **unique
+  owned `HARNESS_ROOT`**, the harness's scrubbed child environment, and
+  **owned-only** stop/restart; it never calls `opencode service …`. The same
+  smoke suite asserts child-env/config containment: no inherited
+  `OPENCODE_CONFIG`/`OPENCHAMBER_*`/`AI_AGENT`, child `HOME` is the scratch home,
+  and no config source outside the scratch root. `safety.sh` case C additionally
+  refuses a root whose ancestor holds `opencode.json`. `test/client-guard.test.ts`
+  proves the TS client never imports `@opencode/client/service`; the Python client
+  ignores `OPENROUTER_API_KEY`.
+- **Global/ancestor config inheritance risk (documented).** OpenCode merges
+  discovered `opencode.json(c)` and `.opencode/opencode.json(c)` from the current
+  directory through every ancestor. The harness starts the child in
+  `$HARNESS_ROOT/cwd` and refuses roots whose ancestors contain config, which
+  *avoids* the risk; the risk itself is documented here and in the harness README
+  as an inheritance risk, not claimed as proven isolation against an arbitrary
+  project tree.
 
 ### Step-00 deliverables
 
@@ -221,7 +242,9 @@ opencode --version ; node --version ; python3 --version   # v2.2.0 ; v24.22.1 ; 
   configuration, isolation: recorded in the prototype and integration READMEs;
   owned-service isolation demonstrated; global config isolation still documented
   as a risk.
-- Language decision: **proposed** in the ADR; not accepted.
+- Language decision: **accepted by the user 2026-10-27** — Python core with a
+  supported, explicitly authenticated OpenCode V2 HTTP integration; TypeScript is
+  retained as reference only. See ADR `001`.
 - Written restart findings: which state persists / whether an in-flight turn
   continues / interruption detection — **answered empirically**: sessions and
   admitted user inputs (and a partial assistant `finish:error`) persist; an
@@ -239,9 +262,10 @@ opencode --version ; node --version ; python3 --version   # v2.2.0 ; v24.22.1 ; 
 - **Retry anomaly:** a same-id retry produced an extra server-side `idle` with no
   user message (no second model call). Recorded as an observation, not a client
   fix.
-- **Open decision:** the language/integration choice (ADR `001`, **Proposed**).
-  Stack not ratified. Step 01 stays blocked until step 00 passes or the user
-  explicitly accepts the partial state and the decision.
+- **Decision resolved:** the language/integration choice (ADR `001`) was accepted
+  by the user on 2026-10-27 (**Python core** with a supported, explicitly
+  authenticated OpenCode V2 HTTP integration); TypeScript is retained as
+  reference only. Step 01 may now begin.
 - The native OpenCode `generate.decisions` route, real `409`/`503`/paging
   behaviour, per-question failures on the live route, and global config isolation
   remain unverified. None of these is by itself an unmet mandatory criterion where
@@ -266,15 +290,39 @@ opencode --version ; node --version ; python3 --version   # v2.2.0 ; v24.22.1 ; 
   The prototype suites write nothing outside their directories; restore any edit
   to the ordinary service's configuration only if one was made — none was.
 
+## Reassessment against the original six criteria
+
+Step 00 was reassessed strictly against the six criteria **as written** in
+`docs/implementation/00-runtime-spike.md` lines 16–21 — not against a stronger
+"prove isolation against an arbitrary project tree" reading that criterion 6 never
+asked for:
+
+| # | Criterion (as written) | Status | Basis |
+| --- | --- | --- | --- |
+| 1 | Closing the CLI does not stop the server-owned task; a second client retrieves the result | **PASS** | real service, both prototypes |
+| 2 | Retrying an admission ID yields one accepted input; admission ≠ completion | **PASS** | real service, both prototypes |
+| 3 | Restarting only the disposable service yields continuation or an explicit unknown/interrupted | **PASS** | real service, both prototypes → explicit `unknown` |
+| 4 | Typed predicate/choice/score and per-question failures via the selected route, **or** a documented direct-OpenRouter fallback with accounting boundary | **PASS** | fallback tested live ($0.00002037 ≤ $0.25); native route unexercised; per-question failures mock-only and disclosed |
+| 5 | Fresh critic context and role/model pinning; a fork is not automatically a clean critic | **PASS** | real metadata, both prototypes; fork-vs-fresh contrasted in mock unit tests |
+| 6 | No access/config changes to ordinary coding sessions; **document** global/ancestor inheritance risks | **PASS** | `smoke.sh` asserts ordinary endpoint + registration unchanged and env/config contained; `safety.sh` case C refuses an ancestor-config root; the risk is documented |
+
+All six are evidenced, with the limits stated honestly (the model transport is a
+fixture; the native decision route and live per-question failures are unexercised;
+config inheritance is documented rather than proven against an arbitrary tree). On
+that basis the plan index ticks step 00, and the user accepted the language
+decision.
+
 ## Exact next actions
 
-1. Decide criterion 4's route explicitly: accept the tested direct-OpenRouter
-   fallback plus its accounting boundary (which line 19 allows) as the chosen
-   route, or authorize a paid native `generate.decisions` verification.
-2. Obtain user disposition of the **proposed** language ADR `001`. Do **not**
-   ratify a stack before that.
-3. Only after step 00 passes (or the user explicitly accepts this partial state)
-   may step 01 (`01-contracts.md`) begin storage/IPC/package-layout decisions.
+1. Begin step 01 (`docs/implementation/01-contracts.md`) — a contracts/decision
+   session before substantial implementation. Its
+   [kickoff](../kickoffs/01-contracts.md) carries the read order and the open user
+   decisions (P1–P6 and friends).
+2. The retained Jev route is the tested direct-OpenRouter fallback plus its
+   accounting boundary (which line 19 allows). The native `generate.decisions`
+   route remains unexercised and is **not** required while that fallback is the
+   chosen route; do not run a native paid verification without explicit user
+   authorization and a budget.
 
 ## Commits
 
