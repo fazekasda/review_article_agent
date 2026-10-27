@@ -2,7 +2,7 @@
 
 ## Status and authority
 
-- **Contract version:** `v3` (draft representation, dated 2026-10-27).
+- **Contract version:** `v3.1` (draft representation, dated 2026-10-27).
 - **Approval state: PROPOSED — approval pending.** The *requirements* below are
   carried over from already-confirmed sources and must not be weakened. The
   *representations* introduced here — record names, field names, field types,
@@ -390,15 +390,17 @@ recorded in the baseline, §5.3).
 | `scope_id` | `id` | M | |
 | `target_ref` | `ref` | M | The exact validated revision. |
 | `result` | `enum{clear, defects_found, blocked}` | M | |
-| `model_calls` | `int` | M | MUST be `0` (read-only). |
+| `repair_passes` | `int` | M | MUST be `0`; read-only forbids edits, not authorized model-based checks. |
 | `performed_at` | `ts` | M | |
 
-Invariants: a `ValidationRecord` adds **no** repair, MUST have `model_calls = 0`,
+Invariants: a `ValidationRecord` adds **no** repair, MUST have `repair_passes = 0`,
 MUST NOT create a `Round`, and MUST NOT increment `consumed_rounds`. A repair
 requested by validation MUST route back to an existing authorized stage, never
 open an unlimited terminal edit loop (spec line 42). Model-created revisions MUST
 NOT reset or bypass any budget; a worker MUST NOT schedule further model calls
-once a budget is `blocked` or work is paused.
+once a budget is `blocked` or work is paused. Separately authorized read-only
+model checks may run subject to the usual rights, cost, and approval gates; they
+cannot perform a repair or replenish the round budget.
 
 ## 6. Machine decisions versus human decisions
 
@@ -474,7 +476,7 @@ answers with an ambiguous global kind):
 | --- | --- | --- | --- |
 | `answer_kind` | `enum{predicate, choice, score}` | M | Exactly one typed answer; `box` excluded. |
 | `wire_type` | `enum{noul, choice, score}` | M | The adapter wire kind (`predicate`→`noul`); persisted for audit. |
-| `probability` | `probability` | M | Present iff `answer_kind = predicate`; the raw `noul` value in `[0,1]` (no boolean, no threshold). |
+| `probability` | `probability` | O | Mandatory iff `answer_kind = predicate`, absent otherwise; the raw `noul` value in `[0,1]` (no boolean, no threshold). |
 | `choice` | `string` | O | Mandatory iff `answer_kind = choice`; MUST be one of the declared `options`. |
 | `score` | `number` | O | Mandatory iff `answer_kind = score`; index within `[0, len(levels)-1]`. |
 | `legend` | `map<string,string>` | O | Present iff `answer_kind = score`; keys MUST be declared level indices (as decimal strings). |
@@ -1012,6 +1014,11 @@ time. → **verdict: blocked** pending reconciliation.
 | Durable storage schema / IPC / package layout | Step-01 **proposal** (step 01 deliverable line 12); SQLite remains a proposal | User | Nothing here is an accepted schema; not a step-02-only decision. |
 
 ## 13. Change history
+
+`v3.1` (2026-10-27, proposed): coordinator's bounded consistency correction
+after two worker repairs. Predicate probability is conditionally mandatory, not
+mandatory for choice/score answers. Read-only validation forbids repairs, not
+separately authorized model checks; it consumes no repair round.
 
 | Version | Date | Change | Status |
 | --- | --- | --- | --- |
