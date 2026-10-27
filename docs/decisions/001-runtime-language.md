@@ -133,7 +133,8 @@ that the official client is TypeScript-first, so Option B reuses the supported
 client instead of maintaining a hand-written HTTP integration, while the
 already-live-verified Jev call is preserved as a Python tool rather than
 discarded. That recommendation is retained here only as the record that was
-considered and rejected (see Decision for the agreed rationale).
+considered and rejected (see Decision for the recorded rationale — coordinator
+analysis, not a stated user motive).
 
 ## Decision
 
@@ -144,17 +145,19 @@ considered and rejected (see Decision for the agreed rationale).
   adapter (`spikes/runtime/live-jev/`) is **retained as the tested** Jev route; the
   native OpenCode `generate.decisions` route remains **unexercised** and is not
   required by step line 19 while the documented fallback is the chosen route.
-- **Rejected option and rationale (recorded).** The step-00 session's
-  TypeScript-core recommendation (Option B) was considered and **not adopted**.
-  A TypeScript core would mean the already-live-verified Python Jev adapter and
-  the scientific/data tooling either move to TypeScript or run as a second
-  process; the user preferred one language for the tooling. The trade-off it
-  accepts is Option A's **hand-maintained HTTP contract cost**: every field must
-  track the experimental OpenAPI, and the official client's envelope handling and
-  generated error `_tag`s are not reused, so drift risk is ours. This is a
-  language/tooling trade-off only: it is **not** a claim that Python is faster,
-  more accurate, or scientifically better, and it changes no scientific
-  requirement.
+- **Rejected option (recorded).** The step-00 session's TypeScript-core
+  recommendation (Option B) was considered and **not adopted**: the user approved
+  the Python implementation (their stated approval was "I approve the Python
+  implementation"), and gave no motive, so none is attributed to them.
+- **Engineering rationale and trade-offs (coordinator analysis, not the user's
+  motive).** A TypeScript core would mean the already-live-verified Python Jev
+  adapter and the scientific/data tooling either move to TypeScript or run as a
+  second process; Option A instead accepts a **hand-maintained HTTP contract
+  cost** — every field must track the experimental OpenAPI, and the official
+  client's envelope handling and generated error `_tag`s are not reused, so drift
+  risk is ours. This is a language/tooling trade-off only: it is **not** a claim
+  that Python is faster, more accurate, or scientifically better, and it changes
+  no scientific requirement.
 - **Scope:** runtime/integration language and client only. It decides nothing
   about the store schema (SQLite remains a *proposal*, `docs/specification.md`
   line 16), IPC, package layout, CLI spelling (step 02), or agent-framework

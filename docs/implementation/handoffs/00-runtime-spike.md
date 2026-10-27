@@ -191,8 +191,9 @@ opencode --version ; node --version ; python3 --version   # v2.2.0 ; v24.22.1 ; 
   **`$0.00002037`** (provider-reported) against a `$0.25` ceiling. Verified
   separately; this task made **no** paid calls.
 - **Native OpenCode `generate.decisions` route: not exercised** (would be a paid
-  call). It is not required by line 19 provided the documented fallback is the
-  chosen route — which remains a **user decision** recorded in the ADR.
+  call). It is not required by line 19 while the documented fallback is the
+  retained route; exercising the native route later would need explicit user
+  authorization and a budget.
 
 ### 5. Fresh critic context and role/model pinning; a writer-history fork is not a clean critic — **PASS (real metadata, both prototypes)**
 
