@@ -28,8 +28,8 @@ Commands:
   discover   Print the app-owned instance descriptor (auth passwordFile path).
   info       Print the live /api/info document.
   contract   Capture the live OpenAPI document + print version summary.
-  cleanup    Stop and delete the whole scratch tree.
-  selftest   Run tests/smoke.sh end to end.
+  cleanup    Stop and delete the whole scratch tree (harness-owned only).
+  selftest   Run tests/smoke.sh and tests/safety.sh end to end.
 
 Environment overrides:
   HARNESS_ROOT          scratch root (default: ${TMPDIR:-/tmp}/opencode/spike-harness)
@@ -64,7 +64,10 @@ PY
 }
 
 cmd_selftest() {
-  bash "$HERE/tests/smoke.sh"
+  local rc=0
+  bash "$HERE/tests/smoke.sh" || rc=1
+  bash "$HERE/tests/safety.sh" || rc=1
+  return "$rc"
 }
 
 case "${1:-}" in

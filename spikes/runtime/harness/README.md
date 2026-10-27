@@ -16,6 +16,7 @@ call.
 | `harness.sh` | Lifecycle CLI: `start`, `stop`, `restart`, `status`, `discover`, `info`, `contract`, `cleanup`, `selftest`. |
 | `lib.sh` | Shared lifecycle/isolation functions (sourced by the CLI and tests). |
 | `tests/smoke.sh` | Success / error / cleanup / isolation tests (28 assertions). |
+| `tests/safety.sh` | Non-destructive ownership / process-identity guard tests (31 assertions). |
 | `contract/opencode-v2-session-contract.md` | Curated admission-ID / receipt / retrieval contract for the TS and Python prototypes. |
 
 ## Usage
@@ -28,8 +29,8 @@ bash harness.sh contract        # fetch /openapi.json, print version summary
 bash harness.sh restart         # replace process, keep data (durability)
 bash harness.sh status
 bash harness.sh stop
-bash harness.sh cleanup         # stop + delete the whole scratch tree
-bash harness.sh selftest        # run tests/smoke.sh
+bash harness.sh cleanup         # stop + delete the harness-owned scratch tree
+bash harness.sh selftest        # run tests/smoke.sh and tests/safety.sh
 ```
 
 Overrides: `HARNESS_ROOT` (default `${TMPDIR:-/tmp}/opencode/spike-harness`) and
@@ -58,9 +59,14 @@ Overrides: `HARNESS_ROOT` (default `${TMPDIR:-/tmp}/opencode/spike-harness`) and
    `~/.config/opencode`, `~/.local/share/opencode`, or
    `~/.local/state/opencode`.
 4. **cwd outside repository ancestors.** The server runs in
-   `$HARNESS_ROOT/cwd` (e.g. `/tmp/opencode/spike-harness/cwd`). `harness.sh`
-   refuses to start if `$HARNESS_ROOT` is inside the repository or is an ancestor
-   of it, and if it overlaps the ordinary OpenCode locations.
+   `$HARNESS_ROOT/cwd` (e.g. `/tmp/opencode/spike-harness/cwd`). Every mutating
+   operation runs `harness_assert_root_safe` first, which refuses a symlinked root,
+   a root equal to `/`, `/tmp`, `/home`, or `$HOME`, a root that overlaps the
+   repository or a protected path (`$HOME/.config`, `$HOME/.local`,
+   `$HOME/.cache`, `/etc`, `/usr`, `/var`, the ordinary OpenCode locations), and
+   any root whose ancestors already contain `opencode.json(c)`, `.opencode/`, or
+   `AGENTS.md` (ancestor config/instruction discovery risk). It never creates
+   anything before these checks pass.
 5. **Loopback + auth.** Binds `127.0.0.1` only. `OPENCODE_PASSWORD` is a random
    per-run secret written to `$HARNESS_ROOT/run/password` (mode 600); HTTP Basic
    user is `opencode`. Unauthenticated and wrong-password requests get `401`.
@@ -74,6 +80,34 @@ Overrides: `HARNESS_ROOT` (default `${TMPDIR:-/tmp}/opencode/spike-harness`) and
    subscription is opened, and no `/generate` endpoint is called. Tests only
    create a session, admit a prompt envelope, and read it back. Verified: the
    isolated log shows **zero** model/generate/assistant activity after admission.
+
+### Repair 1 — ownership and process-identity guards
+
+The first version had an unguarded `rm -rf "$HARNESS_ROOT"` in cleanup and a
+`kill -0`-only stop, so a pre-existing unrelated directory (or a tampered PID
+record) could be deleted or signalled. The current harness adds:
+
+* **Ownership marker.** Creating a root writes `$HARNESS_ROOT/.harness-owned.json`
+  (mode 600) with `{kind, markerVersion, root, ownerUid, instanceId, createdAtMs}`
+  and `chmod 700` on the root. `start` refuses a pre-existing **unowned** root;
+  `cleanup` refuses to `rm -rf` anything whose marker is missing, whose recorded
+  `root` differs from the canonical path, or whose `ownerUid` is not the current
+  user. `rm -rf` runs on the canonical (symlink-free) path only, and a symlinked
+  root is refused outright.
+* **Process identity beyond PID.** Each start records
+  `run/instance.pid.json` = `{pid, starttime, exe, cwd, home, port, passwordSha256,
+  instanceId}`. Before sending any signal, the harness requires the live
+  `/proc/<pid>` to match **all** of: `starttime` (guards PID reuse), `exe`
+  (`/proc/<pid>/exe` → the exact opencode binary), `cwd` (our `$HARNESS_ROOT/cwd`),
+  `HOME` (our scratch home), and the per-run `OPENCODE_PASSWORD` (exact match).
+  A `stopped` (dead PID) record is cleared without signalling anyone; a **foreign**
+  (live but mismatched) record makes `stop` and `cleanup` refuse.
+* **Concurrency exclusion.** All mutating operations take `flock` on
+  `$HARNESS_ROOT.lock`. The spawned server is launched with the lock fd closed
+  (`9>&-`) so it does not inherit and hold the lock after the CLI exits.
+* **Same guards on every mutation.** `start`, `stop`, `restart`, and `cleanup`
+  each call `harness_assert_root_safe`, take the lock, and (for stop/cleanup)
+  require the ownership marker; `restart` is `stop` + `start` under one lock.
 
 ## Findings
 
@@ -138,14 +172,25 @@ behind explicit budget authorization.
 ```
 $ bash spikes/runtime/harness/tests/smoke.sh
 == summary: 28 passed, 0 failed ==
+$ bash spikes/runtime/harness/tests/safety.sh
+== summary: 31 passed, 0 failed ==
+$ bash spikes/runtime/harness/harness.sh selftest   # both suites
 ```
 
-Covers: auth success/401, loopback bind, environment scrubbing
+`tests/smoke.sh` covers: auth success/401, loopback bind, environment scrubbing
 (`/proc/<pid>/environ`), config-source containment, admission receipt + retry
 idempotency, typed errors (400/404), restart durability, cleanup/port release,
 and non-interference (ordinary endpoint URL and registration hash unchanged).
-An unsafe `HARNESS_ROOT` (inside the repo / ancestor of it) is rejected with no
-artefacts left behind.
+
+`tests/safety.sh` (non-destructive, private scratch base) covers: an unowned
+non-empty root refused by start **and** cleanup with its sentinel intact; a
+symlinked root refused with the target untouched; an ancestor `opencode.json`
+refused; a `$HOME/.config` root refused with nothing created; a **tampered PID
+record must not signal an unrelated process** (unrelated `sleep` and the real
+instance both survive; cleanup then refuses while the foreign record stands); a
+stale/dead PID cleaned without signalling anyone; owned cleanup removing only the
+owned tree (sibling preserved); and the concurrency lock making `start` wait for
+a held lock.
 
 ## Limitations
 
