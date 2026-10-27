@@ -26,7 +26,9 @@ What it guarantees
   **only** when ``require_storage_allowed`` passes; raw or missing-storage-right
   content is rejected. A fully validated record whose storage is ``unknown`` may
   still be persisted as **metadata only** via :meth:`ArtifactRepository.store_rights_record`
-  (the C03 §5.2 quarantine path) — never with its bytes.
+  (the C03 §5.2 quarantine path) — never with its bytes. A **superseded** record
+  (a newer ``record_revision`` for the same ``rights_id`` exists) can never
+  authorize a new import — fail closed — while old revisions stay readable.
 * **Exact, same-project dependencies (C01 §5.5).** Each dependency is an exact
   ``RefRevision`` (optionally typed by a C01 role, default ``derived_from``) that
   must already exist in this project; the edge graph is persisted for later
@@ -593,11 +595,27 @@ class ArtifactRepository:
         written. With a ref, ``revision_id`` may be omitted and is then derived
         from the record's bound subject (never a random unbound id).
 
+        **Superseded rights fail closed.** If a newer ``record_revision`` exists
+        for the same ``{project_id, rights_id}``, an older record cannot authorize
+        a **new** import even if it previously allowed storage (a fresh operation
+        must not rely on superseded rights). Old revisions stay stored and
+        readable, so history and backups remain honest; a stale reference is never
+        silently rebound. This applies to both the raw and ref paths.
+
         ``parent_revision_id`` names the exact revision this edit is based on. A
         later revision MUST name the artifact's **current head** as its parent
         (a stale/absent parent is refused, so no lost edit), and a first revision
         MUST name none. All arguments are validated and the whole write is one
         transaction; a failure leaves no rows behind.
+
+        **Provenance / idempotency.** ``provenance`` (when given) is a four-field
+        object ``{method, actor, performed_at, origin}`` whose ``origin`` MUST
+        equal ``origin_locator`` — the source origin is represented once, so no
+        separate untracked provenance origin exists. Caller-supplied
+        ``acquired_at_utc`` and ``provenance.performed_at`` are matched exactly
+        against a reused revision on any replay/shortcut (a changed explicit
+        timestamp conflicts); generated ``now()`` timestamps are intentionally
+        excluded from idempotency.
         """
         conn = self._assert_open()
         # ---- structural validation (before the transaction) ---------------- #
@@ -631,6 +649,11 @@ class ArtifactRepository:
             provenance, origin_locator=origin_locator, acquired_by=acquired_by,
             performed_at=acquired_at,
         )
+        # Generated ``now()`` values are intentionally ignored by idempotency;
+        # a *caller-supplied* acquired/performed timestamp must be reproduced
+        # exactly on any replay/shortcut or it conflicts (checked vs stored row).
+        acquired_at_explicit = acquired_at_utc is not None
+        provenance_explicit = provenance is not None
 
         # Normalize rights. A raw record needs revision_id so its subject can
         # bind this exact revision; a stored ref is resolved and re-validated
@@ -684,6 +707,14 @@ class ArtifactRepository:
                 ) = self._resolve_rights_ref_for_import(
                     ref_for_import, artifact_id, revision_id
                 )
+            # Fail closed on superseded rights: a NEW import operation may not use
+            # a rights record that a newer record_revision for the same
+            # {project_id, rights_id} has superseded, even if it previously
+            # allowed storage. Old revisions stay stored/readable (honest
+            # history; backups keep them), but they cannot authorize new bytes.
+            # This runs for BOTH raw and ref paths, before any shortcut or write.
+            self._assert_rights_not_superseded(rights_ref)
+
             # Immutable rights identity: same
             # {project_id, rights_id, record_revision} with **different canonical
             # bytes** is a conflict — detected BEFORE any duplicate shortcut so a
@@ -734,6 +765,10 @@ class ArtifactRepository:
                         artifact_id, prior["revision_id"]
                     )
                     if existing is not None:
+                        self._assert_explicit_timestamps_match(
+                            existing, acquired_at_explicit, acquired_at,
+                            provenance_explicit, prov_at,
+                        )
                         return self._revision_with_deps(existing)
 
             # (2) resolve to an existing identical revision: by explicit id, else
@@ -754,6 +789,13 @@ class ArtifactRepository:
                 matched = self._find_duplicate(artifact_id, content_sha, signature)
 
             if matched is not None:
+                # A caller-supplied acquired/performed timestamp must be
+                # reproduced exactly on the matched revision (generated now() is
+                # ignored); a changed explicit timestamp conflicts.
+                self._assert_explicit_timestamps_match(
+                    matched, acquired_at_explicit, acquired_at,
+                    provenance_explicit, prov_at,
+                )
                 # A NEW request key that resolves to an existing identical
                 # revision must be bound atomically, so a later divergent reuse
                 # of that key is rejected (never silently accepted).
@@ -989,6 +1031,14 @@ class ArtifactRepository:
         actor = _require_nonempty_str(provenance["actor"], "provenance.actor")
         at = _require_timestamp(provenance["performed_at"], "provenance.performed_at")
         origin = _require_nonempty_str(provenance["origin"], "provenance.origin")
+        # The source origin is represented once (as ``origin_locator``). Refusing
+        # a divergent ``provenance.origin`` keeps a no-request duplicate from
+        # silently dropping a changed origin, without a second untracked column.
+        if origin != origin_locator:
+            raise RecordValidationError(
+                "provenance.origin must equal origin_locator; the source origin is "
+                "represented once (no separate untracked provenance origin)."
+            )
         return method, actor, at, origin
 
     def _fingerprint(self, **kwargs: object) -> str:
@@ -1112,6 +1162,57 @@ class ArtifactRepository:
             " created_at_utc) VALUES (?, ?, ?, ?, ?, ?)",
             (self.project_id, request_id, fingerprint, artifact_id, revision_id, _utc_now()),
         )
+
+    def _assert_rights_not_superseded(self, rights_ref: RightsRef) -> None:
+        """Reject a rights record that a newer revision for its id supersedes.
+
+        Fail closed: once a newer ``record_revision`` exists for the same
+        ``{project_id, rights_id}``, an older record cannot authorize a **new**
+        import even if it previously allowed storage. Old revisions remain stored
+        and readable (history is preserved for backup/audit).
+        """
+        row = self._assert_open().execute(
+            "SELECT MAX(record_revision) AS newest FROM rights_record "
+            "WHERE project_id = ? AND rights_id = ?",
+            (rights_ref.project_id, rights_ref.rights_id),
+        ).fetchone()
+        newest = row["newest"] if row is not None else None
+        if newest is not None and rights_ref.record_revision < newest:
+            raise ArtifactConflictError(
+                f"rights record {rights_ref.rights_id!r} revision "
+                f"{rights_ref.record_revision} is superseded by revision {newest}; "
+                f"a superseded rights record cannot authorize a new import."
+            )
+
+    def _assert_explicit_timestamps_match(
+        self,
+        row: sqlite3.Row,
+        acquired_at_explicit: bool,
+        acquired_at: str,
+        provenance_explicit: bool,
+        prov_at: str,
+    ) -> None:
+        """Fail closed when a *caller-supplied* timestamp differs from stored.
+
+        Generated ``now()`` values are not compared (they are intentionally
+        excluded from idempotency); only explicitly supplied ``acquired_at_utc``
+        and ``provenance.performed_at`` are matched against the stored revision.
+        """
+        if acquired_at_explicit and row["acquired_at_utc"] != acquired_at:
+            raise ArtifactConflictError(
+                "acquired_at_utc differs from the stored revision for the same "
+                "request/revision; an explicit acquisition time must be reproduced "
+                "exactly."
+            )
+        if (
+            provenance_explicit
+            and row["provenance_performed_at_utc"] != prov_at
+        ):
+            raise ArtifactConflictError(
+                "provenance.performed_at differs from the stored revision for the "
+                "same request/revision; an explicit provenance time must be "
+                "reproduced exactly."
+            )
 
     def _find_duplicate(
         self, artifact_id: str, content_sha: str, signature: dict

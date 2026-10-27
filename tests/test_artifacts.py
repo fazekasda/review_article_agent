@@ -814,6 +814,184 @@ class IdempotencyFingerprintTest(ArtifactTestBase):
             self.assertEqual(len(repo.list_revisions("a")), 1)
 
 
+class SupersededRightsTest(ArtifactTestBase):
+    """A superseded rights record cannot authorize a new import (fail closed)."""
+
+    def _allowed(self, store, record_revision):
+        return _valid_rights(
+            store.project_id, "a", "r1",
+            rights_id="RIGHTS-x", record_revision=record_revision,
+        )
+
+    def _storage(self, record, status, basis_kind="unknown"):
+        record = dict(record)
+        record["operations"] = dict(record["operations"])
+        record["operations"]["storage"] = status
+        record["basis"] = dict(record["basis"])
+        record["basis"]["storage"] = {"kind": basis_kind, "evidence": {"ref": "", "provenance": ""}}
+        return record
+
+    def test_ref_to_superseded_allowed_record_rejected(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            ref1 = repo.store_rights_record(self._allowed(store, 1))  # formerly allowed
+            # A newer record revision for the same rights id revokes storage.
+            repo.store_rights_record(
+                self._storage(self._allowed(store, 2), "not_allowed")
+            )
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"after-revocation",
+                    origin_locator="synthetic", rights=ref1,
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) FROM import_request").fetchone()[0], 0
+            )
+            # Historical rights data is preserved and readable.
+            self.assertEqual(repo.get_rights_record(ref1)["record_revision"], 1)
+
+    def test_raw_old_while_newer_exists_rejected(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            repo.store_rights_record(self._allowed(store, 1))
+            repo.store_rights_record(
+                self._storage(self._allowed(store, 2), "not_allowed")
+            )
+            old_raw = self._allowed(store, 1)
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=old_raw,
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+
+    def test_newest_allowed_record_imports(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            repo.store_rights_record(self._allowed(store, 1))
+            ref2 = repo.store_rights_record(self._allowed(store, 2))  # newest, allowed
+            rev = repo.import_revision(
+                artifact_id="a", revision_id="r1", content=b"authorized",
+                origin_locator="synthetic", rights=ref2,
+            )
+            self.assertEqual(rev.rights_ref.record_revision, 2)
+            self.assertEqual(repo.read_content("a", "r1"), b"authorized")
+
+    def test_newest_unknown_record_blocked(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            repo.store_rights_record(self._allowed(store, 1))
+            ref2 = repo.store_rights_record(
+                self._storage(self._allowed(store, 2), "unknown")
+            )
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=ref2,
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+
+
+class ExplicitProvenanceTest(ArtifactTestBase):
+    """Explicit timestamps are replayed exactly; provenance.origin is strict."""
+
+    def test_explicit_acquired_at_exact_retry_ok_changed_conflicts(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            first = repo.import_revision(
+                artifact_id="a", revision_id="r1", content=b"x",
+                origin_locator="synthetic",
+                rights=_valid_rights(store.project_id, "a", "r1"),
+                request_id="req-t", acquired_at_utc="2026-10-27T05:00:00Z",
+            )
+            again = repo.import_revision(
+                artifact_id="a", revision_id="r1", content=b"x",
+                origin_locator="synthetic",
+                rights=_valid_rights(store.project_id, "a", "r1"),
+                request_id="req-t", acquired_at_utc="2026-10-27T05:00:00Z",
+            )
+            self.assertEqual(again.revision_id, first.revision_id)
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "a", "r1"),
+                    request_id="req-t", acquired_at_utc="2026-10-27T06:00:00Z",
+                )
+            self.assertEqual(len(repo.list_revisions("a")), 1)
+
+    def test_explicit_performed_at_exact_retry_ok_changed_conflicts(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+
+            def prov(at):
+                return {"method": "import", "actor": "actor-a", "performed_at": at,
+                        "origin": "synthetic"}
+
+            first = repo.import_revision(
+                artifact_id="a", revision_id="r1", content=b"x",
+                origin_locator="synthetic",
+                rights=_valid_rights(store.project_id, "a", "r1"),
+                request_id="req-p", provenance=prov("2026-10-27T05:00:00Z"),
+            )
+            again = repo.import_revision(
+                artifact_id="a", revision_id="r1", content=b"x",
+                origin_locator="synthetic",
+                rights=_valid_rights(store.project_id, "a", "r1"),
+                request_id="req-p", provenance=prov("2026-10-27T05:00:00Z"),
+            )
+            self.assertEqual(again.revision_id, first.revision_id)
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "a", "r1"),
+                    request_id="req-p", provenance=prov("2026-10-27T06:00:00Z"),
+                )
+
+    def test_explicit_acquired_at_conflicts_on_duplicate_shortcut(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            repo.import_revision(
+                artifact_id="a", revision_id="r1", content=b"x",
+                origin_locator="synthetic",
+                rights=_valid_rights(store.project_id, "a", "r1"),
+                acquired_at_utc="2026-10-27T05:00:00Z",
+            )
+            # No request id: the duplicate shortcut must still compare the
+            # explicitly supplied acquisition time against the stored row.
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "a", "r1"),
+                    acquired_at_utc="2026-10-27T06:00:00Z",
+                )
+
+    def test_provenance_origin_must_equal_origin_locator(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="origin-a",
+                    rights=_valid_rights(store.project_id, "a", "r1"),
+                    provenance={"method": "import", "actor": "a",
+                                "performed_at": "2026-10-27T05:00:00Z",
+                                "origin": "origin-b"},
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+
+
 class IdempotencyBoundaryTest(ArtifactTestBase):
     """Duplicate/replay shortcuts must compare ALL meaningful inputs."""
 
