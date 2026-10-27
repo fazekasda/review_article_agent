@@ -548,5 +548,445 @@ class MigrationTest(ArtifactTestBase):
             ProjectStore.open_at(paths.app_dir_for(str(self.tmp / "p")))
 
 
+def _pre_acquisition_rights(project_id, artifact_id, **overrides):
+    """A valid pre-acquisition RightsRecord (subject_artifact_ref, no revision)."""
+    ops = {op: "unknown" for op in _OPS}
+    record = {
+        "rights_id": overrides.pop("rights_id", "RIGHTS-pre-1"),
+        "project_id": project_id,
+        "record_revision": overrides.pop("record_revision", 1),
+        "subject": {
+            "kind": "subject_artifact_ref",
+            "project_id": project_id,
+            "artifact_id": artifact_id,
+        },
+        "operations": ops,
+        "basis": {
+            op: {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
+            for op in _OPS
+        },
+        "authorization": None,
+        "restrictions": [],
+        "privacy": {"personal_data": False, "confidentiality": "unknown", "denial": False},
+        "recorded_by": "agent:recorder",
+        "recorded_at": "2026-10-27T00:00:00Z",
+        "derived_status": "valid",
+    }
+    record.update(overrides)
+    return record
+
+
+class RightsRefImportTest(ArtifactTestBase):
+    """Every import path must fully validate rights for THIS exact revision."""
+
+    def _stored_ref(self, repo, artifact_id, revision_id, **changes):
+        rights = _valid_rights(repo.project_id, artifact_id, revision_id)
+        rights.update(changes)
+        return repo.store_rights_record(rights)
+
+    def test_ref_with_unknown_storage_rejected_no_bytes(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            art = repo.create_artifact("a", kind="document")
+            rights = _valid_rights(store.project_id, "a", "r1")
+            rights["operations"]["storage"] = "unknown"
+            rights["basis"]["storage"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
+            ref = repo.store_rights_record(rights)
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a",
+                    revision_id="r1",
+                    content=b"not-authorized",
+                    origin_locator="synthetic",
+                    rights=ref,
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+            self.assertIsNone(repo.get_revision("a", "r1"))
+
+    def test_ref_with_not_allowed_storage_rejected(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            rights = _valid_rights(store.project_id, "a", "r1")
+            rights["operations"]["storage"] = "not_allowed"
+            rights["basis"]["storage"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
+            ref = repo.store_rights_record(rights)
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=ref,
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+
+    def test_ref_with_privacy_denial_rejected(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            rights = _valid_rights(store.project_id, "a", "r1")
+            rights["privacy"]["denial"] = True
+            ref = repo.store_rights_record(rights)
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=ref,
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+
+    def test_ref_for_other_revision_or_artifact_rejected(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            repo.create_artifact("b", kind="document")
+            ref_r2 = self._stored_ref(repo, "a", "r2")   # bound to r2
+            ref_b = self._stored_ref(repo, "b", "r1")    # bound to artifact b
+            # Wrong revision id for this ref's subject.
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=ref_r2,
+                )
+            # Ref bound to a different artifact.
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=ref_b,
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+
+    def test_ref_cross_project_rejected(self) -> None:
+        with self.new_store("a") as store_a, self.new_store("b") as store_b:
+            repo_a = self.repo_for(store_a)
+            repo_b = self.repo_for(store_b)
+            repo_a.create_artifact("a", kind="document")
+            ref = repo_a.store_rights_record(_valid_rights(store_a.project_id, "a", "r1"))
+            with self.assertRaises(RecordValidationError):
+                repo_b.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=ref,
+                )
+            self.assertEqual(repo_b.list_revisions("a"), [])
+
+    def test_ref_bool_record_revision_rejected(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            bad = {"project_id": store.project_id, "rights_id": "RIGHTS-1", "record_revision": True}
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=bad,
+                )
+            # A pre-built RightsRef with a bool revision is refused too.
+            with self.assertRaises(RecordValidationError):
+                repo.get_rights_record(RightsRef(store.project_id, "RIGHTS-1", True))
+
+    def test_ref_omitting_revision_id_derives_bound_id(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            ref = repo.store_rights_record(_valid_rights(store.project_id, "a", "r-bound"))
+            rev = repo.import_revision(
+                artifact_id="a", content=b"bytes", origin_locator="synthetic",
+                rights=ref,  # no revision_id: derive from the bound subject
+            )
+            self.assertEqual(rev.revision_id, "r-bound")
+            self.assertEqual(repo.read_content("a", "r-bound"), b"bytes")
+
+    def test_metadata_pre_acquisition_subject_artifact_ref(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            art = repo.create_artifact("a", kind="document")
+            ref = repo.store_rights_record(_pre_acquisition_rights(store.project_id, "a"))
+            stored = repo.get_rights_record(ref)
+            self.assertEqual(stored["subject"]["kind"], "subject_artifact_ref")
+            self.assertNotIn("revision_id", stored["subject"])
+            # Pre-acquisition metadata cannot authorize content bytes.
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=ref,
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+
+
+class ParentFreshnessTest(ArtifactTestBase):
+    def test_stale_parent_edit_denied_no_rows(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            self.import_document(repo, "a", b"r1", rights_revision="r1")
+            self.import_document(repo, "a", b"r2", rights_revision="r2", parent_revision_id="r1")
+            with self.assertRaises(RecordValidationError):
+                self.import_document(
+                    repo, "a", b"r3", rights_revision="r3", parent_revision_id="r1"
+                )
+            self.assertEqual(len(repo.list_revisions("a")), 2)
+            self.assertEqual(repo.current_revision("a").revision_id, "r2")
+
+    def test_second_revision_requires_current_parent(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            self.import_document(repo, "a", b"r1", rights_revision="r1")
+            with self.assertRaises(RecordValidationError):
+                self.import_document(repo, "a", b"r2", rights_revision="r2")
+            self.assertEqual(len(repo.list_revisions("a")), 1)
+
+    def test_first_revision_must_not_name_parent(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            with self.assertRaises(RecordValidationError):
+                self.import_document(
+                    repo, "a", b"x", rights_revision="r1", parent_revision_id="r0"
+                )
+            self.assertEqual(repo.list_revisions("a"), [])
+
+    def test_idempotent_replay_before_head_returns_historical(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            r1 = self.import_document(
+                repo, "a", b"one", rights_revision="r1", request_id="req-1"
+            )
+            self.import_document(
+                repo, "a", b"two", rights_revision="r2", parent_revision_id="r1"
+            )
+            # Replaying the r1 request after a new head returns the historical r1.
+            again = self.import_document(
+                repo, "a", b"one", rights_revision="r1", request_id="req-1"
+            )
+            self.assertEqual(again.revision_id, r1.revision_id)
+            self.assertEqual(repo.current_revision("a").revision_id, "r2")
+
+    def test_duplicate_replay_after_later_revision_returns_historical(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            r1 = self.import_document(repo, "a", b"one", rights_revision="r1")
+            self.import_document(
+                repo, "a", b"two", rights_revision="r2", parent_revision_id="r1"
+            )
+            # Identical import of r1's payload (no request id) reuses historical r1.
+            again = self.import_document(repo, "a", b"one", rights_revision="r1")
+            self.assertEqual(again.revision_id, r1.revision_id)
+            self.assertEqual(len(repo.list_revisions("a")), 2)
+
+
+class IdempotencyFingerprintTest(ArtifactTestBase):
+    def test_rights_changed_on_same_request_conflicts(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            first = _valid_rights(store.project_id, "a", "r1")
+            repo.import_revision(
+                artifact_id="a", revision_id="r1", content=b"x",
+                origin_locator="synthetic", rights=first, request_id="req-x",
+            )
+            changed = _valid_rights(store.project_id, "a", "r1")
+            changed["restrictions"] = ["quote_limit"]
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=changed, request_id="req-x",
+                )
+            self.assertEqual(len(repo.list_revisions("a")), 1)
+
+    def test_provenance_changed_on_same_request_conflicts(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            rights = _valid_rights(store.project_id, "a", "r1")
+            repo.import_revision(
+                artifact_id="a", revision_id="r1", content=b"x",
+                origin_locator="synthetic", rights=rights, request_id="req-p",
+                provenance={"method": "import", "actor": "actor-a",
+                            "performed_at": "2026-10-27T00:00:00Z", "origin": "synthetic"},
+            )
+            with self.assertRaises(ArtifactConflictError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic", rights=rights, request_id="req-p",
+                    provenance={"method": "import", "actor": "actor-b",
+                                "performed_at": "2026-10-27T00:00:00Z", "origin": "synthetic"},
+                )
+            self.assertEqual(len(repo.list_revisions("a")), 1)
+
+
+class ReturnedDependenciesTest(ArtifactTestBase):
+    def test_returned_dependencies_populated(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            base = repo.create_artifact("base", kind="document")
+            base_rev = self.import_document(repo, "base", b"base", rights_revision="rb")
+            derived = repo.create_artifact("derived", kind="finding")
+            rev = repo.import_revision(
+                artifact_id="derived",
+                content=b"out",
+                origin_locator="synthetic",
+                rights=_valid_rights(store.project_id, "derived", "rd"),
+                revision_id="rd",
+                dependencies=[
+                    {"project_id": store.project_id, "artifact_id": "base",
+                     "revision_id": base_rev.revision_id}
+                ],
+            )
+            self.assertEqual(len(rev.dependencies), 1)
+            dep = rev.dependencies[0]
+            self.assertEqual((dep.artifact_id, dep.revision_id, dep.role),
+                             ("base", base_rev.revision_id, "derived_from"))
+            # Also populated from the read API.
+            self.assertEqual(len(repo.get_revision("derived", "rd").dependencies), 1)
+
+
+class DependencyRoleTest(ArtifactTestBase):
+    def _revision(self, repo, artifact_id, kind, content, revision_id, **kwargs):
+        repo.create_artifact(artifact_id, kind=kind)
+        return repo.import_revision(
+            artifact_id=artifact_id,
+            content=content,
+            origin_locator="synthetic",
+            rights=_valid_rights(repo.project_id, artifact_id, revision_id),
+            revision_id=revision_id,
+            **kwargs,
+        )
+
+    def _dep(self, store, artifact_id, revision_id, role):
+        return {"project_id": store.project_id, "artifact_id": artifact_id,
+                "revision_id": revision_id, "role": role}
+
+    def test_reports_must_target_study(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            study = self._revision(repo, "S", "study", b"s", "rs")
+            doc = self._revision(repo, "D2", "document", b"d2", "rd")
+            # Valid: document reports a study.
+            self._revision(repo, "D", "document", b"d", "rd1",
+                           dependencies=[self._dep(store, "S", study.revision_id, "reports")])
+            # Invalid: reports a document.
+            repo.create_artifact("X", kind="document")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="X", content=b"x", origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "X", "rx"),
+                    revision_id="rx",
+                    dependencies=[self._dep(store, "D2", doc.revision_id, "reports")],
+                )
+
+    def test_uses_dataset_must_target_dataset(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            ds = self._revision(repo, "DS", "dataset", b"ds", "rds")
+            self._revision(repo, "U", "document", b"u", "ru",
+                           dependencies=[self._dep(store, "DS", ds.revision_id, "uses_dataset")])
+            doc = self._revision(repo, "DOC", "document", b"doc", "rdoc")
+            repo.create_artifact("U2", kind="finding")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="U2", content=b"u2", origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "U2", "ru2"), revision_id="ru2",
+                    dependencies=[self._dep(store, "DOC", doc.revision_id, "uses_dataset")],
+                )
+
+    def test_describes_experiment_must_target_experiment(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            ex = self._revision(repo, "EX", "experiment", b"ex", "rex")
+            self._revision(repo, "D3", "document", b"d3", "rd3",
+                           dependencies=[self._dep(store, "EX", ex.revision_id, "describes_experiment")])
+            doc = self._revision(repo, "DOC2", "document", b"doc2", "rdoc2")
+            repo.create_artifact("D4", kind="document")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="D4", content=b"d4", origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "D4", "rd4"), revision_id="rd4",
+                    dependencies=[self._dep(store, "DOC2", doc.revision_id, "describes_experiment")],
+                )
+
+    def test_version_of_must_be_same_artifact(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            a1 = self._revision(repo, "A", "document", b"a1", "ra1")
+            other = self._revision(repo, "B", "document", b"b", "rb")
+            # Same artifact, older revision -> valid (parent is the fresh head).
+            self._revision(repo, "A", "document", b"a2", "ra2", parent_revision_id=a1.revision_id,
+                           dependencies=[self._dep(store, "A", a1.revision_id, "version_of")])
+            # Cross-artifact version_of -> rejected.
+            repo.create_artifact("C", kind="document")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="C", content=b"c", origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "C", "rc"), revision_id="rc",
+                    dependencies=[self._dep(store, "B", other.revision_id, "version_of")],
+                )
+
+    def test_duplicate_bytes_of_requires_equal_bytes(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            r1 = self._revision(repo, "P", "document", b"same-bytes", "rp1")
+            # Equal bytes -> valid.
+            self._revision(repo, "Q", "document", b"same-bytes", "rq1",
+                           dependencies=[self._dep(store, "P", r1.revision_id, "duplicate_bytes_of")])
+            # Different bytes -> rejected.
+            repo.create_artifact("R", kind="document")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="R", content=b"different", origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "R", "rr"), revision_id="rr",
+                    dependencies=[self._dep(store, "P", r1.revision_id, "duplicate_bytes_of")],
+                )
+
+    def test_unsupported_role_rejected(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            r1 = self._revision(repo, "P", "document", b"p", "rp")
+            repo.create_artifact("Z", kind="finding")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="Z", content=b"z", origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "Z", "rz"), revision_id="rz",
+                    dependencies=[self._dep(store, "P", r1.revision_id, "extracted_from")],
+                )
+
+
+class TypedErrorTest(ArtifactTestBase):
+    def test_document_envelope_nonstring_key_typed_error(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", content={1: "x", "schema_version": 1,
+                                              "document_type": "d", "payload": {}},
+                    origin_locator="synthetic",
+                    rights=RightsRef(store.project_id, "RIGHTS-rev-1", 1),
+                )
+
+    def test_provenance_nonstring_key_typed_error(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "a", "r1"),
+                    provenance={1: "x", "method": "import", "actor": "a",
+                                "performed_at": "2026-10-27T00:00:00Z", "origin": "s"},
+                )
+
+    def test_dependencies_integer_typed_error(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            repo.create_artifact("a", kind="document")
+            with self.assertRaises(RecordValidationError):
+                repo.import_revision(
+                    artifact_id="a", revision_id="r1", content=b"x",
+                    origin_locator="synthetic",
+                    rights=_valid_rights(store.project_id, "a", "r1"),
+                    dependencies=5,
+                )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

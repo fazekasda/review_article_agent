@@ -89,6 +89,22 @@ DEPENDENCY_ROLES = (
     "duplicate_bytes_of",
 )
 
+#: The subset of :data:`DEPENDENCY_ROLES` this generic storage layer can check
+#: without scientific processing. ``version_of`` must point at an older revision
+#: of the *same* artifact; ``reports``/``uses_dataset``/``describes_experiment``
+#: must target a ``study``/``dataset``/``experiment`` artifact; ``derived_from``
+#: is the unconstrained generic edge; ``duplicate_bytes_of`` requires the two
+#: revisions' bytes to actually match. Any other C01 role is **rejected** here
+#: rather than recorded as an unverifiable (possibly false) relation.
+GENERIC_DEPENDENCY_ROLES = (
+    "version_of",
+    "reports",
+    "uses_dataset",
+    "describes_experiment",
+    "derived_from",
+    "duplicate_bytes_of",
+)
+
 #: The only supported generic JSON document-envelope schema version.
 SUPPORTED_DOCUMENT_SCHEMA_VERSION = 1
 
@@ -234,22 +250,27 @@ def _normalize_rights_ref(value: object) -> RightsRef:
                 "rights_ref: must be a RightsRecordRef with exactly "
                 "{project_id, rights_id, record_revision}"
             )
-        revision = value["record_revision"]
-        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
-            raise RecordValidationError(
-                "rights_ref.record_revision: must be a positive integer"
-            )
         candidate = RightsRef(
-            project_id=validate_identifier(value["project_id"], "rights_ref.project_id"),
-            rights_id=validate_identifier(value["rights_id"], "rights_ref.rights_id"),
-            record_revision=revision,
+            project_id=value["project_id"],
+            rights_id=value["rights_id"],
+            record_revision=value["record_revision"],
         )
     else:
         raise RecordValidationError(
             "rights: must be a validated RightsRecord object or a RightsRecordRef"
         )
+    # Validate the identity on every path, including a pre-built RightsRef: a
+    # bool or non-positive ``record_revision`` must never reach a query.
     validate_identifier(candidate.project_id, "rights_ref.project_id")
     validate_identifier(candidate.rights_id, "rights_ref.rights_id")
+    if (
+        isinstance(candidate.record_revision, bool)
+        or not isinstance(candidate.record_revision, int)
+        or candidate.record_revision < 1
+    ):
+        raise RecordValidationError(
+            "rights_ref.record_revision: must be a positive integer"
+        )
     return candidate
 
 
@@ -261,7 +282,12 @@ def _validate_document_envelope(value: dict) -> dict:
     """
     if not isinstance(value, dict):
         raise RecordValidationError("content: JSON document envelope must be an object")
-    extra = sorted(set(value) - set(_DOCUMENT_KEYS))
+    for key in value:
+        if not isinstance(key, str):
+            raise RecordValidationError(
+                f"content: envelope key {key!r} is not a string"
+            )
+    extra = sorted(k for k in value if k not in _DOCUMENT_KEYS)
     if extra:
         raise RecordValidationError(
             f"content: unknown envelope field(s): {', '.join(extra)}"
@@ -295,7 +321,7 @@ def _normalize_dependencies(
 ) -> list[DependencyRef]:
     if dependencies is None:
         dependencies = []
-    if isinstance(dependencies, (str, bytes, dict)):
+    if not isinstance(dependencies, (list, tuple)):
         raise RecordValidationError(
             "dependencies: must be a list of RefRevision/dependency objects"
         )
@@ -306,6 +332,11 @@ def _normalize_dependencies(
             ref_value = item.as_ref()
             role = item.role
         elif isinstance(item, dict):
+            for key in item:
+                if not isinstance(key, str):
+                    raise RecordValidationError(
+                        f"{field}: key {key!r} is not a string"
+                    )
             role = item.get("role", default_role)
             ref_value = {k: v for k, v in item.items() if k != "role"}
         else:
@@ -450,17 +481,19 @@ class ArtifactRepository:
 
     # -- rights records ------------------------------------------------------ #
     def store_rights_record(self, raw_record: dict) -> RightsRef:
-        """Validate and persist a canonical ``RightsRecord`` (metadata).
+        """Validate and persist a canonical ``RightsRecord`` (metadata only).
 
         Any fully valid record may be stored — including one whose ``storage`` is
-        ``unknown`` (the C03 §5.2 metadata-only quarantine path). This persists
-        the record **only**; it stores no source bytes. A record whose identity
+        ``unknown`` (the C03 §5.2 metadata-only quarantine path), and including a
+        **pre-acquisition** record whose subject is ``subject_artifact_ref`` (no
+        content revision exists yet, so none is fabricated). This persists the
+        record **only**; it stores no source bytes. A record whose identity
         ``{project_id, rights_id, record_revision}`` already exists with different
         canonical bytes raises :class:`ArtifactConflictError`.
         """
-        ref, canonical = self._validated_rights(raw_record)
+        ref, canonical, validated = self._validated_rights(raw_record)
         with self._store.transaction():
-            return self._store_rights_row(ref, canonical)
+            return self._store_rights_row(ref, canonical, validated)
 
     def get_rights_record(self, rights_ref: RightsRef | dict) -> dict | None:
         ref = _normalize_rights_ref(rights_ref)
@@ -471,19 +504,19 @@ class ArtifactRepository:
 
         return json.loads(row["canonical"].decode("utf-8"))
 
-    def _validated_rights(self, raw_record: dict) -> tuple[RightsRef, bytes]:
+    def _validated_rights(self, raw_record: dict) -> tuple[RightsRef, bytes, dict]:
+        """Validate a raw record; return identity ref + canonical bytes + normalized.
+
+        Accepts both canonical subject discriminators (``source_revision`` and the
+        pre-acquisition ``subject_artifact_ref``). The stricter requirement that a
+        stored record authorize **content bytes** is enforced at import time.
+        """
         validated = validate_rights_record(raw_record, self.project_id)
         canonical = canonical_json(validated)
-        subject = validated["subject"]
-        if subject["kind"] != "source_revision":
-            raise RecordValidationError(
-                "rights_record.subject: a revision's rights record must use the "
-                "'source_revision' subject (no content revision is fabricated)"
-            )
         ref = RightsRef(
             self.project_id, validated["rights_id"], validated["record_revision"]
         )
-        return ref, canonical
+        return ref, canonical, validated
 
     def _rights_row(self, ref: RightsRef) -> sqlite3.Row | None:
         return self._assert_open().execute(
@@ -492,11 +525,10 @@ class ArtifactRepository:
             (ref.project_id, ref.rights_id, ref.record_revision),
         ).fetchone()
 
-    def _store_rights_row(self, ref: RightsRef, canonical: bytes) -> RightsRef:
+    def _store_rights_row(
+        self, ref: RightsRef, canonical: bytes, validated: dict
+    ) -> RightsRef:
         """Persist a validated rights record; reject same-identity byte changes."""
-        import json
-
-        validated = json.loads(canonical.decode("utf-8"))
         subject = validated["subject"]
         existing = self._rights_row(ref)
         if existing is not None:
@@ -554,13 +586,17 @@ class ArtifactRepository:
 
         ``rights`` is either a raw canonical ``RightsRecord`` (validated; its
         subject must bind ``revision_id`` — so ``revision_id`` is then required)
-        or an existing :class:`RightsRef`/``RightsRecordRef``. Content is stored
-        **only** when the record permits ``storage``; otherwise the call is
-        rejected and nothing is written.
+        or an existing :class:`RightsRef`/``RightsRecordRef``. **Every path**
+        loads and fully validates the record against THIS exact revision — same
+        project, exact ``source_revision`` subject, and ``storage`` allowed —
+        before any byte is written; otherwise the call is rejected and nothing is
+        written. With a ref, ``revision_id`` may be omitted and is then derived
+        from the record's bound subject (never a random unbound id).
 
-        ``parent_revision_id`` names the exact revision this edit is based on: it
-        must already exist in this artifact, which prevents a lost edit against a
-        stale/absent base. All arguments are validated and the whole write is one
+        ``parent_revision_id`` names the exact revision this edit is based on. A
+        later revision MUST name the artifact's **current head** as its parent
+        (a stale/absent parent is refused, so no lost edit), and a first revision
+        MUST name none. All arguments are validated and the whole write is one
         transaction; a failure leaves no rows behind.
         """
         conn = self._assert_open()
@@ -596,9 +632,13 @@ class ArtifactRepository:
             performed_at=acquired_at,
         )
 
-        # Normalize rights; a raw record needs revision_id to bind its subject.
+        # Normalize rights. A raw record needs revision_id so its subject can
+        # bind this exact revision; a stored ref is resolved and re-validated
+        # against THIS exact revision (same project, storage allowed) inside the
+        # transaction below.
         rights_raw: dict | None = None
-        fixed_rights_ref: RightsRef | None = None
+        raw_canonical: bytes | None = None
+        ref_for_import: RightsRef
         if isinstance(rights, dict) and "operations" in rights:
             if revision_id is None:
                 raise RecordValidationError(
@@ -614,11 +654,12 @@ class ArtifactRepository:
             validated = validate_rights_record(rights, self.project_id, subject=subject)
             require_storage_allowed(validated)  # raw content only if storage allowed
             rights_raw = validated
-            fixed_rights_ref = RightsRef(
+            raw_canonical = canonical_json(validated)
+            ref_for_import = RightsRef(
                 self.project_id, validated["rights_id"], validated["record_revision"]
             )
         else:
-            fixed_rights_ref = _normalize_rights_ref(rights)
+            ref_for_import = _normalize_rights_ref(rights)
 
         # ---- atomic write -------------------------------------------------- #
         with self._store.transaction():
@@ -627,20 +668,44 @@ class ArtifactRepository:
                     f"artifact_id: no artifact {artifact_id!r} in this project"
                 )
 
-            # request-id idempotency (scoped to this project).
+            # Resolve + fully validate rights against THIS exact revision on
+            # every path (raw and ref): exact subject, same project, and storage
+            # allowed — before any byte is written.
+            if rights_raw is not None:
+                rights_ref = ref_for_import
+                validated_rights = rights_raw
+                rights_canonical = raw_canonical
+            else:
+                (
+                    rights_ref,
+                    rights_canonical,
+                    validated_rights,
+                    revision_id,
+                ) = self._resolve_rights_ref_for_import(
+                    ref_for_import, artifact_id, revision_id
+                )
+            rights_digest = sha256_digest(rights_canonical)
+
+            # Idempotency fingerprint covers the *normalized full payload*,
+            # including the canonical rights digest and declared provenance, so a
+            # same-request replay with changed rights/provenance conflicts.
             fingerprint = self._fingerprint(
                 artifact_id=artifact_id,
                 revision_id=revision_id,
                 parent_revision_id=parent_revision_id,
                 content_sha256=content_sha,
+                rights_digest=rights_digest,
+                rights_ref=rights_ref.as_dict(),
                 dependencies=[d.as_dict() for d in deps],
-                rights_ref=fixed_rights_ref.as_dict(),
                 media_type=resolved_media,
                 origin_locator=prov_origin,
                 acquired_by=acquired_by,
                 provenance_method=prov_method,
                 provenance_actor=prov_actor,
             )
+
+            # Idempotent replay runs BEFORE the head-freshness check: a retry
+            # returns the prior historical result; a divergent payload conflicts.
             if request_id is not None:
                 prior = self._import_request_row(request_id)
                 if prior is not None:
@@ -653,44 +718,44 @@ class ArtifactRepository:
                         artifact_id, prior["revision_id"]
                     )
                     if existing is not None:
-                        return self._row_to_revision(existing)
+                        return self._revision_with_deps(existing)
 
-            # parent must exist within this artifact.
-            if parent_revision_id is not None:
-                if self._revision_row(artifact_id, parent_revision_id) is None:
-                    raise RecordValidationError(
-                        f"parent_revision_id: {parent_revision_id!r} is not an "
-                        f"existing revision of artifact {artifact_id!r}"
-                    )
+            # A repeated *identical* import (no request id) safely reuses the
+            # prior result — even historical, after a later head — without
+            # disturbing the head.
+            duplicate = self._find_duplicate(
+                artifact_id, content_sha, parent_revision_id, rights_ref, deps
+            )
+            if duplicate is not None:
+                return duplicate
+
+            # A genuinely new revision must name the CURRENT head (or none for a
+            # first revision); this prevents a stale/lost edit.
+            self._enforce_parent_freshness(artifact_id, parent_revision_id)
+
+            if (
+                revision_id is not None
+                and self._revision_row(artifact_id, revision_id) is not None
+            ):
+                raise ArtifactConflictError(
+                    f"revision_id {revision_id!r} already exists for artifact "
+                    f"{artifact_id!r} with a different payload."
+                )
 
             # persist/confirm the rights record, pinned to this revision.
             if rights_raw is not None:
-                rights_ref = self._store_rights_row(
-                    fixed_rights_ref, canonical_json(rights_raw)
+                self._store_rights_row(
+                    rights_ref, rights_canonical, validated_rights
                 )
-            else:
-                rights_ref = fixed_rights_ref
-                if self._rights_row(rights_ref) is None:
-                    raise RecordValidationError(
-                        f"rights: no stored rights record for "
-                        f"{rights_ref.as_dict()!r}"
-                    )
+            elif self._rights_row(rights_ref) is None:
+                raise RecordValidationError(
+                    f"rights: no stored rights record for "
+                    f"{rights_ref.as_dict()!r}"
+                )
 
-            # every dependency target must already exist in this project.
+            # dependencies: existence on this project + strong role checks.
             for dep in deps:
-                if self._revision_row(dep.artifact_id, dep.revision_id) is None:
-                    raise RecordValidationError(
-                        f"dependency: revision {dep.as_dict()!r} does not exist "
-                        f"in this project"
-                    )
-
-            # repeated identical import reuses the existing revision.
-            if request_id is None:
-                duplicate = self._find_duplicate(
-                    artifact_id, content_sha, parent_revision_id, rights_ref, deps
-                )
-                if duplicate is not None:
-                    return duplicate
+                self._check_dependency(artifact_id, dep, content_bytes)
 
             if revision_id is None:
                 revision_id = self.new_revision_id()
@@ -738,9 +803,127 @@ class ArtifactRepository:
                         _utc_now(),
                     ),
                 )
-            return self._row_to_revision(
+            return self._revision_with_deps(
                 self._revision_row(artifact_id, revision_id)
             )
+
+    def _resolve_rights_ref_for_import(
+        self, ref: RightsRef, artifact_id: str, revision_id: str | None
+    ) -> tuple[RightsRef, bytes, dict, str]:
+        """Load a stored rights record and fully validate it for this revision.
+
+        Enforces: the record exists in **this** project; its subject is the
+        canonical ``source_revision`` binding (a pre-acquisition
+        ``subject_artifact_ref`` cannot authorize content bytes); it binds the
+        **exact** ``artifact_id``/``revision_id``; and ``storage`` is allowed.
+        When ``revision_id`` is omitted it is derived from the record's bound
+        subject — never a random unbound id.
+        """
+        import json
+
+        row = self._rights_row(ref)
+        if row is None:
+            raise RecordValidationError(
+                f"rights: no stored rights record for {ref.as_dict()!r} in this "
+                f"project"
+            )
+        parsed = json.loads(bytes(row["canonical"]).decode("utf-8"))
+        subject = parsed["subject"]
+        if subject["kind"] != "source_revision":
+            raise RecordValidationError(
+                "rights: referenced record has a pre-acquisition "
+                "(subject_artifact_ref) subject; it cannot authorize content bytes"
+            )
+        if revision_id is None:
+            revision_id = subject["revision_id"]
+        revision_id = validate_identifier(revision_id, "revision_id")
+        expected = {
+            "kind": "source_revision",
+            "project_id": self.project_id,
+            "artifact_id": artifact_id,
+            "revision_id": revision_id,
+        }
+        validated = validate_rights_record(parsed, self.project_id, subject=expected)
+        require_storage_allowed(validated)
+        rights_ref = RightsRef(
+            self.project_id, validated["rights_id"], validated["record_revision"]
+        )
+        return rights_ref, bytes(row["canonical"]), validated, revision_id
+
+    def _enforce_parent_freshness(
+        self, artifact_id: str, parent_revision_id: str | None
+    ) -> None:
+        """Require the named parent to be the artifact's CURRENT head.
+
+        The first revision must name no parent. Any later revision must name the
+        current head as its exact parent, so an edit based on a stale revision is
+        refused (no lost edit) and no row is written.
+        """
+        if parent_revision_id is not None and (
+            self._revision_row(artifact_id, parent_revision_id) is None
+        ):
+            raise RecordValidationError(
+                f"parent_revision_id: {parent_revision_id!r} is not an existing "
+                f"revision of artifact {artifact_id!r}"
+            )
+        head = self._assert_open().execute(
+            "SELECT revision_id FROM revision WHERE project_id = ? AND "
+            "artifact_id = ? ORDER BY rowid DESC LIMIT 1",
+            (self.project_id, artifact_id),
+        ).fetchone()
+        if head is None:
+            if parent_revision_id is not None:
+                raise RecordValidationError(
+                    "parent_revision_id: this is the artifact's first revision; "
+                    "it must not name a parent"
+                )
+            return
+        if parent_revision_id != head["revision_id"]:
+            raise RecordValidationError(
+                f"parent_revision_id: stale edit; the current head is "
+                f"{head['revision_id']!r}, but parent {parent_revision_id!r} was "
+                f"named."
+            )
+
+    def _check_dependency(
+        self, from_artifact_id: str, dep: DependencyRef, content_bytes: bytes
+    ) -> None:
+        """Existence + strong role checks for a generic dependency edge."""
+        if dep.role not in GENERIC_DEPENDENCY_ROLES:
+            raise RecordValidationError(
+                f"dependency role {dep.role!r} is not supported by the generic "
+                f"artifact store; refusing to record an unverifiable relation"
+            )
+        target = self._revision_row(dep.artifact_id, dep.revision_id)
+        if target is None:
+            raise RecordValidationError(
+                f"dependency: revision {dep.as_dict()!r} does not exist in this "
+                f"project"
+            )
+        if dep.role == "version_of":
+            if dep.artifact_id != from_artifact_id:
+                raise RecordValidationError(
+                    "version_of dependency must target an older revision of the "
+                    "same artifact"
+                )
+        elif dep.role in ("reports", "uses_dataset", "describes_experiment"):
+            want = {
+                "reports": "study",
+                "uses_dataset": "dataset",
+                "describes_experiment": "experiment",
+            }[dep.role]
+            artifact = self._artifact_row(dep.artifact_id)
+            if artifact is None or artifact["kind"] != want:
+                raise RecordValidationError(
+                    f"{dep.role} dependency must target a {want!r} artifact"
+                )
+        elif dep.role == "duplicate_bytes_of":
+            if bytes(target["content"]) != content_bytes:
+                raise RecordValidationError(
+                    "duplicate_bytes_of dependency requires the two revisions' "
+                    "bytes to be identical"
+                )
+        # derived_from is the unconstrained generic edge.
 
     def _normalize_content(
         self, content: object, media_type: str | None
@@ -773,8 +956,13 @@ class ArtifactRepository:
             return "import", acquired_by, performed_at, origin_locator
         if not isinstance(provenance, dict):
             raise RecordValidationError("provenance: must be an object")
+        for key in provenance:
+            if not isinstance(key, str):
+                raise RecordValidationError(
+                    f"provenance: key {key!r} is not a string"
+                )
         allowed = {"method", "actor", "performed_at", "origin"}
-        extra = sorted(set(provenance) - allowed)
+        extra = sorted(k for k in provenance if k not in allowed)
         if extra:
             raise RecordValidationError(
                 f"provenance: unknown field(s): {', '.join(extra)}"
@@ -865,7 +1053,7 @@ class ArtifactRepository:
                 _dependency_key(d) for d in self._dependency_rows(artifact_id, row["revision_id"])
             )
             if existing_deps == want:
-                return self._row_to_revision(row)
+                return self._revision_with_deps(row)
         return None
 
     def _dependency_rows(
