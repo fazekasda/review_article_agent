@@ -21,7 +21,14 @@ function runCli(args: readonly string[]): Promise<CliResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args], {
       cwd: PACKAGE_ROOT,
-      env: { ...process.env, OPENCODE_URL: "", OPENCODE_TOKEN: "" },
+      env: {
+        ...process.env,
+        OPENCODE_URL: "",
+        OPENCODE_TOKEN: "",
+        OPENCODE_AUTH: "",
+        OPENCODE_BASIC_USERNAME: "",
+        OPENCODE_BASIC_PASSWORD: "",
+      },
     });
     let stdout = "";
     let stderr = "";
@@ -108,6 +115,22 @@ test("the CLI refuses an unauthenticated or implicit endpoint", async () => {
   const noToken = await runCli(["result", "--url", "http://127.0.0.1:4096", "--session", "ses_x", "--id", "msg_y"]);
   assert.equal(noToken.status, 1);
   assert.match(noToken.stderr, /refusing unauthenticated/);
+});
+
+test("the CLI authenticates with Basic when asked", async () => {
+  const server = new MockServer({ requireBasic: { username: "opencode", password: "pw" } });
+  const http = await startHttpServer(server);
+  try {
+    const ok = await runCli(["check", "--url", http.url, "--auth", "basic", "--password", "pw"]);
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.equal((JSON.parse(ok.stdout) as { ok: boolean }).ok, true);
+
+    const bad = await runCli(["check", "--url", http.url, "--auth", "basic", "--password", "wrong"]);
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /Unauthorized|credentials/);
+  } finally {
+    await http.close();
+  }
 });
 
 test("the decisions command is dry-run by default (no paid call)", async () => {

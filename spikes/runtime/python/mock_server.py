@@ -18,11 +18,15 @@ reads, taken from the published V2 OpenAPI document:
 * ``POST /api/experimental/generate/decisions``
 
 The mock is a test double, not a compliant server: it validates just enough to
-prove client behaviour.
+prove client behaviour. It accepts ``Authorization: Bearer <token>`` (the
+historical scheme) and/or HTTP Basic ``<user>:<password>`` (the scheme the
+disposable 2.2.0 harness was observed to use), and rejects a ``cursor`` combined
+with ``order`` on the message list, matching the published operation.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import threading
@@ -43,12 +47,23 @@ WAIT_RE = re.compile(r"^/api/experimental/session/(ses[^/]+)/wait$")
 class MockState:
     """Mutable server state plus tunable failure modes for tests."""
 
-    def __init__(self, *, token: str | None = None):
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        basic_username: str = "opencode",
+        basic_password: str | None = None,
+    ):
         self.token = token
+        self.basic_username = basic_username
+        self.basic_password = basic_password
         self.sessions: dict[str, dict[str, Any]] = {}
         self.inbox: dict[str, list[dict[str, Any]]] = {}
         self.messages: dict[str, list[dict[str, Any]]] = {}
         self.seen_admission: dict[str, str] = {}  # admission id -> session id
+        # Every accepted request is recorded (method, path, query, Authorization)
+        # so tests can prove the exact wire query and credential scheme.
+        self.requests: list[dict[str, Any]] = []
         self._counter = 0
         self._tick = 1_700_000_000_000
         # failure tunables
@@ -214,9 +229,17 @@ class MockHandler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8")) if raw else {}
 
     def _authorized(self) -> bool:
-        if not self.state.token:
+        if not self.state.token and not self.state.basic_password:
             return True
-        return self.headers.get("Authorization") == f"Bearer {self.state.token}"
+        auth = self.headers.get("Authorization")
+        if self.state.token and auth == f"Bearer {self.state.token}":
+            return True
+        if self.state.basic_password:
+            raw = f"{self.state.basic_username}:{self.state.basic_password}".encode("utf-8")
+            expected = "Basic " + base64.b64encode(raw).decode("ascii")
+            if auth == expected:
+                return True
+        return False
 
     def _unauthorized(self) -> None:
         self._json(401, {"_tag": "UnauthorizedError", "message": "missing or bad token"})
@@ -246,6 +269,14 @@ class MockHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        self.state.requests.append(
+            {
+                "method": method,
+                "path": path,
+                "query": query,
+                "authorization": self.headers.get("Authorization"),
+            }
+        )
         if not self._authorized():
             return self._unauthorized()
 
@@ -282,6 +313,15 @@ class MockHandler(BaseHTTPRequestHandler):
             sid = match.group(1)
             if sid not in self.state.sessions:
                 return self._not_found(sid)
+            # Published contract: the cursor must not be combined with order.
+            if query.get("cursor") and query.get("order"):
+                return self._json(
+                    400,
+                    {
+                        "_tag": "InvalidRequestError",
+                        "message": "cursor must not be combined with order",
+                    },
+                )
             return self._json(200, self._message_page(sid, query))
 
         match = MESSAGE_RE.match(path)
@@ -434,8 +474,16 @@ class MockHandler(BaseHTTPRequestHandler):
 class MockServer:
     """Context manager running the mock on an ephemeral loopback port."""
 
-    def __init__(self, *, token: str | None = None):
-        self.state = MockState(token=token)
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        basic_username: str = "opencode",
+        basic_password: str | None = None,
+    ):
+        self.state = MockState(
+            token=token, basic_username=basic_username, basic_password=basic_password
+        )
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
         self._httpd.state = self.state  # type: ignore[attr-defined]
         self._thread = threading.Thread(
@@ -463,13 +511,29 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the mock OpenCode V2 endpoint.")
     parser.add_argument("--port", type=int, default=0, help="0 picks a free port")
     parser.add_argument("--token", default=None, help="require this bearer token")
+    parser.add_argument(
+        "--basic-password",
+        default=None,
+        help="also/instead accept HTTP Basic opencode:<this password>",
+    )
+    parser.add_argument(
+        "--basic-username", default="opencode", help="Basic username (default opencode)"
+    )
     args = parser.parse_args()
 
-    state = MockState(token=args.token)
+    state = MockState(
+        token=args.token,
+        basic_username=args.basic_username,
+        basic_password=args.basic_password,
+    )
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), MockHandler)
     httpd.state = state  # type: ignore[attr-defined]
     host, port = httpd.server_address[:2]
-    print(f"mock opencode v2 at http://{host}:{port} (token={'set' if args.token else 'none'})")
+    print(
+        f"mock opencode v2 at http://{host}:{port} "
+        f"(bearer={'set' if args.token else 'none'}, "
+        f"basic={'set' if args.basic_password else 'none'})"
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

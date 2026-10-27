@@ -16,8 +16,8 @@ No API field is invented.
 | File | Purpose |
 | --- | --- |
 | `opencode_v2.py` | Stdlib-only client: session create, admission, per-turn reconciliation, bounded wait, interrupt, fork, fresh critic, typed decisions. |
-| `mock_server.py` | Deterministic local mock of the used endpoints (incl. cursor paging and a redirect route). |
-| `test_opencode_v2.py` | 59 unittest cases (success, retry, reconciliation, paging, typed-decision boundary, error, invalid input, endpoint safety). |
+| `mock_server.py` | Deterministic local mock of the used endpoints (incl. cursor paging, a redirect route, and Bearer/Basic auth). |
+| `test_opencode_v2.py` | 78 unittest cases (success, retry, reconciliation, paging query conformance, auth schemes, typed-decision boundary, error, invalid input, endpoint safety). |
 | `demo_lifecycle.py` | Two-client durability demo against the mock. |
 
 Python 3.14 (`python3`), standard library only. No third-party dependency.
@@ -26,9 +26,10 @@ Python 3.14 (`python3`), standard library only. No third-party dependency.
 
 ```sh
 cd spikes/runtime/python
-python3 -m unittest -v test_opencode_v2   # 59 tests, ~2s
+python3 -m unittest -v test_opencode_v2   # 78 tests, ~2.5s
 python3 demo_lifecycle.py                 # prints the two-client transcript
-python3 mock_server.py --token secret     # optional: standalone mock on a free port
+python3 mock_server.py --token secret     # optional: standalone mock, Bearer auth
+python3 mock_server.py --basic-password pw # optional: standalone mock, Basic auth
 ```
 
 ## API shape used (from the published OpenAPI)
@@ -73,18 +74,35 @@ explicit endpoint plus `authorization: Bearer <token>` headers
 (`Service.headers(endpoint)` in the Node service API). This prototype therefore:
 
 * **Requires** an explicit `base_url` (constructor or `OPENCODE_SPIKE_BASE_URL`)
-  and **requires** an explicit bearer token (`OPENCODE_SPIKE_TOKEN`); the client
-  fails closed with `ValueError` if either is missing or empty. `from_env`
-  refuses to guess a default and performs **no** service discovery or start.
+  and **requires** an explicit credential; the client fails closed with
+  `ValueError` if the endpoint or the selected scheme's credential is missing or
+  empty. `from_env` refuses to guess a default and performs **no** service
+  discovery or start.
+* **Authorization scheme is explicit, never guessed.** `auth="bearer"` (the
+  default, for backward compatibility) sends `Authorization: Bearer <token>`;
+  `auth="basic"` sends HTTP Basic `<username>:<password>` with the username
+  defaulting to `opencode`. The disposable **2.2.0 harness was observed to answer
+  HTTP Basic `opencode:<per-run-password>`** — its explicit app-owned descriptor
+  carries the service URL and a per-run password file — so a Bearer-only client
+  cannot connect to it. Supply the password via `password=` or an explicitly
+  named `password_file=`, and the scheme via `auth=`. Supplying the wrong scheme's
+  fields (a token to `basic`, or a password to `bearer`) is refused, so a
+  misconfiguration cannot silently authenticate a different way. There is **no**
+  arbitrary-header escape hatch.
+  * Environment: `OPENCODE_SPIKE_AUTH` (`bearer`|`basic`), then either
+    `OPENCODE_SPIKE_TOKEN` (bearer) or `OPENCODE_SPIKE_PASSWORD` /
+    `OPENCODE_SPIKE_PASSWORD_FILE` (basic, with optional
+    `OPENCODE_SPIKE_USERNAME`).
 * **Enforces loopback.** The host must be `localhost`, a `127.0.0.0/8` address,
   or `::1`; any other host, a non-HTTP(S) scheme, or an embedded credential is
   refused. The spike never talks to a remote or shared service.
-* **Refuses redirects.** A private opener rejects every redirect, so the bearer
-  token is never forwarded to a redirect target (`OpenCodeApiError` with the 3xx
-  status and a "redirect blocked" message).
+* **Refuses redirects.** A private opener rejects every redirect, so the
+  credential (Bearer or Basic) is never forwarded to a redirect target
+  (`OpenCodeApiError` with the 3xx status and a "redirect blocked" message).
 * Never reads OpenCode's private database, service registration, or credentials,
   and deliberately ignores `OPENROUTER_API_KEY` (a provider key is not an
-  endpoint or a service token).
+  endpoint or a service token). A `password_file` is read only from the explicit
+  app-owned path the caller names; nothing is discovered.
 
 A live run against the ordinary shared service is **not** part of this spike: no
 shared discovery/start, no paid calls, no budget authorization.
@@ -114,7 +132,10 @@ shared discovery/start, no paid calls, no budget authorization.
   is `unknown` with a `reason` — never success.
 * **Bounded paging.** `collect_messages()` follows `cursor.next` from the oldest
   message (default 100 pages) so older admissions are not lost behind the first
-  page.
+  page. Query conformance: the published `session.message.list` applies `order`
+  to the **first page** only and forbids combining it with `cursor`, and requires
+  the same `type` filter on every page — so only the first page sends `order`,
+  and later pages send the repeated `type` (when set) plus the opaque `cursor`.
 * **Idempotent admission.** The client-supplied admission ID (`Session.Message.ID`)
   is the idempotency key. Exactly one input is accepted per ID. The mock returns
   `409 ConflictError` on a repeat ID; the `2.2.0` harness observed the same ID
@@ -146,7 +167,7 @@ shared discovery/start, no paid calls, no budget authorization.
 
 | Aspect | Mock (`mock_server.py`) | Live |
 | --- | --- | --- |
-| Transport / auth | local HTTP, bearer checked | same shape, real token |
+| Transport / auth | local HTTP, Bearer or Basic checked | same shape, real credential |
 | Endpoint safety | loopback + token enforced client-side; `302 /api/redirect` refused | same client-side enforcement |
 | Session create | returns a `Session.Info` | same |
 | Prompt idempotency | `409 ConflictError` on repeat ID | observed `200` on a same-ID retry (`2.2.0` harness), one input |
@@ -212,6 +233,20 @@ explicit token, and (for decisions) explicit budget authorization.
 | Score distribution over declared levels | `test_invalid_score_rejected` |
 | Per-question `error` preserved (not an exclusion, not a protocol failure) | `test_per_question_failure_keeps_other_answers` |
 | An HTTP error stays an API error, not a protocol failure | `test_decision_http_error_is_api_error_not_protocol_failure` |
+
+### Task F-compat — Basic transport auth and paging query conformance
+
+| Requirement | Evidence |
+| --- | --- |
+| Explicit Basic vs Bearer auth; default Bearer kept | `OpenCodeV2Client(auth=...)`; `test_basic_auth_reaches_the_server`, `test_bearer_remains_the_default_and_works` |
+| Basic transport auth against the harness's `opencode:<password>` | `test_basic_auth_reaches_the_server` (asserts `Basic base64(opencode:...)`), `test_basic_custom_username` |
+| Fails closed on missing/ambiguous credentials | `test_basic_missing_password_fails_closed`, `test_basic_and_bearer_credentials_are_mutually_exclusive`, `test_unknown_auth_scheme_rejected`, `test_basic_password_file_missing_fails_closed`, `test_basic_password_and_password_file_conflict` |
+| Explicit app-owned password file (no discovery/private parsing) | `test_basic_password_file_is_read_explicitly`; `OpenCodeV2Client(password_file=)` reads only the named path |
+| env/CLI documented | `from_env` + `test_from_env_basic_auth`, `test_from_env_basic_auth_requires_password`, `test_from_env_unknown_auth_scheme_rejected` |
+| Credential never forwarded on a redirect (Basic included) | `test_redirect_is_refused_for_basic_auth`, `test_redirect_blocked_without_token_forwarding` |
+| `order` only on the first page; never with `cursor` | `test_collect_messages_sends_order_only_on_the_first_page`, `test_mock_rejects_cursor_with_order` |
+| `type` filter repeated on later pages | `test_collect_messages_repeats_type_filter_on_later_pages` |
+| Paging regression (reconciliation still completes over pages) | `test_reconcile_still_pages_after_the_query_fix`, `test_paging_finds_older_admission` |
 
 ## Limitations
 

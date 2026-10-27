@@ -68,11 +68,15 @@ npm test                    # node --test test/*.test.ts (includes the tsc check
 
 Node 24 runs the `.ts` sources directly via type stripping; nothing is emitted.
 
-CLI (URL/token/directory come only from arguments or environment; no service
+CLI (URL/auth/directory come only from arguments or environment; no service
 discovery, no database or credential parsing):
 
 ```sh
 node src/cli.ts check      --url http://127.0.0.1:4096 --token "$OPENCODE_TOKEN"
+# the disposable 2.2.0 harness answers HTTP Basic opencode:<per-run-password>;
+# select it explicitly (Bearer stays the default):
+node src/cli.ts check      --url http://127.0.0.1:4096 --auth basic --password "$RUN_PASSWORD"
+node src/cli.ts check      --url http://127.0.0.1:4096 --auth basic --username opencode --password pw
 node src/cli.ts submit     --url ... --token ... --session ses_x --id msg_x --text "review this"
 node src/cli.ts result     --url ... --token ... --session ses_x --id msg_x [--wait-ms 5000]
 node src/cli.ts reconcile  --url ... --token ... --session ses_x --id msg_x
@@ -80,10 +84,26 @@ node src/cli.ts critic     --url ... --token ... --dir /workspace --agent critic
 node src/cli.ts decisions  --url ... --token ... --model openrouter/typesafe/jev-1.14   # dry run; --live to call
 ```
 
-Environment fallbacks: `OPENCODE_URL`, `OPENCODE_TOKEN` (or `OPENCODE_PASSWORD`),
-`OPENCODE_ALLOW_UNAUTHENTICATED=1` (loopback only), `OPENCODE_ALLOW_NON_LOOPBACK=1`.
-The client refuses an implicit URL, refuses an unauthenticated connection, and
-refuses a non-loopback endpoint, all by default.
+**Authorization scheme (explicit, never guessed).** `bearer` is the default
+(backward compatible). `basic` sends `Authorization: Basic base64(opencode:<password>)`,
+the scheme the disposable 2.2.0 harness was observed to require — a Bearer-only
+client cannot connect to it. Supplying a token to `basic`, or a password to
+`bearer`, is refused, so a misconfiguration cannot silently authenticate a
+different way; there is no arbitrary-header escape hatch. The scheme also fails
+closed when its credential is missing.
+
+**Redirects are refused at the transport.** The client wraps `fetch` and forces
+`redirect: "manual"`, turning any 3xx (or `opaqueredirect`) into a loud error, so
+the credential is never forwarded to a redirect target.
+
+Environment fallbacks: `OPENCODE_URL`; scheme `OPENCODE_AUTH` (`bearer`|`basic`);
+then `OPENCODE_TOKEN` (or the historical `OPENCODE_PASSWORD`) for bearer, or
+`OPENCODE_BASIC_USERNAME` (default `opencode`) / `OPENCODE_BASIC_PASSWORD` for
+basic; plus `OPENCODE_ALLOW_UNAUTHENTICATED=1` (loopback only) and
+`OPENCODE_ALLOW_NON_LOOPBACK=1`. `OPENCODE_PASSWORD` is only read for bearer, so
+it can never silently become a Basic password. The client refuses an implicit
+URL, refuses an unauthenticated connection, and refuses a non-loopback endpoint,
+all by default.
 
 ## Reconciliation semantics (bounded per turn)
 
@@ -116,6 +136,17 @@ single stalled request cannot hang the caller.
 | Typed Jev predicate/choice/score handling and per-question failures. | `test/decisions-critic.test.ts`, `src/lifecycle.ts` (`runDecisions`, `summarizeDecisions`) | The route and types are exercised against the mock; live call is **blocked** pending budget authorization. |
 | Fresh critic context and role/model pinning; a writer-history fork is not a clean critic. | `test/decisions-critic.test.ts` | `createCriticSession` pins `agent` + `model.Ref` on a brand-new session (no `parentID`, no fork). |
 | No access/config changes to ordinary coding sessions. | `test/client-guard.test.ts` | The client never imports `@opencode/client/service` and never calls `Service.ensure`/`discover`/`stop`; no `service.json`, database, or state path is read. |
+
+### Task F-compat — Basic transport auth and redirect refusal
+
+| Requirement | Evidence |
+| --- | --- |
+| Explicit Basic vs Bearer auth; default Bearer kept | `test/auth-transport.test.ts` "bearer remains the default scheme", `resolveEndpoint`/`assertUsableEndpoint`/`authorizationHeader` |
+| Basic transport auth against the harness's `opencode:<password>` | "basic auth sends `Basic base64(opencode:password)`", "basic auth honours an explicit username"; `MockServer({ requireBasic })` |
+| Fails closed on a missing/ambiguous credential | "basic without a password fails closed", "a scheme never silently borrows the other scheme's credential", "an unknown auth scheme is rejected" |
+| env/CLI documented and wired | "environment selects the scheme and reads the documented names", `test/cli.integration.test.ts` "the CLI authenticates with Basic when asked"; `--auth`/`--username`/`--password` |
+| Redirects refused so the credential cannot leak | "the transport rejects a redirect so credentials are not forwarded", "a redirect through the client is refused and never followed" (asserts exactly one request) |
+| `order` only on the first page, never with `cursor` (already conformant) | `lifecycle.ts` `walkTimeline` sets `order` only when `cursor` is undefined |
 
 ## Accounting boundary and live unknowns
 

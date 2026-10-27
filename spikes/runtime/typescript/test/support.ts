@@ -16,6 +16,7 @@
  * logic and contract handling, not live server behaviour.
  */
 import { createServer } from "node:http";
+import { Buffer } from "node:buffer";
 import type {
   GenerateDecisionsInput,
   GenerateDecisionResult,
@@ -46,6 +47,11 @@ export interface MockServerOptions {
   readonly version?: string;
   /** Token the mock expects; requests without it get 401. Omit for no auth check. */
   readonly requireToken?: string;
+  /**
+   * Basic credential the mock expects (`opencode:<password>`). Requests without
+   * it get 401. The disposable 2.2.0 harness uses this scheme.
+   */
+  readonly requireBasic?: { readonly username: string; readonly password: string };
   /** Default page size for `message.list`; omit to return the whole timeline. */
   readonly pageSize?: number;
   /** When true, `cursor.next` always repeats, to exercise the client's bound. */
@@ -92,11 +98,13 @@ export class MockServer {
   readonly #sessions = new Map<string, MockSession>();
   readonly #overrides = new Map<string, () => Response>();
   readonly #requireToken: string | undefined;
+  readonly #requireBasic: { readonly username: string; readonly password: string } | undefined;
   #sessionCounter = 0;
 
   constructor(options: MockServerOptions = {}) {
     this.version = options.version ?? "2.2.0-test";
     this.#requireToken = options.requireToken;
+    this.#requireBasic = options.requireBasic;
     this.pageSize = options.pageSize;
     this.stickyCursor = options.stickyCursor ?? false;
     this.duplicatePromptStatus = options.duplicatePromptStatus ?? 409;
@@ -227,6 +235,17 @@ export class MockServer {
     return session;
   }
 
+  #authorized(authorization: string | null): boolean {
+    if (this.#requireToken === undefined && this.#requireBasic === undefined) return true;
+    if (this.#requireToken !== undefined && authorization === `Bearer ${this.#requireToken}`) return true;
+    if (this.#requireBasic !== undefined) {
+      const { username, password } = this.#requireBasic;
+      const expected = `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
+      if (authorization === expected) return true;
+    }
+    return false;
+  }
+
   async #handle(input: string | URL | Request, init?: RequestInit): Promise<Response> {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
     const request = input instanceof Request ? input : undefined;
@@ -244,8 +263,10 @@ export class MockServer {
       return override();
     }
 
-    if (this.#requireToken !== undefined && authorization !== `Bearer ${this.#requireToken}`) {
-      return jsonResponse({ _tag: "UnauthorizedError", message: "missing or invalid bearer token" }, 401);
+    if (!this.#authorized(authorization)) {
+      const message =
+        this.#requireBasic === undefined ? "missing or invalid bearer token" : "missing or invalid credentials";
+      return jsonResponse({ _tag: "UnauthorizedError", message }, 401);
     }
 
     if (method === "GET" && url.pathname === "/api/info") {

@@ -6,13 +6,16 @@ Design constraints (see ``docs/implementation/00-runtime-spike.md`` lines 5, 9,
 15-18, 20 and ``docs/specification.md`` "Product and runtime"):
 
 * Python standard library only (``urllib``), no third-party HTTP client.
-* Explicit, authenticated **loopback** endpoint. The base URL and bearer token
-  are passed in by the caller and both are required: a non-loopback host or a
-  missing token fails closed, redirects are refused so the token is never
-  forwarded, and there is **no** shared-service discovery or start and **no**
-  reading of private databases, registration files, or credentials.
-  ``from_env`` is the only convenience; it refuses to guess a default and
-  deliberately ignores ``OPENROUTER_API_KEY``.
+* Explicit, authenticated **loopback** endpoint. The base URL and an explicit
+  credential are passed in by the caller and both are required: a non-loopback
+  host or a missing credential fails closed, redirects are refused so the
+  credential is never forwarded, and there is **no** shared-service discovery or
+  start and **no** reading of private databases, registration files, or
+  credentials. The Authorization scheme is explicit: ``bearer`` (default, for
+  backward compatibility) or ``basic`` (the disposable 2.2.0 harness answers
+  HTTP Basic ``opencode:<per-run-password>``). ``from_env`` is the only
+  convenience; it refuses to guess a default and deliberately ignores
+  ``OPENROUTER_API_KEY``.
 * Only request/response shapes taken from the published V2 OpenAPI document
   (``https://opencode.ai/v2/openapi.json``, openapi 3.1.0, HttpApi 0.0.1) are
   used. Nothing is invented.
@@ -47,6 +50,7 @@ Admission vs completion (the point of the spike):
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import math
@@ -66,6 +70,16 @@ MESSAGE_ID_RE = re.compile(r"^msg_")
 # Response tags from the published error schemas (*ErrorEncoded).
 CONFLICT_TAG = "ConflictError"
 UNAUTHORIZED_TAG = "UnauthorizedError"
+
+# Supported Authorization schemes. The published OpenAPI declares no
+# securitySchemes, but the disposable 2.2.0 harness was observed to answer HTTP
+# Basic ``opencode:<per-run-password>`` (its explicit app-owned descriptor holds
+# the service URL and a per-run password file). ``bearer`` stays the default for
+# backward compatibility; ``basic`` is opt-in and never guessed or discovered.
+AUTH_BEARER = "bearer"
+AUTH_BASIC = "basic"
+AUTH_SCHEMES = (AUTH_BEARER, AUTH_BASIC)
+BASIC_DEFAULT_USERNAME = "opencode"
 
 # Message types that open a new turn in the projected timeline. The published
 # schemas (Session.Message.*) carry no parent/linkage field, so a turn can only
@@ -228,6 +242,72 @@ def assert_explicit_loopback_url(base_url: str) -> str:
     return base_url
 
 
+def _read_password_file(path: str) -> str:
+    """Read a per-run password from an explicitly named app-owned file.
+
+    The caller supplies the path; nothing is discovered and no OpenCode state,
+    registration file, database, or keychain is consulted. Only the trailing line
+    endings are removed; the rest of the file is the secret verbatim.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().rstrip("\r\n")
+    except OSError as exc:
+        raise ValueError(f"could not read password file {path!r}: {exc}") from None
+
+
+def resolve_auth(
+    *,
+    auth: str,
+    token: str | None,
+    username: str | None,
+    password: str | None,
+    password_file: str | None,
+) -> tuple[str, str | None, str | None]:
+    """Resolve an explicit auth scheme, failing closed on anything missing.
+
+    Returns ``(scheme, username, secret)`` where ``secret`` is the bearer token
+    for ``bearer`` or the password for ``basic``. Exactly one scheme is chosen:
+
+    * ``bearer`` (default) uses ``token``; supplying basic fields is an error, so
+      a misconfiguration cannot silently authenticate a different way.
+    * ``basic`` uses ``username`` (default ``opencode``) + ``password``; the
+      password may come from ``password_file`` instead. A token is refused.
+
+    No scheme is ever discovered, guessed, or read from OpenCode's own state.
+    """
+    if auth not in AUTH_SCHEMES:
+        raise ValueError(f"auth must be one of {AUTH_SCHEMES}, got {auth!r}")
+    if auth == AUTH_BASIC:
+        if token is not None:
+            raise ValueError(
+                "auth='basic' does not use a bearer token; pass username/password instead"
+            )
+        if password is not None and password_file is not None:
+            raise ValueError("pass either password or password_file, not both")
+        secret = password
+        if secret is None and password_file is not None:
+            secret = _read_password_file(password_file)
+        if not isinstance(secret, str) or not secret:
+            raise ValueError(
+                "auth='basic' requires an explicit password (or password_file); "
+                "refusing unauthenticated access"
+            )
+        name = username if username is not None else BASIC_DEFAULT_USERNAME
+        if not isinstance(name, str) or not name:
+            raise ValueError("auth='basic' username must be a non-empty string")
+        return AUTH_BASIC, name, secret
+    if username is not None or password is not None or password_file is not None:
+        raise ValueError(
+            "auth='bearer' uses a token; pass token instead of username/password"
+        )
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError(
+            "an explicit bearer token is required; refusing unauthenticated access"
+        )
+    return AUTH_BEARER, None, token
+
+
 def validate_model_ref(model: dict[str, Any]) -> dict[str, Any]:
     """Validate a ``Model.Ref`` ({id, providerID, variant?}). Never guess."""
     if not isinstance(model, dict):
@@ -250,11 +330,19 @@ class OpenCodeV2Client:
 
     :param base_url: explicit **loopback** endpoint, e.g.
         ``http://127.0.0.1:4096``. Non-loopback hosts are refused. No discovery.
-    :param token: explicit bearer token (``Authorization: Bearer``). Required:
-        the client fails closed without one.
+    :param token: explicit bearer token (``Authorization: Bearer``). Required when
+        ``auth="bearer"`` (the default): the client fails closed without one.
+    :param auth: explicit Authorization scheme, ``"bearer"`` (default) or
+        ``"basic"``. The disposable 2.2.0 harness answers HTTP Basic
+        ``opencode:<per-run-password>``, so ``auth="basic"`` is available; it is
+        never discovered or guessed.
+    :param username: Basic username (default ``opencode``); ``basic`` only.
+    :param password: Basic password; ``basic`` only.
+    :param password_file: path to a file holding the Basic password (an explicit
+        app-owned path; the file is read, never discovered).
     :param directory: absolute location directory pinned on session create.
 
-    Redirects are refused so the bearer token is never forwarded off-origin.
+    Redirects are refused so the credential is never forwarded off-origin.
     """
 
     def __init__(
@@ -262,25 +350,35 @@ class OpenCodeV2Client:
         base_url: str,
         token: str | None = None,
         *,
+        auth: str = AUTH_BEARER,
+        username: str | None = None,
+        password: str | None = None,
+        password_file: str | None = None,
         timeout: float = 30.0,
         directory: str | None = None,
         extra_headers: dict[str, str] | None = None,
         max_message_pages: int = 100,
     ):
         assert_explicit_loopback_url(base_url)
-        if not isinstance(token, str) or not token.strip():
-            raise ValueError(
-                "an explicit bearer token is required; refusing unauthenticated access"
-            )
+        scheme, auth_username, secret = resolve_auth(
+            auth=auth,
+            token=token,
+            username=username,
+            password=password,
+            password_file=password_file,
+        )
         if not isinstance(max_message_pages, int) or max_message_pages < 1:
             raise ValueError("max_message_pages must be a positive integer")
         self.base_url = base_url.rstrip("/")
-        self.token = token
+        self.auth = scheme
+        self.token = token if scheme == AUTH_BEARER else None
+        self.username = auth_username
+        self.password = secret if scheme == AUTH_BASIC else None
         self.timeout = float(timeout)
         self.directory = directory
         self.extra_headers = dict(extra_headers or {})
         self.max_message_pages = max_message_pages
-        # A private opener that refuses redirects (defends the token).
+        # A private opener that refuses redirects (defends the credential).
         self._opener = urllib.request.build_opener(_RedirectRejectedHandler)
 
     # -- construction helpers ------------------------------------------------
@@ -288,7 +386,13 @@ class OpenCodeV2Client:
     def from_env(cls, env: dict[str, str] | None = None) -> "OpenCodeV2Client":
         """Build a client from explicit environment variables only.
 
-        Required: ``OPENCODE_SPIKE_BASE_URL`` and ``OPENCODE_SPIKE_TOKEN``.
+        Always required: ``OPENCODE_SPIKE_BASE_URL`` (no default endpoint).
+        ``OPENCODE_SPIKE_AUTH`` selects ``bearer`` (default) or ``basic``:
+
+        * ``bearer`` — ``OPENCODE_SPIKE_TOKEN`` is required.
+        * ``basic`` — ``OPENCODE_SPIKE_PASSWORD`` or ``OPENCODE_SPIKE_PASSWORD_FILE``
+          is required; ``OPENCODE_SPIKE_USERNAME`` defaults to ``opencode``.
+
         Optional: ``OPENCODE_SPIKE_DIRECTORY``. Refuses a default endpoint and
         never reads provider keys: ``OPENROUTER_API_KEY`` is deliberately ignored.
         """
@@ -297,6 +401,18 @@ class OpenCodeV2Client:
         if not base_url:
             raise ValueError(
                 "OPENCODE_SPIKE_BASE_URL is required; no default endpoint is used"
+            )
+        auth = env.get("OPENCODE_SPIKE_AUTH", AUTH_BEARER)
+        if auth not in AUTH_SCHEMES:
+            raise ValueError(f"OPENCODE_SPIKE_AUTH must be one of {AUTH_SCHEMES}, got {auth!r}")
+        if auth == AUTH_BASIC:
+            return cls(
+                base_url,
+                auth=AUTH_BASIC,
+                username=env.get("OPENCODE_SPIKE_USERNAME"),
+                password=env.get("OPENCODE_SPIKE_PASSWORD"),
+                password_file=env.get("OPENCODE_SPIKE_PASSWORD_FILE"),
+                directory=env.get("OPENCODE_SPIKE_DIRECTORY"),
             )
         token = env.get("OPENCODE_SPIKE_TOKEN")
         if not token:
@@ -310,12 +426,21 @@ class OpenCodeV2Client:
         )
 
     # -- transport -----------------------------------------------------------
+    def _authorization(self) -> str:
+        """The explicit Authorization header value for the configured scheme."""
+        if self.auth == AUTH_BASIC:
+            raw = f"{self.username}:{self.password}".encode("utf-8")
+            return "Basic " + base64.b64encode(raw).decode("ascii")
+        return f"Bearer {self.token}"
+
     def _headers(self, has_body: bool) -> dict[str, str]:
-        headers = {"Accept": "application/json"}
+        headers: dict[str, str] = {"Accept": "application/json"}
         if has_body:
             headers["Content-Type"] = "application/json"
-        headers["Authorization"] = f"Bearer {self.token}"
+        # Caller extras first, then the explicit scheme's Authorization, so an
+        # extra header can never silently replace the configured credential.
         headers.update(self.extra_headers)
+        headers["Authorization"] = self._authorization()
         return headers
 
     def _request(
@@ -582,6 +707,12 @@ class OpenCodeV2Client:
         from the oldest message forward. Returns ``(messages, truncated)`` where
         ``truncated`` is true when the page bound was reached before the server
         exhausted its cursor; a truncated read is never treated as complete.
+
+        Query conformance (published ``session.message.list``): ``order`` applies
+        to the **first page** only and must not be combined with ``cursor``, while
+        the ``type`` filter must be repeated on every page. Only the first page
+        therefore sends ``order``; later pages send the same ``type`` (when set)
+        plus the opaque ``cursor`` and nothing else that could conflict.
         """
         self._require_session_id(session_id)
         bound = self.max_message_pages if max_pages is None else int(max_pages)
@@ -592,7 +723,12 @@ class OpenCodeV2Client:
         pages = 0
         seen_cursors: set[str] = set()
         while True:
-            page = self.list_messages(session_id, type=type, order=order, cursor=cursor)
+            if cursor is None:
+                # First page: order is permitted (and only here).
+                page = self.list_messages(session_id, type=type, order=order)
+            else:
+                # Later pages: repeat the type filter, send the cursor, never order.
+                page = self.list_messages(session_id, type=type, cursor=cursor)
             messages.extend(page.get("data", []))
             pages += 1
             next_cursor = (page.get("cursor") or {}).get("next")

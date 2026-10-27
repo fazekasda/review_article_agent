@@ -8,6 +8,9 @@ Run:  python3 -m unittest -v test_opencode_v2
 
 from __future__ import annotations
 
+import base64
+import os
+import tempfile
 import time
 import unittest
 
@@ -808,6 +811,196 @@ class TestAuthAndTransport(ClientTestCase):
             self.client._request("GET", "/api/session/ses_missing")  # 404 SessionNotFound
 
 
+class TestBasicAuth(unittest.TestCase):
+    """Explicit Basic vs Bearer auth; the 2.2.0 harness answers Basic."""
+
+    def setUp(self) -> None:
+        self.server = MockServer(basic_password="per-run-pw")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+
+    def test_basic_auth_reaches_the_server(self) -> None:
+        client = OpenCodeV2Client(
+            self.server.base_url, auth="basic", password="per-run-pw"
+        )
+        self.assertEqual(client.auth, "basic")
+        self.assertEqual(client.username, "opencode")  # documented default
+        self.assertIsNone(client.token)
+        info = client.info()
+        self.assertIn("version", info)
+        expected = "Basic " + base64.b64encode(b"opencode:per-run-pw").decode("ascii")
+        auths = [req["authorization"] for req in self.server.state.requests]
+        self.assertTrue(auths)
+        self.assertTrue(all(auth == expected for auth in auths), auths)
+
+    def test_basic_custom_username(self) -> None:
+        server = MockServer(basic_username="svc", basic_password="pw")
+        with server:
+            client = OpenCodeV2Client(
+                server.base_url, auth="basic", username="svc", password="pw"
+            )
+            self.assertEqual(client.info()["version"], "mock-0.0.1")
+
+    def test_basic_wrong_password_is_401(self) -> None:
+        client = OpenCodeV2Client(self.server.base_url, auth="basic", password="wrong")
+        with self.assertRaises(OpenCodeApiError) as ctx:
+            client.list_inbox("ses_mock0001")
+        self.assertEqual(ctx.exception.status, 401)
+        self.assertEqual(ctx.exception.tag, "UnauthorizedError")
+
+    def test_bearer_remains_the_default_and_works(self) -> None:
+        server = MockServer(token="bearer-tok")
+        with server:
+            client = OpenCodeV2Client(server.base_url, token="bearer-tok")
+            self.assertEqual(client.auth, "bearer")
+            client.info()
+            self.assertEqual(server.state.requests[-1]["authorization"], "Bearer bearer-tok")
+
+    def test_basic_missing_password_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client(self.server.base_url, auth="basic")
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client(self.server.base_url, auth="basic", username="opencode")
+
+    def test_unknown_auth_scheme_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client(self.server.base_url, auth="digest", password="x")
+
+    def test_basic_and_bearer_credentials_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client(
+                self.server.base_url, token="t", auth="basic", password="p"
+            )
+        with self.assertRaises(ValueError):
+            # bearer + a stray password cannot silently change the scheme
+            OpenCodeV2Client(self.server.base_url, token="t", password="p")
+
+    def test_basic_password_file_is_read_explicitly(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".pw", delete=False) as handle:
+            handle.write("per-run-pw\n")
+            path = handle.name
+        try:
+            client = OpenCodeV2Client(
+                self.server.base_url, auth="basic", password_file=path
+            )
+            self.assertEqual(client.password, "per-run-pw")  # trailing newline dropped
+            self.assertEqual(client.info()["version"], "mock-0.0.1")
+        finally:
+            os.unlink(path)
+
+    def test_basic_password_file_missing_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client(
+                self.server.base_url, auth="basic", password_file="/nonexistent/nope.pw"
+            )
+
+    def test_basic_password_and_password_file_conflict(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client(
+                self.server.base_url, auth="basic", password="p", password_file="/tmp/x"
+            )
+
+    def test_extra_headers_cannot_override_authorization(self) -> None:
+        # an extra header must not be able to replace the configured credential
+        client = OpenCodeV2Client(
+            self.server.base_url,
+            auth="basic",
+            password="per-run-pw",
+            extra_headers={"Authorization": "Bearer stolen", "X-Trace": "1"},
+        )
+        client.info()
+        self.assertEqual(
+            self.server.state.requests[-1]["authorization"],
+            "Basic " + base64.b64encode(b"opencode:per-run-pw").decode("ascii"),
+        )
+
+    def test_redirect_is_refused_for_basic_auth(self) -> None:
+        client = OpenCodeV2Client(
+            self.server.base_url, auth="basic", password="per-run-pw"
+        )
+        with self.assertRaises(OpenCodeApiError) as ctx:
+            client._request("GET", "/api/redirect")
+        self.assertEqual(ctx.exception.status, 302)
+        self.assertIn("redirect blocked", ctx.exception.message)
+        # only the original request was made: no credential went to the target
+        self.assertEqual(len(self.server.state.requests), 1)
+
+
+class TestPagingQueryConformance(unittest.TestCase):
+    """``order`` is a first-page-only parameter; never combined with ``cursor``."""
+
+    def setUp(self) -> None:
+        self.server = MockServer(token="test-token")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.client = OpenCodeV2Client(self.server.base_url, token="test-token")
+        self.sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+
+    def _message_calls(self) -> list[dict]:
+        return [
+            req
+            for req in self.server.state.requests
+            if req["path"] == f"/api/session/{self.sid}/message"
+        ]
+
+    def test_mock_rejects_cursor_with_order(self) -> None:
+        # proves the regression test below is meaningful: the mock enforces the
+        # published "do not combine cursor with order" rule.
+        with self.assertRaises(OpenCodeApiError) as ctx:
+            self.client.list_messages(self.sid, order="asc", cursor="2")
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.tag, "InvalidRequestError")
+
+    def test_collect_messages_sends_order_only_on_the_first_page(self) -> None:
+        for index in range(5):
+            self.server.state.append_user(self.sid, f"msg_page{index:04d}", f"t{index}")
+        self.server.state.message_page_size = 2
+        messages, truncated = self.client.collect_messages(self.sid)
+        self.assertFalse(truncated)
+        self.assertEqual(
+            [m["id"] for m in messages],
+            [f"msg_page{index:04d}" for index in range(5)],
+        )
+        calls = self._message_calls()
+        self.assertGreater(len(calls), 1)  # actually paged
+        self.assertEqual(calls[0]["query"].get("order"), ["asc"])
+        self.assertNotIn("cursor", calls[0]["query"])
+        for call in calls[1:]:
+            self.assertIn("cursor", call["query"])
+            self.assertNotIn("order", call["query"])
+
+    def test_collect_messages_repeats_type_filter_on_later_pages(self) -> None:
+        for index in range(6):
+            if index % 2 == 0:
+                self.server.state.append_user(self.sid, f"msg_u{index:04d}", "u")
+            else:
+                self.server.state.append_system(self.sid, "s")
+        self.server.state.message_page_size = 2
+        messages, truncated = self.client.collect_messages(self.sid, type="system")
+        self.assertFalse(truncated)
+        self.assertTrue(messages)
+        self.assertTrue(all(message["type"] == "system" for message in messages))
+        calls = self._message_calls()
+        self.assertGreater(len(calls), 1)
+        for call in calls:
+            self.assertEqual(call["query"].get("type"), ["system"])
+        for call in calls[1:]:
+            self.assertNotIn("order", call["query"])
+
+    def test_reconcile_still_pages_after_the_query_fix(self) -> None:
+        # regression: reconciliation over a multi-page timeline still completes.
+        for index in range(4):
+            self.server.state.append_user(self.sid, f"msg_old{index:04d}", "old")
+            self.server.state.append_idle(self.sid, "succeeded")
+        self.server.state.append_user(self.sid, "msg_target09", "target")
+        self.server.state.append_assistant(self.sid, "target done")
+        self.server.state.append_idle(self.sid, "succeeded")
+        self.server.state.message_page_size = 3
+        found = self.client.reconcile(self.sid, "msg_target09")
+        self.assertEqual(found.state, "completed")
+        self.assertTrue(found.is_complete)
+
+
 class TestExplicitConfiguration(unittest.TestCase):
     def test_from_env_requires_explicit_base_url(self) -> None:
         with self.assertRaises(ValueError):
@@ -833,6 +1026,37 @@ class TestExplicitConfiguration(unittest.TestCase):
         # A provider key must not substitute for the explicit spike endpoint/token.
         with self.assertRaises(ValueError):
             OpenCodeV2Client.from_env({"OPENROUTER_API_KEY": "present-but-not-used"})
+
+    def test_from_env_basic_auth(self) -> None:
+        client = OpenCodeV2Client.from_env(
+            {
+                "OPENCODE_SPIKE_BASE_URL": "http://127.0.0.1:9999",
+                "OPENCODE_SPIKE_AUTH": "basic",
+                "OPENCODE_SPIKE_PASSWORD": "pw",
+            }
+        )
+        self.assertEqual(client.auth, "basic")
+        self.assertEqual(client.username, "opencode")
+        self.assertEqual(client.password, "pw")
+
+    def test_from_env_basic_auth_requires_password(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client.from_env(
+                {
+                    "OPENCODE_SPIKE_BASE_URL": "http://127.0.0.1:9999",
+                    "OPENCODE_SPIKE_AUTH": "basic",
+                }
+            )
+
+    def test_from_env_unknown_auth_scheme_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client.from_env(
+                {
+                    "OPENCODE_SPIKE_BASE_URL": "http://127.0.0.1:9999",
+                    "OPENCODE_SPIKE_AUTH": "digest",
+                    "OPENCODE_SPIKE_TOKEN": "t",
+                }
+            )
 
 
 if __name__ == "__main__":

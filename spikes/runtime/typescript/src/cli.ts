@@ -12,7 +12,7 @@
  * `submit` exits after printing the receipt: closing the CLI must not stop the
  * server-owned task, so a later `result` invocation is what recovers the outcome.
  */
-import { createRuntimeClient, resolveEndpoint, type RuntimeEndpoint } from "./client.ts";
+import { createRuntimeClient, resolveEndpoint, type AuthScheme, type RuntimeEndpoint } from "./client.ts";
 import { newAdmissionId, type AdmissionId, type Delivery, type SessionId } from "./admission.ts";
 import {
   createCriticSession,
@@ -31,7 +31,7 @@ interface ParsedArgs {
   readonly flags: Readonly<Record<string, string>>;
 }
 
-const VALUE_FLAGS = new Set(["url", "token", "session", "id", "text", "delivery", "wait-ms", "dir", "agent", "model", "variant", "questions"]);
+const VALUE_FLAGS = new Set(["url", "auth", "token", "username", "password", "session", "id", "text", "delivery", "wait-ms", "dir", "agent", "model", "variant", "questions"]);
 
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   const [command, ...rest] = argv;
@@ -59,7 +59,12 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
 function endpointFrom(flags: Readonly<Record<string, string>>): RuntimeEndpoint {
   return resolveEndpoint({
     url: flags.url,
+    // An unknown scheme is rejected by resolveEndpoint; the cast only satisfies
+    // the union type, the runtime validation is the guard.
+    auth: flags.auth as AuthScheme | undefined,
     token: flags.token,
+    username: flags.username,
+    password: flags.password,
   });
 }
 
@@ -85,7 +90,7 @@ async function main(): Promise<number> {
   const { command, flags } = parseArgs(process.argv.slice(2));
   if (command === undefined || command === "help" || flags.help === "true") {
     process.stdout.write(
-      "usage: cli.ts <check|submit|result|reconcile|critic|decisions> [--url URL] [--token TOKEN] ...\n",
+      "usage: cli.ts <check|submit|result|reconcile|critic|decisions> [--url URL] [--auth bearer|basic] [--token TOKEN | --username USER --password PASS] ...\n",
     );
     return command === undefined ? 1 : 0;
   }
