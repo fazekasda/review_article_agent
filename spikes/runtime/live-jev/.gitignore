@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+# A local live run may write an unsanitized report path here; never commit it.
+*.local.json
