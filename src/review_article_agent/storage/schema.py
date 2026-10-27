@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sqlite3
 from typing import Callable, Mapping
+from urllib.parse import quote
 
 from ..domain.errors import MigrationError, StoreError, UnsupportedSchemaVersion
 
@@ -169,6 +170,47 @@ def _summarise(exc: BaseException) -> str:
         # and never contain application data or credentials.
         return f"sqlite: {exc}"
     return exc.__class__.__name__
+
+
+def read_only_probe(db_path: str) -> tuple[int, set[str]]:
+    """Return ``(user_version, user_table_names)`` without writing.
+
+    Used to classify an existing file (registry or store) as empty, ours, or
+    foreign *before* any pragma/migration is applied. Prefers a true read-only
+    URI connection and falls back to a plain ``query_only`` connection if the
+    read-only open cannot attach to WAL shared memory.
+    """
+    conn: sqlite3.Connection
+    try:
+        conn = sqlite3.connect(
+            "file:" + quote(db_path) + "?mode=ro", uri=True, isolation_level=None
+        )
+    except sqlite3.Error:
+        try:
+            conn = sqlite3.connect(db_path, isolation_level=None)
+        except sqlite3.Error as exc:
+            raise StoreError(
+                f"could not open the local database at {db_path!r} for reading."
+            ) from exc
+        try:
+            conn.execute("PRAGMA query_only = ON")
+        except sqlite3.Error:
+            pass
+    try:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    except sqlite3.DatabaseError as exc:
+        raise StoreError(
+            f"the file at {db_path!r} is not a readable SQLite database."
+        ) from exc
+    finally:
+        conn.close()
+    return version, tables
 
 
 def open_connection(db_path: str) -> sqlite3.Connection:

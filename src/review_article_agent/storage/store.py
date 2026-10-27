@@ -12,11 +12,18 @@ A :class:`ProjectStore` owns exactly one project's app-owned directory
   store, so a registry location can be checked against the store it points at;
 * :meth:`ProjectStore.metadata` — the recorded application metadata.
 
-Opening a store applies pending migrations transactionally and refuses a newer
-schema. The store directory holds no user assets in Step 02, so it is safe for a
-future consistent backup to snapshot the SQLite database (with WAL sidecars)
-rather than racing an external file tree; immutable content will be stored as
-SQLite BLOBs by the artifact worker.
+Opening a store **verifies the existing database read-only first** — schema
+version and recorded project identity — and only after that passes does it open
+a writable connection, apply pragmas/migrations, and narrow permissions. A
+foreign SQLite file, an invalid identity, a newer schema, or an identity that
+does not match ``expected_project_id`` are all rejected *before any write*, so a
+rejected open never changes the target's ``journal_mode`` or creates tables in
+it.
+
+The store directory holds no user assets in Step 02, so it is safe for a future
+consistent backup to snapshot the SQLite database (with WAL sidecars) rather
+than racing an external file tree; immutable content will be stored as SQLite
+BLOBs by the artifact worker.
 """
 
 from __future__ import annotations
@@ -26,9 +33,15 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
+from urllib.parse import quote
 
 from .. import __version__
-from ..domain.errors import ProjectPathError, StoreError
+from ..domain.errors import (
+    InvalidProjectId,
+    ProjectPathError,
+    StoreError,
+    UnsupportedSchemaVersion,
+)
 from . import paths, schema
 
 
@@ -57,6 +70,102 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         except sqlite3.Error:  # pragma: no cover - best effort
             pass
         raise
+
+
+class _ReadonlyIdentity:
+    __slots__ = ("schema_version", "project_id", "app_version")
+
+    def __init__(self, schema_version: int, project_id: str, app_version: str) -> None:
+        self.schema_version = schema_version
+        self.project_id = project_id
+        self.app_version = app_version
+
+
+def _read_identity_readonly(
+    db_path: str, *, expected_project_id: str | None
+) -> _ReadonlyIdentity:
+    """Read schema version and project identity **without writing**.
+
+    Prefers a true read-only URI connection; falls back to a plain connection
+    guarded by ``PRAGMA query_only = ON`` when a read-only open cannot attach to
+    WAL shared memory. Neither path issues a ``journal_mode`` change, runs a
+    migration, or creates a table, so a rejected target is left byte-identical.
+
+    Raises :class:`UnsupportedSchemaVersion` for a newer schema,
+    :class:`ProjectPathError` for an ID mismatch against ``expected_project_id``,
+    and :class:`StoreError` for a foreign or corrupt file.
+    """
+    conn: sqlite3.Connection
+    read_only_uri = "file:" + quote(db_path) + "?mode=ro"
+    try:
+        conn = sqlite3.connect(read_only_uri, uri=True, isolation_level=None)
+    except sqlite3.Error:
+        try:
+            conn = sqlite3.connect(db_path, isolation_level=None)
+        except sqlite3.Error as exc:
+            raise StoreError(
+                f"could not open the local database at {db_path!r} for reading."
+            ) from exc
+        try:
+            conn.execute("PRAGMA query_only = ON")
+        except sqlite3.Error:
+            pass
+    conn.row_factory = sqlite3.Row
+    try:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > schema.STORE_SCHEMA_VERSION:
+            raise UnsupportedSchemaVersion(
+                label="project store",
+                found=version,
+                supported=schema.STORE_SCHEMA_VERSION,
+            )
+        if version < 1:
+            raise StoreError(
+                f"the file at {db_path!r} is not a review_article_agent project "
+                f"store (no schema version recorded)."
+            )
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'project'"
+        ).fetchone()
+        if table is None:
+            raise StoreError(
+                f"the file at {db_path!r} is not a review_article_agent project "
+                f"store (no project identity table)."
+            )
+        rows = conn.execute(
+            "SELECT project_id, app_version FROM project"
+        ).fetchall()
+        if len(rows) != 1:
+            raise StoreError(
+                f"the store at {db_path!r} does not contain exactly one project "
+                f"identity row."
+            )
+        project_id = rows[0]["project_id"]
+        try:
+            paths.validate_project_id(project_id)
+        except InvalidProjectId as exc:
+            raise StoreError(
+                f"the store at {db_path!r} records an invalid project identity; "
+                f"refusing to use it."
+            ) from exc
+        if expected_project_id is not None and project_id != expected_project_id:
+            raise ProjectPathError(
+                f"the store at {db_path!r} belongs to project {project_id!r}, "
+                f"not {expected_project_id!r}; refusing to read or write a "
+                f"mismatched store."
+            )
+        return _ReadonlyIdentity(
+            schema_version=version,
+            project_id=project_id,
+            app_version=rows[0]["app_version"] or __version__,
+        )
+    except sqlite3.DatabaseError as exc:
+        raise StoreError(
+            f"the file at {db_path!r} is not a readable review_article_agent "
+            f"store."
+        ) from exc
+    finally:
+        conn.close()
 
 
 class ProjectStore:
@@ -183,18 +292,33 @@ class ProjectStore:
         )
 
     @classmethod
-    def open_at(cls, app_dir: str) -> "ProjectStore":
+    def open_at(
+        cls, app_dir: str, *, expected_project_id: str | None = None
+    ) -> "ProjectStore":
         """Open an existing store, migrating it transactionally.
 
-        Rejects a symlinked app-owned directory or store file and a store whose
-        recorded identity is missing.
+        Rejects a symlinked app-owned directory or store file (and sidecars) and
+        a store whose recorded identity is missing or invalid. When
+        ``expected_project_id`` is given, the recorded identity must match it.
+
+        Identity and schema version are verified **read-only before any write**;
+        only then is a writable connection opened, pragmas applied, and the
+        migration run. A rejected open therefore leaves the target database
+        untouched (its ``journal_mode`` and tables are unchanged).
         """
+        if expected_project_id is not None:
+            paths.validate_project_id(expected_project_id)
         paths.assert_app_dir_safe(app_dir)
         db_path = os.path.join(app_dir, cls.STORE_FILENAME)
         if not os.path.isfile(db_path):
-            raise ProjectPathError(
-                f"no project store found at {db_path!r}."
-            )
+            raise ProjectPathError(f"no project store found at {db_path!r}.")
+
+        # Phase 1: read-only verification (no pragmas, no migration, no chmod).
+        identity = _read_identity_readonly(
+            db_path, expected_project_id=expected_project_id
+        )
+
+        # Phase 2: only now may we write.
         conn = schema.open_connection(db_path)
         try:
             version = schema.migrate(
@@ -203,16 +327,6 @@ class ProjectStore:
                 migrations=schema.STORE_MIGRATIONS,
                 label="project store",
             )
-            row = conn.execute(
-                "SELECT project_id, app_version FROM project LIMIT 2"
-            ).fetchall()
-            if len(row) != 1:
-                raise StoreError(
-                    f"store at {db_path!r} does not contain exactly one project "
-                    f"identity row."
-                )
-            project_id = row[0]["project_id"]
-            app_version = row[0]["app_version"] or __version__
             paths.ensure_owner_private_file(db_path)
         except BaseException:
             conn.close()
@@ -220,9 +334,9 @@ class ProjectStore:
         return cls(
             conn,
             app_dir,
-            project_id,
+            identity.project_id,
             schema_version=version,
-            app_version=app_version,
+            app_version=identity.app_version,
         )
 
     def close(self) -> None:

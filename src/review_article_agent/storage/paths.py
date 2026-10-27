@@ -13,14 +13,15 @@ Layout (per ``ARCH-STORE``):
 
 Safety rules enforced here:
 
-* Project IDs are generated (``uuid4``) and validated against a fixed pattern;
-  they are never derived from a path or Git and are never spliced into a path
-  by this layer.
-* App-owned directories and database files are created owner-private
-  (``0o700`` directory, ``0o600`` file).
-* Symlinked app-owned directories or store files are rejected; a project is
-  only ever reached through its own app-owned directory, so an attacker cannot
-  redirect a lookup to another project's assets.
+* Project IDs are generated (``uuid4``) and validated against a fixed pattern
+  (``fullmatch``; the pattern contains no version-specific escapes) before the
+  value reaches a query or a path.
+* App-owned directories and database files are created **and validated**
+  owner-private (``0o700`` directory, ``0o600`` file). A pre-existing directory
+  or file that is group/world accessible is refused rather than silently used.
+* Symlinked app-owned directories, database files, their ``-wal``/``-shm``
+  sidecars, and the registry lock are rejected, so a lookup can never be
+  redirected to another project's (or a foreign) SQLite file.
 """
 
 from __future__ import annotations
@@ -49,11 +50,16 @@ REGISTRY_LOCK_FILENAME = "registry.lock"
 #: Application namespace under the XDG data home.
 APP_DATA_DIR_NAME = "review_article_agent"
 
-#: Pattern for a valid, application-generated project ID.
-PROJECT_ID_PATTERN = re.compile(r"\Aprj_[0-9a-f]{32}\z")
+#: Pattern for a valid, application-generated project ID. Matched with
+#: ``fullmatch`` (no ``\\z``/``\\A`` escapes, which differ across Python
+#: versions); this keeps the declared ``>=3.11`` requirement honest.
+PROJECT_ID_PATTERN = re.compile(r"prj_[0-9a-f]{32}")
 
 #: Human-readable description used in error messages.
 PROJECT_ID_HINT = "'prj_' followed by 32 lowercase hex characters"
+
+#: Owner-private permission mask: no group/other access.
+_GROUP_OTHER_BITS = 0o077
 
 
 def new_project_id() -> str:
@@ -72,7 +78,7 @@ def validate_project_id(project_id: object) -> str:
     generated shape — including path-like or traversal values — before the
     value reaches a query or a path.
     """
-    if not isinstance(project_id, str) or not PROJECT_ID_PATTERN.match(project_id):
+    if not isinstance(project_id, str) or PROJECT_ID_PATTERN.fullmatch(project_id) is None:
         raise InvalidProjectId(project_id, expected=PROJECT_ID_HINT)
     return project_id
 
@@ -100,6 +106,11 @@ def store_path_for(root: str) -> str:
     return os.path.join(app_dir_for(root), STORE_FILENAME)
 
 
+def sidecar_paths(db_path: str) -> tuple[str, str, str]:
+    """Return ``(db, db-wal, db-shm)`` for a SQLite database path."""
+    return (db_path, db_path + "-wal", db_path + "-shm")
+
+
 def default_data_dir(env: dict[str, str] | None = None) -> str:
     """Resolve the default application data directory.
 
@@ -116,13 +127,67 @@ def default_data_dir(env: dict[str, str] | None = None) -> str:
     return os.path.join(os.path.abspath(base), APP_DATA_DIR_NAME)
 
 
+# --------------------------------------------------------------------------- #
+# owner-private policy
+# --------------------------------------------------------------------------- #
+def is_owner_private(mode: int) -> bool:
+    """True when a file mode grants no group/other access."""
+    return (mode & _GROUP_OTHER_BITS) == 0
+
+
+def assert_owner_private_dir(path: str, *, what: str = "app-owned directory") -> None:
+    """Refuse a directory that is not owner-private (``0o700``-equivalent)."""
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise ProjectPathError(f"{what} {path!r} cannot be inspected.") from exc
+    if not is_owner_private(st.st_mode):
+        raise ProjectPathError(
+            f"{what} {path!r} is not owner-private (mode "
+            f"{st.st_mode & 0o777:04o}); refusing to use a shared directory. "
+            f"Run `chmod 700 {path}` if it is yours."
+        )
+
+
+def assert_owner_private_file(path: str, *, what: str = "database file") -> None:
+    """Refuse a symlinked or non-owner-private database file."""
+    if os.path.islink(path):
+        raise ProjectPathError(f"{what} {path!r} is a symlink; refusing to use it.")
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise ProjectPathError(f"{what} {path!r} cannot be inspected.") from exc
+    if not is_owner_private(st.st_mode):
+        raise ProjectPathError(
+            f"{what} {path!r} is not owner-private (mode "
+            f"{st.st_mode & 0o777:04o}); refusing to use it. Run `chmod 600 "
+            f"{path}` if it is yours."
+        )
+
+
+def assert_not_symlink(path: str, *, what: str) -> None:
+    """Refuse a path that is a symlink (checked with ``lexists`` semantics)."""
+    if os.path.islink(path):
+        raise ProjectPathError(
+            f"{what} {path!r} is a symlink, which could redirect to a foreign "
+            f"file or another project's data; refusing to use it."
+        )
+
+
 def ensure_owner_private_dir(path: str) -> None:
-    """Create ``path`` (and parents) if missing, owner-private (``0o700``)."""
+    """Create ``path`` (and parents) if missing, owner-private (``0o700``).
+
+    A pre-existing directory is **validated**, not silently accepted: if it is
+    group/world accessible, or a symlink, this refuses to use it. This is only
+    ever applied to app-owned directories (the store directory and the data
+    directory), never to a user's project root (see :func:`ensure_directory`).
+    """
     if os.path.islink(path):
         raise ProjectPathError(
             f"refusing to use app-owned directory {path!r}: it is a symlink."
         )
     if os.path.isdir(path):
+        assert_owner_private_dir(path)
         return
     if os.path.exists(path):
         raise ProjectPathError(
@@ -137,7 +202,15 @@ def ensure_owner_private_dir(path: str) -> None:
 
 
 def ensure_owner_private_file(path: str) -> None:
-    """Restrict an existing database file to the owner (``0o600``)."""
+    """Restrict an existing database file we own to the owner (``0o600``).
+
+    Refuses a symlink (so the registry/store never follows a symlink to another
+    file) and only then narrows permissions.
+    """
+    if os.path.islink(path):
+        raise ProjectPathError(
+            f"refusing to use database file {path!r}: it is a symlink."
+        )
     try:
         os.chmod(path, 0o600)
     except OSError:  # pragma: no cover - best effort
@@ -147,9 +220,9 @@ def ensure_owner_private_file(path: str) -> None:
 def ensure_directory(path: str) -> bool:
     """Create a plain (non-app-owned) directory if missing.
 
-    Returns ``True`` when this call created the directory. Does **not** chmod a
-    pre-existing directory and never removes anything; used only for the
-    caller-supplied project root.
+    Returns ``True`` when this call created the directory. This is used only for
+    the caller-supplied project root / relocation destination, so it does **not**
+    chmod or validate a pre-existing directory and never removes anything.
     """
     created = not os.path.isdir(path)
     os.makedirs(path, mode=0o700, exist_ok=True)
@@ -157,21 +230,24 @@ def ensure_directory(path: str) -> bool:
 
 
 def assert_app_dir_safe(app_dir: str) -> None:
-    """Reject a symlinked app-owned directory or store file.
+    """Reject an unsafe app-owned directory, store file, or sidecar.
 
-    ``app_dir`` is expected to be an existing path; a symlink here would let a
-    registry entry point at another project's assets, so it is refused.
+    Refuses a symlinked app-owned directory (which would let a registry entry
+    point at another project's assets), an app-owned directory that is not
+    owner-private, and any symlinked ``store.sqlite3``/``-wal``/``-shm``.
     """
-    if os.path.islink(app_dir):
-        raise ProjectPathError(
-            f"refusing to use app-owned directory {app_dir!r}: it is a symlink, "
-            f"which could redirect to another project's assets."
-        )
-    store = os.path.join(app_dir, STORE_FILENAME)
-    if os.path.islink(store):
-        raise ProjectPathError(
-            f"refusing to use project store {store!r}: it is a symlink."
-        )
+    assert_not_symlink(app_dir, what="app-owned directory")
+    if os.path.isdir(app_dir):
+        assert_owner_private_dir(app_dir)
+    for side in sidecar_paths(os.path.join(app_dir, STORE_FILENAME)):
+        assert_not_symlink(side, what="project store file")
+
+
+def assert_registry_paths_safe(data_dir: str, registry_path: str, lock_path: str) -> None:
+    """Reject symlinked registry database, sidecars, or lock file."""
+    for side in sidecar_paths(registry_path):
+        assert_not_symlink(side, what="registry database file")
+    assert_not_symlink(lock_path, what="registry lock file")
 
 
 def remove_dir_best_effort(path: str) -> None:

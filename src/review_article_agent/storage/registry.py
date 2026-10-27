@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import fcntl
 import os
-import shutil
 import sqlite3
 import secrets
 from contextlib import contextmanager
@@ -46,6 +45,8 @@ from ..domain.errors import (
     ProjectConflict,
     ProjectNotFound,
     ProjectPathError,
+    StoreError,
+    UnsupportedSchemaVersion,
 )
 from . import paths, schema
 from .store import ProjectStore, transaction
@@ -103,7 +104,33 @@ class Registry:
     def _ensure_data_dir(self) -> None:
         paths.ensure_owner_private_dir(self._data_dir)
 
+    def _assert_registry_safe(self) -> None:
+        paths.assert_registry_paths_safe(
+            self._data_dir, self.registry_path, self.lock_path
+        )
+
     def _connect(self) -> sqlite3.Connection:
+        self._assert_registry_safe()
+        # Classify an existing registry file read-only before writing to it, so
+        # a foreign or newer file is never mutated with our pragmas/migrations.
+        if os.path.exists(self.registry_path):
+            version, tables = schema.read_only_probe(self.registry_path)
+            if version > schema.REGISTRY_SCHEMA_VERSION:
+                raise UnsupportedSchemaVersion(
+                    label="application registry",
+                    found=version,
+                    supported=schema.REGISTRY_SCHEMA_VERSION,
+                )
+            if version >= 1 and "projects" not in tables:
+                raise StoreError(
+                    f"the file at {self.registry_path!r} is not a "
+                    f"review_article_agent registry; refusing to use it."
+                )
+            if version == 0 and tables:
+                raise StoreError(
+                    f"the file at {self.registry_path!r} is a foreign database; "
+                    f"refusing to initialise a registry in it."
+                )
         conn = schema.open_connection(self.registry_path)
         try:
             schema.migrate(
@@ -127,7 +154,9 @@ class Registry:
         connection drives the atomic SQLite row updates.
         """
         self._ensure_data_dir()
-        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        self._assert_registry_safe()
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR | nofollow, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             conn = self._connect()
@@ -243,6 +272,9 @@ class Registry:
                 f"project {existing['project_id']!r} named {existing['name']!r}; "
                 f"the requested name {name!r} conflicts."
             )
+        # An idempotent short-circuit must not return a row whose store is
+        # missing, symlinked, or has drifted to another identity.
+        self._verify_store_matches(existing["root_path"], existing["project_id"])
         return self._row_to_info(existing)
 
     def _insert_project_row(
@@ -343,12 +375,16 @@ class Registry:
                 raise ProjectNotFound(project_id)
             old_root = row["root_path"]
             if old_root == new_root_path:
+                # A no-op relocation still re-validates the registration.
+                self._verify_store_matches(old_root, project_id)
                 return self._row_to_info(row)
 
+            moved = False
             if move:
-                # Verify the source store's identity before touching it.
+                # Verify the source store's identity read-only before touching it.
                 self._verify_store_matches(old_root, project_id)
                 self._move_app_dir(old_root, new_root_path)
+                moved = True
             else:
                 old_app = paths.app_dir_for(old_root)
                 if os.path.isdir(old_app) or os.path.islink(old_app):
@@ -359,11 +395,15 @@ class Registry:
                     )
                 self._verify_store_matches(new_root_path, project_id)
 
-            with transaction(conn):
-                conn.execute(
-                    "UPDATE projects SET root_path = ? WHERE project_id = ?",
-                    (new_root_path, project_id),
-                )
+            try:
+                with transaction(conn):
+                    self._update_project_root(conn, project_id, new_root_path)
+            except BaseException:
+                if moved:
+                    # The registry still points at old_root: undo the move so the
+                    # recorded location is never a missing store.
+                    self._undo_move(new_root_path, old_root)
+                raise
             return ProjectInfo(
                 project_id,
                 row["name"],
@@ -372,7 +412,28 @@ class Registry:
                 paths.store_path_for(new_root_path),
             )
 
+    def _update_project_root(
+        self, conn: sqlite3.Connection, project_id: str, new_root_path: str
+    ) -> None:
+        """Update a project's registered location (injectable for tests)."""
+        conn.execute(
+            "UPDATE projects SET root_path = ? WHERE project_id = ?",
+            (new_root_path, project_id),
+        )
+
+    @staticmethod
+    def _same_device(a: str, b: str) -> bool:
+        """True when two existing paths live on the same filesystem."""
+        return os.stat(a).st_dev == os.stat(b).st_dev
+
     def _move_app_dir(self, old_root: str, new_root: str) -> None:
+        """Move only the app-owned directory, atomically, same filesystem.
+
+        A cross-device move is refused: ``shutil.move`` would fall back to a
+        copy-and-delete of a live WAL database, which is unsafe for a consistent
+        store. The caller must relocate to a path on the same filesystem (or use
+        a future backup/restore path) instead.
+        """
         old_app = paths.app_dir_for(old_root)
         new_app = paths.app_dir_for(new_root)
         if os.path.lexists(new_app):
@@ -386,11 +447,33 @@ class Registry:
             )
         created_root = paths.ensure_directory(new_root)
         try:
-            shutil.move(old_app, new_app)
+            if not self._same_device(old_app, new_root):
+                raise ProjectPathError(
+                    f"cannot move {old_app!r} to {new_root!r}: the destination is "
+                    f"on a different filesystem. A live store is not copied "
+                    f"across devices (that would copy a WAL database unsafely); "
+                    f"relocate to the same filesystem or restore from a backup."
+                )
+            os.rename(old_app, new_app)
         except BaseException:
             if created_root:
                 paths.remove_dir_if_empty(new_root)
             raise
+
+    def _undo_move(self, from_root: str, to_root: str) -> None:
+        """Best-effort reverse of :meth:`_move_app_dir` after a failed update."""
+        from_app = paths.app_dir_for(from_root)
+        to_app = paths.app_dir_for(to_root)
+        try:
+            if os.path.lexists(from_app) and not os.path.lexists(to_app):
+                os.rename(from_app, to_app)
+        except OSError as exc:
+            raise StoreError(
+                f"the registry update failed and the store at {from_app!r} could "
+                f"not be moved back to {to_app!r}; it remains at {from_app!r} while "
+                f"the registry still records {to_root!r}. Recover by moving it "
+                f"back or re-registering explicitly."
+            ) from exc
 
     # -- selection ----------------------------------------------------------- #
     def select(self, project_id: str) -> ProjectInfo:
@@ -463,11 +546,12 @@ class Registry:
 
     # -- verification -------------------------------------------------------- #
     def _verify_store_matches(self, root_path: str, project_id: str) -> None:
-        """Open the store at ``root_path`` and confirm its identity.
+        """Confirm the store at ``root_path`` holds ``project_id``.
 
-        Checks are performed *before* any selection/relocation write, and the
-        connection is then closed. Raises :class:`ProjectPathError` on a
-        missing store, a symlinked store, or an ID/location mismatch.
+        The identity is verified **read-only inside** :meth:`ProjectStore.open_at`
+        before any pragma/migration/chmod, and the store is closed immediately.
+        Raises :class:`ProjectPathError` on a missing store, an unsafe store, or
+        an ID/location mismatch — never after a foreign write.
         """
         app_dir = paths.app_dir_for(root_path)
         paths.assert_app_dir_safe(app_dir)
@@ -476,14 +560,5 @@ class Registry:
                 f"project {project_id!r} is registered at {root_path!r} but its "
                 f"app-owned directory {app_dir!r} is missing."
             )
-        store = ProjectStore.open_at(app_dir)
-        try:
-            found = store.project_id
-        finally:
-            store.close()
-        if found != project_id:
-            raise ProjectPathError(
-                f"store at {app_dir!r} belongs to project {found!r}, but the "
-                f"registry maps {project_id!r} to that location; refusing to "
-                f"read or write a mismatched store."
-            )
+        store = ProjectStore.open_at(app_dir, expected_project_id=project_id)
+        store.close()
