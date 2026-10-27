@@ -2,7 +2,7 @@
 
 ## Status and authority
 
-- **Contract version:** `v2` (draft representation, dated 2026-10-27).
+- **Contract version:** `v3` (draft representation, dated 2026-10-27).
 - **Approval state: PROPOSED — approval pending.** The *requirements* below are
   carried over from already-confirmed sources and must not be weakened. The
   *representations* introduced here — record names, field names, field types,
@@ -21,6 +21,12 @@
   invariants only. It does not claim that screening, extraction, drafting,
   review, or origin tracing is implemented, correct, or scientifically
   validated.
+- **Adapter-faithful decisions.** The typed decision shapes (§6.2) are taken from
+  the retained, tested direct-OpenRouter adapter
+  [`spikes/runtime/live-jev/live_jev.py`](../../spikes/runtime/live-jev/live_jev.py)
+  (`noul` predicate probability, `choice` options/confidence/probabilities,
+  `score` levels/legend; `box` unsupported), not from the unexercised native
+  route.
 - **Confirmed sources preserved** (read-only authority for this contract):
   [`docs/specification.md`](../specification.md) ("Gates and scientific
   invariants" lines 52–63; "Citation-origin policy" lines 44–50; "Confirmed
@@ -35,13 +41,13 @@
   and [`docs/implementation/handoffs/00-runtime-spike.md`](../implementation/handoffs/00-runtime-spike.md).
 - **Sibling identity contract:** artifact references use the immutable reference
   tuple `{project_id, artifact_id, revision_id}` defined by the sibling
-  identity-and-evidence contract produced alongside this document in step 01.
-  That tuple is assumed, not redefined here.
+  identity-and-evidence contract of this coordinated step-01 contract set. That
+  tuple is assumed, not redefined here.
 - **Sibling policy contract:** rights, privacy, hosted-model transfer, and
   provider/journal policy are defined by the sibling policy contract
-  [`03-policy-decisions.md`](03-policy-decisions.md), produced in the coordinated
-  contract set (C04). This document does not define that policy; the link
-  resolves once the sibling contract lands.
+  [`03-policy-decisions.md`](03-policy-decisions.md) of the coordinated step-01
+  contract set. This document does not define that policy; the link resolves once
+  the sibling contract lands.
 
 ## Notation and typing rules
 
@@ -49,11 +55,13 @@
 | --- | --- |
 | `string` | UTF-8 text. |
 | `id` | Opaque, stable, non-empty application-assigned identifier. |
+| `id|null` | An `id` or JSON `null`; used where a value is mandatory but legitimately absent in a named state. |
 | `ref` | Immutable artifact reference `{project_id, artifact_id, revision_id}` (sibling contract). |
 | `enum{...}` | Exactly one listed literal; an unrecognized value is **invalid** (fail closed, never coerced). |
 | `ts` | UTC timestamp, ISO-8601, with explicit offset. |
-| `digest` | Canonical content digest: lowercase hex **SHA-256**, the single algorithm for every digest in this contract. There is no per-field algorithm field. |
+| `digest` | Canonical content digest: lowercase hex **SHA-256** (`^[0-9a-f]{64}$`), the single algorithm for every digest in this contract. There is no per-field algorithm field. |
 | `decimal` | Exact base-10 amount encoded as a string (never a JSON float); preserves provider precision. |
+| `probability` | JSON number in `[0,1]`. |
 | `list<T>` | Ordered sequence of `T`. |
 | `map<K,V>` | Key→value mapping with `K`/`V` as named types. |
 | `bool`, `int`, `number` | JSON boolean / integer / number. |
@@ -112,7 +120,9 @@ Invariants:
   `owner_auth_ref`; attempting so makes the record `invalid` and MUST be
   rejected.
 - `authority = owner_authenticated` without a matching validated
-  `owner_auth_ref` ⇒ `invalid`.
+  `owner_auth_ref` ⇒ `invalid`. The `owner_auth_ref` is a **pointer** to an
+  out-of-band check; a record that merely contains the fields does not itself
+  prove authority (see the §11.0 precondition).
 - A plain boolean "authenticated" flag supplied in-band MUST NOT be trusted as
   authority.
 
@@ -163,7 +173,7 @@ Invariants:
 | `artifact_id` | `id` | M | |
 | `revision_id` | `id` | M | Immutable. |
 | `digest` | `digest` | M | Canonical SHA-256 content digest of that revision. |
-| `role` | `enum{source_document, summary, finding, rubric, framework, outline, parser_output, model_output, other}` | M | |
+| `role` | `enum{source_document, summary, finding, rubric, framework, outline, parser_output, model_output, question_def, other}` | M | |
 
 Invariant: the snapshot is **exact** — it enumerates each dependency by
 `project_id` + `artifact_id` + `revision_id` + canonical `digest`, never by name
@@ -180,6 +190,7 @@ entry makes the bound approval `stale` (revision changed) or `invalidated`
 | Stored `digest` ≠ recomputed digest | `invalidated` | Approval not honored. |
 | Declared-material change to rubric / framework / parser / model / policy | `stale` | "Material rubric/model/parser changes reopen relevant pilot approval" (spec line 30). |
 | New artifact revision replaces the approved one | `stale` | The prior approval does not carry forward to the new revision. |
+| The approved tuple was an **original/ancestor revision** and a dependency has since been edited | `stale` **for affected current use** | The historical exact-revision approval is retained for audit only; it MUST NOT authorize current use. |
 | A newer approval for the same `gate_kind` + `gate_id` + target exists | `superseded` | Older approval retained for audit, not honored. |
 | Any project-identity mismatch (approval vs target vs snapshot vs entry) | `invalidated` | Approval denied. |
 
@@ -187,6 +198,10 @@ Invariants:
 
 - A `stale`/`invalidated`/`superseded` approval MUST NOT authorize execution or
   export.
+- A historical exact-revision approval (bound to a now-superseded ancestor tuple)
+  is preserved for **audit history**; it MUST NOT authorize current use. This
+  document does not create a new historical-export policy — the existing safe
+  block (deny current use) is sufficient.
 - Re-approval creates a **new** `Approval` record bound to a new `Snapshot`; it
   MUST NOT mutate the old record's `status` back to `active` in place.
 - "An approved artifact edited afterward becomes a proposal and invalidates
@@ -210,7 +225,8 @@ Invariants:
 | `state` | `enum{open, in_progress, fixed, rejected_with_reason, deferred, superseded}` | M | |
 | `disposition_reason` | `string` | O | Mandatory (non-empty) when `state ∈ {fixed, rejected_with_reason, deferred, superseded}`. |
 | `fix_ref` | `ref` | O | Mandatory when `state = fixed`; a fix MUST point at a new revision. |
-| `successor_issue_id` | `id` | O | Mandatory when `state = superseded`; MUST reference a successor issue that is itself resolved (`fixed`/`rejected_with_reason`). |
+| `counter_evidence` | `EvidenceRef` | O | Mandatory when a **confirmed** `blocking`/`major` issue is `rejected_with_reason` (proof it is demonstrably false). |
+| `successor_issue_id` | `id` | O | Mandatory when `state = superseded`; MUST reference a successor issue that is itself resolved (`fixed`/`rejected_with_reason` with counter-evidence). |
 
 Invariants:
 
@@ -221,14 +237,16 @@ Invariants:
 - `state = fixed` without `fix_ref` ⇒ `invalid`.
 - A **rejected** false objection MUST carry `disposition_reason`; rejecting an
   objection does **not** oblige a rewrite (see §5.3).
-- `state ∈ {superseded, deferred}` MUST NOT close a confirmed `blocking` or
-  `major` issue: such an issue stays **unresolved** unless a validated resolved
-  successor exists (`superseded` with a resolved `successor_issue_id`) or an
-  explicit human disposition is recorded (`Actor` with `authority =
-  owner_authenticated`). `state = superseded` without a resolved
-  `successor_issue_id` is still unresolved, not closed.
-- An unresolved `blocking`/`major` issue makes the **final gate reject**
-  (`blocked`), never pass.
+- **A human disposition may not waive a confirmed blocker.** A `blocking`/`major`
+  issue carrying validated `evidence` can be closed only by a fix (`fix_ref`) or
+  by a rejection with `counter_evidence` proving it demonstrably false. A bare
+  human disposition, `deferred`, or `superseded`-without-resolved-successor MUST
+  NOT clear a confirmed `blocking`/`major` issue to let the stage pass: it stays
+  **unresolved**, and the **final gate rejects** (`blocked`). Human disposition
+  is available only for non-confirmed or below-`major` items.
+- `state ∈ {superseded, deferred}` with no resolved successor and no
+  `counter_evidence` for a `blocking`/`major` issue leaves it unresolved, not
+  closed.
 - Faithful scientific uncertainty is not a defect to erase; it is recorded, not
   "fixed" into false confidence.
 - A summary, real quote, file hash, model probability, or human approval alone
@@ -276,12 +294,12 @@ counts. Until ratified:
 | --- | --- | --- | --- |
 | `budget_lineage_id` | `id` | M | Stable across edits (§5.3). |
 | `project_id` | `id` | M | Per-project; never shared across projects. |
-| `scope_id` | `id` | M | The **section/stage instance** the lineage is scoped to (e.g., the section artifact or stage instance). Two sections never share one lineage. |
+| `scope_id` | `id` | M | The **section/stage instance** the lineage is scoped to. Two sections never share one lineage. |
 | `stage` | `enum{section_critique, original_source_fact_check, manuscript_review}` | M | |
 | `limit` | `int` | M | **Inherited confirmed baseline** (§5.4); not extendable by an `Approval` (§5.3). |
-| `consumed_rounds` | `int` | M | Monotonic; incremented **atomically, exactly once** per completed `Round` (§5.2). |
+| `consumed_rounds` | `int` | M | Monotonic; incremented **atomically at round reservation, before dispatch** (§5.2). |
 | `remaining` | `int` | M | Derived `= limit − consumed_rounds`; never negative. |
-| `state` | `enum{open, ready_for_validation, blocked, exhausted}` | M | See §5.5. |
+| `state` | `enum{open, ready_for_validation, blocked}` | M | See §5.5. |
 
 ### 5.2 `Round`
 
@@ -290,9 +308,11 @@ counts. Until ratified:
 | `round_id` | `id` | M | |
 | `budget_lineage_id` | `id` | M | |
 | `stage` | `enum{...}` | M | Same enum as §5.1. |
-| `findings_pass` | `FindingsPass` | M | Exactly one findings pass per round. |
-| `repair_pass` | `RepairPass` | O | Absent when no repair was needed (early success). |
-| `read_only` | `bool` | M | `true` for final read-only validation (§5.5). |
+| `state` | `enum{reserved, findings_recorded, repair_recorded, finalized, abandoned}` | M | Reservation precedes dispatch. |
+| `reserved_at` | `ts` | M | |
+| `finalized_at` | `ts` | O | Mandatory when `state = finalized`. |
+| `findings_pass` | `FindingsPass` | O | Mandatory when `state ∈ {findings_recorded, repair_recorded, finalized}`. |
+| `repair_pass` | `RepairPass` | O | Present iff a repair was performed (absent for early success). |
 
 `FindingsPass`: `{ pass_id: id M, issues: list<Issue> M, produced_by: Actor M }`.
 `RepairPass`: `{ pass_id: id M, target_ref_before: ref M, target_ref_after: ref M,
@@ -302,11 +322,17 @@ A round is **one findings pass plus one repair pass if needed** (spec line 56).
 
 Invariants:
 
-- `consumed_rounds` increments **atomically and exactly once** per completed
-  `Round` (a single transaction keyed by `round_id`); a retried or
-  crash-recovered round MUST NOT double-increment.
-- Final read-only validation is **not** a budgeted round: it has no
-  `findings_pass`/`repair_pass` and MUST NOT increment `consumed_rounds` (§5.5).
+- A round slot is **reserved atomically before dispatch**: `consumed_rounds`
+  increments once at `state = reserved` in a single transaction keyed by
+  `round_id`. Because the reservation precedes the findings call, a crash or
+  replay after dispatch cannot create unlimited findings passes.
+- `finalized` completes the round **exactly once** (idempotent by `round_id`); a
+  repeated finalize MUST NOT double-increment. `consumed_rounds` is monotonic.
+- A `reserved`/`abandoned` round that never finalized still counts toward
+  `consumed_rounds`; it MUST NOT be silently released to free budget except by
+  explicit reconciliation, and MUST NOT be double-counted.
+- Final read-only validation is a `ValidationRecord` (§5.5), **not** a `Round`:
+  the `Round` shape has no read-only flag and no findings/repair pass for it.
 
 ### 5.3 Budget lineage is not reset by edits
 
@@ -322,9 +348,7 @@ Invariants:
   a lineage: extending a maximum requires an explicit specification change
   recorded outside the normal approval flow. A new lineage is only for a new
   `scope_id` (a genuinely new section/stage instance), never a mid-episode reset.
-- A lineage MUST NOT be reset during the same editing/repair episode: no
-  operation (model or human `Approval`) resets `consumed_rounds` or starts a new
-  lineage within one episode.
+- A lineage MUST NOT be reset during the same editing/repair episode.
 - A rejected false objection (`state = rejected_with_reason`) does **not** force a
   rewrite: the round may close with `repair_pass` absent or with no edits, and
   the reason is retained.
@@ -343,24 +367,38 @@ they are not this contract's invention. They MUST NOT be exceeded, and a generic
 baseline maximum requires an explicit specification change (a user decision
 recorded in the baseline, §5.3).
 
-### 5.5 Exhaustion, readiness, and read-only validation
+### 5.5 Readiness, validation, and exhaustion
 
-- When `remaining = 0` and the round's repair resolved **all** confirmed
-  blockers/major defects and a read-only validation result is clear, the budget
-  state MAY be `ready_for_validation` — preparation for the (unbudgeted) final
-  read-only validation, **not** an automatic success or completion.
-- When `remaining = 0` with any unresolved confirmed factual blocker or major
-  scientific defect, the budget state is `blocked` with human escalation (spec
-  line 56). **Exhaustion blocks further repair passes; it does not automatically
-  pass or complete the stage.**
-- Final read-only validation adds **no** repair and is **not** a budgeted round:
-  it has no `findings_pass`/`repair_pass`, and MUST NOT increment
-  `consumed_rounds`. A repair requested by final validation MUST route back to an
-  existing authorized stage, never open an unlimited terminal edit loop (spec
-  line 42).
-- Model-created revisions MUST NOT reset or bypass any budget; a worker MUST NOT
-  schedule further model calls once a budget is `blocked`/`exhausted` or work is
-  paused.
+**Readiness is decided before validation; success only after checks.**
+
+- `state = ready_for_validation` means the budget is closed with **no unresolved
+  confirmed blocker/major defect** and a final validation is pending. It is
+  readiness, **not** success: no completion claim may be made yet.
+- `state = blocked` when any unresolved confirmed factual blocker or major
+  defect remains (spec line 56). Exhaustion blocks further repair passes; it does
+  **not** automatically pass or complete the stage.
+- A stage completes only after a `ValidationRecord` with `result = clear`. A
+  `ready_for_validation` budget whose validation is `defects_found`/`blocked` is
+  not complete.
+
+`ValidationRecord` (the final read-only validation; **not** a budgeted `Round`):
+
+| Field | Type | Presence | Invariant |
+| --- | --- | --- | --- |
+| `validation_id` | `id` | M | |
+| `budget_lineage_id` | `id` | M | |
+| `scope_id` | `id` | M | |
+| `target_ref` | `ref` | M | The exact validated revision. |
+| `result` | `enum{clear, defects_found, blocked}` | M | |
+| `model_calls` | `int` | M | MUST be `0` (read-only). |
+| `performed_at` | `ts` | M | |
+
+Invariants: a `ValidationRecord` adds **no** repair, MUST have `model_calls = 0`,
+MUST NOT create a `Round`, and MUST NOT increment `consumed_rounds`. A repair
+requested by validation MUST route back to an existing authorized stage, never
+open an unlimited terminal edit loop (spec line 42). Model-created revisions MUST
+NOT reset or bypass any budget; a worker MUST NOT schedule further model calls
+once a budget is `blocked` or work is paused.
 
 ## 6. Machine decisions versus human decisions
 
@@ -392,70 +430,110 @@ Invariants:
   `known` and persisted with the decision; an absent applied version makes the
   record `invalid` and the dependent behavior `blocked`.
 
-### 6.2 `DecisionRecord` (typed Jev/stateless decision)
+### 6.2 `DecisionRecord` (typed Jev/stateless decision) — adapter-faithful
+
+Wire vs canonical: the retained adapter sends question type `noul` for the
+predicate primitive and returns wire answers `{"type":"noul","noul":0..1}`,
+`{"type":"choice","choice":str,"confidence?","probabilities?"}`, and
+`{"type":"score","score":float,"confidence?","probabilities?","legend?"}`. It maps
+these to canonical kinds `predicate`, `choice`, `score` and records `wire_type`.
+A `box` question has **no** wire mapping in the retained adapter and is not an
+accepted live answer.
+
+One `DecisionRecord` is **one question** (singular typed answer; no list of
+answers with an ambiguous global kind):
 
 | Field | Type | Presence | Invariant |
 | --- | --- | --- | --- |
 | `decision_id` | `id` | M | |
-| `question_id` | `string` | M | |
-| `question_kind` | `enum{predicate, choice, score, box}` | M | The typed question/answer union of the accepted Jev route. |
+| `question_id` | `string` | M | Unique within the record set. |
+| `question_def_ref` | `ref` | M | The immutable question definition revision (`QuestionDef`) with its options/levels. |
 | `target` | `ref` | M | |
-| `answers` | `list<AnswerUnion>` | O | Present iff `outcome ∈ {answered, partial_error}`; per-question typed answers. |
-| `outcome` | `enum{answered, partial_error, uncertain, omitted, refusal, malformed}` | M | |
-| `per_question_errors` | `list<PerQuestionError>` | M | May be empty; must be present. |
-| `diagnostics` | `Diagnostic` | O | **Mandatory when `outcome ∈ {partial_error, refusal, malformed}`.** |
+| `answer` | `AnswerUnion` | O | Singular; present iff `outcome ∈ {answered, partial_error}`. |
+| `outcome` | `enum{answered, partial_error, uncertain, omitted, refusal, malformed, unsupported}` | M | |
+| `per_question_error` | `PerQuestionError` | O | Present for a per-question failure; mirrors the adapter's `missing_answer`/`provider_error`. |
+| `diagnostics` | `Diagnostic` | O | **Mandatory when `outcome ∈ {partial_error, refusal, malformed, unsupported}`.** |
 | `versions` | `VersionSet` | M | `adapter` slot `known` for Jev. |
 | `route` | `enum{opencode_session, direct_call}` | M | |
 | `cost` | `CostRecord` | O | **Mandatory when `route = direct_call`.** |
 
-`AnswerUnion` (discriminated by `question_kind`, no invented values):
+`QuestionDef` (immutable definition, referenced by `question_def_ref`):
 
-- `PredicateAnswer`: `{ question_id: string M, value: bool M, probability: number O }`
-  — `probability`, when present, is in `[0,1]`.
-- `ChoiceAnswer`: `{ question_id: string M, choice: string M, confidence: number O }`
-  — `choice` MUST be validated against the question's **declared option set**;
-  an unknown option ⇒ `invalid`.
-- `ScoreAnswer`: `{ question_id: string M, score: number M, legend: map<string,string> O, range: {min: number M, max: number M} O }`
-  — `score` MUST lie within the declared `range` when known; out-of-range ⇒
-  `invalid`.
-- `BoxAnswer`: `{ question_id: string M, box: string M, value: string M }`.
+| Field | Type | Presence | Invariant |
+| --- | --- | --- | --- |
+| `question_id` | `string` | M | |
+| `question_kind` | `enum{predicate, choice, score}` | M | `box` is not an accepted kind (unsupported, §6.2). |
+| `instructions` | `string` | M | |
+| `options` | `list<string>` | O | Mandatory for `choice`; the declared, ordered option set. |
+| `levels` | `list<string>` | O | Mandatory for `score`; the declared, ordered levels; a score is an index `0..len(levels)-1`. |
+| `criteria_ref` | `ref` | M | Immutable revision holding the full criteria. |
 
-`PerQuestionError`: `{ question_id: string M, code: string M, message_redacted: string M }`.
+`AnswerUnion` — discriminated by `answer_kind` (no invented values):
+
+| Field | Type | Presence | Invariant |
+| --- | --- | --- | --- |
+| `answer_kind` | `enum{predicate, choice, score}` | M | Exactly one typed answer; `box` excluded. |
+| `wire_type` | `enum{noul, choice, score}` | M | The adapter wire kind (`predicate`→`noul`); persisted for audit. |
+| `probability` | `probability` | M | Present iff `answer_kind = predicate`; the raw `noul` value in `[0,1]` (no boolean, no threshold). |
+| `choice` | `string` | O | Mandatory iff `answer_kind = choice`; MUST be one of the declared `options`. |
+| `score` | `number` | O | Mandatory iff `answer_kind = score`; index within `[0, len(levels)-1]`. |
+| `legend` | `map<string,string>` | O | Present iff `answer_kind = score`; keys MUST be declared level indices (as decimal strings). |
+| `confidence` | `probability` | O | Adapter `confidence`; `[0,1]` when present. |
+| `probabilities` | `map<string,number>` | O | Adapter `probabilities`; keys MUST be declared option/level identifiers, values `[0,1]`. |
+
+`PerQuestionError`: `{ question_id: string M, reason: enum{missing_answer, provider_error, malformed_answer, unsupported_question_kind} M, code: string O, message_redacted: string M }`.
 `Diagnostic`: `{ code: string M, detail_redacted: string M, raised_at: ts M }`.
 
-**Typed answers / no invented values.** A typed answer MUST be taken from the
-model result; the application MUST NOT synthesize, default, or coerce a choice,
-score, or predicate. A `choice` MUST be validated against its declared options
-and a `score` against its declared legend/range (with the `§6.1` `adapter` slot
-`known`); an invalid shape ⇒ `outcome = malformed` with a persisted `Diagnostic`,
-never a fabricated answer.
+**Predicate.** A predicate answer is a **probability** in `[0,1]` (the adapter's
+raw `noul` value). It is **not** required to be boolean and no numeric threshold
+may be invented to turn a probability into `yes`/`no`; such a cutoff is a policy
+decision, not a wire fact.
 
-**Raw result ≠ scientific eligibility.** A `DecisionRecord` (or a Jev score) is a
-machine proposal about paper text; it does **not** itself establish scientific
-eligibility, exclusion, or selection. Only the human-gated screening decision
-maps it, and a Jev answer alone MUST NOT exclude or admit a candidate.
+**Choice / score.** `choice` MUST be one of the declared `options`; `score` MUST
+be within the declared `levels` index range; `legend` keys MUST be declared level
+indices; `confidence` and `probabilities` are `[0,1]` with declared keys. Any
+violation ⇒ `outcome = malformed` with a persisted `Diagnostic`, never a
+fabricated answer.
+
+**Box unsupported.** A `box` question is **not supported by the retained
+adapter** (no wire type mapping). It MUST NOT produce an invented string result
+and is excluded from the accepted live answer union: it yields `outcome =
+unsupported` (or `per_question_error.reason = unsupported_question_kind`) with a
+`Diagnostic`.
+
+**Typed answers / no invented values.** A typed answer MUST be taken from the
+model result; the application MUST NOT synthesize, default, or coerce a
+probability, choice, or score.
+
+**Raw result ≠ scientific eligibility.** A `DecisionRecord` (or a Jev
+probability/score) is a machine proposal about paper text; it does **not** itself
+establish scientific eligibility, exclusion, or selection. Only the human-gated
+screening decision maps it, and a Jev answer alone MUST NOT exclude or admit a
+candidate.
 
 **Never-exclusion invariant (critical).** When `outcome ∈ {partial_error,
-uncertain, omitted, refusal, malformed}`, or a `per_question_error` is present,
-or the model/provider produced an error/refusal/invalid shape, the application:
+uncertain, omitted, refusal, malformed, unsupported}`, or a `per_question_error`
+is present, or the adapter reports a missing answer / defensive `type:"error"` /
+invalid shape, the application:
 
 - MUST NOT convert it into a screening exclusion (spec line 31) or a scientific
   exclusion;
 - MUST NOT treat it as a negative finding or a negation of the question's
   premise;
 - MUST **retain the candidate** and persist the failure `Diagnostic` (or
-  `per_question_errors`), then route it to `uncertain` retention or human review.
+  `per_question_error`), then route it to `uncertain` retention or human review.
 
-An uncertain, errored, refused, omitted, or malformed decision is **never** an
-exclusion, and its candidate is **never** dropped: a missing/malformed decision
-MUST still retain the candidate and persist a failure diagnostic.
+An uncertain, errored, refused, omitted, malformed, or unsupported decision is
+**never** an exclusion, and its candidate is **never** dropped: a missing or
+malformed decision MUST still retain the candidate and persist a failure
+diagnostic.
 
 ### 6.3 `CostRecord` — direct-call cost separation
 
 | Field | Type | Presence | Invariant |
 | --- | --- | --- | --- |
-| `state` | `enum{known, estimated, unknown, not_incurred}` | M | |
-| `amount_usd` | `decimal` | O | **Mandatory iff `state = known`**; exact decimal string (e.g. `"0.00002037"`), never a float, preserving provider precision. |
+| `state` | `enum{known, estimated, unknown, not_incurred}` | M | Mirrors the adapter `cost_status` (`provider_reported`→`known`, `unknown`→`unknown`, `not_incurred`→`not_incurred`). |
+| `amount_usd` | `decimal` | O | **Mandatory iff `state ∈ {known, estimated}`**; exact decimal string (e.g. `"0.00002037"`), never a float. |
 | `currency` | `enum{USD}` | M | |
 | `route` | `enum{opencode_session, direct_call}` | M | |
 | `accounting_bucket` | `enum{session_statistics, direct_call}` | M | MUST be consistent with `route`. |
@@ -466,17 +544,18 @@ Invariants:
 
 - `amount_usd` is an **exact decimal string**, not an integer of minor units and
   not a float; provider-reported precision (e.g. `0.00002037`) is preserved.
+- `state ∈ {known, estimated}` ⇒ `amount_usd` MUST be present.
 - `state = unknown` ⇒ `amount_usd` is absent and the cost MUST NOT be recorded as
   `0`; an unknown cost is **not zero**.
-- `state = not_incurred` ⇒ no cost was incurred (still recorded, bucket named).
-- `state ∈ {known, estimated}` ⇒ `amount_usd` MUST be present.
+- `state = not_incurred` ⇒ `amount_usd` is absent (no cost incurred; bucket still
+  named).
+- **Reserves are retained for unknown/estimated costs.** When `state ∈ {unknown,
+  estimated}`, `reserve_usd` MUST be retained (not released, not set to zero)
+  until a later settlement resolves the amount.
 - `accounting_bucket` MUST equal the bucket implied by `route`; a mismatch ⇒
   `invalid`. Costs from `direct_call` routes MUST NOT be aggregated into OpenCode
   session statistics; direct calls are accounted separately (spec line 20
   fallback; step 04 line 22; ADR `001` "direct calls … accounted separately").
-- Reserve/dispatch accounting: a paid dispatch MUST carry a `reserve_usd` before
-  admission; actual cost settles against the reserve, and an unsettled reserve is
-  itself `estimated`/`unknown`, not `not_incurred`.
 
 ## 7. Secondary-origin attribution and warned tracing
 
@@ -559,14 +638,21 @@ Invariants:
 | `attempt_no` | `int` | M | Monotonic per logical call; a retry is a **new** attempt. |
 | `started_at` | `ts` | M | |
 | `idempotent_admission_proven` | `bool` | M | MUST be `false` for direct calls (no proven durable admission). |
+| `prior_outcome` | `enum{none, definitive_failure, ambiguous, succeeded}` | M | The established outcome of the prior attempt this one follows. |
+| `retry_authorized_by` | `Actor` | O | Mandatory for any retry (§8.1.1). |
 | `cost` | `CostRecord` | O | Reserve-bearing for paid dispatch (§6.3). |
 
 Invariants:
 
 - Direct calls are recorded as separate dispatch attempts, not as durable
-  admission. A retry MAY re-dispatch and MUST be a new `DispatchAttempt`.
-- The application MUST NOT claim exactly-once execution or billing for the direct
-  route; it reconciles from the recorded attempts and their costs.
+  admission. The application MUST NOT claim exactly-once execution or billing for
+  the direct route.
+- **No blind automatic retry.** A retry MAY be dispatched only with (a) explicit
+  retry authorization/budget (`retry_authorized_by` recorded) **and** (b) either
+  an established prior **definitive failure** (a non-billing rejection) or an
+  explicit human risk disposition. An **ambiguous** prior outcome MUST NOT be
+  retried automatically — it reconciles from recorded state or escalates to a
+  human, consistent with §8.3.
 
 ### 8.2 Exactly-once boundary
 
@@ -599,17 +685,19 @@ Invariants:
 - A stale attempt MUST NOT overwrite a newer authorized result.
 - Lost event streams MUST be reconciled from durable state/messages; missing
   events MUST NOT lose a completion or approval action (step 04).
-- `waiting_human`, `waiting_external`, `paused`, and budget-exhausted work MUST
-  explicitly **release execution resources** (no active executor/machine slot)
-  and MUST NOT schedule new model calls or busy-loop while waiting.
+- `waiting_human`, `waiting_external`, and `paused` release **local compute**
+  (no local executor/machine slot) and MUST NOT schedule new model calls or
+  busy-loop. `waiting_external` and `paused` MUST NOT release the **project's
+  active arbitration**: a remote operation may still be executing, so the project
+  remains the active project until its work is reconciled or quiesced (§8.5).
 
 ### 8.4 Pause, cancel, and detached CLI
 
 | Action | Semantics | Invariant |
 | --- | --- | --- |
 | Close CLI (detached) | CLI lifetime ends; authorized background job continues. | Closing the CLI does NOT cancel an authorized job (README global DoD). |
-| `pause` | Stop scheduling new work; preserve durable state; resumable. | Not terminal; releases execution resources. |
-| `cancel` | Stops scheduling new work; terminal for **scheduling** only. | Cancellation stops scheduling but MUST NOT terminal-clear an ambiguous remote outcome: if the remote result is unknown, `outcome_unresolved` stays `true` (§8.3). It is never `completed`, and external side effects already executed are not retracted. |
+| `pause` | Stop scheduling new work; preserve durable state; resumable. | Not terminal; releases **local compute** but keeps active-project arbitration while a remote operation may still be executing. |
+| `cancel` | Stops scheduling new work; terminal for **scheduling** only. | Cancellation stops scheduling but MUST NOT terminal-clear an ambiguous remote outcome: if the remote result is unknown, `outcome_unresolved` stays `true` (§8.3). It is never `completed`, external side effects already executed are not retracted, and active-project arbitration is retained until the work is reconciled/quiesced. |
 
 A terminal disconnect is distinct from a `pause` request (README "Proposed CLI
 concepts"). Non-owner control MUST be rejected; no root or public unauthenticated
@@ -617,13 +705,14 @@ listener is required (step 03).
 
 ### 8.5 Project activation and safe switching
 
-`ProjectActivation` (nullable identities when inactive):
+`ProjectActivation` (mandatory fields typed `id|null`; `null` is required when
+inactive):
 
 | Field | Type | Presence | Invariant |
 | --- | --- | --- | --- |
 | `state` | `enum{none, active, draining, switching}` | M | |
-| `active_project_id` | `id` | O | MUST be `null` when `state = none`; non-null and unique otherwise. |
-| `activation_token` | `id` | O | MUST be `null` when `state = none`; non-null when `state ∈ {active, draining, switching}`. |
+| `active_project_id` | `id|null` | M | MUST be `null` iff `state = none`; non-null and unique otherwise. |
+| `activation_token` | `id|null` | M | MUST be `null` iff `state = none`; non-null when `state ∈ {active, draining, switching}`. |
 
 Invariants:
 
@@ -634,8 +723,9 @@ Invariants:
   or drain existing work before another project executes).
 - Old-project jobs MUST NOT commit into the new project; per-project approvals
   and budgets are never shared (README global DoD).
-- If the old project's job state is unknown, the switch is `blocked` pending
-  reconciliation (§8.3), not silently completed.
+- While the old project has any still-executing remote work, its active
+  arbitration is retained; if its job state is unknown, the switch is `blocked`
+  pending reconciliation (§8.3), not silently completed.
 
 ## 9. Missing and unknown states (fail closed)
 
@@ -645,18 +735,22 @@ Invariants:
   stage `blocked`.
 - Unknown remote outcome ⇒ `unknown`/`reconciliation_required` with
   `outcome_unresolved = true`; never re-executed, never `completed`, not cleared
-  by cancellation.
+  by cancellation, and no blind retry (§8.1.1).
 - Unresolved tracing limits are `configuration_required` (§7), not a claimed
   reached limit; the dependent behavior is `blocked` rather than guessed.
-- A cost that is unknown is recorded as `unknown` (never `0`); an unknown or
-  malformed decision retains its candidate and its diagnostic.
+- A cost that is unknown is recorded as `unknown` (never `0`) with its reserve
+  retained; a missing/malformed/unsupported decision retains its candidate and
+  its diagnostic.
+- A predicate without a `probability`, a choice outside declared `options`, a
+  score outside declared `levels`, or a `box` question ⇒ `invalid`/`unsupported`;
+  never an invented answer.
 
 ## 10. Rights, privacy, and untrusted data (boundary only)
 
 Rights, privacy, hosted-model transfer, redistribution, and provider/journal
 policy are defined by the sibling policy contract
-[`03-policy-decisions.md`](03-policy-decisions.md) (produced in the coordinated
-contract set, C04), not by this document. This contract only fixes that:
+[`03-policy-decisions.md`](03-policy-decisions.md) of the coordinated step-01
+contract set, not by this document. This contract only fixes that:
 
 - Documents and model outputs are untrusted data; no arbitrary source
   instructions may widen scope, grant approvals, or edit authoritative state.
@@ -667,13 +761,19 @@ contract set, C04), not by this document. This contract only fixes that:
 
 ## 11. Worked examples
 
-All examples are **synthetic** and are **abbreviated projections**: they show the
-fields needed to make the point and omit repeated fields (ids, timestamps,
-unrelated entries). They assert no scientific result. `verdict` is this
-contract's own validity judgement (valid / invalid / blocked), not a scientific
-conclusion. Two **complete minimal** records follow in §11.0.
+All examples are **synthetic**: they are **abbreviated projections** (showing the
+fields needed to make the point, omitting repeated fields) or **complete minimal
+records** (§11.0). Every digest shown is a **valid-shaped but synthetic** 64-hex
+SHA-256 string, not the digest of any real artifact, and none of these examples is
+evidence of a scientific result. `verdict` is this contract's own validity
+judgement (valid / invalid / blocked), not a scientific conclusion.
 
 ### 11.0 Complete valid minimal records
+
+**Out-of-band precondition (not proven by the JSON).** A valid human `Approval`
+requires that the application's owner-auth check (§1.3) already succeeded outside
+the data path; the `owner_auth_ref` below only **points at** that check. The JSON
+does not by itself prove authority, and the digest strings are synthetic.
 
 A complete, valid **human approval** (every `M` field present):
 
@@ -695,14 +795,14 @@ A complete, valid **human approval** (every `M` field present):
     "snapshot_id": "snap_7",
     "project_id": "proj_A",
     "entries": [
-      {"project_id": "proj_A", "artifact_id": "jev_rubric", "revision_id": "rev_3", "digest": "SHA256HEX", "role": "rubric"}
+      {"project_id": "proj_A", "artifact_id": "jev_rubric", "revision_id": "rev_3", "digest": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff", "role": "rubric"}
     ],
     "versions": {
       "context_kind": "human_authored",
-      "input_digest": "SHA256HEX",
+      "input_digest": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
       "model": {"state": "not_applicable"},
       "prompt": {"state": "not_applicable"},
-      "rubric": {"state": "known", "ref": {"version": "jev-rubric/1", "digest": "SHA256HEX"}},
+      "rubric": {"state": "known", "ref": {"version": "jev-rubric/1", "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}},
       "parser": {"state": "not_applicable"},
       "adapter": {"state": "not_applicable"},
       "route": "not_applicable"
@@ -714,27 +814,24 @@ A complete, valid **human approval** (every `M` field present):
 }
 ```
 
-A complete, valid **typed Jev decision** (every `M` field present):
+A complete, valid **predicate decision** (probability mandatory; no boolean):
 
 ```json
 {
   "decision_id": "dec_0001",
   "question_id": "is_original_report",
-  "question_kind": "predicate",
+  "question_def_ref": {"project_id": "proj_A", "artifact_id": "question_def", "revision_id": "qd_rev_1"},
   "target": {"project_id": "proj_A", "artifact_id": "candidate_17", "revision_id": "rev_3"},
-  "answers": [
-    {"question_id": "is_original_report", "value": true, "probability": 0.83}
-  ],
+  "answer": {"answer_kind": "predicate", "wire_type": "noul", "probability": 0.83},
   "outcome": "answered",
-  "per_question_errors": [],
   "versions": {
     "context_kind": "model_derived",
-    "input_digest": "SHA256HEX",
-    "model": {"state": "known", "ref": {"version": "jev-1.14-20261014", "digest": "SHA256HEX"}},
-    "prompt": {"state": "known", "ref": {"version": "screen/1", "digest": "SHA256HEX"}},
-    "rubric": {"state": "known", "ref": {"version": "jev-rubric/1", "digest": "SHA256HEX"}},
+    "input_digest": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    "model": {"state": "known", "ref": {"version": "jev-1.14-20261014", "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}},
+    "prompt": {"state": "known", "ref": {"version": "screen/1", "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}},
+    "rubric": {"state": "known", "ref": {"version": "jev-rubric/1", "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}},
     "parser": {"state": "not_applicable"},
-    "adapter": {"state": "known", "ref": {"version": "jev-adapter/1", "digest": "SHA256HEX"}},
+    "adapter": {"state": "known", "ref": {"version": "jev-adapter/1", "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}},
     "route": "direct_call"
   },
   "route": "direct_call",
@@ -742,46 +839,75 @@ A complete, valid **typed Jev decision** (every `M` field present):
 }
 ```
 
-Checks for these two records: every `M` field is present; each `VersionSlot` with
-`state = known` carries a `ref` and no slot is a fake/placeholder ID; all
-identities share one `project_id`; `accounting_bucket` matches `route`.
+A complete, valid **score decision** (score within declared levels; legend on
+level indices):
+
+```json
+{
+  "decision_id": "dec_0002",
+  "question_id": "confidence_level",
+  "question_def_ref": {"project_id": "proj_A", "artifact_id": "question_def", "revision_id": "qd_rev_1"},
+  "target": {"project_id": "proj_A", "artifact_id": "candidate_17", "revision_id": "rev_3"},
+  "answer": {
+    "answer_kind": "score",
+    "wire_type": "score",
+    "score": 1.09,
+    "legend": {"0": "low", "1": "moderate", "2": "high"},
+    "confidence": 0.36
+  },
+  "outcome": "answered",
+  "versions": {
+    "context_kind": "model_derived",
+    "input_digest": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    "model": {"state": "known", "ref": {"version": "jev-1.14-20261014", "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}},
+    "prompt": {"state": "known", "ref": {"version": "screen/1", "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}},
+    "rubric": {"state": "known", "ref": {"version": "jev-rubric/1", "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}},
+    "parser": {"state": "not_applicable"},
+    "adapter": {"state": "known", "ref": {"version": "jev-adapter/1", "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}},
+    "route": "direct_call"
+  },
+  "route": "direct_call",
+  "cost": {"state": "known", "amount_usd": "0.00002037", "currency": "USD", "route": "direct_call", "accounting_bucket": "direct_call", "reserve_usd": "0.25", "dispatch_ref": "disp_0001"}
+}
+```
+
+The `confidence_level` question declares `levels = ["low","moderate","high"]`, so
+a valid `score` lies in `[0, 2]` and the observed live value `1.09` is in range.
 
 ### 11.1 Uncertain Jev decision
 
 **Valid.** A screening decision for `{proj_A, candidate_17, rev_3}` returns
-`outcome = uncertain`, no `answers`, `versions.adapter.state = known`
+`outcome = uncertain`, no `answer`, `versions.adapter.state = known`
 (`jev-1.14-20261014`), `route = direct_call`, `cost = {state: known, amount_usd:
 "0.00002037", accounting_bucket: direct_call}`. The candidate stays in the
 retained-uncertain set and routes to human review. It is **not** an exclusion. →
 **verdict: valid.**
 
-**Invalid.** The record sets `outcome = answered` with a `PredicateAnswer.value`
-the model did not return, or a `ChoiceAnswer.choice` not in the question's
-declared options (an invented/coerced answer). Inventing or coercing an answer
-violates §6.2. → **verdict: invalid.**
+**Invalid.** The record sets `outcome = answered` with a `predicate.probability`
+the adapter did not return; a `choice` not in the declared `options`; a `score`
+outside the declared `levels`; or a `box` result (unsupported). Inventing,
+coercing, or thresholding an answer violates §6.2. → **verdict: invalid.**
 
-**Missing.** `outcome` absent (or `per_question_errors` absent). → **verdict:
-invalid (blocked)** — no exclusion may be written; the candidate MUST be retained
-and a failure diagnostic persisted (§6.2 never-exclusion).
+**Missing.** `outcome` absent, or a predicate `answer` present without
+`probability`. → **verdict: invalid (blocked)** — no exclusion may be written;
+the candidate MUST be retained and a failure diagnostic persisted (§6.2).
 
 ### 11.2 False critic objection
 
 **Valid.** Critic raises `issue_88` on `{proj_A, draft_sec3, rev_5}`: `claim =
 "paragraph 2 changes the population from mice to rats"`, `evidence = {kind:
 locator, artifact_revision: {proj_A, draft_sec3, rev_5}, locator: "p2, L4"}`,
-`severity = major` (proposed). The author checks the source and both revisions;
-the objection is false. Disposition: `state = rejected_with_reason`,
-`disposition_reason = "rev_5 p2 already reads 'mice'; critic cited rev_4"`.
+`severity = major` (proposed). The author checks both revisions and the source;
+the objection is demonstrably false. Disposition: `state =
+rejected_with_reason`, `disposition_reason = "rev_5 p2 already reads 'mice';
+critic cited rev_4"`, with `counter_evidence` locating the correct text.
 `repair_pass` absent; budget lineage unchanged. → **verdict: valid.**
 
-**Invalid.** `state = fixed` with no `fix_ref` (no new revision). → **verdict:
-invalid.** Also invalid: `state = rejected_with_reason` with an empty
-`disposition_reason`, or an `Issue` with neither `evidence` nor `missing_check`.
-
-**Invalid (closure).** A confirmed `blocking`/`major` issue marked
-`state = superseded` without a resolved `successor_issue_id`, or `deferred` with
-no human disposition — an unresolved blocker cannot be closed this way and makes
-the final gate reject. → **verdict: invalid.**
+**Invalid.** `state = fixed` with no `fix_ref` (no new revision). Also invalid: a
+`blocking`/`major` issue with validated `evidence` closed by a bare human
+disposition, by `deferred`, or by `superseded` without a resolved successor or
+`counter_evidence` — a human cannot waive a confirmed factual blocker/major
+defect to pass; the final gate rejects. → **verdict: invalid.**
 
 **Missing.** `severity` absent, or both `evidence` and `missing_check` absent. →
 **verdict: invalid (blocked)** — cannot be dispositioned; severity taxonomy is
@@ -792,23 +918,26 @@ also unapproved until the user ratifies it (§4.4).
 **Valid (stale).** `Approval{gate_kind=pilot, gate_id=gate_pilot_1,
 target={proj_A, jev_rubric, rev_3}, dependency_snapshot=S_7}` becomes `stale` when
 the rubric is revised to `rev_4`; the pilot stage is `blocked` until a new
-approval on a new snapshot. Unaffected extraction work is preserved.
+approval on a new snapshot. The historical approval on `rev_3` remains for audit
+only and MUST NOT authorize current use. Unaffected extraction work is preserved.
 
 **Valid (budget lineage).** The model regenerates `draft_sec3 rev_6`;
 `budget_lineage_id = L_sec`, `scope_id = sec_3`, `consumed_rounds = 3`,
-`remaining = 0`, `state = ready_for_validation` (all confirmed defects resolved)
-are unchanged. The exhausted budget does not replenish; a new model revision does
-not start a new lineage. → **verdict: valid.**
+`remaining = 0` are unchanged. The lineage does not replenish and is not reset. If
+no unresolved confirmed defect remains, `state = ready_for_validation` — a
+pending validation, **not** success; the stage completes only after a
+`ValidationRecord{result = clear}`, which adds no repair and no round.
 
-**Valid (blocked exhaustion).** Same lineage with an unresolved confirmed
-`major` defect: `remaining = 0`, `state = blocked`; further repair passes stop
-and the stage escalates to a human — it does **not** auto-complete. → **verdict:
-valid (blocked).**
+**Valid (blocked exhaustion).** Same lineage with an unresolved confirmed `major`
+defect: `remaining = 0`, `state = blocked`; further repair passes stop and the
+stage escalates to a human — it does **not** auto-complete. → **verdict: valid
+(blocked).**
 
 **Invalid.** A `Proposal` (model output) changes `budget_lineage_id` to `L_new` or
-sets `consumed_rounds = 0`; or a generic human `Approval` extends `limit` past
-the §5.4 baseline maximum / resets the lineage mid-episode. Neither is permitted
-without an explicit specification change. → **verdict: invalid.**
+sets `consumed_rounds = 0`; a generic human `Approval` extends `limit` past the
+§5.4 baseline maximum or resets the lineage mid-episode; a round is finalized
+twice (double-increment); or a `ValidationRecord` carries `model_calls > 0` or is
+counted as a budgeted round. → **verdict: invalid.**
 
 **Missing.** `dependency_snapshot` absent on the `Approval`; a `SnapshotEntry`
 `digest` absent; or an entry whose `project_id` differs from the approval's. →
@@ -844,8 +973,9 @@ no terminal, and escalates to a human. The work is **not** re-executed under a
 new identity. → **verdict: valid.**
 
 **Invalid.** `Job.state = completed` inferred from a partial `assistant
-(finish: error)` message; an `AdmissionReceipt` with `route = direct_call`; or
-the application re-submits the work with a fresh `admission_id` silently. →
+(finish: error)` message; an `AdmissionReceipt` with `route = direct_call`; a
+direct retry dispatched with `prior_outcome = ambiguous` and no authorization;
+or the application re-submits the work with a fresh `admission_id` silently. →
 **verdict: invalid.**
 
 **Missing.** No durable record: neither an `AdmissionReceipt` (OpenCode route) nor
@@ -862,8 +992,9 @@ stay per-project. → **verdict: valid.**
 
 **Invalid.** Activating project B while project A still has a committing job; a
 second activation attempt executing concurrently (two active projects); a shared
-budget/approval record reused across A and B; or `state = active` with a null
-`active_project_id`. → **verdict: invalid.**
+budget/approval record reused across A and B; `state = active` with a null
+`active_project_id`; or `state = none` with a non-null `active_project_id`. →
+**verdict: invalid.**
 
 **Missing.** `state` absent, or the old project's job state unknown at switch
 time. → **verdict: blocked** pending reconciliation.
@@ -873,10 +1004,11 @@ time. → **verdict: blocked** pending reconciliation.
 | Item | State | Owner | Blocking effect |
 | --- | --- | --- | --- |
 | Severity taxonomy literal set (§4.4) | Proposed / unapproved | User | Any behavior keyed on severity is blocked (fail closed). |
+| Predicate probability cutoff (turning `noul` into yes/no) | Unresolved policy; not invented here | User | Raw probability is retained; no answer is coerced to boolean until decided. |
 | Origin hop/source/retry numeric defaults (§7.2) | Unresolved → `configuration_required` | User | Tracing blocks at depth 0; no limit is pretended configured/reached. |
 | Cost/concurrency limits | Unresolved | User | Budget enforcement uses the inherited round limits; cost/concurrency caps (and paid-dispatch reserves) blocked until set. |
 | Pilot/audit samples and acceptance rules; coverage/stopping rules; explicit acceptance of secondary-origin warnings | Unresolved (spec "Pending decisions") | User | Dependent gates blocked. |
-| Rights/hosted-model policy | Defined by sibling [`03-policy-decisions.md`](03-policy-decisions.md) (coordinated in C04) | User | Hosted-model access is governed there, not by this contract. |
+| Rights/hosted-model policy | Defined by sibling [`03-policy-decisions.md`](03-policy-decisions.md) of the coordinated step-01 contract set | User | Hosted-model access is governed there, not by this contract. |
 | Durable storage schema / IPC / package layout | Step-01 **proposal** (step 01 deliverable line 12); SQLite remains a proposal | User | Nothing here is an accepted schema; not a step-02-only decision. |
 
 ## 13. Change history
@@ -884,4 +1016,5 @@ time. → **verdict: blocked** pending reconciliation.
 | Version | Date | Change | Status |
 | --- | --- | --- | --- |
 | `v1` | 2026-10-27 | Initial proposed representation of gates, approvals, findings budgets, machine decisions, and runtime safety, with worked examples. | **Proposed — approval pending.** |
-| `v2` | 2026-10-27 | Review repairs: gate identity (`gate_kind`/`gate_id`) and project-scoped snapshot; out-of-band authority provenance; `VersionSlot` states (no fake model IDs) and canonical SHA-256 digests; typed Jev answer union, diagnostics, and candidate retention; exact-decimal `CostRecord` with unknown/not-incurred and reserve/dispatch accounting; section-scoped budget lineage with atomic increment, `ready_for_validation`, and no approval-based baseline extension; superseded/deferred cannot close blockers; `configuration_required` tracing with checked secondary evidence; `AdmissionReceipt` restricted to the OpenCode route with `DispatchAttempt`; cancellation not clearing unknown outcomes, nullable inactive activation, explicit resource release; complete minimal examples and abbreviated-projection note; step-01 storage/IPC proposal wording and sibling policy link. | **Proposed — approval pending.** |
+| `v2` | 2026-10-27 | Review repairs: gate identity and project-scoped snapshot; out-of-band authority; `VersionSlot` states; typed answers; exact-decimal costs; section-scoped budgets and readiness; superseded/deferred; `configuration_required`; `DispatchAttempt`; cancellation and nullable activation; complete examples; step-01 storage wording. | **Proposed — approval pending.** |
+| `v3` | 2026-10-27 | Adapter-faithful decisions: predicate probability mandatory (no boolean/threshold), choice options/confidence/probabilities and score levels/legend per `live_jev.py`, `box` unsupported and excluded, singular typed `answer` with immutable `QuestionDef`/`question_def_ref`, `wire_type` persisted, per-question `missing_answer`/`provider_error`; human disposition cannot waive a confirmed blocker (`counter_evidence` required); `ValidationRecord` separated from `Round`, readiness before validation, reservation-before-dispatch with exactly-once finalize; `CostRecord` amount iff known/estimated with retained reserves; nullable `id|null` activation; waiting-external/pause retain project arbitration; direct retry needs authorization and a non-ambiguous prior outcome; ancestor-tuple stale clause; sibling references as the coordinated contract set; valid synthetic 64-hex digests with explicit out-of-band precondition; example validation against types, ranges, and digests. | **Proposed — approval pending.** |
