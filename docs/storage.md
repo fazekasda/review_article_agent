@@ -1,0 +1,157 @@
+# Storage contract — private local backup, verify, and restore
+
+Scope: the **private local storage snapshot and restore** contract implemented by
+[`src/review_article_agent/storage/backup.py`](../src/review_article_agent/storage/backup.py)
+for the Step 02 deliverable *"consistent backup/export and restore with
+manifest/schema versions; secrets excluded"*
+([`02-project-foundation.md`](implementation/02-project-foundation.md) deliverable
+line 11, acceptance line 20). It records only the backup/storage interface and
+behavior; it makes no scientific claim and decides no policy.
+
+Related authority: the accepted `ARCH-MIGRATE` direction
+([`03-policy-decisions.md` §ARCH-MIGRATE](contracts/03-policy-decisions.md)) —
+versioned migrations with manifest/schema versions, a consistent backup/restore
+that captures WAL state and is verified **including while writes occur during
+backup**, unsupported newer schemas failing clearly, and restore verifying
+artifact hashes and approvals. ADR 002 records the acceptance
+([`002-step01-contracts-and-policies.md`](decisions/002-step01-contracts-and-policies.md)).
+
+## 1. What a backup is, and is not
+
+A backup is a **private local storage snapshot** of exactly one project's SQLite
+store plus a manifest.
+
+- It **is**: a consistent, transactionally captured copy of all project data
+  (identity, artifacts, immutable revisions with their BLOB content, rights
+  records, dependencies, import requests, and local fixture approvals), suitable
+  for restoring that project later.
+- It **is not**: a manuscript export, a redistribution package, or a portable
+  interchange format. **Never publish an archive** and **never store credentials
+  as artifact content**. Private storage backup is distinct from manuscript
+  export/redistribution rights.
+
+Mechanism: a backup is produced with SQLite's **online backup API**
+(`sqlite3.Connection.backup`) into a fresh, staged snapshot database. The live
+database file and its `-wal`/`-shm` sidecars are **never** copied directly, so
+committed WAL content is captured and a concurrent writer cannot produce a torn
+backup. Because immutable content is stored as a SQLite BLOB, the snapshot
+captures all data in one consistent database.
+
+The manifest is derived **from the closed snapshot**, never from live state, so
+the digests it records describe exactly the captured bytes.
+
+## 2. Snapshot contents (allowlist)
+
+A backup directory contains **only** these two allowlisted members:
+
+| Member | Meaning |
+| --- | --- |
+| `manifest.json` | versioned manifest (`format_version` 1) |
+| `snapshot.sqlite3` | the closed, self-contained snapshot database |
+
+The project folder, `.env`, external configuration, the application registry,
+provider credentials, and any loose files are **never** part of a snapshot. The
+application never scans for or automatically ingests secrets; the guarantee is
+withdrawal-by-design (only allowlisted members are written), **not** a general
+credential scanner.
+
+The snapshot database contains exactly the schema-3 project tables (`meta`,
+`project`, `artifact`, `rights_record`, `revision`, `dependency`,
+`import_request`, `fixture_approval`, `fixture_approval_entry`). Any other
+("external") table, or a missing required table, is refused so unknown data is
+never accepted as valid storage.
+
+All output is owner-private: the backup directory is `0o700`, and
+`manifest.json`/`snapshot.sqlite3` are `0o600`.
+
+## 3. Manifest
+
+`manifest.json` is canonical JSON with these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `format` | `review_article_agent.private_storage_backup` (foreign-JSON guard) |
+| `format_version` | `1` (the only supported version) |
+| `created_at_utc`, `app_version`, `project_id` | provenance and stable identity |
+| `store_schema_version` | the snapshot's store schema (only `3` is supported) |
+| `database` | `{filename, sha256, byte_size}` of `snapshot.sqlite3` |
+| `counts` | row counts for artifacts/revisions/rights/dependencies/imports/approvals/approval entries |
+| `artifact_digest`, `revision_digest`, `rights_digest` | deterministic aggregate digests over identity + integrity columns |
+| `approvals` | per-approval `{approval_id, snapshot_digest, entry_count}` |
+| `notice` | the non-claim reminder (private snapshot; not an export) |
+
+## 4. Public API
+
+```python
+from review_article_agent.storage.backup import (
+    create_backup,      # (store: ProjectStore, destination) -> dict (JSON-safe summary)
+    verify_backup,      # (backup_dir) -> dict (JSON-safe summary); raises BackupError
+    restore_backup,     # (backup_dir, root, registry: Registry) -> ProjectInfo
+    BackupError,        # subclass of review_article_agent.domain.errors.StoreError
+    BackupConflictError,# subclass of BackupError
+)
+```
+
+`create_backup` requires `destination` to not already exist. `verify_backup`
+opens the supplied backup **read-only** and never modifies it. `restore_backup`
+fully verifies the backup before creating anything, then stages and
+register-last.
+
+## 5. `verify_backup` — fail-closed
+
+`verify_backup` raises `BackupError` (or `UnsupportedSchemaVersion` for a
+newer manifest/store schema) on any of:
+
+- a symlinked backup directory, member, or sidecar; an unexpected member
+  (including a `-wal`/`-shm` sidecar); a non-file member;
+- an invalid/unrecognised manifest, a missing field, an unsafe or traversing
+  database filename, a newer `format_version`, or a newer/unsupported
+  `store_schema_version`;
+- an identity mismatch between the manifest and the snapshot; a failed
+  `PRAGMA integrity_check` or non-empty `PRAGMA foreign_key_check`;
+- an unrecognised schema or an external table;
+- a **recomputed** revision/rights BLOB digest or byte size that does not match
+  the stored column, an invalid rights record, a cross-project key, or an exact
+  rights subject that does not resolve;
+- a dangling dependency or import-request reference;
+- a local fixture approval that is not the non-authorizing constant, or whose
+  exact snapshot (digest, entry digest/size/rights, recorded schema) does not
+  verify — including valid historical `stale`/`superseded` rows, which are never
+  rejected as honest history;
+- a mismatch between the snapshot and any manifest expected value (database
+  hash/size, counts, aggregate digests, or per-approval snapshots).
+
+Because verification **recomputes every inner digest**, rewriting the outer
+`database.sha256` in the manifest does not bypass inner validation.
+
+## 6. `restore_backup` — verified atomic restore
+
+1. **Validate first.** `verify_backup` runs in full before anything is created;
+   a corrupt backup is rejected with the target root untouched.
+2. **Conflict checks (no modifications).** Restoring where the same project is
+   already registered at another root is refused (never a clone); restoring into
+   a root registered to a different project is refused. A repeat restore to the
+   same path and identity is a safe no-op.
+3. **No overwrite.** An existing unregistered app-owned directory is refused
+   rather than overwritten; unrelated files in the target root are preserved.
+4. **Stage, then register last.** The snapshot is copied into an owner-private
+   staging directory inside the target root, renamed atomically into the
+   app-owned directory, and only then registered. On any failure, only this
+   call's own directories are removed (rollback), leaving no half registry row
+   and no stale approvals.
+
+The restored project keeps the snapshot's exact `project_id`; all exact IDs and
+immutable historical approval snapshots are preserved. A new scientific identity
+is never created.
+
+## 7. Compatibility and limitations
+
+- Only the **current store schema (version 3)** backups are supported. A newer
+  store schema is refused clearly; migrations from older schemas (`2 -> 3`) are
+  tested separately and are not part of this module.
+- `verify_backup` re-validates stored rights records and recomputes content
+  digests; it is a structural/integrity check, not a scientific or rights
+  decision.
+- The application never automatically ingests secrets; this module cannot prove
+  the absence of any secret a user manually stored as artifact content. Do not
+  store credentials as artifact content.
