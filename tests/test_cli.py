@@ -9,6 +9,8 @@ All data is synthetic: no secrets, no real project, no scientific evidence.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import shutil
@@ -21,6 +23,10 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 REPO = Path(__file__).resolve().parents[1]
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+import review_article_agent.cli.main as cli_main  # noqa: E402
 
 _OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
 
@@ -123,6 +129,21 @@ class CliTestCase(unittest.TestCase):
             args += ["--request-id", request_id]
         args += list(extra)
         return self.cli(*args, expect=expect)
+
+    def make_artifact_with_revision(
+        self,
+        *,
+        root_name: str = "proj-a",
+        artifact_id: str = "art-A",
+        revision_id: str = "rev-1",
+        content: dict | None = None,
+    ) -> str:
+        pid = self.create_project(root_name)
+        self.cli("--data-dir", str(self.state), "artifact", "create",
+                 "--artifact-id", artifact_id, "--kind", "document", "--project", pid)
+        self.import_revision(pid=pid, artifact_id=artifact_id, revision_id=revision_id,
+                             content=content or _envelope())
+        return pid
 
 
 class EntryPointTest(CliTestCase):
@@ -354,6 +375,194 @@ class WheelPackagingTest(unittest.TestCase):
             )
             self.assertNotIn("Proprietary", metadata)
             self.assertNotIn("\nLicense:", metadata)
+
+
+class LeakBoundaryTest(CliTestCase):
+    """Untrusted input must never be reflected in an error message."""
+
+    SECRET = "SYNTHETIC-SECRET-NO-REAL-CREDENTIAL"
+
+    def test_rights_record_secret_is_not_echoed(self) -> None:
+        pid = self.create_project("proj-a")
+        self.cli("--data-dir", str(self.state), "artifact", "create",
+                 "--artifact-id", "art-A", "--kind", "document", "--project", pid)
+        # An otherwise valid record whose operation status is the secret.
+        bad = _rights_record(pid, "art-A", "rev-1")
+        bad["operations"]["storage"] = self.SECRET
+        rights_path = self.write_json("rights-bad.json", bad)
+        content_path = self.write_json("content-1.json", _envelope())
+        proc = self.raw(
+            "--data-dir", str(self.state), "artifact", "import",
+            "--artifact-id", "art-A", "--revision-id", "rev-1",
+            "--file", str(content_path), "--rights-file", str(rights_path),
+            "--project", pid,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn(self.SECRET, combined)
+        self.assertNotIn("Traceback", combined)
+        self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation")
+
+    def test_invalid_choice_does_not_echo_secret(self) -> None:
+        proc = self.raw("--data-dir", str(self.state), "artifact", "create",
+                        "--artifact-id", "art-A", "--kind", self.SECRET)
+        self.assertEqual(proc.returncode, 2)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn(self.SECRET, combined)
+        self.assertNotIn("Traceback", combined)
+        self.assertEqual(json.loads(proc.stderr)["error"]["category"], "usage")
+
+    def test_unknown_argument_does_not_echo_secret(self) -> None:
+        proc = self.raw("--data-dir", str(self.state), "--secret-option=" + self.SECRET, "list")
+        self.assertEqual(proc.returncode, 2)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn(self.SECRET, combined)
+        self.assertEqual(json.loads(proc.stderr)["error"]["category"], "usage")
+
+    def test_unknown_command_does_not_echo_secret(self) -> None:
+        proc = self.raw(self.SECRET)
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn(self.SECRET, proc.stdout + proc.stderr)
+
+    def test_unknown_config_field_name_is_not_echoed(self) -> None:
+        secret_name = "SYNTHETIC-SECRET-FIELD-NAME"
+        path = self.tmp / "c.json"
+        path.write_text(json.dumps({"schema_version": 1, secret_name: "x"}), encoding="utf-8")
+        proc = self.raw("--config", str(path), "list")
+        self.assertEqual(proc.returncode, 2)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn(secret_name, combined)
+        self.assertNotIn("Traceback", combined)
+
+
+class StrictJsonCliTest(CliTestCase):
+    """Duplicate keys / non-finite / over-deep input fail cleanly (no payload)."""
+
+    def _import(self, content_path: Path, rights_path: Path, *, extra=()):
+        return self.raw(
+            "--data-dir", str(self.state), "artifact", "import",
+            "--artifact-id", "art-A", "--revision-id", "rev-1",
+            "--file", str(content_path), "--rights-file", str(rights_path),
+            *extra,
+        )
+
+    def test_duplicate_keys_rejected_for_content_rights_and_deps(self) -> None:
+        pid = self.create_project("proj-a")
+        self.cli("--data-dir", str(self.state), "artifact", "create",
+                 "--artifact-id", "art-A", "--kind", "document", "--project", pid)
+        rights = self.write_json("rights.json", _rights_record(pid, "art-A", "rev-1"))
+        good_content = self.write_json("content-ok.json", _envelope())
+
+        dup_content = self.tmp / "content-dup.json"
+        dup_content.write_text(
+            '{"schema_version":1,"document_type":"n","payload":{"a":1},"payload":{"b":2}}',
+            encoding="utf-8",
+        )
+        dup_rights = self.tmp / "rights-dup.json"
+        rec = json.dumps(_rights_record(pid, "art-A", "rev-1"))
+        dup_rights.write_text(rec[:-1] + ',"record_revision":1}', encoding="utf-8")
+        dup_deps = self.tmp / "deps-dup.json"
+        dup_deps.write_text(
+            '[{"project_id":"x","project_id":"x","artifact_id":"art-A","revision_id":"rev-1"}]',
+            encoding="utf-8",
+        )
+
+        for proc in (
+            self._import(dup_content, rights),
+            self._import(good_content, dup_rights),
+            self._import(good_content, rights, extra=["--deps-file", str(dup_deps)]),
+        ):
+            self.assertEqual(proc.returncode, 2)
+            self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+            self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation")
+
+    def test_nonfinite_surrogate_and_deep_content_are_stable(self) -> None:
+        pid = self.create_project("proj-a")
+        self.cli("--data-dir", str(self.state), "artifact", "create",
+                 "--artifact-id", "art-A", "--kind", "document", "--project", pid)
+        rights = self.write_json("rights.json", _rights_record(pid, "art-A", "rev-1"))
+
+        cases = {
+            "nonfinite.json": '{"schema_version":1,"document_type":"n","payload":{"a":NaN}}',
+            "surrogate.json": '{"schema_version":1,"document_type":"n","payload":{"a":"\\ud800"}}',
+            "deep.json": "[" * 300 + "]" * 300,
+        }
+        for name, text in cases.items():
+            path = self.tmp / name
+            path.write_text(text, encoding="utf-8")
+            proc = self._import(path, rights)
+            self.assertEqual(proc.returncode, 2, name)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("Traceback", combined)
+            self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation", name)
+
+
+class OutputProtectionTest(CliTestCase):
+    """``artifact content --output`` creates exclusively and never clobbers state."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.pid = self.make_artifact_with_revision()
+
+    def content_args(self, out: Path):
+        return ("--data-dir", str(self.state), "artifact", "content",
+                "art-A", "--revision", "rev-1", "--project", self.pid,
+                "--output", str(out))
+
+    def test_new_output_is_owner_private(self) -> None:
+        out = self.tmp / "export.bin"
+        result = self.cli(*self.content_args(out))
+        self.assertEqual(result["byte_size"], out.stat().st_size)
+        self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+
+    def test_existing_file_is_not_overwritten(self) -> None:
+        out = self.tmp / "existing.bin"
+        out.write_bytes(b"USER-DATA")
+        proc = self.raw(*self.content_args(out))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+        self.assertEqual(out.read_bytes(), b"USER-DATA")
+
+    def test_symlink_target_is_unchanged(self) -> None:
+        target = self.tmp / "target.bin"
+        target.write_bytes(b"ORIGINAL")
+        link = self.tmp / "link.bin"
+        os.symlink(target, link)
+        proc = self.raw(*self.content_args(link))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(target.read_bytes(), b"ORIGINAL")
+        self.assertTrue(link.is_symlink())
+
+    def test_output_inside_data_dir_is_rejected(self) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        proc = self.raw(*self.content_args(self.state / "evil.bin"))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.state / "evil.bin").exists())
+
+    def test_output_inside_app_dir_is_rejected_and_store_unchanged(self) -> None:
+        db = self.tmp / "proj-a" / ".review_article_agent" / "store.sqlite3"
+        before = hashlib.sha256(db.read_bytes()).hexdigest()
+        proc = self.raw(*self.content_args(db))
+        self.assertNotEqual(proc.returncode, 0)
+        after = hashlib.sha256(db.read_bytes()).hexdigest()
+        self.assertEqual(before, after)
+
+
+class OutputEmitUnicodeTest(unittest.TestCase):
+    """Malformed Unicode in a result/error must not raise a raw traceback."""
+
+    def test_emit_result_escapes_surrogate(self) -> None:
+        buf = io.StringIO()
+        cli_main._emit_result({"label": "x\ud800y"}, buf)
+        self.assertIn("\\ud800", buf.getvalue())
+
+    def test_emit_error_escapes_surrogate(self) -> None:
+        buf = io.StringIO()
+        code = cli_main._emit_error(
+            cli_main.CliUsageError("bad \ud800 value"), buf
+        )
+        self.assertEqual(code, cli_main.EXIT_USAGE)
+        self.assertIn("\\ud800", buf.getvalue())
 
 
 if __name__ == "__main__":  # pragma: no cover

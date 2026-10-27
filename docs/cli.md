@@ -54,10 +54,15 @@ streams raw bytes.
 {"error": {"category": "<category>", "message": "<actionable summary>"}}
 ```
 
-Messages are **actionable summaries with safe structural context**. They never
-contain a raw traceback, a raw exception payload, imported file contents, SQL
-text, or a secret. Configuration errors name the offending *field*, never its
-*value*.
+Messages are **curated, actionable summaries** built from the error *category*,
+our own command/field names, and known structural context. They deliberately do
+**not** echo a raw domain-exception string, an untrusted value, a supplied
+identifier, an invalid choice, or a configuration field name — a caller may have
+pasted a credential into any of those. They never contain a raw traceback, an
+imported file's contents, SQL text, or a secret. JSON output (both results and
+errors) is ASCII-escaped, so malformed Unicode cannot raise a raw encode
+traceback. This is **not** a generic secret scanner: it only avoids reflecting
+untrusted/error-path values, and `artifact content` intentionally reads content.
 
 **Exit categories** (stable):
 
@@ -88,7 +93,11 @@ A versioned JSON document. Exactly two fields are permitted:
 * **Any other field is rejected**, including any credential/provider/model/budget
   field (`api_key`, `token`, `password`, `provider`, `model`, `budget`, …). The
   CLI never ingests a provider secret or execution setting from this file. A
-  rejected field is reported by **name only** — its value is never echoed.
+  rejected field is reported **structurally**: neither the field name nor its
+  value is echoed (the name itself could be a secret).
+* The file must be **strict JSON**: duplicate object keys, non-finite numbers
+  (`NaN`/`Infinity`/overflowing literals), and over-deep nesting are rejected
+  cleanly (exit `2`, category `usage`), with no traceback and no payload.
 * A missing, non-UTF-8, malformed-JSON, oversized, or unreadable file is refused
   cleanly (exit `2`, category `usage`).
 
@@ -164,6 +173,25 @@ is given.
   *separately supplied* `--rights-file` validates and its `storage` operation is
   `allowed` (C03 §5.2). The CLI never manufactures, infers, or upgrades a rights
   record.
+* **Strict JSON everywhere.** Imported content, rights records, and dependency
+  files are parsed with rejection of **duplicate object keys at every level**,
+  non-finite numbers, and over-deep nesting. Any failure is a clean validation
+  error (exit `2`) with no traceback and no echoed payload.
+
+### Export output protection (`artifact content --output`)
+
+`--output PATH` is a safety-sensitive write, so it is constrained:
+
+* The file is created **exclusively** (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode
+  `0600`). An **existing file or symlink is never overwritten or followed** — the
+  command fails with an actionable error and leaves the target byte-unchanged. No
+  pre-existing user file is ever chmodded or deleted.
+* Writing inside the **application data directory** or any registered project's
+  **`.review_article_agent` app-owned directory** is refused, so the CLI can never
+  overwrite its own `store.sqlite3` or another project's assets
+  (immutability/isolation).
+* Without `--output`, the revision's raw bytes are streamed to stdout. This is the
+  one explicit content read; it is never part of a status or log line.
 
 ### Copyable synthetic rights-file setup
 

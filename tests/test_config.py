@@ -45,13 +45,15 @@ class ValidateConfigTest(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 validate_config(bad)
 
-    def test_unknown_key_rejected_without_echoing_value(self) -> None:
+    def test_unknown_key_rejected_without_echoing_value_or_name(self) -> None:
         secret = "SUPER_SECRET_VALUE_DO_NOT_ECHO"
         with self.assertRaises(ConfigError) as cm:
             validate_config({"schema_version": 1, "api_key": secret})
         message = str(cm.exception)
-        self.assertIn("api_key", message)
+        # Neither the value nor the (possibly secret-bearing) field name leaks.
         self.assertNotIn(secret, message)
+        self.assertNotIn("api_key", message)
+        self.assertIn("data_dir", message)  # the permitted structural fields are named
 
     def test_credential_style_keys_rejected(self) -> None:
         for key in ("token", "password", "provider", "model", "budget"):
@@ -140,6 +142,67 @@ class ResolveDataDirTest(unittest.TestCase):
     def test_no_env_no_config_uses_home_default(self) -> None:
         got = resolve_data_dir(None, None, {})
         self.assertEqual(got, paths.default_data_dir({}))
+
+
+class StrictJsonTest(unittest.TestCase):
+    """Strict JSON at all levels: duplicates, non-finite, over-deep."""
+
+    def test_duplicate_keys_rejected(self) -> None:
+        from review_article_agent.cli.config import StrictJsonError, load_strict_json
+
+        for text in (
+            '{"a": 1, "a": 2}',
+            '{"outer": {"x": 1, "x": 2}}',
+            '[{"k": 1, "k": 1}]',
+        ):
+            with self.assertRaises(StrictJsonError) as cm:
+                load_strict_json(text)
+            self.assertEqual(cm.exception.code, "duplicate")
+
+    def test_nonfinite_rejected(self) -> None:
+        from review_article_agent.cli.config import StrictJsonError, load_strict_json
+
+        for text in ('{"a": NaN}', '{"a": Infinity}', '{"a": -Infinity}', '{"a": 1e9999}'):
+            with self.assertRaises(StrictJsonError) as cm:
+                load_strict_json(text)
+            self.assertEqual(cm.exception.code, "nonfinite")
+
+    def test_overdeep_rejected(self) -> None:
+        from review_article_agent.cli.config import StrictJsonError, load_strict_json
+
+        with self.assertRaises(StrictJsonError) as cm:
+            load_strict_json("[" * 5000 + "]" * 5000)
+        self.assertEqual(cm.exception.code, "too_deep")
+
+    def test_malformed_rejected(self) -> None:
+        from review_article_agent.cli.config import StrictJsonError, load_strict_json
+
+        with self.assertRaises(StrictJsonError) as cm:
+            load_strict_json("{not json")
+        self.assertEqual(cm.exception.code, "malformed")
+
+    def test_valid_preserves_values(self) -> None:
+        from review_article_agent.cli.config import load_strict_json
+
+        self.assertEqual(load_strict_json('{"a": [1, 2.5, "x", true, null]}'),
+                         {"a": [1, 2.5, "x", True, None]})
+
+    def test_config_file_duplicate_keys_rejected(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="raa-strict-")
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "c.json"
+        path.write_text('{"schema_version": 1, "schema_version": 1}', encoding="utf-8")
+        with self.assertRaises(ConfigError) as cm:
+            load_config_file(path)
+        self.assertIn("duplicate", str(cm.exception))
+
+    def test_config_file_nonfinite_rejected(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="raa-strict-")
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "c.json"
+        path.write_text('{"schema_version": 1, "data_dir": Infinity}', encoding="utf-8")
+        with self.assertRaises(ConfigError):
+            load_config_file(path)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -5,7 +5,7 @@ project foundation. It contains no scientific processing, no agent execution,
 and no model/provider configuration:
 
 * :mod:`review_article_agent.cli.config` — the optional, strict configuration
-  file loader and data-directory resolution.
+  file loader, strict JSON parsing, and data-directory resolution.
 * :mod:`review_article_agent.cli.main` — the ``argparse`` tree, command
   handlers, stable JSON output, and stable non-success exit categories.
 
@@ -21,6 +21,10 @@ The public CLI contract is documented in ``docs/cli.md``.
 from __future__ import annotations
 
 from .config import ConfigError
-from .main import main
 
-__all__ = ["ConfigError", "main"]
+# Re-export the entry function under a distinct name so it does not shadow the
+# ``review_article_agent.cli.main`` submodule attribute (which would otherwise
+# make ``import review_article_agent.cli.main`` resolve to the function).
+from .main import main as run_cli
+
+__all__ = ["ConfigError", "run_cli"]

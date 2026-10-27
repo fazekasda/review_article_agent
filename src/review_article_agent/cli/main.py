@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence, TextIO
@@ -57,8 +58,11 @@ from ..storage import (
 from ..storage.artifacts import Revision
 from .config import (
     CONFIG_SCHEMA_VERSION,
+    STRICT_JSON_REASONS,
     ConfigError,
+    StrictJsonError,
     load_config_file,
+    load_strict_json,
     resolve_data_dir,
 )
 
@@ -79,18 +83,43 @@ EXIT_STORAGE = 4
 
 
 class CliUsageError(Exception):
-    """A command-line usage problem, surfaced as a JSON error (exit 2)."""
+    """A command-line usage problem, surfaced as a JSON error (exit 2).
+
+    The message is always authored/sanitized here (or copied from an argparse
+    message that references only our own option/command names); a raw
+    user-supplied value is never embedded.
+    """
+
+
+#: argparse's ``invalid choice`` message: ``argument NAME: invalid choice: ...``.
+_INVALID_CHOICE_RE = re.compile(r"^argument (?P<name>[^:]+): invalid choice:")
 
 
 class _ArgumentParser(argparse.ArgumentParser):
     """An ``argparse`` parser that raises instead of printing and exiting.
 
     ``--help``/``--version`` still print and exit ``0`` as usual; every *error*
-    (unknown argument, missing required argument, bad choice) is raised as a
-    :class:`CliUsageError` so :func:`main` can emit a consistent JSON error.
+    is raised as a sanitized :class:`CliUsageError` so :func:`main` can emit a
+    consistent JSON error. Reflected raw values (an invalid choice, an
+    unrecognized argument) are deliberately **not** echoed, because a caller may
+    have passed a credential by mistake.
     """
 
     def error(self, message: str) -> "None":  # type: ignore[override]
+        match = _INVALID_CHOICE_RE.match(message)
+        if match:
+            # ``name`` is one of our own option/command names (safe); the
+            # supplied value itself is dropped from the message.
+            name = match.group("name").strip()
+            raise CliUsageError(
+                f"invalid value for {name}; the supplied value is not shown. "
+                f"Run --help to see the valid choices."
+            )
+        if message.startswith("unrecognized arguments:"):
+            raise CliUsageError(
+                "unrecognized argument(s); the supplied values are not shown. "
+                "Run --help for usage."
+            )
         raise CliUsageError(message)
 
 
@@ -377,9 +406,10 @@ def _load_json_document(path: str, *, what: str, stdin: TextIO | None = None) ->
     except UnicodeDecodeError as exc:
         raise RecordValidationError(f"{what}: is not valid UTF-8 text.") from exc
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise RecordValidationError(f"{what}: is not valid JSON.") from exc
+        return load_strict_json(text)
+    except StrictJsonError as exc:
+        reason = STRICT_JSON_REASONS.get(exc.code, "is not usable")
+        raise RecordValidationError(f"{what}: {reason}.") from exc
 
 
 def _load_content(args: argparse.Namespace, stdin: TextIO | None = None) -> object:
@@ -487,6 +517,77 @@ def cmd_artifact_revisions(
         store.close()
 
 
+def _reject_forbidden_output_path(ctx: Context, target: str) -> None:
+    """Refuse an output path inside app-owned state (data dir or a store).
+
+    Keeping the export out of any registered project's app-owned directory and
+    the registry data directory protects immutability and per-project isolation:
+    the CLI must never be able to overwrite its own database or another
+    project's assets through ``--output``.
+    """
+    real_dir = os.path.realpath(os.path.dirname(target) or ".")
+    candidate = os.path.join(real_dir, os.path.basename(target))
+    forbidden: list[str] = [os.path.realpath(ctx.data_dir)]
+    try:
+        for info in ctx.registry.list_projects():
+            forbidden.append(os.path.realpath(paths.app_dir_for(info.root_path)))
+    except Exception:  # noqa: BLE001 - a malformed registry must not enable a write
+        raise StoreError(
+            "could not verify the output location against registered projects; "
+            "refusing to write."
+        )
+    for root in forbidden:
+        if candidate == root or candidate.startswith(root + os.sep):
+            raise StoreError(
+                "refusing to write output inside an app-owned data/store "
+                "directory; choose a path outside the application data "
+                "directory and any project's .review_article_agent directory."
+            )
+
+
+def _write_new_file_exclusive(target: str, data: bytes) -> None:
+    """Create ``target`` exclusively (``O_EXCL|O_NOFOLLOW``) with mode ``0o600``.
+
+    Refuses to overwrite or follow an existing file or symlink (so an existing
+    arbitrary file or a symlink target is never touched); never chmods or
+    deletes a pre-existing user file.
+    """
+    directory = os.path.dirname(target) or "."
+    if not os.path.isdir(directory):
+        raise StoreError(
+            "the output directory does not exist; create it first or choose "
+            "another output path."
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+    try:
+        fd = os.open(target, flags, 0o600)
+    except FileExistsError as exc:
+        raise StoreError(
+            "the output path already exists; refusing to overwrite it. Choose a "
+            "new path or remove the existing file yourself."
+        ) from exc
+    except OSError as exc:
+        # Includes ELOOP from O_NOFOLLOW on a symlink and EACCES.
+        reason = exc.strerror or exc.__class__.__name__
+        raise StoreError(
+            f"the output file could not be created safely ({reason}); the "
+            f"existing path was left unchanged."
+        ) from exc
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except OSError as exc:
+        # We exclusively created this file; remove only our own partial file.
+        try:
+            os.unlink(target)
+        except OSError:  # pragma: no cover - best effort
+            pass
+        reason = exc.strerror or exc.__class__.__name__
+        raise StoreError(f"could not write the revision content ({reason}).") from exc
+
+
 def cmd_artifact_content(
     args: argparse.Namespace, ctx: Context
 ) -> dict[str, object] | RawBytes:
@@ -497,19 +598,14 @@ def cmd_artifact_content(
     finally:
         store.close()
     if args.output is not None:
-        try:
-            with open(args.output, "wb") as handle:
-                handle.write(data)
-        except OSError as exc:
-            reason = exc.strerror or exc.__class__.__name__
-            raise StoreError(
-                f"could not write the revision content ({reason})."
-            ) from exc
+        target = os.path.abspath(args.output)
+        _reject_forbidden_output_path(ctx, target)
+        _write_new_file_exclusive(target, data)
         return {
             "artifact_id": args.artifact_id,
             "revision_id": args.revision,
             "byte_size": len(data),
-            "written": args.output,
+            "written": target,
         }
     return RawBytes(data)
 
@@ -556,9 +652,36 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
 # --------------------------------------------------------------------------- #
 # Output and error handling
 # --------------------------------------------------------------------------- #
+#: Curated, value-free messages keyed by error category. Never built from an
+#: untrusted value, so a reflected credential/source string cannot leak.
+_INTERNAL_MESSAGE = (
+    "an unexpected internal error occurred; the command did not complete. No "
+    "traceback is shown. Re-run with a supported command, or report this."
+)
+_CONFLICT_MESSAGE = (
+    "the request conflicts with existing immutable state (a divergent duplicate "
+    "or a changed revision); no existing data was overwritten."
+)
+_NOT_FOUND_MESSAGE = (
+    "no project is registered with the requested id; run `list` to see the "
+    "registered projects."
+)
+_STORAGE_MESSAGE = (
+    "a project store, registry, or path error occurred; the requested data could "
+    "not be read or written safely."
+)
+_VALIDATION_MESSAGE = (
+    "input data failed validation (an identifier, a JSON document, a rights "
+    "record, or a dependency reference did not match the expected schema); "
+    "nothing was written. Check the input against the documented schema."
+)
+
+
 def _emit_result(result: object, stdout: TextIO | None = None) -> None:
     out = stdout if stdout is not None else sys.stdout
     if isinstance(result, RawBytes):
+        # ``artifact content`` deliberately emits stored bytes verbatim; this is
+        # the one explicit content read, not an error/log path.
         buffer = getattr(out, "buffer", None)
         if buffer is None:  # pragma: no cover - text-only stream in tests
             out.write(result.data.decode("utf-8", errors="replace"))
@@ -566,7 +689,9 @@ def _emit_result(result: object, stdout: TextIO | None = None) -> None:
             buffer.write(result.data)
         out.flush()
         return
-    out.write(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    # ``ensure_ascii=True`` escapes any lone surrogate or non-ASCII value so a
+    # malformed string can never raise a raw encode traceback while writing.
+    out.write(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=True) + "\n")
     out.flush()
 
 
@@ -594,18 +719,40 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
 
 
 def _error_message(exc: BaseException, category: str) -> str:
-    """A safe, actionable message: never a traceback, payload, file, or secret."""
+    """A safe, actionable message: never a traceback, payload, value, or secret.
+
+    Domain exception text is deliberately **not** echoed: a ``RecordValidationError``
+    (or a reflected identifier/choice) may embed untrusted input such as a field
+    value or an accidental credential. Only messages authored here, or copied from
+    curated sanitized sources (:class:`CliUsageError`, :class:`ConfigError`), and
+    known-safe structural context (our own schema labels) reach the user.
+    """
     if category == "internal":
-        return (
-            "an unexpected internal error occurred; the command did not complete. "
-            "No traceback is shown. Re-run with a supported command, or report this."
-        )
-    if category == "storage" and isinstance(exc, OSError) and not isinstance(
-        exc, ReviewAgentError
-    ):
-        reason = exc.strerror or exc.__class__.__name__
-        return f"a filesystem/storage error occurred: {reason}."
-    return str(exc)
+        return _INTERNAL_MESSAGE
+    if category == "usage":
+        if isinstance(exc, (CliUsageError, ConfigError)):
+            return str(exc)
+        return "invalid command-line usage; run --help."
+    if category == "conflict":
+        return _CONFLICT_MESSAGE
+    if category == "not_found":
+        return _NOT_FOUND_MESSAGE
+    if category == "storage":
+        if isinstance(exc, UnsupportedSchemaVersion):
+            # ``label`` is our own curated string ("project store"/"application
+            # registry"), never user input.
+            return (
+                f"the {exc.label} schema version is newer than this application "
+                f"supports; upgrade review_article_agent instead of opening it "
+                f"with an older version."
+            )
+        if isinstance(exc, OSError) and not isinstance(exc, ReviewAgentError):
+            reason = exc.strerror or "I/O error"
+            return f"a filesystem error occurred: {reason}."
+        return _STORAGE_MESSAGE
+    if category == "validation":
+        return _VALIDATION_MESSAGE
+    return _INTERNAL_MESSAGE
 
 
 def _emit_error(
@@ -614,7 +761,7 @@ def _emit_error(
     category, code = classify_error(exc)
     payload = {"error": {"category": category, "message": _error_message(exc, category)}}
     err = stderr if stderr is not None else sys.stderr
-    err.write(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    err.write(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n")
     err.flush()
     return code
 
@@ -649,7 +796,10 @@ def main(
     except Exception as exc:  # noqa: BLE001 - convert every failure to JSON
         return _emit_error(exc, stderr)
 
-    _emit_result(result, stdout)
+    try:
+        _emit_result(result, stdout)
+    except Exception as exc:  # noqa: BLE001 - an output failure is never a traceback
+        return _emit_error(exc, stderr)
     return EXIT_SUCCESS
 
 

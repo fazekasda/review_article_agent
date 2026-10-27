@@ -30,6 +30,7 @@ it is first used; this module only resolves *which* directory that is.
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Mapping
 
@@ -44,6 +45,91 @@ ALLOWED_CONFIG_FIELDS = frozenset({"schema_version", "data_dir"})
 
 #: Upper bound on a configuration file we will even attempt to parse.
 MAX_CONFIG_BYTES = 1 << 20  # 1 MiB
+
+
+class StrictJsonError(ValueError):
+    """A strict-JSON parse failure, carrying a value-free ``code``.
+
+    ``code`` is one of :data:`STRICT_JSON_REASONS`; it never contains any part of
+    the input, so a caller can build a safe message from it.
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+#: Value-free explanations keyed by :class:`StrictJsonError` code.
+STRICT_JSON_REASONS = {
+    "malformed": "is not valid JSON",
+    "duplicate": "contains duplicate object keys",
+    "nonfinite": "contains a non-finite number (NaN/Infinity), which is not permitted",
+    "too_deep": "nests too deeply",
+}
+
+
+#: Maximum accepted nesting depth for strict JSON input. Bounded so an
+#: adversarial document is rejected cleanly (and so Python builds whose JSON
+#: scanner does not recurse cannot be relied on for the bound).
+STRICT_JSON_MAX_DEPTH = 100
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    seen: set[str] = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise StrictJsonError("duplicate")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _reject_nonfinite_constant(_name: str) -> object:
+    raise StrictJsonError("nonfinite")
+
+
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise StrictJsonError("nonfinite")
+    return value
+
+
+def _check_depth(value: object, max_depth: int) -> None:
+    """Iteratively reject a value nested deeper than ``max_depth``."""
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > max_depth:
+            raise StrictJsonError("too_deep")
+        if isinstance(node, dict):
+            stack.extend((item, depth + 1) for item in node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend((item, depth + 1) for item in node)
+
+
+def load_strict_json(text: str) -> object:
+    """Parse JSON that is strict at every nesting level.
+
+    Rejects duplicate object keys, non-finite numbers (``NaN``/``Infinity`` and
+    overflowing literals), and over-deep nesting. Every failure is a
+    :class:`StrictJsonError` whose ``code`` is safe to surface; the offending
+    key, value, and text are **never** echoed.
+    """
+    try:
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_no_duplicate_keys,
+            parse_constant=_reject_nonfinite_constant,
+            parse_float=_finite_float,
+        )
+    except StrictJsonError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise StrictJsonError("malformed") from exc
+    except RecursionError as exc:
+        raise StrictJsonError("too_deep") from exc
+    _check_depth(parsed, STRICT_JSON_MAX_DEPTH)
+    return parsed
 
 
 class ConfigError(ReviewAgentError):
@@ -83,10 +169,11 @@ def load_config_file(path: str | os.PathLike[str]) -> dict[str, object]:
             "document."
         ) from exc
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
+        data = load_strict_json(text)
+    except StrictJsonError as exc:
+        reason = STRICT_JSON_REASONS.get(exc.code, "is not usable")
         raise ConfigError(
-            "the configuration file is not valid JSON; fix or remove it and retry."
+            f"the configuration file {reason}; fix or remove it and retry."
         ) from exc
     return validate_config(data)
 
@@ -103,11 +190,17 @@ def validate_config(data: object) -> dict[str, object]:
         if not isinstance(key, str):
             raise ConfigError("configuration field names must be strings.")
 
-    unknown = sorted(key for key in data if key not in ALLOWED_CONFIG_FIELDS)
+    unknown = [key for key in data if key not in ALLOWED_CONFIG_FIELDS]
     if unknown:
+        # The unknown *names* are not echoed: a caller may have pasted a secret
+        # as a field name, and only the permitted structural fields are known safe.
         raise ConfigError(
-            "unknown configuration field(s): "
-            + ", ".join(unknown)
+            "the configuration contains "
+            + (
+                "one or more unknown fields"
+                if len(unknown) != 1
+                else "an unknown field"
+            )
             + "; the only permitted fields are "
             + ", ".join(sorted(ALLOWED_CONFIG_FIELDS))
             + ". Credentials, provider, and model/budget settings are not read "
@@ -168,8 +261,12 @@ __all__ = [
     "ALLOWED_CONFIG_FIELDS",
     "CONFIG_SCHEMA_VERSION",
     "MAX_CONFIG_BYTES",
+    "STRICT_JSON_MAX_DEPTH",
+    "STRICT_JSON_REASONS",
     "ConfigError",
+    "StrictJsonError",
     "load_config_file",
+    "load_strict_json",
     "resolve_data_dir",
     "validate_config",
 ]
