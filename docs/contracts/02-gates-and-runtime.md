@@ -2,21 +2,32 @@
 
 ## Status and authority
 
-- **Contract version:** `v3.1` (draft representation, dated 2026-10-27).
-- **Approval state: PROPOSED — approval pending.** The *requirements* below are
-  carried over from already-confirmed sources and must not be weakened. The
-  *representations* introduced here — record names, field names, field types,
-  enum literals, and the proposed severity taxonomy — are **proposals for user
-  review**, not accepted policy. Nothing in this document is an accepted
-  scientific or product decision until the user ratifies it.
+- **Contract version:** `v3.2` (representation, dated 2026-10-27).
+- **Approval state: behavioral direction APPROVED (2026-10-27); representation
+  pending field-level review.** On 2026-10-27 the user approved the **behavior**
+  described by the coordinated Step 01 contracts and selected the Step 01
+  operational/technical policy values recorded below (severity categories,
+  pilot/audit sampling, Jev screening mapping, cost/concurrency caps, tracing
+  defaults, secondary-warning handling, recovery semantics). The *requirements*
+  below are carried over from already-confirmed sources and the selected policies
+  and must not be weakened. The *representation* introduced here — record names,
+  field names, field types, and enum literal spellings — remains a **versioned
+  implementation proposal** for review, **not** a line-by-line user ratification of
+  every field. The canonical policy disposition is recorded in the sibling decision
+  record `docs/decisions/002-step01-contracts-and-policies.md` (added by the parallel
+  policy/ADR work; resolves at integration) and in
+  [`03-policy-decisions.md`](03-policy-decisions.md); where that policy record and
+  this contract differ, the policy record governs policy. This contract still makes
+  **no** production or scientific-validation claim.
 - **Scope:** revision-specific approvals and their dependency snapshots; the
   findings/issue lifecycle and review budgets; machine (model) decisions versus
   human decisions; and runtime safety (pause/cancel, project switching, restart
   reconciliation, admission vs completion). Durable storage, IPC, and package
-  layout are a **step-01 deliverable proposal** (`01-contracts.md` line 12),
-  recorded here as proposed, not as an accepted schema; the SQLite schema remains
-  a proposal (`docs/specification.md` line 16). Neither is decided by this
-  document, and neither is categorically a step-02-only decision.
+  layout are a **step-01 deliverable proposal** (`01-contracts.md` line 12); the
+  architecture **direction** was approved 2026-10-27 (policy register §4), but the
+  concrete **schema** remains a proposal (`docs/specification.md` line 16) and is
+  not decided by this document. Migration/backup semantics remain a
+  step-02 test obligation, not categorically a step-02-only decision.
 - **No scientific feature claim.** This contract defines record shapes and
   invariants only. It does not claim that screening, extraction, drafting,
   review, or origin tracing is implemented, correct, or scientifically
@@ -39,6 +50,11 @@
   [`docs/implementation/13-origin-tracing.md`](../implementation/13-origin-tracing.md),
   [`docs/decisions/001-runtime-language.md`](../decisions/001-runtime-language.md),
   and [`docs/implementation/handoffs/00-runtime-spike.md`](../implementation/handoffs/00-runtime-spike.md).
+- **Selected policies (2026-10-27):** the Step 01 behavioral approvals and selected
+  operational/technical values are recorded in `docs/decisions/002-step01-contracts-and-policies.md`
+  (parallel policy/ADR work; resolves at integration) and the policy register
+  [`03-policy-decisions.md`](03-policy-decisions.md). They are authority for the
+  **policy/behavior** represented here.
 - **Sibling identity contract:** artifact references use the immutable reference
   tuple `{project_id, artifact_id, revision_id}` defined by the sibling
   identity-and-evidence contract of this coordinated step-01 contract set. That
@@ -70,10 +86,10 @@
 | `M*` | Mandatory-union: at least one member of a named set must be present. |
 
 Invariant shorthand used below: **MUST**, **MUST NOT**, and **`invalid`/`blocked`**
-are normative for this proposed contract. No numeric scientific threshold may be
-invented to let a stage pass; where a limit is unresolved it is named as
-`unresolved` (runtime: `configuration_required`) and blocks the dependent
-behavior.
+are normative for this contract. No numeric scientific threshold may be invented
+to let a stage pass; where a **mandatory per-project** limit or value is unset it
+is named as **`configuration_required`** (a runtime project gate) and blocks the
+dependent behavior.
 
 ## 1. Actors, provenance, and proposals
 
@@ -221,7 +237,7 @@ Invariants:
 | `claim` | `string` | M | The objection or finding. |
 | `evidence` | `EvidenceRef` | M* | |
 | `missing_check` | `MissingCheck` | M* | |
-| `severity` | `enum{blocking, major, minor, style}` | M | **Proposed taxonomy — see §4.4; unapproved.** |
+| `severity` | `enum{blocking, major, minor, style}` | M | **Selected categories — see §4.4 (behaviorally approved 2026-10-27); representation of the literal set remains a proposal.** |
 | `state` | `enum{open, in_progress, fixed, rejected_with_reason, deferred, superseded}` | M | |
 | `disposition_reason` | `string` | O | Mandatory (non-empty) when `state ∈ {fixed, rejected_with_reason, deferred, superseded}`. |
 | `fix_ref` | `ref` | O | Mandatory when `state = fixed`; a fix MUST point at a new revision. |
@@ -270,21 +286,30 @@ Invariants:
 | `description` | `string` | M | The concrete check that would settle the issue. |
 | `would_settle` | `bool` | M | |
 
-### 4.4 Severity taxonomy — PROPOSED, requires user approval
+### 4.4 Severity taxonomy — four categories (selected 2026-10-27)
 
-The literal set `{blocking, major, minor, style}` above is a **proposal for user
-review**; the specification confirms behavior (confirmed major scientific
-defects/blockers prevent completion; minor/style findings may remain; faithful
-uncertainty is not a defect) but does **not** fix these exact labels or any
-counts. Until ratified:
+The user approved a **four-category** severity scale on 2026-10-27 (the `severity`
+field's literal set and enum representation remain a proposal; the **behavior** is
+selected):
 
-- The taxonomy field is `severity` with `enum`, but its accepted literal set is
-  **unresolved**; an unratified literal set blocks any behavior that keys on
-  severity (fail closed).
-- No numeric threshold, count, or probability is invented here to let a stage
-  pass.
-- Only `blocking`/`major` **confirmed** defects prevent completion; the mapping
-  from observations to those classes is part of the pending taxonomy decision.
+| Category | Meaning |
+| --- | --- |
+| `blocking` | A **factual, support, or essential-check** blocker. |
+| `major` | A **consequential scientific defect**. |
+| `minor` | A **non-consequential** issue. |
+| `style` | A **style preference**. |
+
+Rules:
+
+- **What prevents completion.** Any **`blocking`** or **`major`** item, and any
+  **unclassified** item that is consequential, prevents completion. `minor` and
+  `style` findings may remain (specification line 57); faithful scientific
+  uncertainty is not a defect and is recorded, not erased.
+- **Fail closed on the unclassified.** A consequential item whose severity is
+  missing or not yet assigned is treated as **blocking** until classified; it does
+  **not** pass.
+- **No numeric score.** Severity is categorical; **no** numeric threshold, count, or
+  probability is invented here to let a stage pass.
 
 ## 5. Review budgets and round identity
 
@@ -402,6 +427,35 @@ once a budget is `blocked` or work is paused. Separately authorized read-only
 model checks may run subject to the usual rights, cost, and approval gates; they
 cannot perform a repair or replenish the round budget.
 
+### 5.6 Cost and concurrency caps (selected defaults, 2026-10-27)
+
+The user selected reusable cost/concurrency defaults on 2026-10-27. These are
+**operational caps**, distinct from the confirmed repair-round maxima (§5.4) and
+**not** a promised cost or a scientific threshold:
+
+| Cap | Value | Scope |
+| --- | --- | --- |
+| Cumulative project cap | **USD 25** | Per project. |
+| Cumulative stage cap | **USD 10** | Per stage. |
+| Concurrent external model calls | **at most 2** | Simultaneously, within the project. |
+
+Invariants:
+
+- **Everything counts.** Every route counts toward the caps, including
+  **read-only** model checks and every cost bucket (`session_statistics` and
+  `direct_call`, §6.3).
+- **Reserve before dispatch.** A **defensible upper-bound** reserve (`reserve_usd`)
+  MUST be recorded **before** a paid dispatch is admitted. If the cost cannot be
+  bounded, the dispatch MUST **not** be issued.
+- **Unknown reserve is retained.** An `unknown`/`estimated` cost retains its
+  reserve (never released, never zeroed) until settlement (§6.3).
+- **Caps stop new dispatch.** Reaching a cap stops **new** dispatch/queries; it
+  does **not** retract work already executed and does **not** auto-pass a stage.
+  Only an explicit **human** approval may raise a cap; a restart does **not** reset
+  accumulated cost (see §8.3 on restart).
+- The caps are enforced **independently** of the fixed repair-round maxima
+  (§5.4), which no approval or policy change in this contract alters.
+
 ## 6. Machine decisions versus human decisions
 
 ### 6.1 `VersionSet` — persisted versions
@@ -487,9 +541,22 @@ answers with an ambiguous global kind):
 `Diagnostic`: `{ code: string M, detail_redacted: string M, raised_at: ts M }`.
 
 **Predicate.** A predicate answer is a **probability** in `[0,1]` (the adapter's
-raw `noul` value). It is **not** required to be boolean and no numeric threshold
-may be invented to turn a probability into `yes`/`no`; such a cutoff is a policy
-decision, not a wire fact.
+raw `noul` value). It is **not** required to be boolean. There is **no universal
+numeric cutoff** that turns a probability into `yes`/`no`. How a probability maps
+to a screening decision is a **rubric-specific, pilot-calibrated policy** (selected
+2026-10-27): per rubric, the pilot approves explicit **decision rules** and an
+**uncertainty region** before bulk screening, the **raw probability is retained**,
+and a human approves exclusions. No cutoff is invented here; an uncalibrated
+rubric leaves the mapping **unresolved** and blocks any exclusion that would key on
+it (fail closed; §6.2 never-exclusion invariant).
+
+**Screening mapping is pilot-calibrated and human-gated (selected 2026-10-27).**
+A `noul` probability, a `choice`, or a `score` is a machine proposal about paper
+text; the **rubric-specific** decision rules and uncertainty region are approved in
+the pilot, and **exclusion requires human approval** (random + risk-based
+original-source checks). A Jev answer alone (and any `box` result, which is
+unsupported) MUST NOT exclude or admit a candidate; an answer inside the
+uncertainty region is retained as uncertain and routed to human review.
 
 **Choice / score.** `choice` MUST be one of the declared `options`; `score` MUST
 be within the declared `levels` index range; `legend` keys MUST be declared level
@@ -558,6 +625,9 @@ Invariants:
   `invalid`. Costs from `direct_call` routes MUST NOT be aggregated into OpenCode
   session statistics; direct calls are accounted separately (spec line 20
   fallback; step 04 line 22; ADR `001` "direct calls … accounted separately").
+- **Caps apply across buckets.** The selected cost caps (§5.6) count every bucket
+  and every route against the per-project and per-stage ceilings; a
+  `reserve_usd` MUST be recorded before a paid dispatch is admitted (§5.6).
 
 ## 7. Secondary-origin attribution and warned tracing
 
@@ -570,22 +640,28 @@ Invariants:
 | `depth` | `int` | M | Depth 0 is the currently cited source. |
 | `origin_class` | `enum{primary_verified, secondary_warned, mixed, unclear, own_result, conceptual_contribution}` | M | |
 | `source_ref` | `ref` | M | The source **actually read**; never an unread original. |
-| `config_state` | `enum{configured, configuration_required}` | M | `configuration_required` when hop/source/retry defaults are unset. |
+| `config_state` | `enum{configured, configuration_required}` | M | `configuration_required` when the project's hop/source/retry limits are unset. This is a **runtime project gate**, not a Step 01 open item (§7.2). |
 | `stop_reason` | `enum{none, hop_limit, source_limit, retry_limit, unavailable}` | O | Present iff `config_state = configured`; the actual reason tracing stopped. |
 | `warning_visible` | `bool` | M | |
 | `approval_required` | `enum{none, human_final}` | M | |
 
 ### 7.2 Invariants
 
+- **Tracing limits are required per project (selected 2026-10-27).** Before any
+  upstream tracing work, each project MUST have explicit **maximum citation hops,
+  new sources per claim and per project, and resolution retries**, with cycle
+  detection. There is **no universal numeric default**: the values are a
+  **mandatory per-project configuration**. While unset, `config_state =
+  configuration_required` is a **runtime project gate** (the trace does not
+  proceed past depth 0) — it is **not** a Step 01 unresolved decision.
 - When `stop_reason ≠ none` (a configured limit was reached) or `origin_class =
   secondary_warned`, then `warning_visible` MUST be `true`, `approval_required`
   MUST be `human_final`, and `origin_class` MUST NOT be `primary_verified`.
-- **Unresolved limits are `configuration_required`, not a reached limit.** When
-  hop/source/retry defaults are unset (`config_state =
-  configuration_required`), the application MUST NOT pretend a limit was
-  configured or reached: tracing MUST NOT proceed past depth 0, `stop_reason`
-  MUST be absent, and the trace is `blocked` pending configuration. No number is
-  invented (spec line 48 "Numerical defaults are **not yet agreed**"). These are
+- **Unconfigured limits are not a reached limit.** When the project's
+  hop/source/retry limits are unset (`config_state = configuration_required`), the
+  application MUST NOT pretend a limit was configured or reached: tracing MUST NOT
+  proceed past depth 0, `stop_reason` MUST be absent, and the trace is `blocked`
+  pending project configuration. No number is invented (spec line 48). These are
   not the writer's repair budgets (§5).
 - **Supported secondary evidence MUST be checked.** A `secondary_warned`
   attribution MUST carry an exact `source_ref` (the source actually read) with a
@@ -596,6 +672,12 @@ Invariants:
   approval, **never** "verified primary support" (spec line 50; step 13 line 20;
   ADR `001`; kickoff "At a tracing limit, secondary attribution stays a warned
   state requiring final human approval").
+- **Secondary warnings are handled as review warning + export companion (selected
+  2026-10-27).** The manuscript MUST carry **accurate secondary attribution**; it
+  does **not** need to print a raw warning tag. Final human approval binds the
+  **exact manuscript, its dependency set, and the warning set**; a material edit to
+  any of those **reopens** the approval (I2/I5). The warning stays visible in the
+  review and in the export companion.
 - Cite the source actually read; never substitute an unread original or claim
   direct verification.
 - Section/manuscript checking MUST NOT relabel a real citation to a secondary
@@ -899,11 +981,13 @@ the candidate MUST be retained and a failure diagnostic persisted (§6.2).
 **Valid.** Critic raises `issue_88` on `{proj_A, draft_sec3, rev_5}`: `claim =
 "paragraph 2 changes the population from mice to rats"`, `evidence = {kind:
 locator, artifact_revision: {proj_A, draft_sec3, rev_5}, locator: "p2, L4"}`,
-`severity = major` (proposed). The author checks both revisions and the source;
+`severity = major` (category per §4.4; consequential scientific defect). The
+author checks both revisions and the source;
 the objection is demonstrably false. Disposition: `state =
 rejected_with_reason`, `disposition_reason = "rev_5 p2 already reads 'mice';
 critic cited rev_4"`, with `counter_evidence` locating the correct text.
-`repair_pass` absent; budget lineage unchanged. → **verdict: valid.**
+`repair_pass` absent; budget lineage unchanged. Rejecting a false objection with
+`counter_evidence` does **not** force a rewrite. → **verdict: valid.**
 
 **Invalid.** `state = fixed` with no `fix_ref` (no new revision). Also invalid: a
 `blocking`/`major` issue with validated `evidence` closed by a bare human
@@ -912,8 +996,8 @@ disposition, by `deferred`, or by `superseded` without a resolved successor or
 defect to pass; the final gate rejects. → **verdict: invalid.**
 
 **Missing.** `severity` absent, or both `evidence` and `missing_check` absent. →
-**verdict: invalid (blocked)** — cannot be dispositioned; severity taxonomy is
-also unapproved until the user ratifies it (§4.4).
+**verdict: invalid (blocked)** — cannot be dispositioned; a consequential item
+with unclassified severity is treated as `blocking` until classified (§4.4).
 
 ### 11.3 Stale approval / model-edited budget
 
@@ -1001,27 +1085,38 @@ budget/approval record reused across A and B; `state = active` with a null
 **Missing.** `state` absent, or the old project's job state unknown at switch
 time. → **verdict: blocked** pending reconciliation.
 
-## 12. Open decisions (owners) and dependency notes
+## 12. Selected policies, mandatory per-project values, and dependency notes
 
-| Item | State | Owner | Blocking effect |
+On **2026-10-27** the user approved the behavioral direction and selected the
+operational/technical values below. This section separates **selected global
+policy** from **mandatory per-project value** (no universal default). The canonical
+disposition text is in the policy record (ADR 002
+`docs/decisions/002-step01-contracts-and-policies.md` /
+[`03-policy-decisions.md`](03-policy-decisions.md)). Owner for every item is the
+**user** (with the **project** supplying mandatory per-project values).
+
+| Item | Status (2026-10-27) | Owner | Effect |
 | --- | --- | --- | --- |
-| Severity taxonomy literal set (§4.4) | Proposed / unapproved | User | Any behavior keyed on severity is blocked (fail closed). |
-| Predicate probability cutoff (turning `noul` into yes/no) | Unresolved policy; not invented here | User | Raw probability is retained; no answer is coerced to boolean until decided. |
-| Origin hop/source/retry numeric defaults (§7.2) | Unresolved → `configuration_required` | User | Tracing blocks at depth 0; no limit is pretended configured/reached. |
-| Cost/concurrency limits | Unresolved | User | Budget enforcement uses the inherited round limits; cost/concurrency caps (and paid-dispatch reserves) blocked until set. |
-| Pilot/audit samples and acceptance rules; coverage/stopping rules; explicit acceptance of secondary-origin warnings | Unresolved (spec "Pending decisions") | User | Dependent gates blocked. |
-| Rights/hosted-model policy | Defined by sibling [`03-policy-decisions.md`](03-policy-decisions.md) of the coordinated step-01 contract set | User | Hosted-model access is governed there, not by this contract. |
-| Durable storage schema / IPC / package layout | Step-01 **proposal** (step 01 deliverable line 12); SQLite remains a proposal | User | Nothing here is an accepted schema; not a step-02-only decision. |
+| Severity categories (§4.4) | **Selected** — four accepted categories (`blocking`/`major`/`minor`/`style`) | User | `blocking`/`major` and any unclassified **consequential** item cannot pass; `minor`/`style` may remain. |
+| Predicate probability mapping (§6.2) | **Selected** — no universal cutoff; **rubric-specific, pilot-calibrated** decision rules + uncertainty region; raw probability retained; human exclusion approval | User | An uncalibrated rubric blocks any exclusion keyed on the mapping (fail closed); a `box` result is unsupported. |
+| Origin hop/source/retry limits (§7.2) | **Mandatory per-project** — explicit hops / new sources per claim and project / retries before upstream work; no universal numeric default | Project (User approves) | Unset ⇒ runtime project gate `configuration_required`: tracing blocks at depth 0, no reached limit pretended. |
+| Cost/concurrency caps (§5.6) | **Selected defaults** — USD 25 per project, USD 10 per stage, at most 2 simultaneous external model calls | User | Caps stop **new** dispatch; reserve required before dispatch; human approval to raise; restart does not reset. Not a promised cost or scientific threshold. |
+| Pilot/audit sampling and acceptance | **Mandatory per-project** — explicit sample sizes/rules approved before bulk work | Project (User approves) | Missing plan blocks bulk digestion; important failures pause/correct/re-audit. |
+| Coverage/stopping | **Selected** — coverage report + explicit human freeze of the exact candidate revision; no universal numeric stopping/completeness | User | Unreported coverage state cannot be frozen to pass. |
+| Secondary-origin warnings | **Selected** — review warning + export companion; accurate manuscript secondary attribution (no raw warning tag required); final human approval of the exact manuscript + dependency + warning set | User | Warned claims stay unapproved until that final approval; never verified primary support; material edits reopen. |
+| Rights/hosted-model policy | **Selected** — separate operations; `unknown` blocks; scoped batch authorization (manifest/route/purpose/revision) after rights/privacy/provider terms; never overrides a source restriction | User | Hosted transfer blocked without the scoped authorization; governed with sibling [`03-policy-decisions.md`](03-policy-decisions.md). |
+| Durable storage schema / IPC / package layout | Step-01 **proposal** — architecture **direction** approved 2026-10-27; SQLite **schema** remains a proposal | User | Nothing here is an accepted schema; not a step-02-only decision. |
+
+**Nothing above invents a numeric scientific threshold**, and the confirmed
+repair-round maxima **3 / 2 / 2** are unchanged (§5.4). Where a **mandatory
+per-project** value is unset, dependent behavior is `blocked` (fail closed, §9).
 
 ## 13. Change history
 
-`v3.1` (2026-10-27, proposed): coordinator's bounded consistency correction
-after two worker repairs. Predicate probability is conditionally mandatory, not
-mandatory for choice/score answers. Read-only validation forbids repairs, not
-separately authorized model checks; it consumes no repair round.
-
 | Version | Date | Change | Status |
 | --- | --- | --- | --- |
-| `v1` | 2026-10-27 | Initial proposed representation of gates, approvals, findings budgets, machine decisions, and runtime safety, with worked examples. | **Proposed — approval pending.** |
-| `v2` | 2026-10-27 | Review repairs: gate identity and project-scoped snapshot; out-of-band authority; `VersionSlot` states; typed answers; exact-decimal costs; section-scoped budgets and readiness; superseded/deferred; `configuration_required`; `DispatchAttempt`; cancellation and nullable activation; complete examples; step-01 storage wording. | **Proposed — approval pending.** |
-| `v3` | 2026-10-27 | Adapter-faithful decisions: predicate probability mandatory (no boolean/threshold), choice options/confidence/probabilities and score levels/legend per `live_jev.py`, `box` unsupported and excluded, singular typed `answer` with immutable `QuestionDef`/`question_def_ref`, `wire_type` persisted, per-question `missing_answer`/`provider_error`; human disposition cannot waive a confirmed blocker (`counter_evidence` required); `ValidationRecord` separated from `Round`, readiness before validation, reservation-before-dispatch with exactly-once finalize; `CostRecord` amount iff known/estimated with retained reserves; nullable `id|null` activation; waiting-external/pause retain project arbitration; direct retry needs authorization and a non-ambiguous prior outcome; ancestor-tuple stale clause; sibling references as the coordinated contract set; valid synthetic 64-hex digests with explicit out-of-band precondition; example validation against types, ranges, and digests. | **Proposed — approval pending.** |
+| `v1` | 2026-10-27 | Initial representation of gates, approvals, findings budgets, machine decisions, and runtime safety, with worked examples. | Historical (superseded). |
+| `v2` | 2026-10-27 | Review repairs: gate identity and project-scoped snapshot; out-of-band authority; `VersionSlot` states; typed answers; exact-decimal costs; section-scoped budgets and readiness; superseded/deferred; `configuration_required`; `DispatchAttempt`; cancellation and nullable activation; complete examples; step-01 storage wording. | Historical (superseded). |
+| `v3` | 2026-10-27 | Adapter-faithful decisions: predicate probability mandatory (no boolean/threshold), choice options/confidence/probabilities and score levels/legend per `live_jev.py`, `box` unsupported and excluded, singular typed `answer` with immutable `QuestionDef`/`question_def_ref`, `wire_type` persisted, per-question `missing_answer`/`provider_error`; human disposition cannot waive a confirmed blocker (`counter_evidence` required); `ValidationRecord` separated from `Round`, readiness before validation, reservation-before-dispatch with exactly-once finalize; `CostRecord` amount iff known/estimated with retained reserves; nullable `id|null` activation; waiting-external/pause retain project arbitration; direct retry needs authorization and a non-ambiguous prior outcome; ancestor-tuple stale clause; sibling references as the coordinated contract set; valid synthetic 64-hex digests with explicit out-of-band precondition; example validation against types, ranges, and digests. | Historical (superseded). |
+| `v3.1` | 2026-10-27 | Coordinator's bounded consistency correction after two worker repairs: predicate probability is conditionally mandatory, not mandatory for choice/score answers; read-only validation forbids repairs, not separately authorized model checks, and consumes no repair round. | Historical (superseded). |
+| `v3.2` | 2026-10-27 | Behavioral-direction alignment (2026-10-27 approval): status reframed — behavior approved, representation still proposed. Severity §4.4 becomes the four selected categories with `blocking`/`major`/unclassified-consequential preventing completion. Predicate mapping §6.2 becomes rubric-specific pilot-calibrated rules + uncertainty region (no universal cutoff; raw probability retained; human exclusion approval). Tracing §7.2 becomes required per-project limits (not a Step 01 unresolved item); `configuration_required` is a runtime project gate. New §5.6 records the selected USD 25 / USD 10 / 2 caps and reserve-before-dispatch. §7 adds the review-warning+companion secondary handling (no raw warning tag required; exact manuscript/dependency/warning-set approval; material edits reopen). §12 rewritten to selected policies vs mandatory per-project values. No numeric scientific threshold invented; the 3/2/2 repair maxima are unchanged. Prior "proposed/unapproved" wording retained only in the historical rows above. | **Behaviorally approved (user, 2026-10-27); representation pending review.** |

@@ -1,16 +1,33 @@
-# 01 — Identity and evidence contract (v1.3, **proposed**)
+# 01 — Identity and evidence contract (v1.4, behaviorally approved; representation proposal)
 
-> **Status: PROPOSED — approval pending.** No part of this document is ratified
-> science, an approved schema, or a claim of production completion. It drafts the
-> identity/evidence contract for review; only the user approves scientific policy
-> and the baseline decisions (§8).
+> **Status: behavioral direction APPROVED (2026-10-27); representation pending
+> field-level review.** On 2026-10-27 the user approved the **behavior** described by
+> the coordinated Step 01 contracts and selected the Step 01 operational/technical
+> policy direction (Step 01 interview), including the identity/evidence behavior of
+> this document: distinct duplicate / alternate-version / shared-study cases; no
+> automatic independent support; and revisions, approvals, and rights pinned to
+> **exact immutable revisions**. That approval selects **behavior and policy
+> direction** — it is **not** a line-by-line ratification of every record/field
+> spelling, and the record names, field names, enum literal spellings, and examples
+> here remain a **versioned implementation representation** for review. This
+> document still claims **no** production or scientific validation and **no** audited
+> completeness.
 >
-> **Document version:** `v1.3` (proposal revision of `v1`; see §9 change log).
+> The canonical disposition of the selected policies is recorded in the sibling
+> decision record `docs/decisions/002-step01-contracts-and-policies.md` (added by the
+> parallel policy/ADR work; this plain-path reference resolves when that file lands
+> at integration) and in the policy register
+> [`03-policy-decisions.md`](03-policy-decisions.md). Where this contract and that
+> policy record differ, the policy record governs **policy**; this contract governs
+> only the **representation**.
+>
+> **Document version:** `v1.4` (revision of `v1`; see §9 change log).
 > Versioning rule and change log in §9.
 >
 > **This is not Step 01 completion.** This contract is one of several Step 01
-> deliverables; no Step 01 pass, no scientific policy, and no schema is claimed
-> here. All approvals and open items remain pending (§8).
+> deliverables; no Step 01 pass and no schema is claimed here. Selected policies and
+> mandatory per-project values are recorded in §8; their field-level representation
+> remains a proposal.
 >
 > **Sources this document is derived from:**
 > - [Scientific and product baseline](../specification.md) — Confirmed scientific
@@ -23,11 +40,16 @@
 > - [Runtime language decision 001](../decisions/001-runtime-language.md) —
 >   accepted runtime decision; it approves **no** scientific policy, schema, IPC,
 >   or framework.
+> - `docs/decisions/002-step01-contracts-and-policies.md` — the Step 01 policy
+>   decision record for the 2026-10-27 behavioral approvals (added by the parallel
+>   policy/ADR work; resolves at integration).
 >
-> **Non-claims.** This document invents no numeric scientific threshold, accepts
-> none of P1–P6, and asserts no audited completeness. Sampling audits described
-> here are explicitly **not** independent dual-human review, held-out accuracy
-> validation, or proof that nothing was omitted (specification line 59).
+> **Non-claims.** This document invents no numeric scientific threshold and asserts
+> no audited completeness. The P1–P6 **behavioral direction** was selected
+> 2026-10-27 (§8; policy record); the representation of that behavior in fields is
+> still a proposal. Sampling audits described here are explicitly **not** independent
+> dual-human review, held-out accuracy validation, or proof that nothing was omitted
+> (specification line 59).
 
 ---
 
@@ -65,20 +87,25 @@ contract must preserve them; it must not weaken them.
 - **I11** Documents and model outputs are **untrusted data**; no credential or
   source-text leakage (line 62; kickoff).
 
-### 1.2 Proposed representations (this document — not ratified)
+### 1.2 Proposed representations of approved behavior
 
-Everything in §2–§7 is a **proposal for review**. In particular: the field names,
-enum spellings, state vocabulary, record types, and worked examples are design
-proposals, not approved schema. They are written normatively so reviewers can
-verify them, but nothing here is in force until the user approves it (§8).
+The **behavior** in §2–§7 (the distinctions, state semantics, pinning rules, and
+non-support rules) is covered by the 2026-10-27 behavioral approval (§8). What
+remains a **proposal for field-level review** is the *representation*: the field
+names, enum spellings, state vocabulary, record names, and worked examples are a
+versioned implementation design, written normatively so reviewers can verify them,
+not a line-by-line user ratification. Behavior governs; representation is proposed.
 
 ### 1.3 What this document does not decide
 
-- It does **not** accept, modify, or defer P1–P6; they remain open with the user
-  as owner (§8).
+- It does **not** restate the P1–P6 policy text or the operational/technical policy
+  values; those are dispositioned in the policy record (ADR 002 /
+  [`03-policy-decisions.md`](03-policy-decisions.md)) and, for gate/runtime policy,
+  in [`02-gates-and-runtime.md`](02-gates-and-runtime.md) (§8).
 - It does **not** choose storage/IPC/package layout (step 01's other deliverables).
-- It does **not** set any numeric threshold (sample sizes, severity scores, hop
-  limits, budgets).
+- It does **not** itself set any numeric value — sample sizes, severity scores, hop
+  limits, and budget/concurrency caps are selected policy recorded elsewhere; this
+  document only references them (§8). It invents no numeric scientific threshold.
 - It does **not** claim any scientific feature is implemented or validated.
 
 ---
@@ -331,7 +358,27 @@ limitations, source assets, a rights reference, and revision linkage.
 | `rights_reference` | stated<`RightsRecordRef`> | Req | Pinned rights record for the asset(s) read (I9; §5.6). |
 | `numeric_details` | Opt<object> | Opt | Numbers/units where relevant (line 32). |
 | `extraction_provenance` | ref<ProvenanceRecord> | Req | Who/what/how extracted. |
-| `secondary_warning` | stated<bool> | Req | `known:true` when attribution is limited by a tracing limit; then final human approval is required and this MUST NOT be presented as verified primary support (I10). |
+| `secondary_warning` | stated<bool> | Req | `known:true` when attribution is limited because a tracing limit was reached or the upstream origin is unavailable; then final human approval is required and this MUST NOT be presented as verified primary support (I10). |
+
+Rules:
+
+- **Applicable context is mandatory at extraction and preserved downstream (P2,
+  selected 2026-10-27).** `context` MUST capture the applicable
+  context/causal limits (e.g., species/population/assay/outcome and comparable
+  conditions) at extraction, and that context MUST be preserved into downstream
+  synthesis and review. A synthesis/review that generalizes beyond the captured
+  context is unsupported. **Consequential missing context blocks the affected
+  claim:** a dependent conclusion whose applicable context is `missing`/`unknown`
+  is `blocked` until the context is supplied or a human disposition is recorded;
+  it MUST NOT be produced as if generalizable.
+- **Secondary warning is approved behavior; the raw warning tag is not required in
+  the manuscript (selected 2026-10-27).** A `secondary_warning` `known:true` retains
+  the claim as a warned state pending **final human approval of the exact
+  manuscript, its dependency set, and the warning set**. The manuscript MUST carry
+  **accurate secondary attribution**; it need not print a raw warning tag. Material
+  edits to the manuscript, its dependencies, or the warning set **reopen** that
+  approval (I2/I5). A warned claim MUST NOT be presented as verified primary support
+  (I10). See [`02-gates-and-runtime.md` §7](02-gates-and-runtime.md#7-secondary-origin-attribution-and-warned-tracing).
 
 ### 5.5 `DependencyReference`
 
@@ -399,10 +446,24 @@ Rules (the projection adds no rights; the policy record is authoritative):
   MUST NOT be set to `not_applicable` merely because the artifact is "ours".
 - `unknown` **blocks** the affected operation. In particular, if
   `hosted_model_transfer_right` is `unknown`, no hosted transfer may be attempted;
-  extraction must use a **local model or a human**. P5 remains open (§8).
+  extraction must use a **local model or a human**. Provider/journal verification
+  (P5, selected) still gates hosted transfer (§8; policy register §5).
 
 **Constant reminder:** uploading a file is NOT proof of any of these rights; each
 operation is decided independently.
+
+**Hosted transfer is a scoped batch authorization (selected 2026-10-27).** Rights
+for the four operations are **separate** and `unknown` blocks the affected
+operation. `hosted_model_transfer_right` for a source is not granted by a blanket
+or in-band permission: it requires a **scoped batch authorization** that names the
+**project/source manifest**, the **provider/model route**, the **purpose**, and the
+**exact revision**, and it is granted only **after** the applicable
+rights/privacy/provider terms are satisfied (P5; policy register §5). Adding
+sources or materially changing the manifest/route/purpose/revision **reopens** the
+authorization (I2/I5). A batch authorization **never overrides** a source
+restriction: a source whose `redistribution_right` or `hosted_model_transfer_right`
+is `not_allowed`/`unknown` stays blocked for that operation. See
+[`03-policy-decisions.md` §5.2](03-policy-decisions.md#52-rights-eligibility-is-not-final-authorization).
 
 ### 5.7 `OmissionCheckRecord` (does not imply completeness, I7)
 
@@ -418,6 +479,16 @@ operation is decided independently.
 | `found_omissions` | list<`OmissionRef`> | Req (may be empty) | Omissions detected (§2.4). |
 | `limitations` | stated<string> | Req | Coverage limits of this check. |
 | `guarantee` | constant `sampled_audit_not_completeness` | Req | Explicit non-guarantee: a pass does **not** prove completeness. |
+
+**Sampling is a project-specific plan (selected 2026-10-27).** Before bulk work,
+each project MUST approve an explicit plan giving the sample sizes and rules for
+(a) the one iterative pilot, (b) the exclusion-batch checks (random **and**
+risk-based original-source checks), and (c) the extraction audits for omissions
+**and** incorrect findings. There is **no universal sample size**. An important
+failure (e.g., a material false exclusion or a material omission/error found in
+audit) **pauses the affected work**, requires correction, and then a **re-audit**
+before it may resume. A sampled audit is **not** held-out validation and does not
+prove completeness (`guarantee`; §5.7; specification line 59).
 
 ### 5.8 `ImportOccurrenceRecord` (acquisition event — **not** a scientific revision)
 
@@ -985,40 +1056,58 @@ IndependenceRecord{ independence_id:"IND1", project_id:"P-0001",
 
 ---
 
-## 8. Open approvals and ownership (do not silently decide)
+## 8. Selected policies, mandatory per-project values, and ownership
 
-This section records that the items below remain **open** and are **not** settled
-by this proposal. Owner for all is the **user** unless noted. None are waived.
+On **2026-10-27** the user approved the **behavioral direction** of the P1–P6 and
+operational items below and selected the Step 01 policy values listed here. This
+section distinguishes:
 
-| Id | Open item | Owner | Blocks (until decided) | Status here |
-| --- | --- | --- | --- | --- |
-| P1 | Explicit framework contribution, concept-admission/support/revision criteria, testable implications | user | `framework` artifact admission | **open — not accepted** |
-| P2 | Detailed downstream causal/context-fidelity checks | user | `context`-field checks | **open — not accepted** |
-| P3 | Integrity-status checks (retractions, expressions of concern, corrections) and adjudication | user | source-integrity gating | **open — not accepted** |
-| P4 | Public selection/synthesis and limitations reporting alongside the manuscript | user | public artifacts | **open — not accepted** |
-| P5 | AI-use declaration, human accountability, provider terms, journal policies | user | `hosted_model_transfer_right` default | **open — not accepted** |
-| P6 | Optional target-venue constraint capture and submission-time verification | user | venue constraints | **open — not accepted** |
-| A1 | Pilot/audit samples and acceptance rules | user | `OmissionCheckRecord.sample_rule` | **open — no numeric threshold invented** |
-| A2 | Issue severities | user | finding severity | **open** |
-| A3 | Coverage/stopping rules | user | search freeze | **open** |
-| A4 | Cost/concurrency limits | user | budgets | **open** |
-| A5 | Tracing hop/source/retry defaults | user | `secondary_warning` triggering | **open** |
-| A6 | Explicit acceptance of secondary-origin warnings | user | final approval at a tracing limit | **open (I10 stands regardless)** |
+- **Selected global policy** — a behavioral or value choice now in force for the
+  application direction (still represented at field level as a proposal, §1.2), and
+- **Mandatory per-project value** — a value the **project** MUST supply and have
+  approved before the dependent work proceeds; there is **no universal default**.
 
-Where a decision is unresolved, the dependent field defaults to `unknown` and
-therefore **blocks** dependent behavior (§2.2/§2.3). No numeric scientific
-threshold is invented to let a stage proceed.
+The canonical disposition text lives in the policy record (ADR 002
+`docs/decisions/002-step01-contracts-and-policies.md` /
+[`03-policy-decisions.md`](03-policy-decisions.md)); where the two differ, the
+policy record governs. Owner for every item is the **user**.
+
+| Id | Item | Selected 2026-10-27 (behavior / value) | Kind |
+| --- | --- | --- | --- |
+| P1 | Framework contribution and concept-admission/support/revision | **Evidence-led synthesis with concept safeguards**: organize the evidence and allow justified new relationships/hypotheses with clearly labelled novelty, but never force a novel framework. Concept admission requires a definition, its role, original support, counterevidence, and applicability limits; hypotheses stay distinguished from admitted concepts; material evidence reopens the approval; applicable concepts carry meaningful testable implications. | Selected global policy |
+| P2 | Downstream causal/context-fidelity | **Structured applicable context plus review**: capture applicable context/causal limits at extraction, preserve them downstream, and check synthesis/review for unsupported generalization; **consequential missing context blocks the affected claim** (§5.4). | Selected global policy |
+| P3 | Integrity status (retraction / expression of concern / correction) | **Entry and final checks**: document integrity statuses with provenance and date at corpus entry and again at final approval; human review of affected uses; an **unknown** status is not "clean"; correction, non-replication, and retraction are **not** automatically conflated. | Selected global policy |
+| P4 | Public selection/synthesis and limitations reporting | **Companion plus summary**: a detailed exportable methods/limitations companion **and** a concise manuscript-ready summary; publication stays user-controlled; workflow limitations are reported honestly. | Selected global policy |
+| P5 | AI-use declaration, human accountability, provider/journal policy | **Require process**: AI-use provenance, an editable disclosure, and human accountability; verify provider terms before any hosted use and target-journal policy before any submission-facing approval. | Selected global policy |
+| P6 | Target-venue constraints and submission-time verification | **Optional venue profile**: optional per-project venue constraints with a fresh submission checklist and human confirmation, while the retained output stays **venue-neutral**. | Selected global policy |
+| A1 | Pilot/audit sampling and acceptance | **Project-specific plan**: an explicit project sample-size/rule plan approved **before** bulk work (one iterative pilot; random **and** risk-based exclusion checks; omission/error extraction audits); important failures pause, correct, and re-audit the affected work (§5.7). **No universal sample size.** | Mandatory per-project value |
+| A2 | Issue severity | **Four accepted categories**: `blocking` (factual/support/essential-check blocker), `major` (consequential scientific defect), `minor` (non-consequential), `style` (preference). Blocking/major items, and any unclassified **consequential** item, cannot pass (§§4.4, 4.1 of [`02-gates-and-runtime.md`](02-gates-and-runtime.md)). | Selected global policy |
+| A3 | Coverage/stopping | **Coverage report plus gate**: a coverage report (sources/queries/dates/terminology/citation expansion/yields/duplicates/gaps) and an explicit human decision to freeze the exact candidate revision. **No universal numeric stopping/completeness.** | Selected global policy (freeze is per-project human act) |
+| A4 | Cost/concurrency | **Selected defaults**: cumulative **USD 25 per project**, cumulative **USD 10 per stage**, at most **2 simultaneous external model calls**; all routes and read-only model checks count; a defensible upper-bound reserve is required before dispatch (if it cannot be bounded, **do not dispatch**); an unknown reserve is retained; caps stop new dispatch and only a human may raise them; a restart does **not** reset the caps. **Not a promised cost and not a scientific threshold** (§6.3 of [`02-gates-and-runtime.md`](02-gates-and-runtime.md)). | Selected global default |
+| A5 | Tracing hop/source/retry | **Required per project**: explicit maximum citation hops, new sources per claim and per project, and resolution retries MUST be configured **per project before upstream tracing work**; detect cycles. **No universal numeric default.** While unset, the runtime project gate is `configuration_required` (tracing does not proceed past depth 0) — a **runtime project gate**, not a Step 01 open item. | Mandatory per-project value |
+| A6 | Secondary-origin warnings | **Review plus companion**: a review warning and an export companion, accurate manuscript secondary attribution (no raw warning tag required), and final human approval binding the **exact manuscript + dependency set + warning set**; material edits reopen it; never presented as verified primary support (§7 of [`02-gates-and-runtime.md`](02-gates-and-runtime.md)). | Selected global policy |
+
+Still **fixed and unchanged** in all cases: the confirmed repair-round maxima
+**3 / 2 / 2** (critique/review, original-source fact-check, whole-manuscript). No
+selected policy above and no batch authorization changes those maxima.
+
+Where a mandatory per-project value (A1, A5) has not been supplied and approved,
+the dependent field defaults to `unknown` and therefore **blocks** dependent
+behavior (§2.2/§2.3); no numeric scientific threshold is invented to let a stage
+proceed.
 
 ---
 
 ## 9. Versioning and change log
 
-- This is document version **`v1.3`** (`docs/contracts/01-identities.md`).
+- This is document version **`v1.4`** (`docs/contracts/01-identities.md`).
 - Because the contract itself is versioned, a change to any mandatory field,
   type, state, or rule MUST increment the document version and record the change
   below with its date and approver. Field/record semantics are immutable within a
   version once approved.
-- Until approved, edits are proposal revisions, not ratified changes.
+- The **behavior** covered by the 2026-10-27 approval is in force; edits to its
+  **representation** remain proposal revisions, not ratified field changes, until
+  the user reviews the representation.
 
 | Doc version | Date | Change | Approver |
 | --- | --- | --- | --- |
@@ -1026,6 +1115,7 @@ threshold is invented to let a stage proceed.
 | v1.1 | 2026-10-27 | Repair: separate import occurrence from scientific revision (§5.8), coherent missing-full-text representation (no fake revision), `stated<T>`/subtype grammar and a complete conforming record set (§2.4, §7.0), `known` = availability not verification, affirmative `IndependenceRecord` (§5.9), report/scientific-report terminology, no blanket rights N/A (§5.2/§5.6), mandatory revision `dependencies`+`provenance_id` (§5.2). Still **proposed**. | **pending (user)** |
 | v1.2 | 2026-10-27 | Repair: §7.0 now parseable JSON with 64-hex synthetic digests, matching synthetic passage/locator/context, empty `source_assets`, and an inline Python validator (required keys, `stated` shapes, hash format, enum values, reference resolution); `IndependenceRecord` uses typed `EvidenceRef` and structured `ActorRef` with mandatory human confirmation for agent conclusions (§2.4, §5.9); `shared` underlying data is a hard no-independence rule (§6.1 R4, §6.2); `reports`→`study`, `uses_dataset`→`dataset` targets fixed (§4, §5.5); `RightsReference` is a **projection** of the canonical `RightsRecord` (`docs/contracts/03-policy-decisions.md` §5) with an explicit field mapping and no blanket own-work N/A (§5.2, §5.6); synthetic rights sample is local-processing-only with an explicit synthetic grant. Still **proposed**; not Step 01 completion. | **pending (user)** |
 | v1.3 | 2026-10-27 | Integration alignment: `RightsReference` projection corrected to the canonical fields (`subject` discriminated union, per-operation `basis.<operation>.{kind, evidence:{ref, provenance}}`, `authorization`) — the earlier map named nonexistent `source_revision`/`evidence_ref`/`authorizing_revision` (§5.6); typed pinned **`RightsRecordRef`** `{project_id, rights_id, record_revision}` replaces the mutable bare `rights_id` on `RevisionRecord`/`ImportOccurrenceRecord` and on `EvidenceRecord.rights_reference`, `record_revision` added to the projection, and §7.0 examples + the inline validator resolve the pinned refs and reject cross-project/ill-typed rights refs (§2.4, §5.2, §5.4, §5.6, §5.8, §7.0). Still **proposed**. | **pending (user)** |
+| v1.4 | 2026-10-27 | Behavioral-direction alignment (2026-10-27 approval): status reframed — behavior approved, representation still proposed (§1.2); P1–P6 and A1–A6 §8 rewritten to **selected global policies vs mandatory per-project values** (P1 evidence-led synthesis + concept safeguards; P2 structured applicable context; P3 entry+final integrity checks; P4 companion+summary; P5 required AI-use/accountability/provider process; P6 optional venue profile; A1 project-specific pilot/audit plan; A2 four severity categories; A3 coverage report+freeze; A4 USD25/USD10/2 caps; A5 required per-project tracing limits; A6 review+companion secondary warning); P2 context invariant added (§5.4) with consequential missing context blocking; secondary-warning behavior clarified (no raw warning tag required, exact manuscript/dependency/warning-set approval, material edits reopen); scoped-batch hosted-transfer authorization added to §5.6; project-specific sampling plan added to §5.7. No numeric scientific threshold invented; representation unchanged and still a proposal. Prior "open/unapproved" framing retained only as historical change-log record below. | **behavioral approval (user, 2026-10-27); representation pending review** |
 
 ---
 
@@ -1046,5 +1136,5 @@ threshold is invented to let a stage proceed.
 - All distinctions in implementation `01-contracts.md` acceptance criterion 3 are
   made explicit in §4, §3.2, and §6.2.
 - Independence is an affirmative adjudication (§5.9); a `known` field asserts
-  availability only (§2.2); no P1–P6 are accepted and no numeric scientific
-  threshold is introduced (§8).
+  availability only (§2.2); the P1–P6 **behavior** and the A1–A6 selected policies
+  are recorded in §8 with no numeric scientific threshold invented.
