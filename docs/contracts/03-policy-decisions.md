@@ -1,25 +1,33 @@
 # 03 — Policy and architecture decision register (v1)
 
-> **Status: PROPOSED — awaiting the user. This document is not an approval, and it
-> is not Step 01 completion.** The user directed this session to proceed with
-> preparing the Step 01 contracts. That direction is a **scope instruction to draft
-> this register**; it is **not** approval of any outstanding scientific policy, of
-> the SQLite schema, of IPC, of the package layout, or of any architecture claim.
-> Every policy item below is recorded as
-> **OPEN (`proposed`) and owned by the user** until the user dispositions it with
-> the evidence and exact revision the register requires (sections 1 and 2). No
-> policy, schema, or architecture is ratified here; no behavior is unblocked by
-> this file.
+> **Status: ACCEPTED / RATIFIED — 2026-10-27.** The user dispositioned every P1–P6
+> item, the operational policies, the technical direction, and the rights behavior
+> in the recorded Step 01 interview; this register now carries those dispositions as
+> **`accepted`**. The ratification is anchored to the **reviewed revision
+> `ee7f7eafca80baa6c1aaca278361e56a663493c3`** and is recorded in
+> [`../decisions/002-step01-contracts-and-policies.md`](../decisions/002-step01-contracts-and-policies.md).
+> **What the ratification is:** approval of the **described behavior and direction**,
+> with the concrete **interview amendments** stated per record below.
+> **What it is not:** it is **not** approval of every field-level schema spelling,
+> **not** an independent scientific validation, and **not** a claim that any
+> scientific feature is implemented. The record representation here is an
+> **implementation-facing, versioned contract**; its exact field spellings remain
+> subject to versioned revision, and no numeric scientific threshold is invented.
+> The synthetic `proposed`/invalid fixtures in section 1.4 are retained as
+> **historical format examples** for the offline checker, independent of the
+> ratified status of the records they illustrate.
 
 This register implements the Step 01 [deliverable](../implementation/01-contracts.md)
 "record user disposition of P1–P6 … and agree pilot/audit sampling and acceptance,
 search coverage/stopping, cost/concurrency limits, origin-hop/source/retry defaults,
 and secondary-warning approval" (lines 9–12). It is a **decision register**, not a
-decision record: it defines the record format (section 1), states each open item
+decision record: it defines the record format (section 1), states each item
 faithfully against the [baseline](../specification.md) (sections 2–3), and records
-**proposed** technical direction (sections 4–5) that the user has not accepted.
-Per the register's own rules (section 1.3), a session or coordinator may **write**
-the register but may **not** move a record out of `proposed`.
+the **accepted** technical direction (sections 4–5). Per the register's own rules
+(section 1.3), a session or coordinator may **write** the register but may **not**
+change a record's status; the `accepted` status comes from the user's interview
+selections plus the user's instruction to finalize the step
+([`../decisions/002-step01-contracts-and-policies.md`](../decisions/002-step01-contracts-and-policies.md)).
 
 ## 0. Preserved, already-confirmed baseline (not open here)
 
@@ -80,17 +88,15 @@ threshold ([01-contracts acceptance](../implementation/01-contracts.md), line 18
 **Projections vs. records.** The fields above are **mandatory on every record**. The
 human-readable entries in sections 2–5 are **projections** of a full record, not the
 record itself: they state the fields that differ from the defaults and inherit the
-rest. Unless an entry says otherwise, every entry in sections 2–5 inherits:
-`status = proposed`, `owner = user`, `approval_required = true`,
-`user_evidence = null`, `decided_against_revision = null`,
-`numeric_value = UNSET`, with `id`/`title`/`baseline_excerpt`/`baseline_ref`/
-`recommendation`/`options`/`affected_stages`/`blocking_dependencies`/
-`fail_closed_behavior`/`notes` taken from the entry text. A validator can therefore
-materialize a complete record for any entry by combining its stated fields with these
-defaults; no entry may rely on an **unstated, non-default** value. `numeric_value` is a
-single representative scalar; where a value is structured (multiple ceilings, a caps
-object), the projection shows only a representative scalar and the structure is left
-unresolved in `notes`.
+rest. For the **accepted** records in sections 2–5 the projection states, at minimum,
+`status = accepted`, `owner = user`, `approval_required = true`, the quoted
+`user_evidence` (verbatim interview selection + date 2026-10-27), and
+`decided_against_revision = ee7f7eafca80baa6c1aaca278361e56a663493c3`; every other
+field is taken from the entry text. A validator can materialize a complete record for
+any entry by combining its stated fields with these values; no entry may rely on an
+**unstated, non-default** value. `numeric_value` is a single representative scalar;
+where a value is structured (multiple ceilings, a caps object), the projection shows
+only a representative scalar and the structure is left unresolved in `notes`.
 
 ### 1.2 Status values and transitions
 
@@ -107,19 +113,21 @@ unresolved in `notes`.
    open ("pending") = proposed with user_evidence = null and decided_against_revision = null
 ```
 
-- `proposed` — recorded, owned, **not** ratified. This is the state of **every**
-  policy item in this register.
-- `accepted` — the user accepted the recommendation unchanged.
+- `proposed` — recorded, owned, **not** ratified. This was the initial state of
+  **every** policy item in this register **before** the 2026-10-27 interview; the
+  records in sections 2–5 have since been moved to `accepted` by the user.
+- `accepted` — the user accepted the recommendation; a per-record **interview
+  amendment** records any concrete behavior the user added (an accepted
+  refinement of the recommendation's direction, not a rewrite of the baseline).
 - `modified` — the user accepted a changed variant; the variant text is the
   authoritative record.
 - `deferred` — the user explicitly chose to defer; **only the user may defer**.
 - **Pending ≠ deferred.** An item still awaiting the user's disposition stays
-  `proposed`; a coordinator/session may **not** record it as `deferred`. Deferral is
-  a user act, not a way to clear a queue.
+  `proposed`; a coordinator/session may **not** record it as `deferred`.
 
 ### 1.3 Transition rules (who may do what)
 
-1. A session/coordinator **may create or update** a `proposed` record (fields,
+1. A session/coordinator **may create or update** a record (fields,
    recommendation, options, blockers).
 2. Only the **user** may move a record `proposed → accepted | modified | deferred`,
    and only by supplying `user_evidence` (verbatim quote + date) and
@@ -131,11 +139,19 @@ unresolved in `notes`.
    revision decision, not an in-place edit of the accepted text.
 5. No agent/model output may set any status; only explicit user evidence may.
 
+The 2026-10-27 interviews supplied exactly the evidence rule 1.3(2) requires: the
+**verbatim** selections (quoted below) with their dates, and the reviewed revision
+`ee7f7eafca80baa6c1aaca278361e56a663493c3`. The user's follow-up instruction
+`"Proceed forward and finalize this step until a ready PR"` is the direction to
+record those dispositions in the baseline, this register, and the decision record.
+
 ### 1.4 Decision-record examples (types checked; illustrative, never an acceptance)
 
-These examples are **synthetic/illustrative**. None is an acceptance; `user_evidence`
-values shown are hypothetical placeholders, never a real approval, and no example
-lifts the fixed repair-round maxima (section 0).
+These examples are **historical format examples** retained for the offline checker.
+They show the record format as it stood at the pre-ratification revision; none is a
+current disposition, none is an acceptance, `user_evidence` values shown are
+placeholder shapes (never a real approval), and no example lifts the fixed
+repair-round maxima (section 0).
 
 **Full proposed record (every field present).**
 
@@ -202,54 +218,78 @@ deliberately invalid fixture, **not** a recommendation.
 
 ---
 
-## 2. Policy decisions P1–P6 (each owned by the user; each OPEN / `proposed`)
+## 2. Policy decisions P1–P6 (owner: user; dispositioned `accepted` 2026-10-27)
 
 The baseline requires Step 01 to record accept/modify/defer dispositions
-([spec lines 65–74](../specification.md)). Nothing below is dispositioned: all six
-are recorded `proposed`, owner **user**, with dependent behavior blocked.
+([spec lines 65–74](../specification.md)). All six were dispositioned by the user in
+the recorded Step 01 interview: each is now **`accepted`**, binding to the reviewed
+revision `ee7f7eafca80baa6c1aaca278361e56a663493c3` and dated 2026-10-27. The
+per-record **Interview amendment** bullet states the concrete behavior the user chose
+(an accepted refinement of the recommendation's direction, not a rewrite of the
+baseline). Approval covers the **described behavior and direction**, not the exact
+field-level spelling of any record, and is **not** scientific validation.
 
 ### POL-P1 — Framework contribution and concept-admission/support/revision criteria
 
 - **Baseline excerpt (verbatim).** "P1: explicit framework contribution,
   concept-admission/support/revision criteria and testable implications where
   applicable." ([spec line 69](../specification.md))
-- **Recommendation (proposal only).** Define, in a versioned artifact, what counts
+- **Recommendation (accepted).** Define, in a versioned artifact, what counts
   as the review's *own* framework contribution versus a summary of others', plus
   admission criteria for concepts, the support required before a concept is used,
   and revision criteria when support changes; where applicable, require a testable
   implication per admitted concept. **No numeric scientific threshold is implied.**
+- **Interview amendment (2026-10-27).** The user selected **evidence-led synthesis**
+  and **required safeguards**: organize evidence and allow justified new
+  relationships/hypotheses, **clearly label novelty, and never force a novel
+  framework**; concept admission requires **definition, role, original support,
+  counterevidence, and applicability limits**; hypotheses are **distinguished**
+  from findings, **material changes reopen** the affected approval, and
+  **meaningful testable implications** are required where applicable. No numeric
+  threshold.
+- **User evidence.** `"Evidence-led synthesis (Recommended)"`; `"Require safeguards
+  (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) full formal criteria set at synthesis; (b) minimal criteria +
   per-claim "framework contribution" flag; (c) defer the formal criteria but block
   framework/outline finalization.
-- **Owner / approval.** User. `approval_required = true`.
+- **Owner / approval.** User. `approval_required = true`; `status = accepted`.
 - **Affected stages.** [10 §synthesis](../implementation/README.md),
   [11 §drafting](../implementation/README.md), [12 §review](../implementation/README.md).
-- **Blocking dependencies.** The "shared approved argument record" and framework
-  proposal ([spec lines 34–35](../specification.md)) cannot be finalized; drafting of
-  framework-bearing claims cannot be approved.
-- **Fail-closed.** While open, framework-contribution claims stay **unclassified** and
-  cannot be marked approved; the synthesis stage may produce *proposals* only.
+- **Blocking dependencies.** Resolved: the "shared approved argument record" and
+  framework proposal ([spec lines 34–35](../specification.md)) may now be finalized
+  under the accepted criteria; the safeguard set is the standard against which a
+  framework-bearing claim is admitted.
+- **Fail-closed.** A framework-contribution claim that lacks the required safeguards
+  (definition/role/original support/counterevidence/applicability limits) stays
+  **unclassified** and cannot be marked approved; the synthesis stage proposes only.
 - **numeric_value:** `UNSET` (criteria are categorical, not numeric).
 
 ### POL-P2 — Downstream causal/context-fidelity checks
 
 - **Baseline excerpt (verbatim).** "P2: detailed downstream causal/context-fidelity
   checks." ([spec line 70](../specification.md))
-- **Recommendation (proposal only).** Define the checks that verify a downstream
+- **Recommendation (accepted).** Define the checks that verify a downstream
   conclusion preserves the upstream study's causal/associational status and context
   (species/population/assay/outcome limits), consistent with the confirmed invariant
   that these limitations must be carried into conclusions
   ([spec line 60](../specification.md)). No numeric threshold.
+- **Interview amendment (2026-10-27).** The user selected **structured plus review**:
+  capture the **applicable context and causal limits at extraction**, preserve them
+  through synthesis, and **check synthesis and review for unsupported
+  generalization**; **consequential missing context blocks the affected claim**.
+- **User evidence.** `"Structured plus review (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) structured fidelity checklist per extracted finding; (b) a review-time
   fidelity finding type; (c) defer but block causal claim approval.
-- **Owner / approval.** User. `approval_required = true`.
+- **Owner / approval.** User. `approval_required = true`; `status = accepted`.
 - **Affected stages.** [09 §extraction](../implementation/README.md),
   [10 §synthesis](../implementation/README.md), [12 §review](../implementation/README.md),
   [13 §origin-tracing](../implementation/README.md).
 - **Blocking dependencies.** Only the **pass/approval** of conclusions that depend on
-  a fidelity dimension is blocked. Detection is **not** blocked: fidelity
-  findings/issues may still be **recorded as proposals** and surfaced for the user;
-  they simply cannot be auto-dispositioned to pass.
+  a fidelity dimension is blocked when context is consequentially missing. Detection is
+  **not** blocked: fidelity findings/issues may still be **recorded as proposals** and
+  surfaced for the user; they simply cannot be auto-dispositioned to pass.
 - **Fail-closed.** An unchecked fidelity dimension is a **missing check**, not a pass
   ([spec line 57](../specification.md)); affected conclusions remain unapproved.
 - **numeric_value:** `UNSET`.
@@ -260,133 +300,183 @@ are recorded `proposed`, owner **user**, with dependent behavior blocked.
   expressions of concern, corrections, and adjudication of affected uses. Do not
   treat non-replication as retraction or automatically prohibit historical
   discussion." ([spec line 71](../specification.md))
-- **Recommendation (proposal only).** Define an integrity-status record per source
+- **Recommendation (accepted).** Define an integrity-status record per source
   and per cited use, with the four statuses distinguished, an adjudication path for
   affected uses, and the two explicit non-rules preserved (non-replication ≠
   retraction; no automatic historical-discussion prohibition).
+- **Interview amendment (2026-10-27).** The user selected **entry and final checks**:
+  document integrity checks at **corpus entry** and at **final approval**, with
+  **statuses/provenance/date** and **human review of affected uses**; an **unknown**
+  integrity status is **not clean**; and correction / non-replication / retraction
+  are **not automatically conflated**.
+- **User evidence.** `"Entry and final checks (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) per-source integrity record + per-use adjudication; (b) review-time
   integrity finding only; (c) defer but block any use flagged by an integrity signal.
-- **Owner / approval.** User. `approval_required = true`.
+- **Owner / approval.** User. `approval_required = true`; `status = accepted`.
 - **Affected stages.** [05 §discovery](../implementation/README.md),
   [07 §parsing](../implementation/README.md), [09 §extraction](../implementation/README.md),
   [10 §synthesis](../implementation/README.md), [13 §origin-tracing](../implementation/README.md),
   [14 §delivery](../implementation/README.md).
 - **Blocking dependencies.** Retraction/expression-of-concern/correction handling and
-  adjudication of affected uses are blocked; an integrity-unknown source cannot be
-  silently treated as clean.
+  adjudication of affected uses are now governed by the accepted statuses; an
+  integrity-**unknown** source cannot be silently treated as clean.
 - **Fail-closed.** Unknown integrity status is an explicit **unknown** state that
-  blocks approval of dependent uses; it is never "no issue".
+  blocks approval of dependent uses; it is never "no issue". A correction or a
+  non-replication is adjudicated on its own terms and does not automatically become a
+  retraction.
 - **numeric_value:** `UNSET`.
 
 ### POL-P4 — Public selection/synthesis and limitations reporting
 
 - **Baseline excerpt (verbatim).** "P4: public selection/synthesis and limitations
   reporting alongside the manuscript." ([spec line 72](../specification.md))
-- **Recommendation (proposal only).** Define the reporting artifact that accompanies
+- **Recommendation (accepted).** Define the reporting artifact that accompanies
   the manuscript: how selection/synthesis decisions and limitations are reported
   publicly, aligned with the confirmed rule that a pilot and sampled audits are *not*
   held-out validation ([spec line 59](../specification.md)).
+- **Interview amendment (2026-10-27).** The user selected **companion plus summary**:
+  a detailed, exportable **methods/limitations companion** together with a concise
+  **manuscript-ready summary**; **publication is user-controlled**; the workflow's
+  limitations are reported honestly.
+- **User evidence.** `"Companion plus summary (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) companion report in the export set; (b) a reporting section inside
   the manuscript; (c) defer but block final export.
-- **Owner / approval.** User. `approval_required = true`.
+- **Owner / approval.** User. `approval_required = true`; `status = accepted`.
 - **Affected stages.** [14 §delivery](../implementation/README.md),
   [15 §release](../implementation/README.md).
-- **Blocking dependencies.** The **proposed** reporting artifact (not a baseline
-  mandate) cannot be declared complete; export cannot claim the reporting requirement
-  is satisfied.
-- **Fail-closed.** Without an agreed format, the export records an explicit
-  **proposed** marker that the reporting requirement is open, rather than silently
-  omitting a report. This marker is a proposal, not an accepted baseline requirement.
+- **Blocking dependencies.** Resolved: the companion + summary format is the accepted
+  reporting requirement; export may record that the requirement is met once the
+  accepted format is produced.
+- **Fail-closed.** Absent the accepted companion, the export records an explicit
+  marker that the accepted reporting requirement is unmet, rather than silently
+  omitting a report.
 - **numeric_value:** `UNSET`.
 
 ### POL-P5 — AI-use declaration, human accountability, provider terms, journal policies
 
 - **Baseline excerpt (verbatim).** "P5: AI-use declaration, human accountability,
   applicable provider terms and journal policies." ([spec line 73](../specification.md))
-- **Recommendation (proposal only).** Define the AI-use declaration content, the
+- **Recommendation (accepted).** Define the AI-use declaration content, the
   human-accountability statement, and the process for confirming applicable provider
   terms and target-journal policies before any submission-facing output or any
-  hosted-model transfer. **Verification of a provider's or journal's terms is itself
-  pending under P5** — its absence is not permission (see section 5.5).
+  hosted-model transfer.
+- **Interview amendment (2026-10-27).** The user selected **require process**:
+  record the **actual AI use and versions**, maintain an **editable disclosure** with
+  explicit **human accountability**, verify **provider terms before hosted use**, and
+  verify **journal policy before submission-facing approval**. This is the
+  operational definition; **no blanket prohibition is derived from an unverified or
+  unknown venue** (see POL-P6).
+- **User evidence.** `"Require process (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) declaration template + accountability statement + a per-venue
   terms checklist; (b) declaration only, terms checked at submission; (c) defer but
   block submission-facing output and hosted transfer.
-- **Owner / approval.** User. `approval_required = true`.
+- **Owner / approval.** User. `approval_required = true`; `status = accepted`.
 - **Affected stages.** [04 §agent-runtime](../implementation/README.md),
   [14 §delivery](../implementation/README.md), [15 §release](../implementation/README.md).
-- **Blocking dependencies.** Hosted-model transfer authorization and any
-  submission-facing AI declaration are blocked. (Hosted transfer is *also*
-  independently gated by rights — section 5.)
-- **Fail-closed.** Hosted-model transfer defaults to **`unknown` → blocked** until
-  authorized (sections 5.2–5.3). The declaration's content/format is a **proposal**: the
-  baseline records the AI-use declaration as a P5 item **to be decided**
-  ([spec line 73](../specification.md)) and does not, by itself, mandate a specific
-  mandatory output. No unaccepted scope is asserted as a baseline requirement.
+- **Blocking dependencies.** The AI-use declaration, human-accountability statement,
+  and editable disclosure are accepted requirements. **Provider-term verification
+  gates hosted use**; **journal-policy verification gates submission-facing
+  approval**. (Hosted transfer is *also* independently gated by rights — section 5.)
+- **Fail-closed.** A **hosted-model transfer** defaults to blocked until the provider
+  terms are verified and the transfer is authorized (sections 5.2–5.3). A
+  **submission-facing output** defaults to unapproved until the applicable journal
+  policy is verified. An unverified provider/journal state is a **missing check**,
+  not permission; it is not a blanket prohibition of processing one's own authorized
+  draft (a venue-specific question, POL-P6).
 - **numeric_value:** `UNSET`.
 
 ### POL-P6 — Optional target-venue constraints and submission-time verification
 
 - **Baseline excerpt (verbatim).** "P6: optional target-venue constraint capture and
   submission-time verification; retain venue-neutral output." ([spec line 74](../specification.md))
-- **Recommendation (proposal only).** Define optional capture of target-venue
+- **Recommendation (accepted).** Define optional capture of target-venue
   constraints and a submission-time verification step, while keeping the retained
   output **venue-neutral** (matching the confirmed venue-neutral output rule).
+- **Interview amendment (2026-10-27).** The user selected **optional venue profile**:
+  venue constraints are captured **only when a venue is selected**, with a **fresh
+  submission checklist** and **human confirmation**; **venue-neutral output is
+  retained**. **Venue-specific checks apply only when a venue is selected; an
+  unselected or unknown venue is not a blanket prohibition** — it simply means no
+  venue-specific constraint is claimed and no venue-compliance assertion is made.
+- **User evidence.** `"Optional venue profile (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) optional venue-constraint record + verification checklist;
   (b) verification only, no capture; (c) defer but block any venue-specific claim.
-- **Owner / approval.** User. `approval_required = true`.
+- **Owner / approval.** User. `approval_required = true`; `status = accepted`.
 - **Affected stages.** [10 §synthesis](../implementation/README.md) (outline
   constraints), [14 §delivery](../implementation/README.md),
   [15 §release](../implementation/README.md).
-- **Blocking dependencies.** Venue-specific constraint capture and submission-time
-  verification are blocked; the **venue-neutral** output is preserved regardless.
+- **Blocking dependencies.** Venue-specific constraint checks and submission-time
+  verification apply **only when a venue is selected**. With no selected venue, the
+  **venue-neutral** output is preserved and nothing is blocked by the missing venue.
 - **Fail-closed.** Without a captured venue, the pipeline produces venue-neutral
-  output and cannot assert venue compliance.
+  output and **cannot assert venue compliance** — but it does **not** prohibit
+  processing the draft. No unknown-venue blanket prohibition.
 - **numeric_value:** `UNSET`.
 
 ---
 
-## 3. Operational policies still open (owner: user; status `proposed`)
+## 3. Operational policies (owner: user; dispositioned `accepted` 2026-10-27)
 
 Baseline: "Also decide pilot/audit samples and acceptance rules, issue severities,
 coverage/stopping rules, cost/concurrency limits, tracing defaults, and explicit
 acceptance of secondary-origin warnings." ([spec line 76](../specification.md)).
-Proposed values may remain **unset**; each has an explicit fail-closed behavior.
+Each operational policy is now **`accepted`**; where the user chose a
+**project-specific** rule rather than a universal number, `numeric_value` stays
+`UNSET` and the concrete value is a **future project-setup gate** (per project,
+before the affected work), with the fail-closed behavior stated per record.
 
 ### POL-OPS-PILOT — Pilot/audit sampling and acceptance rules
 
 - **Baseline.** One iterative pilot example set, no separate held-out set; human
   audits examine omissions and incorrect findings; important failures block bulk
   digestion ([spec lines 30, 32](../specification.md)).
-- **Recommendation (proposal only).** Define the pilot sample, the exclusion-batch
+- **Recommendation (accepted).** Define the pilot sample, the exclusion-batch
   audit (random + risk-based original-source checks) sample, the extraction-audit
   sample, and the acceptance rule for each. Samples are **not** held-out validation
   ([spec line 59](../specification.md)).
+- **Interview amendment (2026-10-27).** The user selected **project-specific plan**:
+  an explicit, approved, **project-specific** pilot/audit size and rule is **mandatory
+  before bulk work**; one **iterative pilot**; **random + risk-based exclusion
+  checks** and **omission/error extraction audits**; **important failures
+  pause/correct/re-audit** the affected work. **No universal sample size** is set.
+- **User evidence.** `"Project-specific plan (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) explicit sampling rule + acceptance thresholds; (b) sampling
   proportions left to per-project user choice with a default; (c) defer but block
   pilot approval.
 - **Affected stages.** [08 §screening](../implementation/README.md),
   [09 §extraction](../implementation/README.md), [12 §review](../implementation/README.md).
-- **Blocking dependencies.** Pilot approval and bulk-digestion gates cannot be
-  triggered to pass.
-- **Fail-closed.** With unset samples, no bulk-digestion approval can be granted;
-  the pilot remains open.
-- **numeric_value:** `UNSET` (no invented accuracy/acceptance number).
+- **Blocking dependencies.** Bulk-digestion gates cannot be triggered to pass until
+  the project-specific pilot/audit plan is approved.
+- **Fail-closed.** With no approved project plan, no bulk-digestion approval can be
+  granted; the pilot remains open. **No universal sample size is invented.**
+- **numeric_value:** `UNSET` (project-specific; no invented accuracy/acceptance number).
 
 ### POL-OPS-SEVERITY — Issue severity scale
 
 - **Baseline.** Findings need "evidence or a concrete missing check, severity, and
   explicit fixed/rejected-with-reason disposition" ([spec line 57](../specification.md)).
-- **Recommendation (proposal only).** Define the severity scale used by findings
+- **Recommendation (accepted).** Define the severity scale used by findings
   (critic, fact-check, whole-manuscript, origin) and which severities block. The
-  *requirement* that a severity exists is confirmed; the *scale* is open.
+  *requirement* that a severity exists is confirmed; the *scale* is now accepted.
+- **Interview amendment (2026-10-27).** The user selected **four categories**:
+  **blocking** (factual/support/essential-check), **major** (consequential scientific
+  defect), **minor** (non-consequential), and **style** (preference); **blocking and
+  major issues, and any consequential unclassified issue, prevent completion**.
+- **User evidence.** `"Accept four categories (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) small ordinal scale with defined blocking severities; (b) two-level
   blocking/non-blocking; (c) defer but block any finding from being auto-passed.
 - **Affected stages.** [08](../implementation/README.md)–[14](../implementation/README.md)
   (all finding producers).
 - **Blocking dependencies.** Findings cannot be dispositioned to pass without a
-  severity.
+  severity from the accepted scale.
 - **Fail-closed.** An unclassified-severity finding is treated as **blocking** until
-  classified.
+  classified; a consequential unclassified issue blocks completion.
 - **numeric_value:** `UNSET`.
 
 ### POL-OPS-COVERAGE — Search coverage report and stopping rule
@@ -394,17 +484,24 @@ Proposed values may remain **unset**; each has an explicit fail-closed behavior.
 - **Baseline.** "A coverage report supports an explicit human decision to search
   again or freeze the candidate revision. Never promise all papers."
   ([spec line 28](../specification.md)).
-- **Recommendation (proposal only).** Define what the coverage report contains and
+- **Recommendation (accepted).** Define what the coverage report contains and
   the criteria under which the human freezes the candidate revision (no "all papers"
   guarantee).
+- **Interview amendment (2026-10-27).** The user selected **coverage report plus
+  gate**: the report records **sources, queries, dates, terminology, citation
+  expansion, yields, duplicates, and gaps**, and the **exact candidate revision is
+  frozen by explicit human approval**. **No universal numeric stopping/completeness
+  rule** is set.
+- **User evidence.** `"Coverage report plus gate (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) documented coverage metrics + human freeze decision;
   (b) human-only freeze with no numeric stop rule; (c) defer but block corpus freeze.
 - **Affected stages.** [05 §discovery](../implementation/README.md).
 - **Blocking dependencies.** Candidate-revision freeze and downstream acquisition
   cannot proceed on an unreported coverage state.
-- **Fail-closed.** Without a stopping rule, the state stays **"search open"** and
-  cannot be frozen to pass.
-- **numeric_value:** `UNSET` (coverage/stop numbers not agreed).
+- **Fail-closed.** Without the coverage report, the state stays **"search open"** and
+  cannot be frozen to pass. **No universal numeric stop is invented.**
+- **numeric_value:** `UNSET` (no universal coverage/stop number).
 
 ### POL-OPS-COST — Cost and concurrency limits
 
@@ -413,32 +510,55 @@ Proposed values may remain **unset**; each has an explicit fail-closed behavior.
   [03 lines 12, 21](../implementation/03-durable-worker.md)). Only one paid call
   ($0.00002037) is recorded in the project so far
   ([00 handoff](../implementation/handoffs/00-runtime-spike.md)).
-- **Recommendation (proposal only).** Define per-project and per-stage cost ceilings
+- **Recommendation (accepted).** Define per-project and per-stage cost ceilings
   and the within-project concurrency bound; keep the global
   **one-active-project** limit (ARCH-ACTIVE-ENF).
+- **Interview amendment (2026-10-27).** The user selected **`"$25 / $10 / 2"
+  (Recommended)`**: a **USD-25 cumulative per-project cap**, a **USD-10 cumulative
+  per-stage cap**, and a **maximum of 2 simultaneous external-model calls**. **All
+  routes and read-only model calls are counted**; the **reserve upper bound is set
+  before dispatch**; when a cost **cannot be bounded the call is not dispatched**;
+  an **unknown cost retains its reserve**; reaching a cap **stops new calls** (it
+  does not promise the review's total cost); only a **human** may increase a cap; a
+  **restart does not reset** the counters.
+- **User evidence.** `"$25 / $10 / 2 (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) explicit ceilings + concurrency bound; (b) user-set per project
   with no default; (c) defer but block all paid calls.
 - **Affected stages.** [03](../implementation/03-durable-worker.md),
   [04](../implementation/04-agent-runtime.md), and every paid-capable stage.
-- **Blocking dependencies.** Any new paid call or concurrency above the bound is
-  blocked.
-- **Fail-closed.** With unset ceilings, **no new paid call** is issued; unknown cost
-  retains its reserve and is never reported as zero
+- **Blocking dependencies.** A new paid call or concurrency above the bound is
+  blocked at the cap until a human raises it.
+- **Fail-closed.** With an unbounded cost, **no new paid call** is issued; unknown
+  cost retains its reserve and is never reported as zero
   ([live-jev accounting](../../spikes/runtime/live-jev/README.md)).
-- **numeric_value:** `UNSET` (currency ceilings and concurrency bound not agreed).
+- **numeric_value:** `25` (representative scalar: the USD-25 cumulative per-project
+  cap). The full structured caps object — USD-10 per-stage cap, maximum 2
+  simultaneous external-model calls — is recorded in `notes`.
+- **notes.** Structured caps: `{project_cap_usd: 25, stage_cap_usd: 10,
+  max_concurrent_external_model_calls: 2}`; all routes and read-only model calls are
+  counted; caps stop new calls and are raised only by a human; restart does not reset
+  them. This is a cost/concurrency default only, distinct from the confirmed
+  repair-round maxima (section 0), and is not a promise of total review cost.
 
 ### POL-OPS-TRACE — Citation tracing hop/source/retry defaults
 
 - **Baseline excerpt (verbatim).** "Configure maximum citation hops, new sources per
   claim/project, and resolution retries; detect cycles. Numerical defaults are **not
   yet agreed**. These are not the writer's repair budgets." ([spec line 48](../specification.md))
-- **Recommendation (proposal only).** Define maximum citation hops, new sources per
+- **Recommendation (accepted).** Define maximum citation hops, new sources per
   claim and per project, and resolution retries, with cycle detection. These are
   explicitly **distinct from** the confirmed repair budgets (section 0).
+- **Interview amendment (2026-10-27).** The user selected **required per project**:
+  explicit **maximum hops, sources per claim and per project, and resolution
+  retries are required per project before any upstream tracing work**; **cycles are
+  detected**; there is **no universal default**.
+- **User evidence.** `"Required per project (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) explicit numbers; (b) user-set per project with no default;
   (c) defer the numbers but keep tracing in `configuration_required` (no remote work).
 - **Affected stages.** [13 §origin-tracing](../implementation/README.md).
-- **Blocking dependencies.** While the limits are unset, tracing enters
+- **Blocking dependencies.** Until the per-project limits are set, tracing enters
   **`configuration_required`**: it performs **no remote/upstream tracing work** and
   does **not** infer that any limit was reached. A depth-0 claim is not treated as
   trivially resolved.
@@ -447,8 +567,8 @@ Proposed values may remain **unset**; each has an explicit fail-closed behavior.
   source that was **actually read** supports the claim only secondarily **and** the
   missing upstream origin has been **adjudicated** ([spec line 50](../specification.md));
   it is never a stand-in for an unconfigured limit and never "verified primary
-  support".
-- **numeric_value:** `UNSET`.
+  support". No universal hop/source/retry number is invented.
+- **numeric_value:** `UNSET` (per project; no universal default).
 
 ### POL-OPS-SECONDARY — Explicit acceptance of secondary-origin warnings
 
@@ -457,13 +577,19 @@ Proposed values may remain **unset**; each has an explicit fail-closed behavior.
   approval**. Cite the source actually read; never substitute an unread original or
   claim direct verification." ([spec line 50](../specification.md))
 - **Status nuance.** The **mechanism** is confirmed baseline (section 0): the warned
-  secondary state exists and requires final human approval. What remains **open** is
-  the **operational definition** — the warning's record type/severity, where the
-  approval binds (exact revision), and how it surfaces in export. The register keeps
-  this `proposed` while **never** weakening the confirmed mechanism.
-- **Recommendation (proposal only).** A first-class "secondary-attribution warning"
+  secondary state exists and requires final human approval. The **operational
+  definition** — the warning's record type/severity, where the approval binds (exact
+  revision), and how it surfaces in export — is now **accepted**.
+- **Recommendation (accepted).** A first-class "secondary-attribution warning"
   record bound to the exact artifact revision, surfaced at final read-only validation
   and in export, requiring a recorded human approval.
+- **Interview amendment (2026-10-27).** The user selected **review plus companion**:
+  a **review warning** plus an **export companion**, **accurate manuscript secondary
+  attribution**, and **final human approval against the exact manuscript/dependency/
+  warning set**; **material changes reopen** the approval; the state is **never
+  primary verified**.
+- **User evidence.** `"Review plus companion (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) dedicated warning record + revision-bound approval; (b) reuse the
   findings/episode severity with a secondary flag; (c) defer the record type but keep
   the confirmed warned-state invariant.
@@ -480,91 +606,117 @@ Proposed values may remain **unset**; each has an explicit fail-closed behavior.
 
 ---
 
-## 4. Proposed technical direction (NOT accepted — user gate required)
+## 4. Accepted technical direction (user-gated; accepted 2026-10-27)
 
-Everything in this section is a **proposal** chosen against the Step 00 spike
-evidence; the user has not accepted it, and no schema or executable architecture is
-approved. The runtime language is already confirmed (section 0); that does not
-approve any of the choices below, which Step 01 must present for the user's decision
-([01-contracts lines 12, 23](../implementation/01-contracts.md)).
+Everything in this section was a **proposal** chosen against the Step 00 spike
+evidence; the user **accepted the direction** in the recorded Step 01 interview
+(after the runtime language was already confirmed, section 0). The acceptance covers
+the **described behavior and direction** — not every schema field, and not an
+approval of any executable architecture or of the exact schema spelling, which remain
+implementation-facing, versioned details for Step 02 onward. Each entry below records
+the accepted direction and the interview amendment.
 
 ### ARCH-STORE — One app-owned project-scoped SQLite store + minimal app-level registry
 
-- **Proposal.** One app-owned project-scoped SQLite store per project, plus a
+- **Accepted direction.** One app-owned project-scoped SQLite store per project, plus a
   **minimal application-level registry** that maps application project IDs to store
   locations and performs **active-project arbitration**. Application project IDs are
   independent of paths or Git ([02 lines 9, 16](../implementation/02-project-foundation.md)).
 - **Alternatives.** (a) a single global SQLite file with a project column;
   (b) one SQLite file per project + a registry file; (c) an embedded daemon store.
-- **Evidence.** SQLite is a *proposed* local store, not an approved schema; "prefer
-  the simplest design that passes the recovery tests"; do not depend on OpenCode's
-  private database ([spec line 16](../specification.md)). The Step 00 harness
-  persisted sessions across a real restart using SQLite at
-  `$XDG_DATA_HOME/opencode/opencode.db`
+- **Interview amendment (2026-10-27).** The user selected **approve direction**:
+  per-project SQLite plus a **small atomic global registry/arbitration**. The exact
+  schema remains an implementation-facing, versioned contract.
+- **User evidence.** `"Approve direction (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
+- **Evidence.** SQLite is the accepted local store direction; "prefer the simplest
+  design that passes the recovery tests"; do not depend on OpenCode's private database
+  ([spec line 16](../specification.md)). The Step 00 harness persisted sessions across
+  a real restart using SQLite at `$XDG_DATA_HOME/opencode/opencode.db`
   ([harness README](../../spikes/runtime/harness/README.md)); the spike did **not**
   define an application schema.
-- **Limitations.** No schema is proposed here; the store must satisfy untested
-  recovery/migration/backup criteria ([02 lines 20–21](../implementation/02-project-foundation.md)).
-  A registry is an app-owned file, not an OpenCode database.
-- **User gate.** The user decides store-per-project vs single-store and the registry
-  shape; until then, no schema is authoritative.
+- **Limitations.** The schema is an implementation-facing, versioned detail, and the
+  store must satisfy untested recovery/migration/backup criteria
+  ([02 lines 20–21](../implementation/02-project-foundation.md)). A registry is an
+  app-owned file, not an OpenCode database.
+- **Remaining detail.** Store-per-project vs single-store and the registry shape are
+  recorded as accepted direction; the exact schema is Step 02 work under this
+  direction.
 
 ### ARCH-ASSETS — Immutable assets and revision dependencies
 
-- **Proposal.** Assets are immutable revisions identified by the canonical tuple
-  `{project_id, artifact_id, revision_id}`; approvals and dependency edges reference
-  those exact tuples, not filenames or generic permissions
+- **Accepted direction.** Assets are immutable revisions identified by the canonical
+  tuple `{project_id, artifact_id, revision_id}`; approvals and dependency edges
+  reference those exact tuples, not filenames or generic permissions
   ([spec lines 54–55](../specification.md)). An approved artifact edited
   afterward becomes a proposal and invalidates affected checks
   ([02 lines 16–17](../implementation/02-project-foundation.md)).
 - **Alternatives.** (a) hash-addressed immutable revisions + dependency edges;
   (b) mutable rows with an audit log; (c) external content store + manifest.
+- **Interview amendment (2026-10-27).** The user selected **approve direction**:
+  **immutable assets/revisions** and **exact immutable approval/dependency/rights
+  revisions**.
+- **User evidence.** `"Approve direction (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Evidence.** Confirmed invariant that approvals bind to immutable revisions and
   that a model edit cannot replenish a review budget; Step 02 deliverable "immutable
   artifact revisions … approvals/dependencies"
   ([02 lines 10–11](../implementation/02-project-foundation.md)).
-- **Limitations.** The exact revision identity/hash scheme is not designed here; the
-  invalidation propagation graph is a Step 02 concern.
-- **User gate.** The user confirms revision identity and dependency semantics.
+- **Limitations.** The exact revision identity/hash scheme remains an
+  implementation-facing detail; the invalidation propagation graph is Step 02 work.
+- **Remaining detail.** Revision identity/hash scheme and invalidation graph are
+  Step 02 work under the accepted immutable-revision direction.
 
 ### ARCH-IPC — Local authenticated IPC
 
-- **Proposal.** Owner-only, authenticated local IPC between CLI and the background
-  worker; no root or public unauthenticated listener required; authentication rejects
-  non-owner control ([03 lines 9, 22](../implementation/03-durable-worker.md)).
+- **Accepted direction.** Owner-only, authenticated local IPC between CLI and the
+  background worker; no root or public unauthenticated listener required;
+  authentication rejects non-owner control ([03 lines 9, 22](../implementation/03-durable-worker.md)).
 - **Alternatives.** (a) authenticated loopback HTTP; (b) OS-owner-scoped socket/pipe;
   (c) an **embedded in-process worker — excluded**: a worker embedded in the CLI
   process cannot continue after the CLI closes, violating the durable-continuity
   requirement ([spec line 12](../specification.md)).
+- **Interview amendment (2026-10-27).** The user selected **approve direction**: an
+  **independent worker** reached over an **owner-only authenticated Unix-domain socket
+  on Linux**, **separate from the OpenCode HTTP service**.
+- **User evidence.** `"Approve direction (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Evidence.** The accepted runtime decision's defaults: explicit endpoint and
   credential only, loopback-only, fail-closed, redirects refused
   ([decision 001](../decisions/001-runtime-language.md)); the harness binds
   `127.0.0.1` with a per-run password and refuses foreign control
   ([harness README](../../spikes/runtime/harness/README.md)). Step 03 requires
   authenticated local control.
-- **Limitations.** No IPC protocol is specified; the transport choice is untested as
-  an application contract.
-- **User gate.** The user selects the IPC mechanism; nothing is bound to it yet.
+- **Limitations.** The wire protocol remains an implementation-facing detail; the
+  transport choice is untested as an application contract.
+- **Remaining detail.** The socket protocol/encoding is Step 03 work under the
+  accepted owner-only authenticated UDS direction.
 
 ### ARCH-PKG — Python package layout
 
-- **Proposal (proposal only).** A Python-core package layout (application core +
-  bounded tool/adapter modules for the tested direct-OpenRouter Jev route), keeping
-  the hand-maintained OpenCode HTTP integration isolated behind one adapter module.
+- **Accepted direction.** A Python-core package rooted at `src/review_article_agent/`
+  with bounded modules `domain/`, `storage/`, `cli/`, `worker/`, `adapters/` (the
+  OpenCode HTTP integration isolated behind one adapter module), and **no agent
+  framework**.
 - **Alternatives.** (a) single application package with adapter submodules;
   (b) core package + separate tool processes; (c) core + plugin packages.
+- **Interview amendment (2026-10-27).** The user selected **approve direction**:
+  `src/review_article_agent/{domain,storage,cli,worker,adapters}`, **no framework**.
+- **User evidence.** `"Approve direction (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Evidence.** Python core is accepted; the tested Jev route is the Python
   direct-OpenRouter adapter; the native route is unexercised
   ([decision 001](../decisions/001-runtime-language.md)). The Python prototype is
   stdlib-only.
-- **Limitations.** Package/module names are not decided; no dependency surface is
-  chosen. CLI spelling is Step 02, not here.
-- **User gate.** The user confirms the package layout (or defers to Step 02).
+- **Limitations.** New external dependencies remain an implementation-facing detail;
+  CLI spelling is Step 02, not here.
+- **Remaining detail.** Dependency surface and CLI spelling are Step 02 work under
+  the accepted package layout.
 
 ### ARCH-MIGRATE — Migrations and backup/WAL consistency
 
-- **Proposal.** Versioned storage migrations with manifest/schema versions; a
-  consistent backup/export and restore that captures WAL state, verified including
+- **Accepted direction.** Versioned storage migrations with manifest/schema versions;
+  a consistent backup/export and restore that captures WAL state, verified including
   while writes occur during backup; unsupported newer schemas fail clearly; restore
   verifies artifact hashes and approvals
   ([02 lines 10, 20–21](../implementation/02-project-foundation.md)).
@@ -572,6 +724,10 @@ approve any of the choices below, which Step 01 must present for the user's deci
   migrations; (b) file-level copy of db+`-wal`+`-shm` — **rejected**: a live arbitrary
   file copy is non-compliant with the baseline requirement to use SQLite's
   snapshot/backup mechanism and to account for WAL state; (c) export/import manifest.
+- **Interview amendment (2026-10-27).** The user selected **approve direction**:
+  **consistent backup plus manifest/hash/approval verification**.
+- **User evidence.** `"Approve direction (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Evidence.** Step 02 explicitly forbids copying "only the live database file and
   ignor[ing] WAL state" and requires using SQLite's snapshot/backup mechanism, not an
   arbitrary copy of a live WAL database
@@ -580,21 +736,26 @@ approve any of the choices below, which Step 01 must present for the user's deci
   durable persistence across process restart on the same data home.
 - **Limitations.** No migration tool or schema version exists yet; WAL-consistency
   during concurrent writes is a test obligation of Step 02, not proven here.
-- **User gate.** The user confirms migration/backup semantics alongside ARCH-STORE.
+- **Remaining detail.** Migration tooling and schema versioning are Step 02 work
+  under the accepted backup/verification direction.
 
 ### ARCH-ACTIVE-ENF — Active-project enforcement mechanism (invariant already confirmed)
 
 - **Invariant status.** The **invariant** "exactly one active project at a time
   globally" is **already confirmed baseline** ([spec line 11](../specification.md);
   [README line 66](../implementation/README.md)) and is **not** reopened here. Only
-  the **enforcement mechanism** is `proposed`.
-- **Proposal (mechanism only).** Concurrent activation attempts cannot execute two
+  the **enforcement mechanism** was `proposed`; it is now **accepted**.
+- **Accepted direction (mechanism).** Concurrent activation attempts cannot execute two
   projects; a safe switch reconciles or drains existing work before another project
   executes and cannot leave old-project jobs committing into the new project
   ([03 lines 11, 19](../implementation/03-durable-worker.md)). Waiting gates release
   execution resources.
 - **Alternatives.** (a) a single global lock/lease for the active project;
   (b) per-project locks with a global arbiter; (c) a single-worker model.
+- **Interview amendment (2026-10-27).** The user selected **approve direction**: a
+  **minimal atomic global registry/arbitration** (consistent with ARCH-STORE).
+- **User evidence.** `"Approve direction (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Evidence.** Confirmed baseline "one active project at a time"
   ([spec line 11](../specification.md)); global definition of done "Exactly one
   project may execute at once"
@@ -604,12 +765,33 @@ approve any of the choices below, which Step 01 must present for the user's deci
   ([spec line 11](../specification.md)) and is not defined here; fencing protects
   accepted writes, not arbitrary external side effects
   ([03 line 20](../implementation/03-durable-worker.md)).
-- **User gate (mechanism only).** The user selects how the confirmed invariant is
-  enforced; the invariant itself needs no new gate.
+- **Remaining detail.** The registry mechanism is accepted; the confirmed invariant
+  needs no new gate.
+
+### ARCH-RECOVERY — Recovery semantics (accepted per the contract)
+
+- **Accepted semantics.** The user selected **approve semantics** for the recovery
+  behavior the sibling contract
+  [`02-gates-and-runtime.md`](02-gates-and-runtime.md) specifies: CLI detach
+  continues an authorized background job; pause/cancel stop scheduling and preserve
+  an **unknown** remote outcome; a safe project switch reconciles or quiesces; there
+  is **no silent success, no blind retry, and no budget reset**; an ambiguous remote
+  outcome is dispositioned by a human.
+- **User evidence.** `"Approve semantics (Recommended)"` — 2026-10-27.
+- **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
+- **Note.** The behavioral contract lives in
+  [`02-gates-and-runtime.md`](02-gates-and-runtime.md) (v3.1); this record ratifies
+  the described semantics and does not restate or weaken that contract.
 
 ---
 
-## 5. Rights and privacy model v1
+## 5. Rights and privacy model v1 (behavior accepted 2026-10-27)
+
+The user accepted the **RightsRecord v1 behavior** — the described behavior and the
+same-project/exact-revision guarantees below — without accepting every field-level
+spelling. The record identity, discriminated-union subject, per-operation typed
+basis, and out-of-band authorization binding remain the canonical
+implementation-facing contract, subject to versioned revision.
 
 ### 5.1 RightsRecord v1 — canonical immutable identity and typing
 
@@ -664,7 +846,7 @@ be non-empty for `allowed`.
 
 **C01 reference/projection mapping.** C01
 ([`01-identities.md` §5.6](01-identities.md#56-rightsreference--projection-of-the-canonical-rights-record-i9-p5-open),
-part of this coordinated proposal bundle) holds a **read-only projection**; its
+part of this coordinated contract set) holds a **read-only projection**; its
 per-operation fields map by name onto the canonical record:
 `acquisition_right -> operations.acquisition`,
 `storage_right -> operations.storage`,
@@ -715,6 +897,12 @@ NOT be used as the reference.
   exact source `subject` **and** the exact immutable `record_revision` of this rights
   record (not merely a mutable `rights_id`); no in-band recorded grant confers it. This is
   additional to the P5 gate.
+- **Scoped hosted-use authorization.** A hosted-use authorization is granted as a
+  **scoped batch**: it names the **project/source manifest**, the **provider/model
+  route**, the **purpose**, and the exact **revision**, after the rights/privacy/
+  provider gates are satisfied. **Additions and material changes reopen** the batch;
+  the batch **cannot override** an individual source's restrictions, and there is
+  **no per-source override** of a batch decision.
 - **Unknown/not_allowed block; not_applicable never unblocks.** An operation whose right
   is `unknown` or `not_allowed` is **blocked**, not attempted; `not_applicable` never
   unblocks a real operation.
@@ -738,13 +926,17 @@ services, or credential leakage." ([spec line 62](../specification.md)). Retriev
 source text is data, never instructions that can widen scope, approve, or invoke
 unapproved tools ([04 line 17](../implementation/04-agent-runtime.md)).
 
-### 5.5 Provider/journal verification is pending, not permission
+### 5.5 Provider/journal verification gates its own operation, not everything
 
-Confirming applicable provider terms and target-journal policies is **pending under
-P5/P6** ([spec lines 73–74](../specification.md)). The **absence** of a known
-prohibition is **not** permission: until the user dispositions P5 (and any P6 venue
-constraint), hosted-model transfer and submission-facing output stay gated
-(sections 5.2, POL-P5). "Uploading a file is not proof of all rights"
+Confirming applicable provider terms and target-journal policies is an accepted
+**process** under P5/P6 ([spec lines 73–74](../specification.md)). The gates are
+**operation-scoped**: **provider-term verification gates hosted-model use**;
+**journal-policy verification gates submission-facing approval**. The **absence** of a
+known prohibition is **not** permission for those operations — until the provider
+terms (for a hosted transfer) or the applicable journal policy (for submission-facing
+output) are verified, that operation stays gated. Venue-specific checks apply **only
+when a venue is selected** (POL-P6); an unselected or unknown venue is **not** a
+blanket prohibition. "Uploading a file is not proof of all rights"
 ([spec line 63](../specification.md)).
 
 ### 5.6 RightsRecord examples (structural/type-checked; illustrative, not authorizations)
@@ -893,39 +1085,39 @@ and rejects this as an operational record; no field here authorizes any operatio
 
 ---
 
-## 6. Exact questions the user can answer next
+## 6. Recorded dispositions and remaining project-setup gates
 
-Answer any subset; each answer is a producer of `user_evidence` + a target revision
-for sections 1.2–1.3. Short answers are enough; no long prose required.
+Every Step 01 policy/technical item has a recorded disposition (section 6.1). The
+items below are **not** Step 01 blockers: they are **future project-setup gates** —
+per-project values or verifications that must be established **before the affected
+work** for a given project (section 6.2).
 
-1. **P1:** Accept, modify, or defer the framework-contribution/concept criteria
-   (POL-P1)? If modify, what must the criteria add or drop?
-2. **P2:** Which downstream causal/context-fidelity checks are required (POL-P2)?
-3. **P3:** Confirm the integrity statuses and the adjudication path for affected uses
-   (POL-P3). Is the "non-replication ≠ retraction" wording correct as recorded?
-4. **P4:** What selection/synthesis + limitations reporting accompanies the
-   manuscript (POL-P4)?
-5. **P5:** Approve the AI-use declaration content and the human-accountability
-   statement (POL-P5)?
-6. **P6:** Is target-venue constraint capture **on** (optional) or **off**, and who
-   performs submission-time verification (POL-P6)?
-7. **Pilot/audit:** What pilot and audit sample(s) and acceptance rule (POL-OPS-PILOT)?
-8. **Severity:** What severity scale, and which severities block (POL-OPS-SEVERITY)?
-9. **Coverage/stopping:** What coverage-report contents and freeze rule
-   (POL-OPS-COVERAGE)?
-10. **Cost/concurrency:** What per-project/per-stage cost ceilings and
-    within-project concurrency bound (POL-OPS-COST)?
-11. **Tracing:** What max citation hops, new sources per claim/project, and resolution
-    retries (POL-OPS-TRACE)?
-12. **Secondary warnings:** Confirm the warning record type/severity and where final
-    human approval binds (POL-OPS-SECONDARY).
-13. **Technical direction:** Accept, modify, or defer ARCH-STORE, ARCH-ASSETS,
-    ARCH-IPC, ARCH-PKG, ARCH-MIGRATE, ARCH-ACTIVE-ENF (section 4; the one-active-project
-    **invariant** is already confirmed — only its enforcement mechanism is open) — and,
-    if accepted, against which exact revision?
-14. **Rights:** Confirm the canonical `RightsRecord` v1 fields and tuples (section 5.1),
-    that `unknown`/`not_allowed` block the affected operation, and that a valid
-    `allowed` right is **rights-only eligibility**, not final authorization (section 5.2).
+### 6.1 Recorded dispositions (2026-10-27)
+
+| Record | Disposition |
+| --- | --- |
+| POL-P1 … POL-P6 | **accepted**, with interview amendments (section 2) |
+| POL-OPS-PILOT, POL-OPS-SEVERITY, POL-OPS-COVERAGE, POL-OPS-TRACE, POL-OPS-SECONDARY | **accepted** (section 3) |
+| POL-OPS-COST | **accepted** with the `$25 / $10 / 2` defaults (section 3) |
+| ARCH-STORE, ARCH-ASSETS, ARCH-IPC, ARCH-PKG, ARCH-MIGRATE, ARCH-ACTIVE-ENF | **accepted** direction (section 4) |
+| ARCH-RECOVERY | **accepted** semantics per [`02-gates-and-runtime.md`](02-gates-and-runtime.md) (section 4) |
+| RIGHTS-v1 | **accepted** behavior, incl. same-project / exact-revision guarantees (section 5) |
+
+### 6.2 Project-setup gates (per project; not Step 01 blockers)
+
+1. an explicit **pilot/audit sample size and acceptance plan** before bulk work;
+2. a **rubric-specific Jev mapping / uncertainty region**, calibrated and approved in
+   the pilot (no universal cutoff);
+3. explicit **maximum hops, sources per claim/project, and resolution retries**
+   before any upstream tracing work (no universal default);
+4. actual **source rights/privacy and provider authorizations** before the affected
+   operations;
+5. optional **venue actual current-policy checks** before submission-facing claims
+   (only when a venue is selected).
+
+No further Step 01 decision is required. None of these gates invents a numeric
+scientific threshold; where the user's policy is "per project", the number is set at
+project setup, not here.
 
 ---
 
@@ -933,28 +1125,31 @@ for sections 1.2–1.3. Short answers are enough; no long prose required.
 
 | Record | Topic | Owner | Status | Numeric | Blocks |
 | --- | --- | --- | --- | --- | --- |
-| POL-P1 | Framework contribution / concept criteria | user | **proposed (OPEN)** | UNSET | 10, 11, 12 |
-| POL-P2 | Downstream causal/context-fidelity checks | user | **proposed (OPEN)** | UNSET | 09, 10, 12, 13 |
-| POL-P3 | Integrity-status checks | user | **proposed (OPEN)** | UNSET | 05, 07, 09, 10, 13, 14 |
-| POL-P4 | Public selection/synthesis + limitations reporting | user | **proposed (OPEN)** | UNSET | 14, 15 |
-| POL-P5 | AI-use declaration / accountability / provider+journal terms | user | **proposed (OPEN)** | UNSET | 04, 14, 15 |
-| POL-P6 | Target-venue constraints + submission verification | user | **proposed (OPEN)** | UNSET | 10, 14, 15 |
-| POL-OPS-PILOT | Pilot/audit sampling and acceptance | user | **proposed (OPEN)** | UNSET | 08, 09, 12 |
-| POL-OPS-SEVERITY | Issue severity scale | user | **proposed (OPEN)** | UNSET | 08–14 |
-| POL-OPS-COVERAGE | Coverage/stopping rule | user | **proposed (OPEN)** | UNSET | 05 |
-| POL-OPS-COST | Cost/concurrency limits | user | **proposed (OPEN)** | UNSET | 03, 04, paid stages |
-| POL-OPS-TRACE | Tracing hop/source/retry defaults | user | **proposed (OPEN)** | UNSET | 13 |
-| POL-OPS-SECONDARY | Secondary-warning operational acceptance | user | **proposed (OPEN)** | UNSET | 12, 13, 14 |
-| ARCH-STORE | Store + registry + active-project arbitration | user | **proposed (OPEN)** | — | 02 |
-| ARCH-ASSETS | Immutable assets + revision dependencies | user | **proposed (OPEN)** | — | 02 |
-| ARCH-IPC | Local authenticated IPC | user | **proposed (OPEN)** | — | 03 |
-| ARCH-PKG | Python package layout | user | **proposed (OPEN)** | — | 02–04 |
-| ARCH-MIGRATE | Migrations + backup/WAL consistency | user | **proposed (OPEN)** | — | 02 |
-| ARCH-ACTIVE-ENF | Active-project enforcement mechanism (invariant confirmed) | user | **proposed (OPEN)** | — | 02, 03 |
-| RIGHTS-v1 | Canonical `RightsRecord` v1 tuples + rights-only eligibility | user | **proposed (OPEN)** | — | 04, 06, 09, 14 |
+| POL-P1 | Framework contribution / concept criteria | user | **accepted (2026-10-27)** | UNSET | — |
+| POL-P2 | Downstream causal/context-fidelity checks | user | **accepted (2026-10-27)** | UNSET | — |
+| POL-P3 | Integrity-status checks | user | **accepted (2026-10-27)** | UNSET | — |
+| POL-P4 | Public selection/synthesis + limitations reporting | user | **accepted (2026-10-27)** | UNSET | — |
+| POL-P5 | AI-use declaration / accountability / provider+journal terms | user | **accepted (2026-10-27)** | UNSET | provider gate (hosted use), journal gate (submission) |
+| POL-P6 | Target-venue constraints + submission verification | user | **accepted (2026-10-27)** | UNSET | only when a venue is selected |
+| POL-OPS-PILOT | Pilot/audit sampling and acceptance | user | **accepted (2026-10-27)** | UNSET | project-setup gate |
+| POL-OPS-SEVERITY | Issue severity scale | user | **accepted (2026-10-27)** | UNSET | — |
+| POL-OPS-COVERAGE | Coverage/stopping rule | user | **accepted (2026-10-27)** | UNSET | human freeze required |
+| POL-OPS-COST | Cost/concurrency limits | user | **accepted (2026-10-27)** | 25 / 10 / 2 | paid caps |
+| POL-OPS-TRACE | Tracing hop/source/retry defaults | user | **accepted (2026-10-27)** | UNSET | project-setup gate |
+| POL-OPS-SECONDARY | Secondary-warning operational acceptance | user | **accepted (2026-10-27)** | UNSET | exact-revision human approval |
+| ARCH-STORE | Store + registry + active-project arbitration | user | **accepted (2026-10-27)** | — | — |
+| ARCH-ASSETS | Immutable assets + revision dependencies | user | **accepted (2026-10-27)** | — | — |
+| ARCH-IPC | Local authenticated IPC | user | **accepted (2026-10-27)** | — | — |
+| ARCH-PKG | Python package layout | user | **accepted (2026-10-27)** | — | — |
+| ARCH-MIGRATE | Migrations + backup/WAL consistency | user | **accepted (2026-10-27)** | — | — |
+| ARCH-ACTIVE-ENF | Active-project enforcement mechanism (invariant confirmed) | user | **accepted (2026-10-27)** | — | — |
+| ARCH-RECOVERY | Recovery semantics (per C02) | user | **accepted (2026-10-27)** | — | — |
+| RIGHTS-v1 | Canonical `RightsRecord` v1 tuples + rights-only eligibility | user | **accepted (2026-10-27)** | — | — |
 
-**No record above is accepted. No dependent behavior is unblocked. Step 01 is not
-complete.**
+**All Step 01 policy/technical records above are accepted (2026-10-27), anchored to
+the reviewed revision `ee7f7eafca80baa6c1aaca278361e56a663493c3`.** Dependent
+behavior is unblocked; the exact schema spelling remains an implementation-facing,
+versioned detail, and **no scientific feature is implemented by this register.**
 
 ---
 
@@ -964,6 +1159,8 @@ complete.**
   "Gates and scientific invariants", "Citation-origin policy", "Product and runtime".
 - Step authority: [`docs/implementation/01-contracts.md`](../implementation/01-contracts.md);
   kickoff [`docs/implementation/kickoffs/01-contracts.md`](../implementation/kickoffs/01-contracts.md).
+- Ratification record:
+  [`docs/decisions/002-step01-contracts-and-policies.md`](../decisions/002-step01-contracts-and-policies.md).
 - Decision format: [`docs/implementation/decision-template.md`](../implementation/decision-template.md);
   adopted language decision [`docs/decisions/001-runtime-language.md`](../decisions/001-runtime-language.md).
 - Step 00 evidence: [`docs/implementation/handoffs/00-runtime-spike.md`](../implementation/handoffs/00-runtime-spike.md);
