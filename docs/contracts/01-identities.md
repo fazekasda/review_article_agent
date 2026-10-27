@@ -1,12 +1,16 @@
-# 01 — Identity and evidence contract (v1.1, **proposed**)
+# 01 — Identity and evidence contract (v1.2, **proposed**)
 
 > **Status: PROPOSED — approval pending.** No part of this document is ratified
 > science, an approved schema, or a claim of production completion. It drafts the
 > identity/evidence contract for review; only the user approves scientific policy
 > and the baseline decisions (§8).
 >
-> **Document version:** `v1.1` (proposal revision of `v1`; see §9 change log).
+> **Document version:** `v1.2` (proposal revision of `v1`; see §9 change log).
 > Versioning rule and change log in §9.
+>
+> **This is not Step 01 completion.** This contract is one of several Step 01
+> deliverables; no Step 01 pass, no scientific policy, and no schema is claimed
+> here. All approvals and open items remain pending (§8).
 >
 > **Sources this document is derived from:**
 > - [Scientific and product baseline](../specification.md) — Confirmed scientific
@@ -155,6 +159,8 @@ the field N/A-eligible.
 | `DependencyTarget` | `{to_revision: stated<RefRevision>, to_artifact: RefArtifact}` | `DependencyReference`; see §5.5 |
 | `SubjectRef` | one of `RefRevision` \| `{record_type: string, record_id: string}` | `ProvenanceRecord.subject` |
 | `ModelRef` | `{agent: string, model: string, instructions_revision: string}` | `ProvenanceRecord.model_ref` |
+| `EvidenceRef` | `{target_finding_revision: RefRevision, evidence_id?: string}` — the compared unit is a **finding revision** (which MUST be kind `finding`); `evidence_id` names a specific `EvidenceRecord` when needed and is optional | `IndependenceRecord.evidence_a`/`evidence_b` |
+| `ActorRef` | `{actor_kind: enum[user\|agent], actor_id: string, confirmation_ref: stated<RefRevision>}` — who; `confirmation_ref` MUST be `known` (a human-confirmation revision) when `actor_kind` is `agent`, and `not_applicable` (with reason) for a human | `IndependenceRecord.adjudicated_by` |
 
 ---
 
@@ -236,8 +242,14 @@ and related to a `study` by a `DependencyReference` with role `reports`. The
 - acquired scientific report / paper / preprint ⇒ kind `document` (+ `reports` link);
 - application output ⇒ kind `report`.
 
-The two MUST NOT be conflated, and a `study` (not a `report`) is the target of
-`reports`/`uses_dataset` dependencies.
+The two MUST NOT be conflated. Dependency targets are typed by role (not by the
+`report` kind):
+
+- `reports` targets a **`study`** (a `document` reports a study);
+- `uses_dataset` targets a **`dataset`**;
+- `describes_experiment` targets an **`experiment`**.
+
+A `reports`/`uses_dataset` dependency MUST NOT target a `report` (app output).
 
 ---
 
@@ -280,7 +292,7 @@ revision to stand in for missing full text.
 | `acquired_by` | enum[user\|agent\|import] | Req | Actor class. |
 | `dependencies` | list<ref<DependencyReference>> | Req (may be empty) | **Immutable dependency set** this revision was produced under (e.g., `version_of`, `extracted_from`, `reports`). This is the set approvals bind to (I1); each entry MUST reference a `DependencyReference`. It MAY later gain entries only by creating a **new** revision, never by mutation. |
 | `provenance_id` | ref<ProvenanceRecord> | Req | How this revision came to exist (§5.3). |
-| `rights_id` | ref<RightsReference> | Req | Canonical rights record (§5.6). **No blanket N/A:** every revision MUST reference a `RightsReference`, including our own reports that embed or derive from third-party content (e.g., licensed excerpts). Only a `RightsReference` whose subject provably contains no third-party content may set its own right fields to `not_applicable`, with `basis` stated. |
+| `rights_id` | ref<RightsReference> | Req | Projection of the **canonical** policy `RightsRecord` (§5.6; `docs/contracts/03-policy-decisions.md` §5). Every revision MUST reference one, including our own reports that embed or derive from third-party content. **No blanket own-work N/A:** derived "own" artifacts still inherit the source's restrictions on storage/redistribution/hosted transfer (§5.6). |
 | `immutable` | bool (constant `true`) | Req | Declaration that this revision is immutable (I1/I2). |
 | `notes` | string | Opt | Free text. |
 
@@ -328,28 +340,51 @@ limitations, source assets, a rights reference, and revision linkage.
 | `project_id` | string | Req | Owning project. |
 | `from_revision` | RefRevision | Req | The dependent (consumer) revision. |
 | `target` | `DependencyTarget` = `{to_revision: stated<RefRevision>, to_artifact: RefArtifact}` | Req | The provider. `to_revision` `missing`/`unknown` is allowed only to record an unresolved dependency; it blocks dependent behavior, and `to_artifact` keeps it locatable. |
-| `role` | enum[version_of\|reports\|uses_dataset\|describes_experiment\|extracted_from\|derived_from\|summarizes\|supports_claim\|duplicate_bytes_of] | Req | Relation kind: `version_of` = same artifact's older revision (§6.2); `reports` = a `document` reports a `study` (the baseline "linked reports of one study", §4); `duplicate_bytes_of` = the `from_revision`'s bytes equal the provider revision's bytes (dedup link between two **pre-existing** revisions, §6.1 R1) — a later duplicate *import* is an `ImportOccurrenceRecord` (§5.8), not a new revision and not a role on a revision. |
+| `role` | enum[version_of\|reports\|uses_dataset\|describes_experiment\|extracted_from\|derived_from\|summarizes\|supports_claim\|duplicate_bytes_of] | Req | Relation kind: `version_of` = same artifact's older revision (§6.2); `reports` targets a `study` (the baseline "linked reports of one study", §4); `uses_dataset` targets a `dataset`; `describes_experiment` targets an `experiment`; `duplicate_bytes_of` = the `from_revision`'s bytes equal the provider revision's bytes (dedup link between two **pre-existing** revisions, §6.1 R1) — a later duplicate *import* is an `ImportOccurrenceRecord` (§5.8), not a new revision and not a role on a revision. |
 | `created_at` | timestamp | Req | When declared. |
 | `created_by` | enum[user\|agent\|import] | Req | Actor class. |
 | `state` | §2.2 token | Req | Overall resolution state. |
 
-### 5.6 `RightsReference` (I9; P5 stays open)
+### 5.6 `RightsReference` — projection of the canonical rights record (I9; P5 open)
 
-| Field | Type | Req | Meaning |
+C01 does **not** define a canonical rights schema. The canonical record is
+`RightsRecord` v1 in the policy contract **`docs/contracts/03-policy-decisions.md`
+§5** (sibling C03; not merged into this branch, so it is named by path here rather
+than linked — C04 reconciles the final full field mapping). C01's `rights_id` MUST
+reference a canonical `RightsRecord`; the fields below are a **read-only
+projection** of it for identity/evidence references. The shared operation enum is
+`allowed | not_allowed | unknown | not_applicable`.
+
+| Projection field (C01) | Type | Req | Canonical `RightsRecord` field |
 | --- | --- | --- | --- |
-| `rights_id` | string | Req | Identity. |
-| `project_id` | string | Req | Owning project. |
-| `subject` | RefRevision \| RefArtifact | Req | What the rights apply to. |
-| `acquisition_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | Right to acquire. |
-| `storage_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | Right to retain. |
-| `redistribution_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | Right to redistribute. |
-| `hosted_model_transfer_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | Right to send to a hosted model (P5 open; default until decided: `unknown`, which blocks transfer). |
-| `basis` | stated<string> | Req | License/agreement/permission/own-work. |
-| `restrictions` | stated<string> | Req | Constraints or "none identified". |
-| `decided_by`,`decided_at` | string, timestamp | Req | Who and when. |
+| `rights_id` | string | Req | `rights_id` (same id) |
+| `project_id` | string | Req | `project_id` |
+| `subject` | RefRevision | Req | `source_revision` |
+| `acquisition_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | `operations.acquisition` |
+| `storage_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | `operations.storage` |
+| `redistribution_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | `operations.redistribution` |
+| `hosted_model_transfer_right` | enum[allowed\|not_allowed\|unknown\|not_applicable] | Req | `operations.hosted_transfer` |
+| `basis` | stated<string> | Req | summary of the per-operation `basis.<operation>.{kind, evidence_ref}` |
+| `restrictions` | stated<string> | Req | `restrictions[]` |
+| `decided_by`,`decided_at` | string, timestamp | Req | `recorded_by`, `recorded_at` |
+| — (canonical-only, not projected here) | — | — | `record_revision`, `authorizing_revision`, `privacy`, `derived_status` |
+
+Rules (the projection adds no rights; the policy record is authoritative):
+
+- The four operations are **separate** (I9). `acquisition_right` MAY be
+  `not_applicable` on a derived finding: producing the finding performed no
+  acquisition operation **even when the finding embeds a third-party excerpt**.
+- `not_applicable` MUST NOT be used to escape an operation that actually
+  happened. For a derived artifact that embeds or derives from third-party
+  content, `storage_right`, `redistribution_right`, and
+  `hosted_model_transfer_right` **inherit** the source record's restrictions and
+  MUST NOT be set to `not_applicable` merely because the artifact is "ours".
+- `unknown` **blocks** the affected operation. In particular, if
+  `hosted_model_transfer_right` is `unknown`, no hosted transfer may be attempted;
+  extraction must use a **local model or a human**. P5 remains open (§8).
 
 **Constant reminder:** uploading a file is NOT proof of any of these rights; each
-field is decided independently.
+operation is decided independently.
 
 ### 5.7 `OmissionCheckRecord` (does not imply completeness, I7)
 
@@ -387,7 +422,7 @@ an occurrence may have no bytes (e.g., missing full text).
 | `acquired_by` | enum[user\|agent\|import] | Req | Actor class. |
 | `disposition` | enum[created_new_revision\|duplicate_bytes_of_existing_revision\|no_full_text_acquired\|rejected] | Req | What happened. |
 | `result_revision_id` | stated<ref<RevisionRecord>> | Req | The revision created (disposition `created_new_revision`) or **matched** (disposition `duplicate_bytes_of_existing_revision`); `missing` when `no_full_text_acquired`. |
-| `rights_id` | ref<RightsReference> | Req | Canonical rights record (§5.6); no blanket N/A. |
+| `rights_id` | ref<RightsReference> | Req | Projection of the canonical policy `RightsRecord` (§5.6); no blanket own-work N/A. |
 | `provenance_id` | ref<ProvenanceRecord> | Req | Provenance of the occurrence. |
 
 Invariant: a `duplicate_bytes_of_existing_revision` occurrence MUST NOT create a
@@ -402,21 +437,29 @@ files; it is an explicit adjudicated claim.
 | --- | --- | --- | --- |
 | `independence_id` | string | Req | Identity. |
 | `project_id` | string | Req | Owning project. |
-| `evidence_a`,`evidence_b` | RefRevision (kind `finding` or `EvidenceRecord`) | Req | The two compared evidence units. |
-| `underlying_study_a`,`underlying_study_b` | RefArtifact | Req | The `study`/`dataset`/`experiment` each is attributed to. |
+| `evidence_a`,`evidence_b` | `EvidenceRef` = `{target_finding_revision: RefRevision (kind `finding`), evidence_id?: string}` | Req | The two compared units, named by their **finding revisions** (an optional `evidence_id` pins a specific `EvidenceRecord`). |
+| `underlying_a`,`underlying_b` | RefArtifact (kind `study` \| `dataset` \| `experiment`) | Req | The underlying study/dataset/experiment each unit is attributed to. |
 | `conclusion` | enum[independent\|not_independent\|unknown] | Req | Adjudicated result. |
 | `basis` | stated<string> | Req | The affirmative provenance-backed ground (shared vs distinct data source, overlap, etc.). |
-| `adjudicated_by` | enum[user\|agent] + actor | Req | Who adjudicated; `agent` output is untrusted until human-confirmed for any downstream claim. |
+| `adjudicated_by` | `ActorRef` = `{actor_kind: enum[user\|agent], actor_id: string, confirmation_ref: stated<RefRevision>}` | Req | Who adjudicated. For `actor_kind:agent`, `confirmation_ref` MUST be `known` (a **human-confirmation** revision); agent output is untrusted until confirmed (I11). For `actor_kind:user`, `confirmation_ref` is `not_applicable` with a reason. |
 | `adjudicated_at` | timestamp | Req | When. |
 | `provenance_id` | ref<ProvenanceRecord> | Req | Inputs/sources examined. |
 | `limitations` | stated<string> | Req | Known limits. |
 
-Rules: `conclusion:independent` requires `basis` to affirm **demonstrably
-distinct** underlying data **and** distinct source documents. If the two share a
-study/dataset is **shared or `unknown`**, the conclusion MUST be
-`not_independent` or `unknown`. Distinct document ids/artifacts alone are
-**never** sufficient. Downstream text MAY claim "independent support" only when
-an `IndependenceRecord` with `conclusion:independent` exists (R4, I6).
+Rules:
+
+- `conclusion:independent` requires the `ActorRef` to be human, or agent-produced
+  **and** human-confirmed (`confirmation_ref` `known`).
+- **Shared underlying data is a hard prohibition.** If `underlying_a` and
+  `underlying_b` are the same `study`/`dataset` (or the sharedness is `unknown`),
+  the conclusion MUST be `not_independent` or `unknown` — never `independent`.
+- Distinct `document` artifacts, artifact ids, or revisions are **never**
+  sufficient on their own: `conclusion:independent` requires `basis` to affirm
+  **demonstrably distinct** underlying data **and** distinct source documents.
+  Distinct experiments/analyses (e.g., separate `experiment` artifacts) still
+  require an affirmative adjudication — there is no default or bypass.
+- Downstream text MAY claim "independent support" only when an `IndependenceRecord`
+  with `conclusion:independent` exists (R4, I6).
 
 ---
 
@@ -439,16 +482,19 @@ an `IndependenceRecord` with `conclusion:independent` exists (R4, I6).
   an explicit revision and reopens affected approvals without erasing unaffected
   work (I5).
 - **R3 — Multiple reports of one study/dataset.** Distinct `document` artifacts
-  (acquired research reports, §4) that each declare role `reports` (or
-  `uses_dataset`) toward the same `study`/`dataset` revision. They are **not**
-  independent confirmation (I6).
+  (acquired research reports, §4) that each declare role `reports` toward the same
+  `study` revision, or `uses_dataset` toward the same `dataset` revision. They are
+  **not** independent confirmation (I6).
 - **R4 — No false independent support.** Two evidence records count as
   independent support **only** when an `IndependenceRecord` (§5.9) with
   `conclusion:independent` exists, adjudicated on a provenance-backed basis that
   the underlying data are demonstrably distinct. Distinct `document` artifacts,
-  artifact ids, or revisions are **never** sufficient on their own; a **shared or
-  `unknown`** study/dataset/experiment must yield `not_independent`/`unknown`, and
-  downstream text MUST NOT then claim independent support.
+  artifact ids, or revisions are **never** sufficient on their own. **Sharing
+  underlying data is a hard prohibition:** when the two units share a
+  `study`/`dataset` (or sharedness is `unknown`), the conclusion MUST be
+  `not_independent`/`unknown`, and downstream text MUST NOT then claim
+  independent support. Distinct `experiment`/analysis artifacts likewise require
+  an affirmative adjudication — there is no automatic or bypass independence.
 
 ### 6.2 Distinguishing the three relations
 
@@ -456,8 +502,8 @@ an `IndependenceRecord` with `conclusion:independent` exists (R4, I6).
 | --- | --- | --- | --- |
 | duplicate bytes | one stored revision; later import is an occurrence | `ImportOccurrenceRecord` (disposition `duplicate_bytes_of_existing_revision`), else `duplicate_bytes_of` dependency | No |
 | alternate version | same `artifact_id`, different `revision_id` | `version_of` | No |
-| linked reports of one study | different `document` `artifact_id`, one `study` | `reports` | No (unless §5.9 `independent`) |
-| candidate distinct evidence | different `artifact_id`, different study/dataset | — | Only with an `IndependenceRecord conclusion:independent` (§5.9); otherwise `unknown` |
+| linked reports of one study | different `document` `artifact_id`, one shared `study`/`dataset` | `reports` | **Never** — shared underlying data cannot be independent (R3/R4); `conclusion:independent` is prohibited |
+| candidate distinct evidence | different `artifact_id`, different (non-shared) study/dataset, or distinct experiments | — | Only with an affirmative `IndependenceRecord conclusion:independent` (§5.9, human-confirmed if agent-produced); otherwise `unknown`. Distinct ids alone never suffice |
 
 ---
 
@@ -468,119 +514,256 @@ it exercises. Examples use `P-0001` as the project.
 
 **Reading note.** Except §7.0, the code blocks below are **abridged projections**
 (fields elided with `…` or omitted) chosen to isolate one issue; they are **not**
-complete accepted records and their `…` elisions are not valid values. §7.0 gives
-one **complete conforming** record set against which field/type validity can be
-checked directly.
+complete accepted records and their `…` elisions are not valid values. §7.0 is a
+**complete conforming** record set in real JSON, checked by the inline validator
+printed there.
 
-### 7.0 Complete conforming record set — validity anchor
+### 7.0 Complete conforming record set — validity anchor (parseable)
 
 A source document acquired once (with rights, provenance, and its acquisition
 occurrence), a derived finding revision, the dependency between them, and the
 evidence record linking finding to source. Every mandatory §5 field is present
 with a valid type/state; **outcome `accepted`** for the set.
 
+Hashes are **synthetic digest fixtures** (valid 64-hex `sha256` strings over
+invented bytes) — they assert nothing about any real paper's integrity. The
+`source_assets` list is empty (no `FIG1`); the passage/locator/context are one
+matching synthetic sentence. The block is real JSON, and the inline validator
+below parses it and checks required keys, `stated` shapes, hash format, enum
+values, and record-reference resolution.
+
+<!-- C7.0-JSON-BEGIN -->
+```json
+{
+  "artifact_records": [
+    {"project_id": "P-0001", "artifact_id": "A1", "kind": "document",
+     "created_at": "2026-10-27T10:00:00Z", "created_by": "import",
+     "label": "syn-source-1", "status": "active", "revision_ids": ["R1"]},
+    {"project_id": "P-0001", "artifact_id": "F1", "kind": "finding",
+     "created_at": "2026-10-27T11:00:00Z", "created_by": "agent",
+     "label": "syn-source-1 finding 1", "status": "active", "revision_ids": ["f1"]}
+  ],
+  "revision_records": [
+    {"project_id": "P-0001", "artifact_id": "A1", "revision_id": "R1",
+     "parent_revision_id": {"state": "not_applicable", "reason": "first content revision"},
+     "content_hash": {"state": "known", "value": "sha256:3c0874e293b210d1dc68326d6fc3d2057c0c3f147b9fb4f9d097ec3aa184e2b6"},
+     "hash_algorithm": "sha256", "byte_size": 812345, "media_type": "application/pdf",
+     "origin_locator": "import:batch-1/a.pdf", "acquired_at": "2026-10-27T10:00:01Z",
+     "acquired_by": "import", "dependencies": [], "provenance_id": "PV1",
+     "rights_id": "RT1", "immutable": true},
+    {"project_id": "P-0001", "artifact_id": "F1", "revision_id": "f1",
+     "parent_revision_id": {"state": "not_applicable", "reason": "first content revision"},
+     "content_hash": {"state": "known", "value": "sha256:9d88eb16b7efd644083b219334f91c6fc8524f933c2db92295da2b6d7c5bd09b"},
+     "hash_algorithm": "sha256", "byte_size": 2048, "media_type": "application/json",
+     "origin_locator": "store:finding/F1/f1", "acquired_at": "2026-10-27T11:00:00Z",
+     "acquired_by": "agent", "dependencies": ["DP1"], "provenance_id": "PV2",
+     "rights_id": "RT2", "immutable": true}
+  ],
+  "import_occurrence_records": [
+    {"import_id": "IM1", "project_id": "P-0001", "artifact_id": "A1",
+     "origin_locator": "import:batch-1/a.pdf",
+     "content_hash": {"state": "known", "value": "sha256:3c0874e293b210d1dc68326d6fc3d2057c0c3f147b9fb4f9d097ec3aa184e2b6"},
+     "hash_algorithm": "sha256", "byte_size": 812345, "media_type": "application/pdf",
+     "acquired_at": "2026-10-27T10:00:01Z", "acquired_by": "import",
+     "disposition": "created_new_revision",
+     "result_revision_id": {"state": "known", "value": "R1"},
+     "rights_id": "RT1", "provenance_id": "PV1"}
+  ],
+  "provenance_records": [
+    {"provenance_id": "PV1", "project_id": "P-0001",
+     "subject": {"project_id": "P-0001", "artifact_id": "A1", "revision_id": "R1"},
+     "method": "import", "actor": "import-tool", "inputs": [],
+     "performed_at": "2026-10-27T10:00:01Z",
+     "limitations": {"state": "known", "value": "import step only; content not yet extracted"}},
+    {"provenance_id": "PV2", "project_id": "P-0001",
+     "subject": {"record_type": "RevisionRecord", "record_id": "f1"},
+     "method": "model", "actor": "local-extractor-agent",
+     "model_ref": {"agent": "extractor", "model": "syn-local-model-A", "instructions_revision": "instr-7"},
+     "inputs": [{"project_id": "P-0001", "artifact_id": "A1", "revision_id": "R1"}],
+     "performed_at": "2026-10-27T11:00:00Z",
+     "limitations": {"state": "known", "value": "local synthetic model run; no hosted transfer (RT1.hosted_transfer=unknown)"}}
+  ],
+  "dependency_references": [
+    {"dependency_id": "DP1", "project_id": "P-0001",
+     "from_revision": {"project_id": "P-0001", "artifact_id": "F1", "revision_id": "f1"},
+     "target": {
+       "to_revision": {"state": "known", "value": {"project_id": "P-0001", "artifact_id": "A1", "revision_id": "R1"}},
+       "to_artifact": {"project_id": "P-0001", "artifact_id": "A1"}},
+     "role": "extracted_from", "created_at": "2026-10-27T11:00:00Z",
+     "created_by": "agent", "state": "known"}
+  ],
+  "evidence_records": [
+    {"evidence_id": "EV1", "project_id": "P-0001",
+     "target_finding_revision": {"project_id": "P-0001", "artifact_id": "F1", "revision_id": "f1"},
+     "source_revision": {"state": "known", "value": {"project_id": "P-0001", "artifact_id": "A1", "revision_id": "R1"}},
+     "original_locator": {"state": "known", "value": {"kind": "page", "value": "p.4"}},
+     "passage": {"state": "known", "value": "In the synthetic assay, compound Z reduced signal Y under condition C1."},
+     "context": {"state": "known", "value": "synthetic in vitro assay; cell line SYN-1; endpoint signal Y"},
+     "attribution": {"state": "known", "value": "author_interpretation"},
+     "limitations": {"state": "known", "value": "single synthetic condition; no in vivo analogue"},
+     "source_assets": [],
+     "rights_reference": {"state": "known", "value": "RT1"},
+     "extraction_provenance": "PV2",
+     "secondary_warning": {"state": "known", "value": false}}
+  ],
+  "rights_references": [
+    {"rights_id": "RT1", "project_id": "P-0001",
+     "subject": {"project_id": "P-0001", "artifact_id": "A1", "revision_id": "R1"},
+     "acquisition_right": "allowed", "storage_right": "allowed",
+     "redistribution_right": "not_allowed", "hosted_model_transfer_right": "unknown",
+     "basis": {"state": "known", "value": "synthetic human grant (grant:syn-grant-1): local processing only"},
+     "restrictions": {"state": "known", "value": "local_processing_only; no_redistribution; no_hosting"},
+     "decided_by": "user", "decided_at": "2026-10-27T10:05:00Z"},
+    {"rights_id": "RT2", "project_id": "P-0001",
+     "subject": {"project_id": "P-0001", "artifact_id": "F1", "revision_id": "f1"},
+     "acquisition_right": "not_applicable", "storage_right": "allowed",
+     "redistribution_right": "not_allowed", "hosted_model_transfer_right": "unknown",
+     "basis": {"state": "known", "value": "derived finding; inherits RT1 restrictions"},
+     "restrictions": {"state": "known", "value": "inherits RT1: local_processing_only; no_redistribution; no_hosting"},
+     "decided_by": "user", "decided_at": "2026-10-27T11:05:00Z"}
+  ]
+}
 ```
-ArtifactRecord{
-  project_id:"P-0001", artifact_id:"A1", kind:"document",
-  created_at:"2026-10-27T10:00:00Z", created_by:"import",
-  label:"Smith 2020", status:"active", revision_ids:["R1"] }
+<!-- C7.0-JSON-END -->
 
-RevisionRecord{
-  project_id:"P-0001", artifact_id:"A1", revision_id:"R1",
-  parent_revision_id:{state:"not_applicable", reason:"first content revision"},
-  content_hash:{state:"known", value:"sha256:aaaa…"},
-  hash_algorithm:"sha256", byte_size:812345, media_type:"application/pdf",
-  origin_locator:"import:batch-1/a.pdf",
-  acquired_at:"2026-10-27T10:00:01Z", acquired_by:"import",
-  dependencies:[], provenance_id:"PV1", rights_id:"RT1", immutable:true }
+**Inline validator** (stdlib only; no production code file). It reads the JSON
+block marked above from this document and validates the record set:
 
-ImportOccurrenceRecord{
-  import_id:"IM1", project_id:"P-0001", artifact_id:"A1",
-  origin_locator:"import:batch-1/a.pdf",
-  content_hash:{state:"known", value:"sha256:aaaa…"}, hash_algorithm:"sha256",
-  byte_size:812345, media_type:"application/pdf",
-  acquired_at:"2026-10-27T10:00:01Z", acquired_by:"import",
-  disposition:"created_new_revision", result_revision_id:{state:"known", value:"R1"},
-  rights_id:"RT1", provenance_id:"PV1" }
+<!-- C7.0-VALIDATOR-BEGIN -->
+```python
+import json, re, sys
 
-RightsReference{
-  rights_id:"RT1", project_id:"P-0001",
-  subject:{project_id:"P-0001", artifact_id:"A1", revision_id:"R1"},
-  acquisition_right:"allowed", storage_right:"allowed",
-  redistribution_right:"not_allowed", hosted_model_transfer_right:"unknown",
-  basis:{state:"known", value:"open-access license L1"},
-  restrictions:{state:"known", value:"no redistribution"},
-  decided_by:"user", decided_at:"2026-10-27T10:05:00Z" }
+REQUIRED = {
+ "artifact_records": {"project_id","artifact_id","kind","created_at","created_by","revision_ids"},
+ "revision_records": {"project_id","artifact_id","revision_id","parent_revision_id","content_hash",
+   "hash_algorithm","byte_size","origin_locator","acquired_at","acquired_by","dependencies",
+   "provenance_id","rights_id","immutable"},
+ "import_occurrence_records": {"import_id","project_id","artifact_id","origin_locator","content_hash",
+   "acquired_at","acquired_by","disposition","result_revision_id","rights_id","provenance_id"},
+ "provenance_records": {"provenance_id","project_id","subject","method","actor","inputs",
+   "performed_at","limitations"},
+ "dependency_references": {"dependency_id","project_id","from_revision","target","role",
+   "created_at","created_by","state"},
+ "evidence_records": {"evidence_id","project_id","target_finding_revision","source_revision",
+   "original_locator","passage","context","attribution","limitations","source_assets",
+   "rights_reference","extraction_provenance","secondary_warning"},
+ "rights_references": {"rights_id","project_id","subject","acquisition_right","storage_right",
+   "redistribution_right","hosted_model_transfer_right","basis","restrictions","decided_by","decided_at"},
+}
+KINDS = {"rubric","framework","outline","report","document","study","dataset","experiment","finding"}
+OPS   = {"allowed","not_allowed","unknown","not_applicable"}
+STATE = {"known","missing","unknown","not_applicable"}
+HASH  = re.compile(r"^sha256:[0-9a-f]{64}$")
+HOSTED= re.compile(r"hosted|openrouter|remote|cloud", re.I)
+errors = []
 
-ProvenanceRecord{
-  provenance_id:"PV1", project_id:"P-0001",
-  subject:{project_id:"P-0001", artifact_id:"A1", revision_id:"R1"},
-  method:"import", actor:"import-tool", inputs:[],
-  performed_at:"2026-10-27T10:00:01Z",
-  limitations:{state:"known", value:"import step only; content not yet extracted"} }
+def check_stated(path, v):
+    if set(v) - {"state","value","reason"}:
+        errors.append(f"{path}: unexpected keys {sorted(set(v)-{'state','value','reason'})}")
+    st = v.get("state")
+    if st not in STATE:
+        errors.append(f"{path}: bad state {st!r}"); return
+    if st == "known":
+        if "value" not in v: errors.append(f"{path}: known without value")
+    else:
+        if "value" in v: errors.append(f"{path}: non-known {st} carries value")
+        if not (isinstance(v.get("reason"), str) and v["reason"]):
+            errors.append(f"{path}: {st} needs non-empty reason")
 
-ArtifactRecord{
-  project_id:"P-0001", artifact_id:"F1", kind:"finding",
-  created_at:"2026-10-27T11:00:00Z", created_by:"agent",
-  label:"Smith 2020 finding 1", status:"active", revision_ids:["f1"] }
+def walk(obj, path=""):
+    if isinstance(obj, dict):
+        if obj.get("state") in STATE and set(obj) <= {"state","value","reason"}:
+            check_stated(path, obj); return
+        for k, val in obj.items(): walk(val, f"{path}.{k}" if path else k)
+    elif isinstance(obj, list):
+        for i, el in enumerate(obj): walk(el, f"{path}[{i}]")
 
-RevisionRecord{
-  project_id:"P-0001", artifact_id:"F1", revision_id:"f1",
-  parent_revision_id:{state:"not_applicable", reason:"first content revision"},
-  content_hash:{state:"known", value:"sha256:eeee…"}, hash_algorithm:"sha256",
-  byte_size:2048, media_type:"application/json",
-  origin_locator:"store:finding/F1/f1",
-  acquired_at:"2026-10-27T11:00:00Z", acquired_by:"agent",
-  dependencies:["DP1"], provenance_id:"PV2", rights_id:"RT2", immutable:true }
+def refrev(r): return (r["project_id"], r["artifact_id"], r["revision_id"])
 
-DependencyReference{
-  dependency_id:"DP1", project_id:"P-0001",
-  from_revision:{project_id:"P-0001", artifact_id:"F1", revision_id:"f1"},
-  target:{
-    to_revision:{state:"known",
-      value:{project_id:"P-0001", artifact_id:"A1", revision_id:"R1"}},
-    to_artifact:{project_id:"P-0001", artifact_id:"A1"} },
-  role:"extracted_from", created_at:"2026-10-27T11:00:00Z", created_by:"agent",
-  state:"known" }
+def main(path):
+    doc = open(path, encoding="utf-8").read()
+    m = re.search(r"<!--\s*C7\.0-JSON-BEGIN\s*-->(.*?)<!--\s*C7\.0-JSON-END\s*-->", doc, re.S)
+    if not m: print("FAIL: JSON markers not found"); sys.exit(1)
+    data = json.loads(re.search(r"```json\s*(.*?)```", m.group(1), re.S).group(1))
 
-EvidenceRecord{
-  evidence_id:"EV1", project_id:"P-0001",
-  target_finding_revision:{project_id:"P-0001", artifact_id:"F1", revision_id:"f1"},
-  source_revision:{state:"known",
-    value:{project_id:"P-0001", artifact_id:"A1", revision_id:"R1"}},
-  original_locator:{state:"known", value:{kind:"page", value:"p.4"}},
-  passage:{state:"known", value:"…verbatim original excerpt…"},
-  context:{state:"known", value:"in vitro; human cell line; endpoint X"},
-  attribution:{state:"known", value:"author_interpretation"},
-  limitations:{state:"known", value:"single cell line; no in vivo"},
-  source_assets:[{asset_ref:"FIG1", media_type:"image/png", locator:"page:4"}],
-  rights_reference:{state:"known", value:"RT1"},
-  extraction_provenance:"PV2",
-  secondary_warning:{state:"known", value:false} }
+    for key, req in REQUIRED.items():
+        for i, rec in enumerate(data[key]):
+            miss = req - set(rec)
+            if miss: errors.append(f"{key}[{i}] missing keys {sorted(miss)}")
+    for i, a in enumerate(data["artifact_records"]):
+        if a["kind"] not in KINDS: errors.append(f"artifact_records[{i}].kind invalid {a['kind']!r}")
+    for k, v in data.items(): walk(v, k)
+    for k in ("revision_records", "import_occurrence_records"):
+        for i, r in enumerate(data[k]):
+            h = r["content_hash"]
+            if h.get("state") == "known" and not HASH.match(h["value"]):
+                errors.append(f"{k}[{i}].content_hash is not 64-hex sha256")
+            if "hash_algorithm" in r and r["hash_algorithm"] not in ("sha256","sha512"):
+                errors.append(f"{k}[{i}].hash_algorithm invalid")
+    for i, r in enumerate(data["rights_references"]):
+        for op in ("acquisition_right","storage_right","redistribution_right","hosted_model_transfer_right"):
+            if r[op] not in OPS: errors.append(f"rights_references[{i}].{op} invalid enum {r[op]!r}")
 
-ProvenanceRecord{
-  provenance_id:"PV2", project_id:"P-0001",
-  subject:{record_type:"RevisionRecord", record_id:"f1"},
-  method:"model", actor:"extractor-agent",
-  model_ref:{agent:"extractor", model:"small-model-A", instructions_revision:"instr-7"},
-  inputs:[{project_id:"P-0001", artifact_id:"A1", revision_id:"R1"}],
-  performed_at:"2026-10-27T11:00:00Z",
-  limitations:{state:"known", value:"model output is untrusted data (I11)"} }
+    prov  = {p["provenance_id"] for p in data["provenance_records"]}
+    rights= {r["rights_id"] for r in data["rights_references"]}
+    deps  = {d["dependency_id"] for d in data["dependency_references"]}
+    revs  = {refrev(r) for r in data["revision_records"]}
+    arts  = {(a["project_id"], a["artifact_id"]) for a in data["artifact_records"]}
 
-RightsReference{
-  rights_id:"RT2", project_id:"P-0001",
-  subject:{project_id:"P-0001", artifact_id:"F1", revision_id:"f1"},
-  acquisition_right:"not_applicable", storage_right:"allowed",
-  redistribution_right:"unknown", hosted_model_transfer_right:"unknown",
-  basis:{state:"known", value:"own analysis; embeds an excerpt from RT1"},
-  restrictions:{state:"known", value:"inherits RT1 excerpt restriction; no redistribution"},
-  decided_by:"user", decided_at:"2026-10-27T11:05:00Z" }
+    for i, r in enumerate(data["revision_records"]):
+        if r["provenance_id"] not in prov: errors.append(f"revision_records[{i}].provenance_id unresolved")
+        if r["rights_id"] not in rights: errors.append(f"revision_records[{i}].rights_id unresolved")
+        for d in r["dependencies"]:
+            if d not in deps: errors.append(f"revision_records[{i}].dependencies {d!r} unresolved")
+    for i, r in enumerate(data["artifact_records"]):
+        for rid in r["revision_ids"]:
+            if (r["project_id"], r["artifact_id"], rid) not in revs:
+                errors.append(f"artifact_records[{i}].revision_ids {rid!r} unresolved")
+    for i, o in enumerate(data["import_occurrence_records"]):
+        if o["rights_id"] not in rights: errors.append(f"import_occurrence_records[{i}].rights_id unresolved")
+        if o["provenance_id"] not in prov: errors.append(f"import_occurrence_records[{i}].provenance_id unresolved")
+        rv = o["result_revision_id"]
+        if rv.get("state") == "known" and (o["project_id"], o["artifact_id"], rv["value"]) not in revs:
+            errors.append(f"import_occurrence_records[{i}].result_revision_id unresolved")
+    for i, d in enumerate(data["dependency_references"]):
+        if refrev(d["from_revision"]) not in revs: errors.append(f"dependency_references[{i}].from_revision unresolved")
+        if (d["target"]["to_artifact"]["project_id"], d["target"]["to_artifact"]["artifact_id"]) not in arts:
+            errors.append(f"dependency_references[{i}].to_artifact unresolved")
+        tr = d["target"]["to_revision"]
+        if tr.get("state") == "known" and refrev(tr["value"]) not in revs:
+            errors.append(f"dependency_references[{i}].to_revision unresolved")
+    for i, e in enumerate(data["evidence_records"]):
+        if refrev(e["target_finding_revision"]) not in revs: errors.append(f"evidence_records[{i}].target_finding_revision unresolved")
+        sr = e["source_revision"]
+        if sr.get("state") == "known" and refrev(sr["value"]) not in revs:
+            errors.append(f"evidence_records[{i}].source_revision unresolved")
+        rr = e["rights_reference"]
+        if rr.get("state") == "known" and rr["value"] not in rights:
+            errors.append(f"evidence_records[{i}].rights_reference unresolved")
+        if e["extraction_provenance"] not in prov: errors.append(f"evidence_records[{i}].extraction_provenance unresolved")
+
+    if any(r["hosted_model_transfer_right"] == "unknown" for r in data["rights_references"]):
+        for i, p in enumerate(data["provenance_records"]):
+            if p["method"] == "model":
+                if "model_ref" not in p: errors.append(f"provenance_records[{i}] model without model_ref")
+                elif HOSTED.search(p["model_ref"].get("model","")):
+                    errors.append(f"provenance_records[{i}] hosted model used while hosted_transfer is unknown")
+
+    if errors:
+        print("INVALID:"); [print(" -", e) for e in errors]; sys.exit(1)
+    print(f"OK: §7.0 record set valid ({sum(len(v) for v in data.values())} records)")
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else "docs/contracts/01-identities.md")
 ```
+<!-- C7.0-VALIDATOR-END -->
 
 - **Outcome:** `accepted`. Every mandatory field above has a declared type and a
-  valid state; `dependencies`/`result_revision_id`/`rights_id`/`provenance_id`
-  links all resolve; both rights records exist (no blanket N/A: `RT2` exists
-  because `F1` embeds an excerpt from `RT1`).
+  valid state; the inline validator passes (required keys, `stated` shapes,
+  hash format, operation enums, and all record references resolve). `RT2` exists
+  because `F1` embeds content derived from `RT1` (no blanket own-work N/A); the
+  extraction uses a **local** synthetic model since `hosted_transfer` is
+  `unknown`.
 
 ### 7.1 Duplicate PDF — valid
 
@@ -754,11 +937,15 @@ DependencyReference{ from_revision:RefRevision{A11,a1}, to_revision:RefRevision{
   role:"reports", state:"known" }
 # adjudicating independence (required before any "independent" claim):
 IndependenceRecord{ independence_id:"IND1", project_id:"P-0001",
-  evidence_a:RefRevision{F1,r1}, evidence_b:RefRevision{F2,r1},
-  underlying_study_a:RefArtifact{S1}, underlying_study_b:RefArtifact{S1},
+  evidence_a:{target_finding_revision:RefRevision{F1,r1}},
+  evidence_b:{target_finding_revision:RefRevision{F2,r1}},
+  underlying_a:RefArtifact{S1}, underlying_b:RefArtifact{S1},  # same study/dataset
   conclusion:"not_independent",
-  basis:{state:"known", value:"both reports describe study S1 / dataset D1"},
-  adjudicated_by:user, ... }
+  basis:{state:"known", value:"both reports share study S1 / dataset D1"},
+  adjudicated_by:{actor_kind:"user", actor_id:"user:reviewer-1",
+                  confirmation_ref:{state:"not_applicable", reason:"human adjudication"}},
+  adjudicated_at:"2026-10-27T12:00:00Z", provenance_id:"PV-IND1", ... }
+# PV-IND1 and remaining fields omitted here (abridged)
 ```
 
 - **Outcome:** `accepted` as relations; a synthesis memo counting `A10`+`A11` as
@@ -799,7 +986,7 @@ threshold is invented to let a stage proceed.
 
 ## 9. Versioning and change log
 
-- This is document version **`v1.1`** (`docs/contracts/01-identities.md`).
+- This is document version **`v1.2`** (`docs/contracts/01-identities.md`).
 - Because the contract itself is versioned, a change to any mandatory field,
   type, state, or rule MUST increment the document version and record the change
   below with its date and approver. Field/record semantics are immutable within a
@@ -810,14 +997,19 @@ threshold is invented to let a stage proceed.
 | --- | --- | --- | --- |
 | v1 | 2026-10-27 | Initial proposed identity/evidence contract; open items recorded in §8. | **pending (user)** |
 | v1.1 | 2026-10-27 | Repair: separate import occurrence from scientific revision (§5.8), coherent missing-full-text representation (no fake revision), `stated<T>`/subtype grammar and a complete conforming record set (§2.4, §7.0), `known` = availability not verification, affirmative `IndependenceRecord` (§5.9), report/scientific-report terminology, no blanket rights N/A (§5.2/§5.6), mandatory revision `dependencies`+`provenance_id` (§5.2). Still **proposed**. | **pending (user)** |
+| v1.2 | 2026-10-27 | Repair: §7.0 now parseable JSON with 64-hex synthetic digests, matching synthetic passage/locator/context, empty `source_assets`, and an inline Python validator (required keys, `stated` shapes, hash format, enum values, reference resolution); `IndependenceRecord` uses typed `EvidenceRef` and structured `ActorRef` with mandatory human confirmation for agent conclusions (§2.4, §5.9); `shared` underlying data is a hard no-independence rule (§6.1 R4, §6.2); `reports`→`study`, `uses_dataset`→`dataset` targets fixed (§4, §5.5); `RightsReference` is a **projection** of the canonical `RightsRecord` (`docs/contracts/03-policy-decisions.md` §5) with an explicit field mapping and no blanket own-work N/A (§5.2, §5.6); synthetic rights sample is local-processing-only with an explicit synthetic grant. Still **proposed**; not Step 01 completion. | **pending (user)** |
 
 ---
 
 ## 10. Verification hooks for reviewers
 
 - Every mandatory field above carries a type and meaning (§5); §7.0 is a complete
-  conforming record set with mandatory fields and valid types/states. `stated<T>`
-  shape and named subtypes are defined in §2.4.
+  conforming record set in parseable JSON with mandatory fields and valid
+  types/states. `stated<T>` shape and named subtypes are defined in §2.4.
+- Run the inline §7.0 validator on this file to confirm required keys, `stated`
+  shapes, 64-hex `sha256` format, operation enums, and that every record reference
+  resolves: `python3 <extracted-validator-block> docs/contracts/01-identities.md`
+  (expected output begins `OK:`).
 - Missing/invalid data maps to `rejected_invalid` or `blocked` (§2.3),
   demonstrated in §7.2, §7.4, §7.5.
 - The four required examples (duplicate PDF, alternate version, missing full
