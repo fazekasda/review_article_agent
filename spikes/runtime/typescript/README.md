@@ -25,7 +25,7 @@ descriptors in `node_modules/@opencode/client/dist/promise/generated/`.
 | server identity | `server.info` | `GET /api/info` | `ServerInfo` (not enveloped) |
 | create session | `session.create` | `POST /api/session` | `{ data: Session.Info }` |
 | read session | `session.get` | `GET /api/session/{sessionID}` | `{ data: Session.Info }` |
-| **admit input** | `session.prompt` | `POST /api/session/{sessionID}/prompt` | `{ data: Session.Inbox.User }`; body `{ id?, text, delivery? }`; `409 ConflictError` on duplicate `id` |
+| **admit input** | `session.prompt` | `POST /api/session/{sessionID}/prompt` | `{ data: Session.Inbox.User }`; body `{ id?, text, delivery? }`; a repeated `id` returns `200` (idempotent) **or** `409 ConflictError` — see below |
 | enqueued work | `session.inbox.list` | `GET /api/session/{sessionID}/inbox` | `{ data: Session.Inbox.Info[] }` |
 | timeline | `session.message.list` | `GET /api/session/{sessionID}/message` | `{ data: Session.Message.Info[], cursor }` |
 | events | `event.subscribe` | `GET /api/event` | live-only; **no replay** (missed events are missed) |
@@ -33,9 +33,22 @@ descriptors in `node_modules/@opencode/client/dist/promise/generated/`.
 
 Identifiers: `Session.ID` matches `^ses`; `Session.Message.ID` matches `^msg_`.
 The client-supplied admission id is the request `id`; the server returns the
-`Session.Inbox.User` it durably enqueued. A terminal outcome is recorded in the
+`Session.Inbox.User` it durably holds. A terminal outcome is recorded in the
 message timeline as a `Session.Message.Idle` with `outcome: "succeeded" | "failed"
 | "interrupted"`, and on `Session.Info.outcome`.
+
+**Duplicate admission semantics (corrected).** A repeated admission id is *not*
+always answered with `409`. A live harness retry of the same id returned `200`
+with the already-held inbox item. Both mean exactly one accepted input:
+
+- `200` — idempotent; the server returns the held `Session.Inbox.User`. This is
+  indistinguishable from a first accept in the response alone, so the receipt is
+  reported as `accepted`.
+- `409 ConflictError` — the client reconciles against the inbox and the paginated
+  timeline and reports `duplicate-accepted`, or rethrows if no record survives.
+
+Neither result is a completion. The single-input guarantee is the server's; the
+client never enqueues a second time.
 
 The generated client unwraps `{ data: ... }` for `create`/`get`/`prompt`/`inbox.list`/`decisions`,
 returns `{ data, cursor }` unchanged for `message.list`, and throws declared
@@ -72,13 +85,34 @@ Environment fallbacks: `OPENCODE_URL`, `OPENCODE_TOKEN` (or `OPENCODE_PASSWORD`)
 The client refuses an implicit URL, refuses an unauthenticated connection, and
 refuses a non-loopback endpoint, all by default.
 
+## Reconciliation semantics (bounded per turn)
+
+`reconcile` reconstructs exactly one admission's state and never guesses:
+
+- **Windowed.** The target turn starts at the user message whose id equals the
+  admission id and ends at the next `user`/`synthetic` message (exclusive) or the
+  end of the timeline. A terminal `idle` before the target (an earlier turn) or
+  after the next user message (a later turn) is **not** attributed to the target.
+- **Authoritative only.** Only an `idle` outcome inside the window means
+  `succeeded`/`failed`/`interrupted`. An assistant message with `time.completed`
+  is deliberately not accepted as a shortcut.
+- **Paginated.** The timeline is walked oldest-first following `cursor.next`.
+- **Bounded and honest.** A page cap, a repeated-cursor guard, and a repeated
+  message-id guard stop the walk; a caller cancellation and a per-request deadline
+  bound every HTTP request. Absent, unreadable, truncated, or ambiguous reads
+  resolve to `unknown` — never success.
+
+`waitForResolution` respects an external `AbortSignal` (returns `cancelled: true`)
+and a per-request `requestTimeoutMs` (default: the remaining wait budget), so a
+single stalled request cannot hang the caller.
+
 ## Acceptance criteria → evidence
 
 | Criterion (00-runtime-spike.md) | Where | Notes |
 | --- | --- | --- |
 | Closing the prototype CLI does not stop a bounded server-owned task; a second client retrieves the result after missed events. | `test/cli.integration.test.ts` (3 separate CLI processes against a loopback listener), `test/submit-reconcile.test.ts` "a second client recovers the result after missed events" | Reconciliation reads persisted state only; no event stream is opened. Mocked transport. |
-| Retrying a client-supplied admission id produces one accepted session input; admission is not mistaken for completion. | `test/submit-reconcile.test.ts`, receipt key set asserted in `test/cli.integration.test.ts` | 409 is reconciled against the inbox/message timeline; the receipt has no `outcome` field and `reconcile` reports `pending`. |
-| Restart yields recoverable continuation or an explicit interrupted/unknown outcome; no lost work silently declared complete. | `test/submit-reconcile.test.ts` (`interrupted`, `failed`, `unknown` cases) | A delivered admission with no terminal `idle` message resolves to `unknown`, never success. Mocked. |
+| Retrying a client-supplied admission id produces one accepted session input; admission is not mistaken for completion. | `test/submit-reconcile.test.ts`, `test/wait-bounds.test.ts` (200-idempotent retry), receipt key set asserted in `test/cli.integration.test.ts` | Both the `409` path (reconcile against paginated inbox/timeline) and the live-observed `200` idempotent path yield one accepted input. The receipt has no `outcome` field. |
+| Restart yields recoverable continuation or an explicit interrupted/unknown outcome; no lost work silently declared complete. | `test/submit-reconcile.test.ts` (`interrupted`, `failed`, `unknown` cases), `test/reconcile-window.test.ts` (prior/later terminal, next-user and synthetic boundaries, assistant shortcut, pagination, repeated-cursor bound, page cap), `test/wait-bounds.test.ts` | Only an authoritative `idle` inside the target window counts; anything absent/unreadable/truncated/ambiguous is `unknown`. Mocked. |
 | Typed Jev predicate/choice/score handling and per-question failures. | `test/decisions-critic.test.ts`, `src/lifecycle.ts` (`runDecisions`, `summarizeDecisions`) | The route and types are exercised against the mock; live call is **blocked** pending budget authorization. |
 | Fresh critic context and role/model pinning; a writer-history fork is not a clean critic. | `test/decisions-critic.test.ts` | `createCriticSession` pins `agent` + `model.Ref` on a brand-new session (no `parentID`, no fork). |
 | No access/config changes to ordinary coding sessions. | `test/client-guard.test.ts` | The client never imports `@opencode/client/service` and never calls `Service.ensure`/`discover`/`stop`; no `service.json`, database, or state path is read. |

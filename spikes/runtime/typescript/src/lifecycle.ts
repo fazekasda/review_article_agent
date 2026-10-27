@@ -15,11 +15,13 @@ import type {
   GenerateDecisionResult,
   GenerateDecisionsInput,
   GenerateErrorAnswer,
+  MessageListInput,
   ModelRef,
   OpenCodeClient,
   SessionInboxInfo,
   SessionInboxUser,
   SessionInfo,
+  SessionMessageIdle,
   SessionMessageInfo,
   SessionStructuredError,
 } from "@opencode/client";
@@ -78,11 +80,114 @@ function userInboxItem(items: readonly SessionInboxInfo[], admissionId: Admissio
   return undefined;
 }
 
-function userMessage(items: readonly SessionMessageInfo[], admissionId: AdmissionId): SessionMessageInfo | undefined {
-  for (const item of items) {
-    if (item.type === "user" && item.id === admissionId) return item;
+/**
+ * Options shared by reconciliation and its callers. Every option exists because a
+ * single unbounded read can hang a caller or wander a hostile timeline.
+ */
+export interface ReconcileOptions {
+  /** Caller cancellation; combined with the per-request deadline. */
+  readonly signal?: AbortSignal | undefined;
+  /** Per-HTTP-request deadline so one stalled request cannot block a bounded wait. */
+  readonly requestTimeoutMs?: number | undefined;
+  /** Safety cap on timeline pages walked before giving up and reporting unknown. */
+  readonly maxPages?: number | undefined;
+  /** Page size requested per call. */
+  readonly pageLimit?: number | undefined;
+}
+
+function requestOptionsFor(options: ReconcileOptions): { signal: AbortSignal } | undefined {
+  const signals: AbortSignal[] = [];
+  if (options.signal !== undefined) signals.push(options.signal);
+  if (options.requestTimeoutMs !== undefined) signals.push(AbortSignal.timeout(options.requestTimeoutMs));
+  if (signals.length === 0) return undefined;
+  const signal = signals.length === 1 ? (signals[0] as AbortSignal) : AbortSignal.any(signals);
+  return { signal };
+}
+
+type Visit = (message: SessionMessageInfo) => "continue" | "stop";
+
+interface WalkResult {
+  /** True only when the timeline was followed through to its end. */
+  readonly complete: boolean;
+  /** True when the visitor asked to stop (a deliberate, known boundary). */
+  readonly stopped: boolean;
+  /** Why a non-complete walk ended without a deliberate stop. */
+  readonly reason?: string;
+}
+
+/**
+ * Walk the message timeline oldest-first, following `cursor.next`.
+ *
+ * The read is bounded in three ways so a caller can never hang or loop forever:
+ * a page cap, a repeated-cursor guard, and a per-request deadline. When any of
+ * them triggers, the walk reports `complete: false`; callers must then treat the
+ * result as ambiguous rather than guessing.
+ */
+async function walkTimeline(
+  client: OpenCodeClient,
+  sessionId: SessionId,
+  visit: Visit,
+  options: ReconcileOptions,
+): Promise<WalkResult> {
+  const maxPages = options.maxPages ?? 100;
+  const requested = new Set<string>();
+  const visited = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 1; ; page += 1) {
+    if (cursor !== undefined) {
+      if (requested.has(cursor)) {
+        return { complete: false, stopped: false, reason: "the server repeated a pagination cursor" };
+      }
+      requested.add(cursor);
+    }
+    const input: MessageListInput = {
+      sessionID: sessionId,
+      ...(options.pageLimit === undefined ? {} : { limit: options.pageLimit }),
+      // The contract says not to combine a cursor with an explicit order.
+      ...(cursor === undefined ? { order: "asc" } : { cursor }),
+    };
+    const response = await client.message.list(input, requestOptionsFor(options));
+    for (const message of response.data) {
+      if (visited.has(message.id)) {
+        return { complete: false, stopped: false, reason: "the timeline repeated a message id" };
+      }
+      visited.add(message.id);
+      if (visit(message) === "stop") return { complete: false, stopped: true };
+    }
+    const next = response.cursor?.next;
+    if (next === undefined || next === null || next === "") return { complete: true, stopped: false };
+    if (page >= maxPages) {
+      return { complete: false, stopped: false, reason: `the page cap of ${maxPages} was reached` };
+    }
+    cursor = next;
   }
-  return undefined;
+}
+
+/** Search the whole (bounded) timeline for the admission's delivered user message. */
+async function findDeliveredAdmission(
+  client: OpenCodeClient,
+  sessionId: SessionId,
+  admissionId: AdmissionId,
+  options: ReconcileOptions,
+): Promise<{ readonly found: boolean; readonly createdAt?: number; readonly complete: boolean }> {
+  let createdAt: number | undefined;
+  const walk = await walkTimeline(
+    client,
+    sessionId,
+    (message) => {
+      if (message.type === "user" && message.id === admissionId) {
+        createdAt = message.time.created;
+        return "stop";
+      }
+      return "continue";
+    },
+    options,
+  );
+  return {
+    found: createdAt !== undefined,
+    ...(createdAt === undefined ? {} : { createdAt }),
+    complete: walk.complete,
+  };
 }
 
 export interface SubmitInput {
@@ -96,10 +201,15 @@ export interface SubmitInput {
 /**
  * Durably admit one session input.
  *
- * On success the server returns the `Session.Inbox.User` it enqueued. If the same
- * admission id is submitted again the server replies 409 Conflict; we then reconcile
- * and report a `duplicate-accepted` receipt, proving exactly one accepted input
- * rather than a second enqueue.
+ * On success the server returns the `Session.Inbox.User` it holds. A repeated
+ * admission id is answered by the server either with `200` (idempotent: it returns
+ * the already-held inbox item) or with `409 ConflictError`. This was observed live:
+ * a real harness retry of the same id returned `200`, not always `409`. Both mean
+ * exactly one accepted input, and neither may be reported as a completion. Because
+ * a `200` retry is indistinguishable from a first accept in that response alone,
+ * `status` is `duplicate-accepted` only when the conflict path reconciled a
+ * pre-existing record; a `200` retry is reported as `accepted`. The single-input
+ * guarantee is the server's; the client never enqueues a second time.
  */
 export async function submitAdmission(
   client: OpenCodeClient,
@@ -129,15 +239,17 @@ export async function submitAdmission(
     }
 
     // Already delivered: the admission id now exists as a persisted user message.
-    const messages = await client.message.list({ sessionID: sessionId, order: "asc" });
-    if (userMessage(messages.data, admissionId) !== undefined) {
+    // The timeline is paginated and bounded, so this cannot miss an old admission
+    // on a later page or loop forever.
+    const delivered = await findDeliveredAdmission(client, sessionId, admissionId, {});
+    if (delivered.found) {
       return {
         kind: "admission",
         status: "duplicate-accepted",
         sessionId,
         admissionId,
         delivery: input.delivery ?? "queue",
-        admittedAt: (userMessage(messages.data, admissionId) as { time: { created: number } }).time.created,
+        admittedAt: delivered.createdAt ?? Date.now(),
         serverVersion,
         reconciled: true,
       };
@@ -152,49 +264,103 @@ export async function submitAdmission(
 }
 
 /**
- * Rebuild the state of an admission from persisted server state.
+ * Rebuild the state of one admission from persisted server state.
  *
  * Event subscriptions are live-only, so a client that was disconnected (or a CLI
  * that exited) has no way to observe what happened. Reading the inbox and the
  * message timeline reconstructs it:
- *   - still in the inbox           -> pending
- *   - user message + idle message  -> succeeded / failed / interrupted
- *   - user message, no idle        -> unknown (in flight, or lost to a restart)
- *   - no record at all             -> unknown
+ *   - still in the inbox                      -> pending
+ *   - authoritative `idle` inside this turn   -> succeeded / failed / interrupted
+ *   - turn ended (next user/synthetic or end)  -> unknown (no terminal outcome)
+ *   - target absent from a fully-read timeline -> unknown
+ *   - timeline unreadable/truncated/ambiguous  -> unknown
+ *
+ * The turn window starts at the target user message and ends at the next
+ * `user`/`synthetic` message (exclusive) or the end of the timeline. An `idle`
+ * that belongs to an earlier turn (before the target) or a later turn (after the
+ * next user message) is never attributed to the target.
+ *
+ * Completion is taken only from an authoritative `idle` outcome. An assistant
+ * message that looks finished (`time.completed`) is deliberately *not* accepted
+ * as a shortcut, because the server records the authoritative terminal marker
+ * separately.
  */
 export async function reconcile(
   client: OpenCodeClient,
   sessionId: SessionId,
   admissionId: AdmissionId,
+  options: ReconcileOptions = {},
 ): Promise<Resolution> {
   assertSessionId(sessionId);
   assertAdmissionId(admissionId);
 
-  const inbox = await client.session.inbox.list({ sessionID: sessionId });
+  const inbox = await client.session.inbox.list({ sessionID: sessionId }, requestOptionsFor(options));
   if (userInboxItem(inbox, admissionId) !== undefined) return { state: "pending" };
 
-  const messages = await client.message.list({ sessionID: sessionId, order: "asc" });
-  const index = messages.data.findIndex((message) => message.type === "user" && message.id === admissionId);
-  if (index === -1) {
+  let found = false;
+  let outcome: Resolution | undefined;
+  let windowEnded = false;
+
+  const walk = await walkTimeline(
+    client,
+    sessionId,
+    (message) => {
+      if (!found) {
+        if (message.type === "user" && message.id === admissionId) found = true;
+        return "continue";
+      }
+      // Inside the target turn. The next user/synthetic message begins another turn.
+      if (message.type === "user" || message.type === "synthetic") {
+        windowEnded = true;
+        return "stop";
+      }
+      if (message.type === "idle") {
+        outcome = classifyIdle(message);
+        windowEnded = true;
+        return "stop";
+      }
+      return "continue";
+    },
+    options,
+  );
+
+  if (outcome !== undefined) return outcome;
+
+  if (!found) {
+    return walk.complete
+      ? {
+          state: "unknown",
+          reason: `admission ${admissionId} is neither enqueued nor present in the message timeline`,
+        }
+      : {
+          state: "unknown",
+          reason: `the message timeline could not be read completely while locating admission ${admissionId} (${walk.reason ?? "truncated"})`,
+        };
+  }
+
+  if (windowEnded) {
     return {
       state: "unknown",
-      reason: `admission ${admissionId} is neither enqueued nor present in the message timeline`,
+      reason: `admission ${admissionId} ended its turn without an authoritative idle outcome`,
     };
   }
 
-  for (const message of messages.data.slice(index + 1)) {
-    if (message.type === "idle") {
-      if (message.outcome === "succeeded") return { state: "succeeded" };
-      if (message.outcome === "interrupted") return { state: "interrupted" };
-      const detail = message.error === undefined ? undefined : structuredErrorSummary(message.error);
-      return detail === undefined ? { state: "failed" } : { state: "failed", detail };
-    }
-  }
+  return walk.complete
+    ? {
+        state: "unknown",
+        reason: `admission ${admissionId} was delivered but no terminal outcome was recorded (in flight or interrupted by a restart)`,
+      }
+    : {
+        state: "unknown",
+        reason: `the message timeline could not be read completely while locating the outcome for admission ${admissionId} (${walk.reason ?? "truncated"})`,
+      };
+}
 
-  return {
-    state: "unknown",
-    reason: `admission ${admissionId} was delivered but no terminal outcome was recorded (in flight or interrupted by a restart)`,
-  };
+function classifyIdle(message: SessionMessageIdle): Resolution {
+  if (message.outcome === "succeeded") return { state: "succeeded" };
+  if (message.outcome === "interrupted") return { state: "interrupted" };
+  const detail = message.error === undefined ? undefined : structuredErrorSummary(message.error);
+  return detail === undefined ? { state: "failed" } : { state: "failed", detail };
 }
 
 function structuredErrorSummary(error: SessionStructuredError): string {
@@ -205,18 +371,28 @@ function structuredErrorSummary(error: SessionStructuredError): string {
 export interface WaitOptions {
   readonly timeoutMs: number;
   readonly pollMs?: number;
+  /**
+   * Deadline applied to each individual HTTP request. Bounds a single stalled
+   * request; defaults to the remaining wait budget.
+   */
+  readonly requestTimeoutMs?: number;
+  /** Caller cancellation. Resolves as `cancelled` rather than hanging. */
   readonly signal?: AbortSignal;
+  readonly maxPages?: number;
+  readonly pageLimit?: number;
 }
 
 export interface WaitResult {
   readonly resolution: Resolution;
   readonly timedOut: boolean;
+  readonly cancelled: boolean;
   readonly polls: number;
 }
 
 /**
- * Optional bounded wait. Returns as soon as the admission reaches a terminal state
- * or the timeout elapses. Never converts a timeout into a success.
+ * Optional bounded wait. Returns as soon as the admission reaches a terminal state,
+ * the total timeout elapses, the caller cancels, or a read fails or times out.
+ * Never converts a timeout or a failed read into a success.
  */
 export async function waitForResolution(
   client: OpenCodeClient,
@@ -225,32 +401,63 @@ export async function waitForResolution(
   options: WaitOptions,
 ): Promise<WaitResult> {
   const pollMs = options.pollMs ?? 500;
-  const deadline = Date.now() + options.timeoutMs;
+  const deadline = Date.now() + Math.max(0, options.timeoutMs);
+  const base: ReconcileOptions = {
+    ...(options.maxPages === undefined ? {} : { maxPages: options.maxPages }),
+    ...(options.pageLimit === undefined ? {} : { pageLimit: options.pageLimit }),
+  };
   let polls = 0;
+  let last: Resolution = { state: "unknown", reason: "no poll completed before the deadline" };
+
   for (;;) {
+    if (options.signal?.aborted === true) return cancelled(polls);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { resolution: last, timedOut: true, cancelled: false, polls };
+
+    const budget = options.requestTimeoutMs === undefined ? remaining : Math.max(1, Math.min(options.requestTimeoutMs, remaining));
     polls += 1;
-    const resolution = await reconcile(client, sessionId, admissionId);
-    const terminal = resolution.state !== "pending" && resolution.state !== "unknown";
-    if (terminal) return { resolution, timedOut: false, polls };
-    if (Date.now() + pollMs > deadline) return { resolution, timedOut: true, polls };
-    await delay(pollMs, options.signal);
+    try {
+      last = await reconcile(client, sessionId, admissionId, {
+        ...base,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        requestTimeoutMs: budget,
+      });
+    } catch (error) {
+      return {
+        resolution: { state: "unknown", reason: `read failed or timed out: ${describeError(error)}` },
+        timedOut: false,
+        cancelled: Boolean(options.signal?.aborted),
+        polls,
+      };
+    }
+
+    if (last.state !== "pending" && last.state !== "unknown") {
+      return { resolution: last, timedOut: false, cancelled: false, polls };
+    }
+    if (Date.now() + pollMs > deadline) return { resolution: last, timedOut: true, cancelled: false, polls };
+    if (await sleep(pollMs, options.signal)) return cancelled(polls);
   }
 }
 
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
+function cancelled(polls: number): WaitResult {
+  return { resolution: { state: "unknown", reason: "wait cancelled" }, timedOut: false, cancelled: true, polls };
+}
+
+/** Resolves `true` when the signal aborted before the delay elapsed. */
+function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
     if (signal?.aborted === true) {
-      reject(new Error("aborted"));
+      resolve(true);
       return;
     }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
     const onAbort = (): void => {
       clearTimeout(timer);
-      reject(new Error("aborted"));
+      resolve(true);
     };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(false);
+    }, ms);
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 }

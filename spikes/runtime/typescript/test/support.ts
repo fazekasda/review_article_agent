@@ -46,6 +46,15 @@ export interface MockServerOptions {
   readonly version?: string;
   /** Token the mock expects; requests without it get 401. Omit for no auth check. */
   readonly requireToken?: string;
+  /** Default page size for `message.list`; omit to return the whole timeline. */
+  readonly pageSize?: number;
+  /** When true, `cursor.next` always repeats, to exercise the client's bound. */
+  readonly stickyCursor?: boolean;
+  /**
+   * How the mock answers a repeated admission id. The live harness observed `200`
+   * (idempotent) rather than only `409`, so both are testable.
+   */
+  readonly duplicatePromptStatus?: 200 | 409;
 }
 
 export function jsonResponse(data: unknown, status = 200): Response {
@@ -59,6 +68,12 @@ function envelope(data: unknown, status = 200): Response {
   return jsonResponse({ data }, status);
 }
 
+/** Cursor format used by the mock: `c<offset>`. */
+function cursorOffset(cursor: string): number {
+  const match = /^c(\d+)$/.exec(cursor);
+  return match === null ? 0 : Number(match[1]);
+}
+
 let idCounter = 0;
 export function testAdmissionId(label: string): string {
   idCounter += 1;
@@ -68,6 +83,12 @@ export function testAdmissionId(label: string): string {
 export class MockServer {
   readonly version: string;
   readonly requests: RecordedRequest[] = [];
+  /** Default `message.list` page size; tests may change it after construction. */
+  pageSize: number | undefined;
+  /** When true, every `message.list` response repeats the same `cursor.next`. */
+  stickyCursor: boolean;
+  /** Status returned for a repeated admission id: 200 (idempotent) or 409. */
+  readonly duplicatePromptStatus: 200 | 409;
   readonly #sessions = new Map<string, MockSession>();
   readonly #overrides = new Map<string, () => Response>();
   readonly #requireToken: string | undefined;
@@ -76,6 +97,9 @@ export class MockServer {
   constructor(options: MockServerOptions = {}) {
     this.version = options.version ?? "2.2.0-test";
     this.#requireToken = options.requireToken;
+    this.pageSize = options.pageSize;
+    this.stickyCursor = options.stickyCursor ?? false;
+    this.duplicatePromptStatus = options.duplicatePromptStatus ?? 409;
   }
 
   /** The transport to hand to `OpenCode.make({ fetch })`. */
@@ -156,6 +180,47 @@ export class MockServer {
     return [...this.#must(sessionId).messages];
   }
 
+  /** Append a delivered user message (starts/ends a turn) out of band. */
+  appendUser(sessionId: string, id: string, text = ""): void {
+    const session = this.#must(sessionId);
+    session.admitted.add(id);
+    session.messages.push({ id, time: { created: Date.now() }, text, type: "user" });
+  }
+
+  /** Append a synthetic message, which also terminates a turn window. */
+  appendSynthetic(sessionId: string, text = ""): void {
+    this.#must(sessionId).messages.push({
+      id: testAdmissionId("synthetic"),
+      time: { created: Date.now() },
+      text,
+      type: "synthetic",
+    });
+  }
+
+  /** Append an assistant message without a terminal idle marker. */
+  appendAssistant(sessionId: string): void {
+    const session = this.#must(sessionId);
+    const assistant: SessionMessageAssistant = {
+      id: testAdmissionId("assistant"),
+      time: { created: Date.now(), completed: Date.now() },
+      type: "assistant",
+      agent: session.info.agent ?? "build",
+      model: session.info.model ?? { id: "test-model", providerID: "test" },
+      content: [],
+    };
+    session.messages.push(assistant);
+  }
+
+  /** Append only a terminal idle marker for the current turn. */
+  appendIdle(sessionId: string, outcome: SessionMessageIdle["outcome"]): void {
+    this.#must(sessionId).messages.push({
+      id: testAdmissionId("idle"),
+      time: { created: Date.now() },
+      type: "idle",
+      outcome,
+    });
+  }
+
   #must(sessionId: string): MockSession {
     const session = this.#sessions.get(sessionId);
     if (session === undefined) throw new Error(`mock has no session ${sessionId}`);
@@ -224,12 +289,37 @@ export class MockServer {
       if (method === "GET" && suffix === "") return envelope(session.info);
       if (method === "GET" && suffix === "/inbox") return envelope(session.inbox);
       if (method === "GET" && suffix === "/message") {
-        return jsonResponse({ data: session.messages, cursor: {} });
+        const limitParam = url.searchParams.get("limit");
+        const cursorParam = url.searchParams.get("cursor");
+        const requested = limitParam === null ? this.pageSize : Number(limitParam);
+        const size =
+          requested === undefined || !Number.isFinite(requested) || requested <= 0
+            ? session.messages.length
+            : requested;
+        const start = cursorParam === null ? 0 : cursorOffset(cursorParam);
+        const slice = session.messages.slice(start, start + size);
+        const end = start + slice.length;
+        let next: string | null = end < session.messages.length ? `c${end}` : null;
+        if (this.stickyCursor) next = "c0";
+        return jsonResponse({ data: slice, cursor: next === null ? {} : { next } });
       }
       if (method === "POST" && suffix === "/prompt") {
         const prompt = (body ?? {}) as { id?: string; text?: string; delivery?: "steer" | "queue" };
         const admissionId = prompt.id ?? testAdmissionId("auto");
         if (session.admitted.has(admissionId)) {
+          if (this.duplicatePromptStatus === 200) {
+            const existing = session.inbox.find((item) => item.id === admissionId);
+            if (existing !== undefined) return envelope(existing);
+            // Already delivered: an idempotent server would return the held item.
+            return envelope({
+              id: admissionId,
+              sessionID: sessionId,
+              time: { created: Date.now() },
+              type: "user",
+              payload: { text: prompt.text ?? "" },
+              delivery: prompt.delivery ?? "queue",
+            });
+          }
           return jsonResponse({ _tag: "ConflictError", message: `admission ${admissionId} already accepted` }, 409);
         }
         session.admitted.add(admissionId);
