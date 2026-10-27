@@ -73,10 +73,19 @@ All the original examples in `01-contracts.md` must be walked through the
 contracts: **duplicate PDF, alternate version, missing full text, uncertain Jev
 decision, omitted result, false critic objection, and secondary-origin warning.**
 
-## Still open — do not silently decide
+## Pending decisions — resolved by decision 002 (historical)
 
-The user's pending decisions (specification "Pending decisions") stay **OPEN**
-until explicitly dispositioned in this session with an owner:
+> **Historical note (added when Step 01 closed).** The section below was the
+> *pre-session* orientation. On 2026-10-27 the user **resolved every item** in the
+> recorded Step 01 interview; the dispositions are in
+> [`docs/decisions/002-step01-contracts-and-policies.md`](../../decisions/002-step01-contracts-and-policies.md)
+> and the register
+> [`docs/contracts/03-policy-decisions.md`](../../contracts/03-policy-decisions.md).
+> Nothing below is still open. It is retained as the record of what the session had
+> to decide, not as a current blocker.
+
+The user's pending decisions (specification "Pending decisions") were **OPEN** until
+dispositioned in this session with an owner (all now resolved — P1–P6 accepted):
 
 - **P1** explicit framework contribution, concept-admission/support/revision
   criteria, and testable implications where applicable;
@@ -97,6 +106,12 @@ Record accept/modify/defer, give open items an owner, and let unresolved items
 block dependent behavior. Do not invent a numeric scientific threshold to let a
 stage pass, and do not treat the language approval as approving any scientific
 policy, the SQLite schema, IPC, or a framework.
+
+**Outcome.** Accept/modify/defer was recorded for every item (all accepted, with
+interview amendments); the language approval was never treated as approving a
+scientific policy, the SQLite schema, IPC, or a framework. No numeric scientific
+threshold was invented; per-project sample/tracing values remain future
+project-setup gates, not Step 01 open items.
 
 ## Runtime invariants to preserve
 
@@ -127,19 +142,25 @@ contract-level agreements, not new policies:
 No production daemon, no full agent framework, no scientific corpus, and no UI.
 No scientific feature completion is claimed by step 01.
 
-## Handoff required
+## Handoff (completed)
 
-End the session with `docs/implementation/handoffs/01-contracts.md` containing
+The session ended with `docs/implementation/handoffs/01-contracts.md` containing
 acceptance evidence per criterion, exactly which checks were run and which were
-not, open decisions with owners, and exact next actions. **Do not merge
-automatically and do not run new paid model tests.** The only paid call recorded
-so far is the single authorized Jev call in step 00.
+not, open decisions with owners, and exact next actions. The step was **not merged
+automatically** and **no new paid model tests** were run. The only paid call
+recorded so far is the single authorized Jev call in step 00.
 
-## Launch prompt (copy and paste into the new session)
+## Launch prompt (historical — step 01 is complete)
 
-> Implement step 01. Read `docs/implementation/01-contracts.md` (authoritative)
+> **Historical / completed.** This was the copy-paste prompt for the session that
+> already ran. Step 01 is closed (see
+> [`handoffs/01-contracts.md`](../handoffs/01-contracts.md)); the launch prompt is
+> retained only as a record. The next implementation step is
+> [`02-project-foundation.md`](../02-project-foundation.md).
+
+> ~~Implement step 01. Read `docs/implementation/01-contracts.md` (authoritative)
 > and `docs/implementation/kickoffs/01-contracts.md`, then follow the kickoff's
 > read order. Follow the step's deliverables, acceptance criteria, and
 > verification verbatim; do not edit its criteria. Leave the handoff at
 > `docs/implementation/handoffs/01-contracts.md`. Do not merge and do not run
-> paid tests.
+> paid tests.~~

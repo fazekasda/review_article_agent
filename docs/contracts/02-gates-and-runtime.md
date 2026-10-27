@@ -14,8 +14,9 @@
   field names, field types, and enum literal spellings — remains a **versioned
   implementation proposal** for review, **not** a line-by-line user ratification of
   every field. The canonical policy disposition is recorded in the sibling decision
-  record `docs/decisions/002-step01-contracts-and-policies.md` (added by the parallel
-  policy/ADR work; resolves at integration) and in
+  record
+  [`../decisions/002-step01-contracts-and-policies.md`](../decisions/002-step01-contracts-and-policies.md)
+  and in
   [`03-policy-decisions.md`](03-policy-decisions.md); where that policy record and
   this contract differ, the policy record governs policy. This contract still makes
   **no** production or scientific-validation claim.
@@ -51,8 +52,9 @@
   [`docs/decisions/001-runtime-language.md`](../decisions/001-runtime-language.md),
   and [`docs/implementation/handoffs/00-runtime-spike.md`](../implementation/handoffs/00-runtime-spike.md).
 - **Selected policies (2026-10-27):** the Step 01 behavioral approvals and selected
-  operational/technical values are recorded in `docs/decisions/002-step01-contracts-and-policies.md`
-  (parallel policy/ADR work; resolves at integration) and the policy register
+  operational/technical values are recorded in
+  [`../decisions/002-step01-contracts-and-policies.md`](../decisions/002-step01-contracts-and-policies.md)
+  and the policy register
   [`03-policy-decisions.md`](03-policy-decisions.md). They are authority for the
   **policy/behavior** represented here.
 - **Sibling identity contract:** artifact references use the immutable reference

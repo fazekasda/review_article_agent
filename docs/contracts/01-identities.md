@@ -14,9 +14,9 @@
 > completeness.
 >
 > The canonical disposition of the selected policies is recorded in the sibling
-> decision record `docs/decisions/002-step01-contracts-and-policies.md` (added by the
-> parallel policy/ADR work; this plain-path reference resolves when that file lands
-> at integration) and in the policy register
+> decision record
+> [`../decisions/002-step01-contracts-and-policies.md`](../decisions/002-step01-contracts-and-policies.md)
+> and in the policy register
 > [`03-policy-decisions.md`](03-policy-decisions.md). Where this contract and that
 > policy record differ, the policy record governs **policy**; this contract governs
 > only the **representation**.
@@ -24,10 +24,13 @@
 > **Document version:** `v1.4` (revision of `v1`; see §9 change log).
 > Versioning rule and change log in §9.
 >
-> **This is not Step 01 completion.** This contract is one of several Step 01
-> deliverables; no Step 01 pass and no schema is claimed here. Selected policies and
+> **This document alone is not Step 01 completion.** This contract is one of several
+> Step 01 deliverables, so by itself it is not completion proof and it claims no
+> audited schema. The step's completion statement and criterion-by-criterion evidence
+> are in the Step 01
+> [handoff](../implementation/handoffs/01-contracts.md). Selected policies and
 > mandatory per-project values are recorded in §8; their field-level representation
-> remains a proposal.
+> remains a versioned, reviewable implementation representation.
 >
 > **Sources this document is derived from:**
 > - [Scientific and product baseline](../specification.md) — Confirmed scientific
@@ -40,9 +43,8 @@
 > - [Runtime language decision 001](../decisions/001-runtime-language.md) —
 >   accepted runtime decision; it approves **no** scientific policy, schema, IPC,
 >   or framework.
-> - `docs/decisions/002-step01-contracts-and-policies.md` — the Step 01 policy
->   decision record for the 2026-10-27 behavioral approvals (added by the parallel
->   policy/ADR work; resolves at integration).
+> - [`docs/decisions/002-step01-contracts-and-policies.md`](../decisions/002-step01-contracts-and-policies.md)
+>   — the Step 01 policy decision record for the 2026-10-27 behavioral approvals.
 >
 > **Non-claims.** This document invents no numeric scientific threshold and asserts
 > no audited completeness. The P1–P6 **behavioral direction** was selected
@@ -398,7 +400,7 @@ Rules:
 C01 does **not** define a canonical rights schema. The canonical record is
 `RightsRecord` v1 in the sibling policy contract
 [`03-policy-decisions.md` §5.1](03-policy-decisions.md#51-rightsrecord-v1--canonical-immutable-identity-and-typing)
-(C03, part of this coordinated proposal bundle). C01 holds a **read-only
+(C03, part of this coordinated contract set). C01 holds a **read-only
 projection** of that canonical record and never re-decides rights. The shared
 operation enum is `allowed | not_allowed | unknown | not_applicable`.
 
@@ -446,8 +448,11 @@ Rules (the projection adds no rights; the policy record is authoritative):
   MUST NOT be set to `not_applicable` merely because the artifact is "ours".
 - `unknown` **blocks** the affected operation. In particular, if
   `hosted_model_transfer_right` is `unknown`, no hosted transfer may be attempted;
-  extraction must use a **local model or a human**. Provider/journal verification
-  (P5, selected) still gates hosted transfer (§8; policy register §5).
+  extraction must use a **local model or a human**. The P5/P6 verification gates are
+  **operation-scoped**: **provider-term verification gates hosted transfer**, and
+  **journal-policy verification gates submission-facing approval** — the latter
+  applies **only when a venue is selected** (an unselected/unknown venue is **not** a
+  blanket prohibition). See §8; policy register §5.5.
 
 **Constant reminder:** uploading a file is NOT proof of any of these rights; each
 operation is decided independently.

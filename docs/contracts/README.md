@@ -1,20 +1,26 @@
-# Step 01 contracts — proposal bundle (reading map)
+# Step 01 contracts — reading map
 
-> **Status: PROPOSED — awaiting user ratification. This is not Step 01 completion
-> and not an approval.** This page is only a map of the proposed Step 01 contract
-> set. Every document it points at is a **proposal for review**; nothing here is
-> ratified science, an approved schema, an accepted policy, or a claim that any
-> feature is implemented. Only the **user** moves a policy/technical item out of
-> `proposed` (see §"Authority vs. proposal" and
-> [`03-policy-decisions.md` §1](03-policy-decisions.md)).
+> **Status: ACCEPTED direction (2026-10-27); representation reviewable.** The user
+> approved the **behavior and technical direction** of this bundle in the recorded
+> Step 01 interview (see
+> [`../decisions/002-step01-contracts-and-policies.md`](../decisions/002-step01-contracts-and-policies.md)
+> and [`03-policy-decisions.md`](03-policy-decisions.md)). The record names, field
+> names, enum spellings, state vocabulary, rights schema, and architecture **schema**
+> remain a **versioned implementation-facing representation** — reviewable
+> line-by-line, but **not** a new human-ratification gate: the user approved the
+> described behavior, not every field spelling, and a field-spelling change is a
+> versioned representation revision, not a Step 01 blocker. This page is the reading
+> map to the accepted direction; the Step 01
+> [handoff](../implementation/handoffs/01-contracts.md) carries the
+> criterion-by-criterion evidence and the completion statement.
 
 ## What is in the bundle
 
-| Document | Doc version | What it proposes |
-| --- | --- | --- |
-| [`01-identities.md`](01-identities.md) | `v1.3` (proposed) | Artifact/revision identity, evidence and attribution records, provenance, dependency links, missing/unknown states, rights **projection**, worked examples. |
-| [`02-gates-and-runtime.md`](02-gates-and-runtime.md) | `v3.1` (proposed) | Revision-specific approvals and dependency snapshots, findings/issue lifecycle, review budgets, machine vs. human decisions, runtime safety (pause/cancel, project switching, restart reconciliation). |
-| [`03-policy-decisions.md`](03-policy-decisions.md) | `v1` (proposed) | The decision **register** for P1–P6 and operational/technical items, the canonical `RightsRecord` v1, and the proposed architecture direction. |
+| Document | Doc version | Status | What it represents |
+| --- | --- | --- | --- |
+| [`01-identities.md`](01-identities.md) | `v1.4` | Behavior approved 2026-10-27; representation reviewable | Artifact/revision identity, evidence and attribution records, provenance, dependency links, missing/unknown states, rights **projection**, worked examples. |
+| [`02-gates-and-runtime.md`](02-gates-and-runtime.md) | `v3.2` | Behavior approved 2026-10-27; representation reviewable | Revision-specific approvals and dependency snapshots, findings/issue lifecycle, review budgets, machine vs. human decisions, runtime safety (pause/cancel, project switching, restart reconciliation). |
+| [`03-policy-decisions.md`](03-policy-decisions.md) | `v1` | **ACCEPTED** (all items, 2026-10-27) | The decision **register** for P1–P6 and operational/technical items, the canonical `RightsRecord` v1, and the accepted architecture direction. |
 
 Confirmed sources that must not be weakened (read-only authority) are
 [`../specification.md`](../specification.md) and the Step 01 step document
@@ -24,22 +30,27 @@ runtime invariants, and the accepted
 [decision 001](../decisions/001-runtime-language.md) selects the runtime
 language/integration only.
 
-## Authority vs. proposal
+## Authority vs. representation
 
 - **Authority (not reopened here):** the confirmed requirements in
   [`../specification.md`](../specification.md) and the Step 01 acceptance criteria
   in [`../implementation/01-contracts.md`](../implementation/01-contracts.md), plus
   the runtime invariants in the [kickoff](../implementation/kickoffs/01-contracts.md).
-  A proposal below **must not silently override** them.
-- **Proposal (this bundle):** all record names, field names, field types, enum
-  literals, state vocabulary, rights schema, and the architecture direction. They
-  are written normatively so reviewers can check them mechanically, but they are
-  **not in force** until the user ratifies them.
-- **Who decides:** every P1–P6 and operational/technical record is owned by the
-  **user** and stays `proposed` until the user dispositions it with `user_evidence`
-  and a `decided_against_revision` SHA ([`03-policy-decisions.md` §1](03-policy-decisions.md)).
-  A session or coordinator may **write** an entry but may **not** accept, modify,
-  or defer it.
+  The accepted policies below **must not silently override** them.
+- **Accepted behavior (2026-10-27):** the described behavior and technical direction
+  of the P1–P6 and operational items, recorded in
+  [`03-policy-decisions.md`](03-policy-decisions.md) and the decision record
+  [`../decisions/002-step01-contracts-and-policies.md`](../decisions/002-step01-contracts-and-policies.md).
+- **Reviewable representation (this bundle):** the record names, field names, field
+  types, enum literals, state vocabulary, and rights schema. They are written
+  normatively so reviewers can check them mechanically, and they are an
+  **implementation-facing, versioned contract**. The user approved the behavior, not
+  every field spelling; a field-spelling change is a versioned representation
+  revision, not a new human-approval round.
+- **Who decides:** the **user** owns every policy/technical item; the accepted
+  statuses and the exact-revision anchor are recorded in
+  [`03-policy-decisions.md`](03-policy-decisions.md). Only the **user** reopens an
+  accepted item, by a new exact-revision decision.
 
 ## Requirement-to-section map
 
@@ -81,13 +92,13 @@ The seven named worked examples (kickoff lines 79–80):
   exact immutable `record_revision`, with explicit types and out-of-band
   provenance (C03 §5.1/§5.2).
 
-## Recommendations for user decision (not approvals)
+## Accepted technical direction (2026-10-27)
 
-These are the coordinator's **concrete technical recommendations** offered for the
-user to accept, modify, or defer (**not** an approval, and **not** ratifying any
-scientific value). Each is scoped to the open architecture items in
-[`03-policy-decisions.md` §4](03-policy-decisions.md); the alternatives remain
-recorded there and nothing is decided by this page.
+These were the coordinator's **concrete technical recommendations**; the user
+**accepted the direction** in the recorded Step 01 interview (the described
+behavior and direction — not every schema field). The alternatives remain recorded
+in [`03-policy-decisions.md`](03-policy-decisions.md) §4, and the exact schema
+spelling is Step 02 work under the accepted direction.
 
 1. **Storage (ARCH-STORE / ARCH-ACTIVE-ENF).** One **app-owned project-scoped
    SQLite store per project**, plus a **minimal atomic application-level registry**
@@ -105,18 +116,19 @@ recorded there and nothing is decided by this page.
    `cli/`, `worker/`, `adapters/` (the OpenCode HTTP integration isolated behind
    one adapter module), and **no agent framework**.
 
-No scientific numeric value (threshold, sample size, severity score, hop/source/
-retry default, or cost/concurrency limit) is proposed here; those remain `UNSET`
-and owned by the user ([`03-policy-decisions.md` §1.1](03-policy-decisions.md),
-§2–§3).
+No numeric **scientific** value (threshold, sample size, severity score, or
+hop/source/retry default) is set here; per-project values remain project-setup
+gates ([`03-policy-decisions.md`](03-policy-decisions.md)). The selected
+cost/concurrency defaults are USD 25 cumulative per project, USD 10 cumulative per
+stage, and at most 2 simultaneous external-model calls.
 
 ## Status and handoff
 
-- Every contract in this bundle is **proposed**; the Step 01
+- The behavioral directions are accepted (2026-10-27); the representation remains a
+  versioned implementation contract (above). The Step 01
   [handoff](../implementation/handoffs/01-contracts.md) records criterion-by-criterion
-  evidence as **draft vs. pending ratification** and states that **Step 02 is
-  blocked** until the user dispositions the open items. This bundle **does not**
-  claim Step 01 completion.
+  evidence with valid/invalid/missing examples. This map is not itself completion
+  proof; the handoff is the completion statement.
 - Offline documentation checks for this bundle:
   [`scripts/check_contract_docs.py`](../../scripts/check_contract_docs.py)
   (`python3 scripts/check_contract_docs.py`).

@@ -15,7 +15,10 @@ revision **`ee7f7eafca80baa6c1aaca278361e56a663493c3`** and are dated **2026-10-
 The user's evidence is the recorded Step 01 interview at
 `/home/fazekasda/.local/state/opencode-coordinator/6803b8c89a0b0dd2de643e7cb58db51e763c4278393e2fb549f2b30cd4ebb0c9/20261027T215129Z-72e522b4/interview.json`
 (conversation selections recorded against that same `source_revision`; not an
-independent approval service), plus the user's follow-up instruction
+independent approval service). That external path is **optional provenance only**:
+the verbatim interview selections are reproduced in full in the table below, so this
+record is **self-contained** and has **no runtime dependency** on that file. The
+user's follow-up instruction was
 **"Proceed forward and finalize this step until a ready PR."**
 
 **What this approval is and what it is not.** It approves the **described behavior
