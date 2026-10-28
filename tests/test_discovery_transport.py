@@ -682,5 +682,67 @@ class BrokenConnectionTests(unittest.TestCase):
         self.assertFalse(out.truncated)
 
 
+class LocalInterruptionTests(unittest.TestCase):
+    """The opt-in local-refusal signal (Step 05 X1-R1 repair).
+
+    ``DiscoveryRequestInterrupted`` lets a trusted low-level hook refuse an
+    attempt locally (budget/gate) **before** any socket is opened. Only this type
+    is swallowed; the transport then returns an explicit failed result retaining
+    the attempts already recorded and fabricating none.
+    """
+
+    def test_typed_signal_is_a_transport_error_not_a_network_error(self):
+        self.assertTrue(
+            issubclass(transport.DiscoveryRequestInterrupted, transport.DiscoveryTransportError)
+        )
+        self.assertFalse(
+            issubclass(transport.DiscoveryRequestInterrupted, transport.TransportNetworkError)
+        )
+
+    def test_refusal_adds_no_fabricated_attempt(self):
+        client, fake, _, _ = make_client(
+            [transport.DiscoveryRequestInterrupted("request_limit")]
+        )
+        result = client.get(ESEARCH, {"term": "x"})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure, "attempts_exhausted")
+        self.assertEqual(result.attempts, ())
+        self.assertEqual(result.attempt_count, 0)
+        # The hook was consulted once, but no HTTP attempt was recorded.
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_refusal_after_a_real_failed_attempt_retains_only_real_attempts(self):
+        client, fake, _, _ = make_client(
+            [
+                response(503),
+                transport.DiscoveryRequestInterrupted("request_limit"),
+                response(200, b"{}"),  # must never be reached
+            ]
+        )
+        result = client.get(ESEARCH, {"term": "x"})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure, "attempts_exhausted")
+        self.assertEqual(result.attempt_count, 1)
+        self.assertEqual([a.outcome for a in result.attempts], ["retryable"])
+        self.assertEqual([a.status for a in result.attempts], [503])
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_genuine_exhaustion_records_exactly_max_attempts(self):
+        # The invariant that distinguishes a real exhaustion from a local refusal.
+        client, _, _, _ = make_client(
+            [response(503), response(503), response(503)], max_attempts=3
+        )
+        result = client.get(ESEARCH, {"term": "x"})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure, "attempts_exhausted")
+        self.assertEqual(result.attempt_count, 3)
+        self.assertEqual([a.outcome for a in result.attempts], ["retryable"] * 3)
+
+    def test_other_hook_exceptions_still_propagate(self):
+        client, _, _, _ = make_client([RuntimeError("boom")])
+        with self.assertRaises(RuntimeError):
+            client.get(ESEARCH, {"term": "x"})
+
+
 if __name__ == "__main__":
     unittest.main()

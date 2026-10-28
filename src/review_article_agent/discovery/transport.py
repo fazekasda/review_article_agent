@@ -105,6 +105,7 @@ __all__ = [
     "DiscoveryValidationError",
     "DiscoveryEndpointError",
     "TransportNetworkError",
+    "DiscoveryRequestInterrupted",
     "TransportResponse",
     "AttemptRecord",
     "RetrievalResult",
@@ -268,6 +269,19 @@ class DiscoveryEndpointError(DiscoveryTransportError):
 
 class TransportNetworkError(DiscoveryTransportError):
     """A low-level transport could not complete a request (no HTTP status)."""
+
+
+class DiscoveryRequestInterrupted(DiscoveryTransportError):
+    """A trusted low-level hook refused an attempt **before** any socket was opened.
+
+    This is an **opt-in** local signal (budget or gate refusal) raised by an
+    injected low-level transport. :meth:`DiscoveryTransport.get` catches *only*
+    this type and returns an explicit failed
+    :class:`RetrievalResult` (``failure="attempts_exhausted"``) that retains every
+    attempt already recorded in that call and adds **no** attempt for the refused
+    request, because no request was made. Any other exception type is unaffected
+    and propagates as before.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -978,6 +992,12 @@ class DiscoveryTransport:
         with static diagnostics and full attempt provenance. (A locally-injected
         ``transport`` that violates its contract is a caller bug and raises
         :class:`DiscoveryValidationError`.)
+
+        An injected low-level hook may refuse an attempt locally by raising the
+        opt-in :class:`DiscoveryRequestInterrupted`; that is the **only** hook
+        exception swallowed here, and it yields an explicit failed result
+        (``failure="attempts_exhausted"``) retaining the attempts already recorded
+        with no fabricated attempt. Every other hook exception propagates.
         """
         final_url = build_request_url(url, params)
         attempts: list[AttemptRecord] = []
@@ -989,6 +1009,18 @@ class DiscoveryTransport:
                     final_url,
                     timeout=self._timeout,
                     max_response_bytes=self._max_response_bytes,
+                )
+            except DiscoveryRequestInterrupted:
+                # A trusted local hook (budget/gate) refused *before* any socket
+                # was opened. No attempt is fabricated for the refused request:
+                # return an explicit failure that retains only the attempts
+                # already recorded in this call.
+                return self._failure(
+                    final_url,
+                    attempts,
+                    "attempts_exhausted",
+                    None,
+                    "the request was refused locally before it was attempted",
                 )
             except TransportNetworkError:
                 completed_at = self._utcnow()

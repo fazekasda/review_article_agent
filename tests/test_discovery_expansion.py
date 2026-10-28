@@ -441,6 +441,16 @@ class FailureTests(ExpansionBase):
 # --------------------------------------------------------------------------- #
 # Durable replay and operation identity
 # --------------------------------------------------------------------------- #
+class ExplodingProvider:
+    """A low-level provider that must never be called (asserts no I/O)."""
+
+    calls: list[str] = []
+
+    def __call__(self, url, *, timeout, max_response_bytes):
+        ExplodingProvider.calls.append(url)
+        raise transport.TransportNetworkError("must not be called")
+
+
 class PersistenceTests(ExpansionBase):
     def test_relations_are_persisted_under_deterministic_keys(self):
         provider = FakeProvider(
@@ -520,27 +530,126 @@ class PersistenceTests(ExpansionBase):
         )
         self.assertEqual(first.to_mapping(), replay_first.to_mapping())
 
-    def test_replay_is_stable_when_a_relation_was_page_budget_capped(self):
+    def _reopen_repo(self):
+        self.store.close()
+        reopened = ProjectStore.open_at(
+            self.app_dir, expected_project_id=self.project_id
+        )
+        self.addCleanup(reopened.close)
+        self.store = reopened
+        self.repo = DiscoveryRepository(reopened)
+        return self.repo
+
+    def test_budget_refusal_mid_relation_keeps_prior_page_and_edge_across_reopen(self):
         provider = FakeProvider(
             {
                 ("MED", "1", "references"): [
-                    json_response(ref_payload(5, [entry("2")]))  # declares 5, needs more pages
+                    json_response(ref_payload(2, [entry("2")])),  # page 1: declares 2
+                    json_response(ref_payload(2, [entry("3")])),  # page 2 (would be needed)
                 ],
                 ("MED", "1", "citations"): [json_response(cit_payload(0, []))],
             }
         )
-        capped_limits = limits(max_requests=1, max_pages=5)
+        limited = limits(max_requests=1, max_pages=5, page_size=1)
         first = self.run_expansion(
-            provider, [CitationNode("MED", "1")], limits=capped_limits
+            provider, [CitationNode("MED", "1")], limits=limited
         )
+        # Page 1 was the only real request; page 2 was refused locally.
+        self.assertEqual(len(provider.calls), 1)
+        self.assertLessEqual(len(provider.calls), limited.max_requests)
         reasons = {stop.reason for stop in first.stops}
-        self.assertIn("page_budget_capped", reasons)
         self.assertIn("request_limit", reasons)
-        # The replay makes no provider call and halts at exactly the same point.
-        replay = self.run_expansion(
-            FakeProvider(), [CitationNode("MED", "1")], limits=capped_limits
+        self.assertIn("relation_interrupted", reasons)
+        # The partial relation is persisted and the page-1 edge is retained.
+        references = [r for r in first.relations if r.direction == "references"][0]
+        self.assertEqual(references.page_count, 2)  # page 1 + the refused failed page
+        self.assertEqual(references.record_count, 1)
+        self.assertEqual(
+            [e.child_source_id for e in _edges_for(first, "MED:1", "references")],
+            ["MED:2"],
         )
+        self.assertFalse(first.to_mapping()["guarantees"]["completeness_claimed"])
+
+        # Reopen and replay with an exploding provider: identical report, no I/O.
+        repo = self._reopen_repo()
+        ExplodingProvider.calls = []
+        replay = expand_citations(
+            repo,
+            [CitationNode("MED", "1")],
+            request_id="run-1",
+            limits=limited,
+            transport=ExplodingProvider(),
+        )
+        self.assertEqual(ExplodingProvider.calls, [])
         self.assertEqual(first.to_mapping(), replay.to_mapping())
+
+    def test_callback_refusal_mid_relation_keeps_prior_page_and_edge_across_reopen(self):
+        provider = FakeProvider(
+            {
+                ("MED", "1", "references"): [
+                    json_response(ref_payload(2, [entry("2")])),  # page 1 allowed
+                    json_response(ref_payload(2, [entry("3")])),  # page 2 refused
+                ],
+                ("MED", "1", "citations"): [json_response(cit_payload(0, []))],
+            }
+        )
+        allowed_first_only = {"count": 0}
+
+        def gate(_context):
+            allowed_first_only["count"] += 1
+            return allowed_first_only["count"] <= 1
+
+        lim = limits(max_requests=8, max_pages=5, page_size=1)
+        first = self.run_expansion(
+            provider, [CitationNode("MED", "1")], limits=lim, before_request=gate
+        )
+        self.assertEqual(len(provider.calls), 1)
+        reasons = {stop.reason for stop in first.stops}
+        self.assertIn("before_request_refused", reasons)
+        self.assertNotIn("request_limit", reasons)
+        self.assertEqual(
+            [e.child_source_id for e in _edges_for(first, "MED:1", "references")],
+            ["MED:2"],
+        )
+
+        # Replay WITHOUT the callback must still reproduce the identical report,
+        # because the cause is derived from the persisted partial result.
+        repo = self._reopen_repo()
+        ExplodingProvider.calls = []
+        replay = expand_citations(
+            repo,
+            [CitationNode("MED", "1")],
+            request_id="run-1",
+            limits=lim,
+            transport=ExplodingProvider(),
+        )
+        self.assertEqual(ExplodingProvider.calls, [])
+        self.assertEqual(first.to_mapping(), replay.to_mapping())
+
+    def test_retry_then_refusal_keeps_real_attempts_and_no_fictitious_attempt(self):
+        provider = FakeProvider(
+            {
+                ("MED", "1", "references"): [
+                    response(503),
+                    json_response(ref_payload(0, [])),  # never reached
+                ],
+            }
+        )
+        lim = limits(max_requests=1, max_pages=5)
+        report = self.run_expansion(provider, [CitationNode("MED", "1")], limits=lim)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertLessEqual(len(provider.calls), lim.max_requests)
+        references = [r for r in report.relations if r.direction == "references"][0]
+        self.assertEqual(references.stop_reason, "failure")
+        self.assertFalse(references.complete)
+        # Exactly the one *real* retryable attempt is retained; no fabricated one.
+        self.assertEqual(references.attempt_count, 1)
+        stored = {r.request_id: r for r in self.repo.list_searches()}
+        partial = stored[references.request_id].result
+        last = partial.pages[-1]
+        self.assertEqual([a.outcome for a in last.attempts], ["retryable"])
+        self.assertEqual([a.status for a in last.attempts], [503])
+        self.assertIn("request_limit", {s.reason for s in report.stops})
 
     def test_accepts_a_project_store_directly(self):
         provider = FakeProvider(

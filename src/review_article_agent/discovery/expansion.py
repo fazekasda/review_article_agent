@@ -39,8 +39,9 @@ the shared :class:`~review_article_agent.discovery.transport.DiscoveryTransport`
   new record-size rule is invented here.
 * **Every low-level HTTP attempt is budgeted.** The request cap counts **every**
   real low-level attempt, including transport retries, not merely one per relation
-  call (see :class:`_GuardedLowLevel`). The shared transport is reused unchanged:
-  its low-level hook is injected, so no edit to ``transport.py`` is required.
+  call (see :class:`_GuardedLowLevel`). The shared transport is reused unchanged in
+  behaviour: its low-level hook is injected, and the only transport addition is one
+  opt-in exception type it catches (see below).
 * **Durable, replayable provenance.** Each relation result is persisted through
   the existing :class:`~review_article_agent.storage.discovery.DiscoveryRepository`
   under a deterministic relation request key derived from the operation
@@ -86,16 +87,19 @@ results.
 Known limitations (honest, not hidden)
 --------------------------------------
 
-* **An interrupted relation is a gap, not a stored partial result.** A request
-  budget or a ``before_request`` refusal stops the traversal by raising an
-  internal halt that propagates out of the shared adapter. Prior *completed*
-  relation results (and every page they held) and every observed edge are always
-  retained, and the interrupted relation is recorded as an explicit
-  ``relation_interrupted`` gap. Because the shared adapter returns its pages only
-  on completion and ``transport.py``/``citations.py`` must not change, the
-  not-yet-returned pages of an interrupted relation are not reconstructed here.
-  The caller can re-run once budget is available; the deterministic keys then
-  reuse whatever did complete.
+* **An interrupted relation is preserved and marked, never silently lost.** A
+  request budget or a ``before_request`` refusal stops the traversal with an
+  explicit ``request_limit``/``before_request_refused`` gap (plus
+  ``relation_interrupted``). The refusal is raised by the injected low-level hook
+  as the opt-in
+  :class:`~review_article_agent.discovery.transport.DiscoveryRequestInterrupted`
+  and caught only by :meth:`DiscoveryTransport.get`, which returns an explicit
+  failed retrieval with the attempts already recorded and **no** fabricated
+  attempt; the shared adapter then returns a partial :class:`SearchResult` that
+  keeps every already-observed page and edge. That partial result is persisted
+  like any other, so a replay reproduces the identical report with no provider
+  request. The only thing not reconstructed is a page whose request was never
+  made, which is exactly the explicit local gap.
 * **The request budget is not a research budget.** ``max_requests`` counts
   low-level attempts, including retries; hitting it is an explicit stop, never
   "we searched everything".
@@ -130,6 +134,8 @@ from .citations import (
 )
 from .records import SearchResult
 from .transport import (
+    DEFAULT_MAX_ATTEMPTS,
+    DiscoveryRequestInterrupted,
     DiscoveryTransport,
     DiscoveryValidationError,
     http_get,
@@ -182,11 +188,18 @@ MAX_REQUESTS_HARD = 1_000_000
 #: The caller's replay key follows the existing bounded opaque-identifier shape.
 MAX_REQUEST_ID_CHARS = 512
 
+#: The retry budget this module configures on its internal transport. It is fixed
+#: (never caller-supplied) so that a local refusal — which can only happen at
+#: attempt ``1.._INTERNAL_MAX_ATTEMPTS`` — is unambiguously distinguishable, from
+#: the persisted result alone, from a genuine provider ``attempts_exhausted``
+#: (which always records exactly this many attempts). This keeps a replayed
+#: interrupted relation identical to the original without any new field.
+_INTERNAL_MAX_ATTEMPTS = DEFAULT_MAX_ATTEMPTS
+
 #: Static, curated expansion stop reasons (never peer text).
 #: ``hop_limit`` / ``source_limit`` / ``request_limit`` / ``before_request_refused``
 #: are budget or policy stops; ``relation_incomplete`` / ``empty_relation`` /
-#: ``unsafe_native_id`` / ``page_budget_capped`` / ``relation_interrupted`` are
-#: explicit coverage gaps.
+#: ``unsafe_native_id`` / ``relation_interrupted`` are explicit coverage gaps.
 EXPANSION_STOP_REASONS = (
     "hop_limit",
     "source_limit",
@@ -196,7 +209,6 @@ EXPANSION_STOP_REASONS = (
     "relation_incomplete",
     "empty_relation",
     "unsafe_native_id",
-    "page_budget_capped",
 )
 
 
@@ -209,15 +221,6 @@ class ExpansionError(ReviewAgentError):
 
 class ExpansionValidationError(ExpansionError, ValueError):
     """A locally supplied argument is invalid (nothing was requested)."""
-
-
-class _ExpansionHalt(Exception):
-    """Internal control-flow: a real attempt was refused before it was made."""
-
-    def __init__(self, reason: str, detail: str) -> None:
-        super().__init__(f"{reason}: {detail}")
-        self.reason = reason
-        self.detail = detail
 
 
 # --------------------------------------------------------------------------- #
@@ -453,8 +456,12 @@ class _GuardedLowLevel:
     :class:`~review_article_agent.discovery.transport.DiscoveryTransport`, so it is
     invoked **before every real low-level attempt** — including each transport
     retry. When the budget is exhausted, or the callback refuses (returns ``False``
-    or raises), it raises :class:`_ExpansionHalt` **before** any request, so no
-    socket call is made and the shared transport records no fabricated attempt.
+    or raises), it raises the public, opt-in
+    :class:`~review_article_agent.discovery.transport.DiscoveryRequestInterrupted`
+    **before** any request. The shared transport then returns an explicit failed
+    retrieval that preserves the attempts already recorded and fabricates none;
+    no synthetic HTTP response is ever returned. The refusal cause is kept on
+    :attr:`interrupt_reason`.
     """
 
     def __init__(
@@ -477,12 +484,17 @@ class _GuardedLowLevel:
         self._relation_key = relation_key
         self._parent = parent
         self._direction = direction
+        self.interrupted = False
+        self.interrupt_reason: str | None = None
+
+    def _refuse(self, reason: str) -> None:
+        self.interrupted = True
+        self.interrupt_reason = reason
+        raise DiscoveryRequestInterrupted(reason)
 
     def __call__(self, url: str, *, timeout: float, max_response_bytes: int) -> Any:
         if self._budget.remaining <= 0:
-            raise _ExpansionHalt(
-                "request_limit", "the request budget is exhausted"
-            )
+            self._refuse("request_limit")
         if self._before is not None:
             context = RequestAttemptContext(
                 request_id=self._request_id,
@@ -495,16 +507,10 @@ class _GuardedLowLevel:
             )
             try:
                 decision = self._before(context)
-            except Exception as exc:  # noqa: BLE001 - a refusing callback stops us
-                raise _ExpansionHalt(
-                    "before_request_refused",
-                    "the before_request callback refused an attempt",
-                ) from exc
+            except Exception:  # noqa: BLE001 - a refusing callback stops us
+                self._refuse("before_request_refused")
             if decision is False:
-                raise _ExpansionHalt(
-                    "before_request_refused",
-                    "the before_request callback refused an attempt",
-                )
+                self._refuse("before_request_refused")
         self._budget.remaining -= 1
         self._budget.attempts += 1
         return self._lowlevel(
@@ -774,6 +780,35 @@ def _relation_expansion(
     )
 
 
+def _local_interruption_cause(
+    result: SearchResult, cumulative_attempts: int, max_requests: int
+) -> str | None:
+    """Classify a locally interrupted relation result, or return ``None``.
+
+    A local budget/gate refusal produces a failed relation whose **last** page is
+    an ``attempts_exhausted`` failure holding *fewer* than
+    :data:`_INTERNAL_MAX_ATTEMPTS` attempts: the shared transport returns as soon
+    as its hook refuses, so it never records its final attempt. A genuine provider
+    exhaustion always records exactly :data:`_INTERNAL_MAX_ATTEMPTS` attempts, so
+    the two are distinguishable from the persisted result alone (and therefore a
+    replay agrees without any new stored field). The precise cause is then derived
+    deterministically: the budget boundary is reached exactly when the cumulative
+    recorded attempts equal ``max_requests``; otherwise a gate refused.
+    """
+    if result.stop_reason != "failure" or result.failure != "attempts_exhausted":
+        return None
+    if not result.pages:
+        return None
+    last = result.pages[-1]
+    if last.complete or last.failure != "attempts_exhausted":
+        return None
+    if len(last.attempts) >= _INTERNAL_MAX_ATTEMPTS:
+        return None  # a genuine provider exhaustion, not a local refusal
+    if cumulative_attempts >= max_requests:
+        return "request_limit"
+    return "before_request_refused"
+
+
 def _split_native(
     source_id: str | None,
 ) -> tuple[str | None, str | None, bool]:
@@ -904,45 +939,45 @@ def expand_citations(
             relation_key = _relation_key(
                 request_id, fingerprint, direction, node
             )
-            try:
-                record = _retrieve(
-                    repo=repo,
-                    existing=existing,
-                    lowlevel=lowlevel,
-                    budget=budget,
-                    before_request=before_request,
-                    request_id=request_id,
-                    fingerprint=fingerprint,
-                    relation_key=relation_key,
-                    node=node,
-                    direction=direction,
-                    limits=validated_limits,
-                )
-            except _ExpansionHalt as halt:
-                stops.add(halt.reason, halt.detail, node, direction)
-                stops.add(
-                    "relation_interrupted",
-                    "a relation retrieval was interrupted before it completed",
-                    node,
-                    direction,
-                )
-                halt_reason = halt.reason
-                halted = True
-                break
+            record = _retrieve(
+                repo=repo,
+                existing=existing,
+                lowlevel=lowlevel,
+                budget=budget,
+                before_request=before_request,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                relation_key=relation_key,
+                node=node,
+                direction=direction,
+                limits=validated_limits,
+            )
 
             relations.append(_relation_expansion(record, node, direction))
             result: SearchResult = record.result
-            if result.stop_reason == "page_limit" and (
-                len(result.pages) < validated_limits.max_pages
-            ):
-                # The page budget was capped to the remaining request budget (this
-                # is re-derived from the persisted result, so a replay agrees).
+            local_cause = _local_interruption_cause(
+                result, budget.attempts, validated_limits.max_requests
+            )
+            if local_cause is not None:
+                # A trusted local refusal (budget or gate) — not a provider
+                # failure. The persisted partial result and the edges below retain
+                # everything already observed; only the not-yet-requested pages
+                # are missing, and that is an explicit, typed gap.
                 stops.add(
-                    "page_budget_capped",
-                    "the page budget was capped to the remaining request budget",
+                    local_cause,
+                    "a local budget/gate refusal stopped this relation before "
+                    "its remaining requests were made",
                     node,
                     direction,
                 )
+                stops.add(
+                    "relation_interrupted",
+                    "a relation retrieval was interrupted locally before it completed",
+                    node,
+                    direction,
+                )
+                halted = True
+                halt_reason = local_cause
             if result.stop_reason != "completed":
                 stops.add(
                     "relation_incomplete",
@@ -1061,10 +1096,11 @@ def _retrieve(
 
     A relation already recorded for this exact key is reused with **no** provider
     request; its recorded attempt count is still debited from the request budget so
-    an exact replay stops at exactly the same point. Otherwise at most
-    ``min(max_pages, remaining budget)`` pages are requested (so the request budget
-    is never exceeded by page count alone, and prior pages survive), and the result
-    is persisted through the repository.
+    an exact replay stops at exactly the same point. Otherwise the relation is
+    requested up to ``max_pages`` pages; if the request budget runs out mid-relation
+    the injected hook refuses the next request locally and the shared transport
+    returns a partial result that keeps every page already observed, which is then
+    persisted through the repository.
     """
     saved = existing.get(relation_key)
     if saved is not None:
@@ -1072,10 +1108,6 @@ def _retrieve(
         budget.remaining -= reused_attempts
         budget.attempts += reused_attempts
         return saved
-
-    effective_pages = min(limits.max_pages, budget.remaining)
-    if effective_pages < 1:
-        raise _ExpansionHalt("request_limit", "the request budget is exhausted")
 
     guard = _GuardedLowLevel(
         lowlevel,
@@ -1087,14 +1119,16 @@ def _retrieve(
         parent=node,
         direction=direction,
     )
-    client = EuropePMCCitationClient(DiscoveryTransport(transport=guard))
+    client = EuropePMCCitationClient(
+        DiscoveryTransport(transport=guard, max_attempts=_INTERNAL_MAX_ATTEMPTS)
+    )
     if direction == "references":
         result = client.references(
-            node.source, node.id, page_size=limits.page_size, max_pages=effective_pages
+            node.source, node.id, page_size=limits.page_size, max_pages=limits.max_pages
         )
     else:
         result = client.citations(
-            node.source, node.id, page_size=limits.page_size, max_pages=effective_pages
+            node.source, node.id, page_size=limits.page_size, max_pages=limits.max_pages
         )
     record = repo.record_search(request_id=relation_key, result=result)
     if isinstance(existing, dict):
