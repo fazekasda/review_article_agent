@@ -650,6 +650,39 @@ class CorruptionTest(HumanApprovalTestBase):
     def _drop_update_trigger(self, store, table):
         store.connection.execute(f"DROP TRIGGER IF EXISTS {table}_no_update")
 
+    def _drop_delete_trigger(self, store, table):
+        store.connection.execute(f"DROP TRIGGER IF EXISTS {table}_no_delete")
+
+    def _rewrite_evidence(self, store, auth_id, mutate, *, method=None, owner_uid=None):
+        """Rewrite a stored evidence canonical (and optionally its columns).
+
+        Recomputes the canonical digest so the row stays self-consistent, which
+        is what isolates the *semantic* projection checks under test.
+        """
+        self._drop_update_trigger(store, "owner_auth_evidence")
+        row = store.connection.execute(
+            "SELECT canonical FROM owner_auth_evidence WHERE project_id = ? "
+            "AND auth_id = ?",
+            (store.project_id, auth_id),
+        ).fetchone()
+        record = json.loads(bytes(row["canonical"]).decode("utf-8"))
+        mutate(record)
+        canonical = canonical_json(record)
+        sets = ["canonical = ?", "content_sha256 = ?"]
+        params: list = [canonical, sha256_digest(canonical)]
+        if method is not None:
+            sets.append("method = ?")
+            params.append(method)
+        if owner_uid is not None:
+            sets.append("owner_uid = ?")
+            params.append(owner_uid)
+        params.extend([store.project_id, auth_id])
+        store.connection.execute(
+            "UPDATE owner_auth_evidence SET " + ", ".join(sets) + " "
+            "WHERE project_id = ? AND auth_id = ?",
+            tuple(params),
+        )
+
     def test_corrupt_canonical_snapshot_is_invalid(self) -> None:
         with self.new_store() as store:
             self._chain(store)
@@ -731,6 +764,137 @@ class CorruptionTest(HumanApprovalTestBase):
             problems = integrity_problems(store.connection, store.project_id)
             self.assertTrue(problems)
             self.assertTrue(any("no valid parent" in p for p in problems))
+
+    def test_orphan_evidence_without_approval_is_detected(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            approvals = HumanApprovalRepository(store)
+            self._record(store, approvals, self.prepare(store))
+            conn = store.connection
+            # Simulate a deleted approval (and its entries) whose evidence row
+            # remains: the evidence must not look like honest history on its own.
+            self._drop_update_trigger(store, "human_approval")
+            self._drop_update_trigger(store, "human_approval_entry")
+            self._drop_delete_trigger(store, "human_approval")
+            self._drop_delete_trigger(store, "human_approval_entry")
+            conn.execute("DELETE FROM human_approval_entry")
+            conn.execute("DELETE FROM human_approval")
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM owner_auth_evidence").fetchone()[0], 1
+            )
+            problems = integrity_problems(conn, store.project_id)
+            self.assertTrue(
+                any("no valid corresponding approval" in p for p in problems)
+            )
+
+    def test_corrupt_granted_and_created_timestamps_are_invalid(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            approvals = HumanApprovalRepository(store)
+            record = self._record(store, approvals, self.prepare(store))
+            self._drop_update_trigger(store, "human_approval")
+            store.connection.execute(
+                "UPDATE human_approval SET granted_at_utc = 'not-a-time', "
+                "created_at_utc = 'not-a-time' WHERE approval_id = ?",
+                (record.approval_id,),
+            )
+            with self.assertRaises(HumanApprovalCorruptionError):
+                approvals.get_approval(record.approval_id)
+            self.assertEqual(approvals.evaluate(record.approval_id).status, "invalidated")
+            self.assertFalse(approvals.verify_snapshot(record.approval_id).ok)
+            self.assertTrue(integrity_problems(store.connection, store.project_id))
+
+    def test_granted_time_must_match_evidence_verified_time(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            approvals = HumanApprovalRepository(store)
+            record = self._record(store, approvals, self.prepare(store))
+            self._drop_update_trigger(store, "human_approval")
+            # A *valid* but different instant must not be accepted as the grant.
+            store.connection.execute(
+                "UPDATE human_approval SET granted_at_utc = ? WHERE approval_id = ?",
+                ("2000-01-01T00:00:00+00:00", record.approval_id),
+            )
+            with self.assertRaises(HumanApprovalCorruptionError):
+                approvals.get_approval(record.approval_id)
+            self.assertEqual(approvals.evaluate(record.approval_id).status, "invalidated")
+
+    def test_equivalent_utc_offset_for_granted_time_is_accepted(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            approvals = HumanApprovalRepository(store)
+            record = self._record(store, approvals, self.prepare(store))
+            self._drop_update_trigger(store, "human_approval")
+            # The same instant expressed with a different (equivalent) offset is a
+            # legitimate historical representation, not corruption.
+            instant = datetime.fromisoformat(record.granted_at_utc)
+            equivalent = instant.astimezone(timezone(timedelta(hours=-5))).isoformat()
+            store.connection.execute(
+                "UPDATE human_approval SET granted_at_utc = ? WHERE approval_id = ?",
+                (equivalent, record.approval_id),
+            )
+            self.assertEqual(approvals.evaluate(record.approval_id).status, "active")
+            self.assertTrue(approvals.verify_snapshot(record.approval_id).ok)
+            self.assertEqual(integrity_problems(store.connection, store.project_id), [])
+
+    def test_evidence_canonical_with_extra_key_is_invalid(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            approvals = HumanApprovalRepository(store)
+            record = self._record(store, approvals, self.prepare(store))
+            self._rewrite_evidence(
+                store,
+                record.owner_auth_id,
+                lambda rec: rec.__setitem__("authority", "owner_authenticated"),
+            )
+            with self.assertRaises(HumanApprovalCorruptionError):
+                approvals.get_approval(record.approval_id)
+            self.assertEqual(approvals.evaluate(record.approval_id).status, "invalidated")
+            self.assertTrue(integrity_problems(store.connection, store.project_id))
+
+    def test_evidence_method_must_be_the_approved_method(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            approvals = HumanApprovalRepository(store)
+            record = self._record(store, approvals, self.prepare(store))
+            self._rewrite_evidence(
+                store,
+                record.owner_auth_id,
+                lambda rec: rec.__setitem__("method", "totp"),
+                method="totp",
+            )
+            with self.assertRaises(HumanApprovalCorruptionError):
+                approvals.get_approval(record.approval_id)
+            self.assertEqual(approvals.evaluate(record.approval_id).status, "invalidated")
+
+    def test_evidence_owner_uid_boolean_projection_is_invalid(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            approvals = HumanApprovalRepository(store)
+            record = self._record(store, approvals, self.prepare(store))
+            # A JSON boolean ``true`` compares equal to ``1`` in Python, so the
+            # boolean must be refused explicitly rather than trusted as an int.
+            self._rewrite_evidence(
+                store,
+                record.owner_auth_id,
+                lambda rec: rec.__setitem__("owner_uid", True),
+                owner_uid=1,
+            )
+            with self.assertRaises(HumanApprovalCorruptionError):
+                approvals.get_approval(record.approval_id)
+            self.assertEqual(approvals.evaluate(record.approval_id).status, "invalidated")
+
+    def test_reapproval_evidence_pairs_are_not_flagged(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self.prepare(store)
+            self.install()
+            approvals = HumanApprovalRepository(store)
+            approvals.record_decision(prepared, self.mint(prepared))
+            approvals.record_decision(prepared, self.mint(prepared))
+            # Each approval has exactly one corresponding evidence row, so a
+            # legitimate re-approval is not mistaken for an orphan/duplicate.
+            self.assertEqual(integrity_problems(store.connection, store.project_id), [])
 
     def test_foreign_project_row_is_detected(self) -> None:
         with self.new_store() as store:

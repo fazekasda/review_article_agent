@@ -97,6 +97,7 @@ from ..runtime.gates import (
 from ..runtime.owner_auth import (
     APPROVAL_DECISIONS,
     APPROVAL_GATE_KINDS,
+    OWNER_APPROVAL_METHOD,
     ActionDigestMismatch,
     ApprovalAlreadyConsumed,
     ApprovalExpired,
@@ -139,6 +140,15 @@ AUTHORITY_OWNER_AUTHENTICATED = "owner_authenticated"
 
 #: A lowercase hex SHA-256 digest (the contract's single digest algorithm).
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+#: The exact keys of the persisted owner-auth evidence canonical record
+#: (:meth:`review_article_agent.runtime.owner_auth.OwnerAuthEvidence.as_record`).
+#: A canonical blob that carries any other key is not the exact safe projection
+#: and is refused, so an extra (potentially authority-bearing) field is never
+#: trusted silently.
+_EVIDENCE_KEYS = frozenset(
+    {"auth_id", "method", "owner_uid", "verified_at", "action_digest"}
+)
 
 # --------------------------------------------------------------------------- #
 # Static, curated problem messages
@@ -797,7 +807,14 @@ class HumanApprovalRepository:
 
     @_fail_closed_row("owner auth evidence")
     def _validate_evidence_row(self, row: sqlite3.Row) -> OwnerAuthEvidence:
-        """Structurally revalidate one owner-auth evidence row."""
+        """Structurally revalidate one owner-auth evidence row.
+
+        The stored canonical blob must be **exactly** the safe projection
+        (:data:`_EVIDENCE_KEYS`): an extra or missing key is refused rather than
+        trusted. The method must be the approved owner-auth method, the owner uid
+        a non-negative integer (never a JSON boolean), every projected column must
+        match the canonical record, and both stored timestamps must be valid.
+        """
         if row["project_id"] != self.project_id:
             raise HumanApprovalCorruptionError("owner auth evidence: foreign project row.")
         auth_id = validate_identifier(row["auth_id"], "auth_id")
@@ -812,21 +829,37 @@ class HumanApprovalRepository:
             raise HumanApprovalCorruptionError(
                 "owner auth evidence: canonical bytes are not an object."
             )
+        if set(parsed) != _EVIDENCE_KEYS:
+            raise HumanApprovalCorruptionError(
+                "owner auth evidence: canonical bytes are not the exact safe "
+                "projection."
+            )
+        owner_uid = parsed.get("owner_uid")
+        if isinstance(owner_uid, bool) or not isinstance(owner_uid, int) or owner_uid < 0:
+            raise HumanApprovalCorruptionError(
+                "owner auth evidence: the owner uid is not a non-negative integer."
+            )
         if (
             parsed.get("auth_id") != auth_id
             or parsed.get("method") != row["method"]
-            or parsed.get("owner_uid") != row["owner_uid"]
+            or owner_uid != row["owner_uid"]
             or parsed.get("action_digest") != row["action_digest"]
         ):
             raise HumanApprovalCorruptionError(
                 "owner auth evidence: projected columns do not match the canonical "
                 "record."
             )
+        if row["method"] != OWNER_APPROVAL_METHOD:
+            raise HumanApprovalCorruptionError(
+                "owner auth evidence: the method is not the approved owner-auth "
+                "method."
+            )
         verified_at = _require_timestamp(row["verified_at_utc"], "verified_at_utc")
         if parsed.get("verified_at") != row["verified_at_utc"]:
             raise HumanApprovalCorruptionError(
                 "owner auth evidence: verified-at column does not match the record."
             )
+        _require_timestamp(row["created_at_utc"], "created_at_utc")
         return OwnerAuthEvidence(
             auth_id=auth_id,
             method=row["method"],
@@ -875,6 +908,10 @@ class HumanApprovalRepository:
         rationale = row["rationale"]
         if not isinstance(rationale, str) or rationale == "":
             raise HumanApprovalCorruptionError("human approval: the rationale is empty.")
+        # Every stored timestamp must be a real, offset-carrying timestamp: a
+        # corrupt time is never silently accepted as an "honest" historical row.
+        granted_at = _require_timestamp(row["granted_at_utc"], "granted_at_utc")
+        _require_timestamp(row["created_at_utc"], "created_at_utc")
         snapshot_digest = row["snapshot_digest"]
         _bare_hex(snapshot_digest, "snapshot_digest")
         if row["snapshot_schema_version"] != HUMAN_GATE_SNAPSHOT_SCHEMA_VERSION:
@@ -948,12 +985,23 @@ class HumanApprovalRepository:
         # The out-of-band owner-auth binding: the approval only *points at* the
         # evidence row, and the stored action digest must equal the digest of the
         # approval's exact action (project/target/snapshot/gate/decision/rationale).
-        evidence_row = self._evidence_row(row["owner_auth_id"])
+        owner_auth_id = validate_identifier(row["owner_auth_id"], "owner_auth_id")
+        _bare_hex(row["owner_auth_action_digest"], "owner_auth_action_digest")
+        evidence_row = self._evidence_row(owner_auth_id)
         if evidence_row is None:
             raise HumanApprovalCorruptionError(
                 "human approval: the owner-auth evidence row is missing."
             )
         evidence = self._validate_evidence_row(evidence_row)
+        # The approval is *granted* at the instant the out-of-band confirmation
+        # succeeded; a stored granted time that does not equal the evidence's
+        # verified time (compared as instants, so an equivalent UTC offset is
+        # accepted) is a corrupt authority binding.
+        if granted_at != evidence.verified_at:
+            raise HumanApprovalCorruptionError(
+                "human approval: the granted time does not match the owner-auth "
+                "evidence."
+            )
         derived_action_digest = action_digest(
             OwnerAction(
                 project_id=self.project_id,
@@ -1164,15 +1212,19 @@ class HumanApprovalRepository:
 
         Exported so a later backup verifier can reuse this instead of duplicating
         the structural/hash/link revalidation. Detects a foreign-project row, a
-        corrupt approval/evidence row, and an orphan (parentless) entry or
-        evidence row. It imposes **no** current-head requirement: a legitimate
-        historical ``stale``/``superseded`` row is structurally valid.
+        corrupt approval/evidence row, an orphan (parentless) entry row, and an
+        owner-auth evidence row **without exactly one** valid corresponding
+        approval (a capability is single-use, so an evidence row must back exactly
+        one approval — a deleted approval or a duplicated reference is refused).
+        It imposes **no** current-head requirement: a legitimate historical
+        ``stale``/``superseded`` row is structurally valid.
         """
         problems: list[str] = []
         approval_rows = self._conn().execute(
             "SELECT rowid AS _rowid, * FROM human_approval ORDER BY rowid"
         ).fetchall()
         valid_approval_ids: set[str] = set()
+        valid_evidence_refs: dict[str, int] = {}
         for index, row in enumerate(approval_rows):
             if row["project_id"] != self.project_id:
                 problems.append(
@@ -1187,6 +1239,11 @@ class HumanApprovalRepository:
                 )
             else:
                 valid_approval_ids.add(row["approval_id"])
+                auth_id = row["owner_auth_id"]
+                if isinstance(auth_id, str):
+                    valid_evidence_refs[auth_id] = (
+                        valid_evidence_refs.get(auth_id, 0) + 1
+                    )
 
         entry_rows = self._conn().execute(
             "SELECT project_id, approval_id FROM human_approval_entry ORDER BY rowid"
@@ -1216,6 +1273,18 @@ class HumanApprovalRepository:
             except Exception:  # noqa: BLE001 - a corrupt row must not abort the sweep
                 problems.append(
                     f"owner_auth_evidence: row {index} failed integrity revalidation"
+                )
+                continue
+            references = valid_evidence_refs.get(row["auth_id"], 0)
+            if references == 0:
+                problems.append(
+                    f"owner_auth_evidence: row {index} has no valid corresponding "
+                    f"approval"
+                )
+            elif references > 1:
+                problems.append(
+                    f"owner_auth_evidence: row {index} is referenced by more than one "
+                    f"valid approval"
                 )
         return problems
 
@@ -1270,10 +1339,11 @@ def integrity_problems(conn: sqlite3.Connection, project_id: str) -> list[str]:
 
     Read-only. Returns a list of static problem descriptions (empty when every
     row is structurally intact, internally consistent, and correctly linked). It
-    detects a foreign-project row, a corrupt approval/evidence row, and an orphan
-    (parentless) entry or evidence row, and imposes **no** current-head
-    requirement — a legitimate historical ``stale``/``superseded`` row is
-    structurally valid. The connection is never written to.
+    detects a foreign-project row, a corrupt approval/evidence row, an orphan
+    (parentless) entry row, and an owner-auth evidence row without exactly one
+    valid corresponding approval (a capability is single-use), and imposes **no**
+    current-head requirement — a legitimate historical ``stale``/``superseded``
+    row is structurally valid. The connection is never written to.
     """
     repo = HumanApprovalRepository(_ReadOnlyStoreView(conn, project_id))
     return repo.verify_all_integrity()
