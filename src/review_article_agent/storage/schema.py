@@ -42,7 +42,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 4
+STORE_SCHEMA_VERSION = 5
 
 #: Registry maps project IDs to names and locations, records the single
 #: *selected* project, and records durable **execution activation** (which
@@ -513,11 +513,168 @@ def _store_v4(conn: sqlite3.Connection) -> None:
     )
 
 
+def _store_v5(conn: sqlite3.Connection) -> None:
+    """Add the durable immutable **runtime task/session/proposal mappings**.
+
+    These tables back :mod:`review_article_agent.storage.agent_runtime`: per-project
+    configuration snapshots, app-owned OpenCode service/project/session mappings,
+    bounded-task records, and non-authorizing proposal records (C02 §1/§6.1/§8;
+    step 04 deliverables 1-2 and acceptance 3/4/7).
+
+    Only new tables and triggers are added; migrations 1-4 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture
+    approvals, and the synthetic job/attempt/budget tables) are never rewritten,
+    so their exact bytes/refs are preserved across the upgrade (``ARCH-ASSETS``;
+    step doc line 21). Immutability is enforced at the database: every runtime
+    row is immutable (never ``UPDATE``d/``DELETE``d), so a change is always a
+    **new** row. Composite foreign keys pin every task/proposal reference to an
+    existing same-project revision and every proposal to its persisted task, so a
+    failed transaction can leave no dangling reference.
+
+    The schema deliberately stores **no** endpoint, password, provider key, or
+    challenge value: those never reach a durable row (spec lines 62-63;
+    ``docs/storage.md``). ``config_digest``/``fingerprint``/``stored_digest``
+    values are recomputed from the exact canonical bytes the application wrote.
+    """
+    conn.execute(
+        """
+        CREATE TABLE runtime_config_snapshot (
+            project_id     TEXT NOT NULL,
+            snapshot_id    TEXT NOT NULL,
+            config_version INTEGER NOT NULL,
+            config_digest  TEXT NOT NULL,
+            canonical      BLOB NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            PRIMARY KEY (project_id, snapshot_id),
+            UNIQUE (project_id, config_digest),
+            UNIQUE (project_id, config_version)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_session_mapping (
+            project_id          TEXT NOT NULL,
+            mapping_id          TEXT NOT NULL,
+            service_instance_id TEXT NOT NULL,
+            opencode_project_id TEXT,
+            clean_location      TEXT NOT NULL,
+            session_id          TEXT NOT NULL,
+            role                TEXT NOT NULL,
+            provider_id         TEXT NOT NULL,
+            model_id            TEXT NOT NULL,
+            variant             TEXT,
+            config_digest       TEXT NOT NULL,
+            config_snapshot_id  TEXT NOT NULL,
+            created_at_utc      TEXT NOT NULL,
+            PRIMARY KEY (project_id, mapping_id),
+            UNIQUE (project_id, session_id),
+            FOREIGN KEY (project_id, config_snapshot_id)
+                REFERENCES runtime_config_snapshot (project_id, snapshot_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_bounded_task (
+            project_id         TEXT NOT NULL,
+            task_id            TEXT NOT NULL,
+            request_id         TEXT NOT NULL,
+            fingerprint        TEXT NOT NULL,
+            role               TEXT NOT NULL,
+            config_digest      TEXT NOT NULL,
+            config_snapshot_id TEXT NOT NULL,
+            target_artifact_id TEXT NOT NULL,
+            target_revision_id TEXT NOT NULL,
+            prompt_version     TEXT NOT NULL,
+            size_limit         INTEGER NOT NULL,
+            step_limit         INTEGER NOT NULL,
+            canonical          BLOB NOT NULL,
+            created_at_utc     TEXT NOT NULL,
+            PRIMARY KEY (project_id, task_id),
+            UNIQUE (project_id, request_id),
+            FOREIGN KEY (project_id, config_snapshot_id)
+                REFERENCES runtime_config_snapshot (project_id, snapshot_id),
+            FOREIGN KEY (project_id, target_artifact_id, target_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_task_input (
+            project_id  TEXT NOT NULL,
+            task_id     TEXT NOT NULL,
+            ordinal     INTEGER NOT NULL,
+            artifact_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            digest      TEXT NOT NULL,
+            PRIMARY KEY (project_id, task_id, ordinal),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id),
+            FOREIGN KEY (project_id, artifact_id, revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_proposal (
+            project_id         TEXT NOT NULL,
+            proposal_id        TEXT NOT NULL,
+            task_id            TEXT NOT NULL,
+            role               TEXT NOT NULL,
+            provider_id        TEXT NOT NULL,
+            model_id           TEXT NOT NULL,
+            variant            TEXT,
+            target_artifact_id TEXT NOT NULL,
+            target_revision_id TEXT NOT NULL,
+            task_digest        TEXT NOT NULL,
+            input_digest       TEXT NOT NULL,
+            payload_digest     TEXT NOT NULL,
+            stored_digest      TEXT NOT NULL,
+            canonical          BLOB NOT NULL,
+            created_at_utc     TEXT NOT NULL,
+            PRIMARY KEY (project_id, proposal_id),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id)
+        )
+        """
+    )
+
+    for table in (
+        "runtime_config_snapshot",
+        "runtime_session_mapping",
+        "runtime_bounded_task",
+        "runtime_task_input",
+        "runtime_proposal",
+    ):
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
     3: _store_v3,
     4: _store_v4,
+    5: _store_v5,
 }
 
 

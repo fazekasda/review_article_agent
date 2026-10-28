@@ -76,7 +76,12 @@ from review_article_agent.runtime.jobs import (  # noqa: E402
     JobRepository,
     StaleFenceError,
 )
-from review_article_agent.storage import ProjectStore, Registry, paths  # noqa: E402
+from review_article_agent.storage import (  # noqa: E402
+    ProjectStore,
+    Registry,
+    paths,
+    schema,
+)
 from review_article_agent.storage.backup import (  # noqa: E402
     create_backup,
     restore_backup,
@@ -857,7 +862,7 @@ class BackupRestoreInteropTest(_AcceptanceBase):
             store.close()
         report = verify_backup(backup_dir)
         self.assertTrue(report["ok"])
-        self.assertEqual(report["store_schema_version"], 4)
+        self.assertEqual(report["store_schema_version"], schema.STORE_SCHEMA_VERSION)
 
         reg2 = Registry(self.tmp / "state2")
         restored = restore_backup(backup_dir, self.tmp / "restored", reg2)

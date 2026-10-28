@@ -727,7 +727,7 @@ class MigrationTest(JobTestBase):
         self.store.close()
         conn = schema.open_connection(paths.store_path_for(str(self.tmp)))
         try:
-            conn.execute("PRAGMA user_version = 5")
+            conn.execute(f"PRAGMA user_version = {schema.STORE_SCHEMA_VERSION + 1}")
         finally:
             conn.close()
         with self.assertRaises(UnsupportedSchemaVersion):
