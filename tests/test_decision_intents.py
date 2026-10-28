@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import sqlite3
 import sys
 import tempfile
@@ -331,6 +332,39 @@ class IntentTestBase(unittest.TestCase):
             "UPDATE revision SET content = ?, content_sha256 = ?, byte_size = ? "
             "WHERE project_id = ? AND artifact_id = ? AND revision_id = ?",
             (content, digest, len(content), self.pid, artifact_id, revision_id),
+        )
+
+    def _forge_intent_canonical(self, dispatch_id, mutate) -> None:
+        """Rewrite a stored intent's canonical bytes **consistently** (self-hashes).
+
+        The canonical bytes, ``content_digest`` and the projected columns are kept
+        in agreement, so the forgery is only detectable by re-deriving the actual
+        independent pins (parent links, refs, request wire).
+        """
+        conn = self.store.connection
+        conn.execute("DROP TRIGGER IF EXISTS decision_request_intent_no_update")
+        row = conn.execute(
+            "SELECT canonical FROM decision_request_intent WHERE project_id = ? "
+            "AND dispatch_id = ?",
+            (self.pid, dispatch_id),
+        ).fetchone()
+        mapping = json.loads(bytes(row["canonical"]).decode("utf-8"))
+        mutate(mapping)
+        canonical = canonical_json(mapping)
+        conn.execute(
+            "UPDATE decision_request_intent SET canonical = ?, content_digest = ?, "
+            " stage = ?, task_id = ?, request_sha256 = ?, request_bytes = ? "
+            "WHERE project_id = ? AND dispatch_id = ?",
+            (
+                canonical,
+                hashlib.sha256(canonical).hexdigest(),
+                mapping["stage"],
+                mapping["task_id"],
+                mapping["request_sha256"],
+                mapping["request_bytes"],
+                self.pid,
+                dispatch_id,
+            ),
         )
 
     def _corrupt_revision_content(self, artifact_id, revision_id, content=b"tampered") -> None:
@@ -778,6 +812,135 @@ class IntegrityTest(IntentTestBase):
         conn.execute("PRAGMA foreign_keys = ON")
         problems = decision_intent_integrity_problems(conn, self.pid)
         self.assertTrue(any("foreign" in problem for problem in problems))
+
+
+class IntegrityRepairTest(IntentTestBase):
+    """Regression coverage for the T5f-R1 independent-pin / bound / immutability repairs."""
+
+    def test_second_same_fingerprint_task_refused(self) -> None:
+        # A second persisted task with identical canonical bytes (same fingerprint)
+        # but a different request key (hence a different task id) must never be
+        # recorded against this dispatch. Zero write on refusal.
+        second_bounded = BoundedTask.from_mapping(
+            json.loads(self.task.canonical.decode("utf-8")), configuration=self.config
+        )
+        second = self.runtime.record_task(
+            second_bounded, request_id="task-req-2", configuration=self.config
+        )
+        self.assertNotEqual(second.task_id, self.task.task_id)
+        self.assertEqual(second.fingerprint, self.task.fingerprint)
+        with self.assertRaises(DecisionIntentValidationError):
+            self._record(task=second)
+        self.assertEqual(self.intents.list_intents(), [])
+
+    def test_read_detects_parent_dispatch_tamper(self) -> None:
+        record = self._record()
+        conn = self.store.connection
+        conn.execute("DROP TRIGGER IF EXISTS runtime_dispatch_no_update")
+        conn.execute(
+            "UPDATE runtime_dispatch SET stage = 'forged' WHERE project_id = ? "
+            "AND dispatch_id = ?",
+            (self.pid, record.dispatch_id),
+        )
+        with self.assertRaises(DecisionIntentCorruptionError):
+            self.intents.get_intent(record.dispatch_id)
+        self.assertTrue(decision_intent_integrity_problems(conn, self.pid))
+
+    def test_read_detects_parent_task_tamper(self) -> None:
+        record = self._record()
+        conn = self.store.connection
+        conn.execute("DROP TRIGGER IF EXISTS runtime_bounded_task_no_update")
+        conn.execute(
+            "UPDATE runtime_bounded_task SET prompt_version = 'tampered/9' "
+            "WHERE project_id = ? AND task_id = ?",
+            (self.pid, self.task.task_id),
+        )
+        with self.assertRaises(DecisionIntentCorruptionError):
+            self.intents.get_intent(record.dispatch_id)
+
+    def test_read_detects_self_consistent_parent_mismatch(self) -> None:
+        # Self-consistent outer hashes: canonical + content_digest + columns agree,
+        # yet the recorded stage no longer matches the actual parent dispatch.
+        record = self._record()
+        self._forge_intent_canonical(
+            record.dispatch_id, lambda m: m.__setitem__("stage", "forged_stage")
+        )
+        with self.assertRaises(DecisionIntentCorruptionError):
+            self.intents.get_intent(record.dispatch_id)
+        self.assertTrue(
+            decision_intent_integrity_problems(self.store.connection, self.pid)
+        )
+
+    def test_read_detects_wire_question_mismatch(self) -> None:
+        # Self-consistent forgery of the recorded request wire (and its digest/size)
+        # that no longer matches the recorded question descriptors.
+        record = self._record()
+
+        def mutate(mapping):
+            mapping["plan_request"]["questions"]["is_original_report"][
+                "instructions"
+            ] = "FORGED WIRE INSTRUCTIONS"
+            body = canonical_json(mapping["plan_request"])
+            mapping["request_sha256"] = hashlib.sha256(body).hexdigest()
+            mapping["request_bytes"] = len(body)
+
+        self._forge_intent_canonical(record.dispatch_id, mutate)
+        with self.assertRaises(DecisionIntentCorruptionError):
+            self.intents.get_intent(record.dispatch_id)
+
+    def test_forged_cyclic_request_is_typed_error(self) -> None:
+        cyclic: dict = {}
+        cyclic["a"] = cyclic
+        forged = dataclasses.replace(self.plan, request={"state": cyclic})
+        with self.assertRaises(DecisionIntentValidationError):
+            self._record(plan=forged)
+        self.assertEqual(self.intents.list_intents(), [])
+
+    def test_record_nested_mappings_are_immutable(self) -> None:
+        record = self._record()
+        for container, key in (
+            (record.versions, "input_digest"),
+            (record.target, "artifact_id"),
+            (record.plan_request, "model"),
+            (record.questions[0].question_def_ref, "revision_id"),
+            (record.questions[0].criteria_ref, "revision_id"),
+        ):
+            with self.assertRaises(TypeError):
+                container[key] = "FORGED"  # type: ignore[index]
+        # ``to_mapping`` returns a fresh plain copy: mutating it never touches the
+        # record, and it still round-trips to the exact stored canonical bytes.
+        copy = record.to_mapping()
+        copy["versions"]["input_digest"] = "FORGED"
+        copy["target"]["artifact_id"] = "FORGED"
+        self.assertEqual(record.versions["input_digest"], self.input_digest)
+        self.assertEqual(dict(record.target), self.target_ref)
+        self.assertEqual(canonical_json(record.to_mapping()), record.canonical)
+
+    def test_overlong_question_def_refused(self) -> None:
+        record = self._record()
+        qdef_ref = self.qdef_refs["study_design"]
+        overlong = b"[" + b"0," * 200_000 + b"0]"
+        self.assertGreater(len(overlong), 131_072)
+        self._tamper_revision(
+            qdef_ref["artifact_id"], qdef_ref["revision_id"], overlong
+        )
+        with self.assertRaises(DecisionIntentCorruptionError):
+            self.intents.get_intent(record.dispatch_id)
+
+    def test_valid_history_survives_submission_and_new_heads(self) -> None:
+        first = self._record()
+        self.artifacts.import_revision(
+            artifact_id=self.target_artifact.artifact_id,
+            content=b"a newer target revision",
+            origin_locator="import:synthetic",
+            rights=_rights(self.pid, self.target_artifact.artifact_id, "rev_2"),
+            revision_id="rev_2",
+            parent_revision_id="rev_1",
+        )
+        self.dispatch.mark_submitted(self.dispatch_record.dispatch_id)
+        self.assertEqual(self.intents.get_intent(first.dispatch_id).canonical, first.canonical)
+        self.assertEqual(self._record().canonical, first.canonical)
+        self.assertEqual(self.intents.verify_all_integrity(), [])
 
 
 class MigrationTest(IntentTestBase):

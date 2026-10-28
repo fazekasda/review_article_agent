@@ -82,6 +82,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 from typing import Any
 
 from ..domain.errors import StoreError
@@ -139,6 +140,15 @@ INTENT_ROUTE = "direct_call"
 #: question/state payload cannot produce an unbounded row. The plan request is
 #: already bounded by the adapter's ``SAFE_MAX_REQUEST_BYTES`` (32 KiB).
 MAX_INTENT_BYTES = 262_144
+
+#: Upper bound on a question-definition or criteria revision's JSON bytes, checked
+#: **before** any parse so an overlong referenced document is refused.
+MAX_QUESTION_DEF_BYTES = 131_072
+MAX_CRITERIA_BYTES = 131_072
+
+#: The canonical-JSON depth bound (matches ``domain.records``); applied to every
+#: parsed stored/intent document before it is walked or thawed.
+_MAX_JSON_DEPTH = 64
 
 #: Version slots every Jev/typed-decision stage consumes (§6.1).
 JEV_CONSUMED_SLOTS = ("model", "prompt", "adapter")
@@ -272,6 +282,13 @@ _M_COLUMNS = (
 _M_REQUEST_BINDING = "the recorded plan request does not match the recorded request digest/size"
 _M_RECORD_SIZE = "a decision-intent record exceeds the permitted canonical size"
 _M_BAD_ROW = "the stored decision-intent row is malformed"
+_M_TASK_DISPATCH = "the supplied task is not the task the dispatch pins"
+_M_PARENT = "the recorded intent does not match its parent dispatch/task"
+_M_PROJECT = "the recorded intent project does not match the store project"
+_M_CANONICAL_SIZE = "the recorded intent canonical bytes exceed the permitted size"
+_M_CANONICAL_ROUNDTRIP = "the recorded intent bytes are not in canonical form"
+_M_DESCRIPTOR = "a recorded question descriptor does not match its referenced definition"
+_M_REF_TOO_LARGE = "a referenced question/criteria revision exceeds the permitted size"
 
 
 # --------------------------------------------------------------------------- #
@@ -357,8 +374,18 @@ def _bounded_str(value: object) -> bool:
 
 
 def _deep_freeze(value: Any) -> Any:
+    """Deep-freeze a JSON-portable value to immutable containers.
+
+    Every :class:`~collections.abc.Mapping` becomes a read-only
+    :class:`~types.MappingProxyType` (deeply) and every list/tuple becomes a tuple,
+    so a returned record exposes **no** mutable alias: a caller cannot mutate the
+    recorded intent through a nested dict/list. :func:`_thaw` returns a fresh plain
+    copy for a JSON-safe mapping.
+    """
     if isinstance(value, Mapping):
-        return {key: _deep_freeze(item) for key, item in value.items()}
+        return MappingProxyType(
+            {key: _deep_freeze(item) for key, item in value.items()}
+        )
     if isinstance(value, (list, tuple)):
         return tuple(_deep_freeze(item) for item in value)
     return value
@@ -370,6 +397,41 @@ def _thaw(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_thaw(item) for item in value]
     return value
+
+
+def _bounded_json_bytes(
+    data: object, *, max_bytes: int, too_large: str, malformed: str
+) -> Any:
+    """Parse bounded, portable JSON bytes; refuse an overlong/hostile document.
+
+    The length is bounded **before** the parse, ``json.loads`` recursion is caught,
+    and the parsed value is re-validated through :func:`canonical_json` (which
+    enforces the depth/cycle/portability bounds) **before** any recursive walk.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise DecisionIntentValidationError(malformed)
+    raw = bytes(data)
+    if len(raw) > max_bytes:
+        raise DecisionIntentValidationError(too_large)
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise DecisionIntentValidationError(malformed) from exc
+    try:
+        canonical_json(parsed)
+    except Exception as exc:  # RecordValidationError / ValueError / TypeError
+        raise DecisionIntentValidationError(malformed) from exc
+    return parsed
+
+
+def _bounded_request_mapping(request: object) -> None:
+    """Bound a plan's raw request (length/depth/cycles) before any thaw/walk."""
+    if not isinstance(request, Mapping):
+        raise DecisionIntentValidationError(_M_BAD_PLAN)
+    try:
+        canonical_json(request)
+    except Exception as exc:  # RecordValidationError / ValueError / TypeError
+        raise DecisionIntentValidationError(_M_BAD_PLAN) from exc
 
 
 def _fail_closed_row(what: str):
@@ -420,6 +482,11 @@ class QuestionIntent:
     question_def_digest: str
     supported: bool
 
+    def __post_init__(self) -> None:
+        # No mutable alias: the exposed refs are deeply read-only.
+        object.__setattr__(self, "question_def_ref", _deep_freeze(dict(self.question_def_ref)))
+        object.__setattr__(self, "criteria_ref", _deep_freeze(dict(self.criteria_ref)))
+
     def to_mapping(self) -> dict[str, Any]:
         return {
             "question_id": self.question_id,
@@ -468,6 +535,18 @@ class DecisionIntentRecord:
     content_digest: str
     created_at_utc: str
     canonical: bytes
+
+    def __post_init__(self) -> None:
+        # Deep-freeze every exposed nested field so a returned record is truly
+        # immutable and exposes no mutable alias (``versions``/``target``/
+        # ``plan_request`` and each question's refs). ``to_mapping`` returns a
+        # fresh plain copy.
+        object.__setattr__(self, "target", _deep_freeze(dict(self.target)))
+        object.__setattr__(self, "versions", _deep_freeze(self.versions))
+        object.__setattr__(self, "plan_request", _deep_freeze(self.plan_request))
+        object.__setattr__(self, "questions", tuple(self.questions))
+        object.__setattr__(self, "consumed_versions", tuple(self.consumed_versions))
+        object.__setattr__(self, "canonical", bytes(self.canonical))
 
     @property
     def digest(self) -> str:
@@ -584,18 +663,33 @@ def _validate_versions(
 def _revalidate_plan(plan: object) -> jev.DispatchPlan:
     """Re-derive and re-check the exact Jev plan (no I/O; fail closed).
 
-    Uses a public reconstruct through :func:`review_article_agent.runtime.jev.plan_dispatch`
-    (which re-derives the wire body from the plan's own questions/state and
-    re-validates the reserve/bound/pricing) and, when the adapter exposes it, its
-    own dispatch-time revalidation. A forged/replaced plan (a mutated request body,
-    a mismatched bound/reserve/server cap, or a question list that does not produce
-    the recorded request) is refused.
+    Bounds the plan through the adapter's own dispatch-time validator **first**
+    (when exposed) and, in every path, through a length/depth/cycle-bounded
+    :func:`canonical_json` of the raw request **before** any recursive thaw/walk, so
+    a hostile/cyclic forged request is a static typed error rather than a raw
+    ``RecursionError``. It then re-derives the wire body from the plan's own
+    questions/state via :func:`review_article_agent.runtime.jev.plan_dispatch` and
+    re-validates the reserve/bound/pricing. A forged/replaced plan (a mutated
+    request body, a mismatched bound/reserve/server cap, or a question list that
+    does not produce the recorded request) is refused.
     """
     if not isinstance(plan, jev.DispatchPlan):
         raise DecisionIntentValidationError(_M_BAD_PLAN)
+    # (1) The adapter's own bounded dispatch-time revalidation, when exposed.
+    adapter_revalidate = getattr(jev, "_revalidate_plan", None)
+    if callable(adapter_revalidate):
+        try:
+            adapter_revalidate(plan)
+        except Exception as exc:  # JevError / RecordValidationError / ...
+            raise DecisionIntentValidationError(_M_BAD_PLAN) from exc
+    # (2) Bound the raw request (length/depth/cycles) BEFORE any recursive walk.
+    _bounded_request_mapping(plan.request)
     if not isinstance(plan.request, Mapping):
         raise DecisionIntentValidationError(_M_BAD_PLAN)
-    state = _thaw(plan.request.get("state"))
+    try:
+        state = _thaw(plan.request.get("state"))
+    except Exception as exc:  # defensive: a hostile request must be a typed error
+        raise DecisionIntentValidationError(_M_BAD_PLAN) from exc
     try:
         rebuilt = jev.plan_dispatch(
             plan.questions,
@@ -631,13 +725,6 @@ def _revalidate_plan(plan: object) -> jev.DispatchPlan:
         raise
     except Exception as exc:  # RecordValidationError / ValueError / TypeError
         raise DecisionIntentValidationError(_M_BAD_PLAN) from exc
-    # Belt and braces: the adapter's own dispatch-time revalidation, when exposed.
-    adapter_revalidate = getattr(jev, "_revalidate_plan", None)
-    if callable(adapter_revalidate):
-        try:
-            adapter_revalidate(plan)
-        except Exception as exc:  # JevError / ...
-            raise DecisionIntentValidationError(_M_BAD_PLAN) from exc
     return plan
 
 
@@ -699,22 +786,30 @@ def _load_question(
     *,
     reader,
 ) -> jev.QuestionDef:
-    """Rebuild the typed :class:`jev.QuestionDef` from the two verified refs."""
+    """Rebuild the typed :class:`jev.QuestionDef` from the two verified refs.
+
+    Both referenced documents are length-bounded and re-validated as portable,
+    depth-bounded JSON **before** any parse/walk.
+    """
     qdef_bytes = reader(qdef_ref)
-    try:
-        qdef_raw = json.loads(qdef_bytes.decode("utf-8"))
-    except (ValueError, UnicodeError) as exc:
-        raise DecisionIntentValidationError(_M_BAD_QUESTION_DEF) from exc
+    qdef_raw = _bounded_json_bytes(
+        qdef_bytes,
+        max_bytes=MAX_QUESTION_DEF_BYTES,
+        too_large=_M_REF_TOO_LARGE,
+        malformed=_M_BAD_QUESTION_DEF,
+    )
     kind, instructions, options, levels, embedded_crit_ref = _parse_question_def(
         question_id, qdef_raw
     )
     if dict(embedded_crit_ref) != dict(crit_ref):
         raise DecisionIntentValidationError(_M_BAD_QUESTION_DEF)
     crit_bytes = reader(crit_ref)
-    try:
-        criteria = json.loads(crit_bytes.decode("utf-8"))
-    except (ValueError, UnicodeError) as exc:
-        raise DecisionIntentValidationError(_M_BAD_CRITERIA) from exc
+    criteria = _bounded_json_bytes(
+        crit_bytes,
+        max_bytes=MAX_CRITERIA_BYTES,
+        too_large=_M_REF_TOO_LARGE,
+        malformed=_M_BAD_CRITERIA,
+    )
     try:
         return jev.QuestionDef(
             question_id=question_id,
@@ -976,6 +1071,16 @@ class DecisionIntentRepository:
         with self._store.transaction():
             persisted_task = self._require_persisted_task(task)
             persisted_dispatch = self._require_persisted_dispatch(dispatch)
+            # The supplied task must be exactly the task the dispatch pins: a
+            # second persisted task with identical canonical bytes (a different
+            # request key, hence a different task id) must never be recorded
+            # against this dispatch.
+            if (
+                task.task_id != dispatch.task_id
+                or persisted_task.task_id != persisted_dispatch.task_id
+                or persisted_task.fingerprint != persisted_dispatch.task_fingerprint
+            ):
+                raise DecisionIntentValidationError(_M_TASK_DISPATCH)
             # The consumed refs must be within the task's own pinned scope.
             _assert_ref_in_task(persisted_task.target, persisted_task)
             for qid in qdef_refs:
@@ -1298,23 +1403,88 @@ class DecisionIntentRepository:
 
     @_fail_closed_row("decision request intent")
     def _validate_intent_row(self, row: sqlite3.Row) -> DecisionIntentRecord:
-        """Structurally revalidate a stored intent; fail closed."""
+        """Structurally revalidate a stored intent; fail closed.
+
+        Re-derives **actual independent pins**: the canonical project, the parent
+        dispatch and its pinned task (all identity fields), the recorded target and
+        per-question refs against the task's own historical pins, the recorded
+        question descriptors against the referenced definitions, and the exact
+        request/plan binding — never trusting the row's own columns or a stored
+        hash. History-preserving: it never requires the refs to be the *current*
+        heads.
+        """
         if row["project_id"] != self.project_id:
             raise DecisionIntentCorruptionError("decision request intent: foreign project row.")
         dispatch_id = _identifier(row["dispatch_id"])
         if row["intent_id"] != _intent_id(self.project_id, dispatch_id):
             raise DecisionIntentCorruptionError("decision request intent: id is not dispatch-scoped.")
         canonical = bytes(row["canonical"])
+        if len(canonical) > MAX_INTENT_BYTES:
+            raise DecisionIntentCorruptionError(_M_CANONICAL_SIZE)
         if _sha256_hex(canonical) != _bare_hex(row["content_digest"], "content_digest"):
             raise DecisionIntentCorruptionError("decision request intent: content digest mismatch.")
-        try:
-            parsed = json.loads(canonical.decode("utf-8"))
-        except (ValueError, UnicodeError) as exc:
-            raise DecisionIntentCorruptionError("decision request intent: canonical bytes are malformed.") from exc
+        parsed = _bounded_json_bytes(
+            canonical,
+            max_bytes=MAX_INTENT_BYTES,
+            too_large=_M_CANONICAL_SIZE,
+            malformed=_M_CANONICAL,
+        )
         mapping = _validate_intent_mapping(parsed)
+        if mapping["project_id"] != self.project_id:
+            raise DecisionIntentCorruptionError(_M_PROJECT)
+        # The stored bytes must be exactly the canonical form of the parsed value
+        # (no non-canonical spelling, reordered keys, or extra bytes).
+        if canonical_json(parsed) != canonical:
+            raise DecisionIntentCorruptionError(_M_CANONICAL_ROUNDTRIP)
         self._assert_columns_match(row, mapping)
+        self._assert_parent_links(mapping)
         self._verify_recorded_refs(mapping)
         return self._row_to_record(row, mapping, canonical)
+
+    def _assert_parent_links(self, mapping: Mapping[str, Any]) -> None:
+        """Load and compare the actual parent dispatch and its pinned task."""
+        dispatch_id = mapping["dispatch_id"]
+        try:
+            dispatch = self._dispatch.get_dispatch(dispatch_id)
+        except DispatchCorruptionError as exc:
+            raise DecisionIntentCorruptionError(_M_PARENT) from exc
+        if dispatch is None or dispatch.project_id != self.project_id:
+            raise DecisionIntentCorruptionError(_M_PARENT)
+        if (
+            dispatch.dispatch_id != dispatch_id
+            or dispatch.task_id != mapping["task_id"]
+            or dispatch.task_fingerprint != mapping["task_fingerprint"]
+            or dispatch.route != mapping["route"]
+            or dispatch.stage != mapping["stage"]
+            or dispatch.input_digest != mapping["input_digest"]
+            or dispatch.version_digest != mapping["version_digest"]
+            or dispatch.reserve_usd != mapping["reserve_usd"]
+            or dispatch.bound_evidence_digest != mapping["bound_evidence_digest"]
+        ):
+            raise DecisionIntentCorruptionError(_M_PARENT)
+        try:
+            task = self._runtime.get_task(dispatch.task_id)
+        except RuntimeCorruptionError as exc:
+            raise DecisionIntentCorruptionError(_M_PARENT) from exc
+        if (
+            task is None
+            or task.project_id != self.project_id
+            or task.task_id != mapping["task_id"]
+            or task.fingerprint != mapping["task_fingerprint"]
+            or task.prompt_version != mapping["prompt_version"]
+        ):
+            raise DecisionIntentCorruptionError(_M_PARENT)
+        target = _ref(mapping["target"], self.project_id)
+        pinned_target = {
+            "project_id": task.target["project_id"],
+            "artifact_id": task.target["artifact_id"],
+            "revision_id": task.target["revision_id"],
+        }
+        if target != pinned_target:
+            raise DecisionIntentCorruptionError(_M_PARENT)
+        for question in mapping["questions"]:
+            _assert_ref_in_task(_ref(question["question_def_ref"], self.project_id), task)
+            _assert_ref_in_task(_ref(question["criteria_ref"], self.project_id), task)
 
     def _assert_columns_match(self, row: sqlite3.Row, mapping: Mapping[str, Any]) -> None:
         expected = {
@@ -1343,11 +1513,13 @@ class DecisionIntentRepository:
                 raise DecisionIntentCorruptionError(_M_COLUMNS)
 
     def _verify_recorded_refs(self, mapping: Mapping[str, Any]) -> None:
-        """Recompute the recorded ref bytes and rebuild the recorded questions.
+        """Recompute the recorded ref bytes and re-derive the recorded question/plan.
 
         History-preserving: it never requires the refs to be the *current* heads,
-        only that the recorded revisions still exist with the recorded bytes and
-        that they rebuild the recorded descriptor digests.
+        only that the recorded revisions still exist with the recorded bytes, that
+        they rebuild the recorded descriptor digests (matching question kind), and
+        that the recorded request wire is exactly the request those recorded
+        questions would send.
         """
         target = _ref(mapping["target"], self.project_id)
         self._read_verified_ref(target, require_current=False)
@@ -1355,6 +1527,7 @@ class DecisionIntentRepository:
         def reader(ref: Mapping[str, str]) -> bytes:
             return self._read_verified_ref(ref, require_current=False)
 
+        rebuilt_questions: list[jev.QuestionDef] = []
         for question in mapping["questions"]:
             rebuilt = _load_question(
                 question["question_id"],
@@ -1362,11 +1535,43 @@ class DecisionIntentRepository:
                 question["criteria_ref"],
                 reader=reader,
             )
+            if rebuilt.question_kind != question["question_kind"]:
+                raise DecisionIntentCorruptionError(_M_QUESTION_MISMATCH)
             if question_descriptor_digest(rebuilt) != question["question_def_digest"]:
-                raise DecisionIntentCorruptionError(
-                    "decision request intent: a recorded question descriptor does not "
-                    "match its referenced definition."
-                )
+                raise DecisionIntentCorruptionError(_M_DESCRIPTOR)
+            rebuilt_questions.append(rebuilt)
+
+        # Reconstruct the exact Jev plan from the recorded request state/server cap
+        # and the recorded questions, then revalidate the recorded request binding.
+        plan_request = _thaw(mapping["plan_request"])
+        if not isinstance(plan_request, Mapping):
+            raise DecisionIntentCorruptionError(_M_REQUEST_BINDING)
+        try:
+            rebuilt_plan = jev.plan_dispatch(
+                rebuilt_questions,
+                plan_request.get("state"),
+                reserve_usd=mapping["reserve_usd"],
+                model=mapping["model"],
+                endpoint=mapping["endpoint"],
+                server_cap="provider" in plan_request,
+            )
+        except Exception as exc:  # JevError / ...
+            raise DecisionIntentCorruptionError(_M_REQUEST_BINDING) from exc
+        if (
+            canonical_json(plan_request) != bytes(rebuilt_plan.request_body)
+            or rebuilt_plan.request_sha256 != mapping["request_sha256"]
+            or rebuilt_plan.request_bytes != mapping["request_bytes"]
+            or rebuilt_plan.cost_upper_bound_usd != mapping["cost_upper_bound_usd"]
+            or rebuilt_plan.pricing_version != mapping["pricing_version"]
+            or rebuilt_plan.reserve_usd != mapping["reserve_usd"]
+            or tuple(rebuilt_plan.supported_question_ids)
+            != tuple(mapping["supported_question_ids"])
+            or tuple(rebuilt_plan.unsupported_question_ids)
+            != tuple(mapping["unsupported_question_ids"])
+            or rebuilt_plan.endpoint != mapping["endpoint"]
+            or rebuilt_plan.model != mapping["model"]
+        ):
+            raise DecisionIntentCorruptionError(_M_REQUEST_BINDING)
 
     def _row_to_record(
         self, row: sqlite3.Row, mapping: Mapping[str, Any], canonical: bytes
