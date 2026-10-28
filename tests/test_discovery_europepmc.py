@@ -276,6 +276,31 @@ class IdentityTests(unittest.TestCase):
         self.assertTrue(record.is_missing_identifier())
         self.assertTrue(result.complete)
 
+    def test_native_source_containing_a_colon_is_rejected(self):
+        # source="MED:A", id="B" would otherwise collide with source="MED",
+        # id="A:B" once composed as "MED:A:B".
+        script = [
+            json_response(
+                epmc_payload(hit_count=1, results=[item("B", source="MED:A")])
+            )
+        ]
+        client, _, _, _ = make_client(script)
+        result = client.search("q")
+        self.assertFalse(result.complete)
+        self.assertEqual(result.failure, "malformed_response")
+
+    def test_colon_in_the_id_is_unambiguous(self):
+        # The native source has no ":", so the first ":" delimits source from id.
+        script = [
+            json_response(
+                epmc_payload(hit_count=1, results=[item("A:B", source="MED")])
+            )
+        ]
+        client, _, _, _ = make_client(script)
+        result = client.search("q")
+        self.assertTrue(result.complete)
+        self.assertEqual(result.records[0].source_id, "MED:A:B")
+
     def test_nullable_metadata_fields_are_preserved(self):
         results = [
             item(
@@ -329,6 +354,83 @@ class ConsistencyTests(unittest.TestCase):
         self.assertTrue(result.pages[0].complete)
         self.assertFalse(result.pages[1].complete)
 
+    def test_duplicate_identity_when_raw_count_equals_total_is_malformed(self):
+        # hitCount 4 and four raw rows, but one identity repeats: never complete.
+        a, b, c = item("A"), item("B"), item("C")
+        script = [
+            json_response(
+                epmc_payload(hit_count=4, results=[a, b], next_cursor="C1")
+            ),
+            json_response(epmc_payload(hit_count=4, results=[b, c])),
+        ]
+        client, _, _, _ = make_client(script)
+        result = client.search("q")
+
+        self.assertFalse(result.complete)
+        self.assertEqual(result.failure, "malformed_response")
+        self.assertEqual(len(result.records), 4)
+        self.assertEqual(
+            sum(1 for r in result.records if r.source_id == "MED:B"), 2
+        )
+
+    def test_duplicate_identity_within_one_page_is_malformed(self):
+        script = [
+            json_response(
+                epmc_payload(hit_count=2, results=[item("A"), item("A")])
+            )
+        ]
+        client, _, _, _ = make_client(script)
+        result = client.search("q")
+        self.assertFalse(result.complete)
+        self.assertEqual(result.failure, "malformed_response")
+
+    def test_missing_native_id_is_not_merged_or_treated_as_a_duplicate(self):
+        # Two records with no native id and an identical title are distinct
+        # explicit observations, never merged and never a fabricated identity.
+        rows = [
+            item(None, source="MED", title="Same title"),
+            item(None, source="MED", title="Same title"),
+        ]
+        script = [json_response(epmc_payload(hit_count=2, results=rows))]
+        client, _, _, _ = make_client(script)
+        result = client.search("q")
+
+        self.assertTrue(result.complete)
+        self.assertEqual(len(result.records), 2)
+        self.assertTrue(all(r.source_id is None for r in result.records))
+        self.assertTrue(all(r.is_missing_identifier() for r in result.records))
+
+    def test_page_returning_more_records_than_requested_is_malformed(self):
+        script = [
+            json_response(
+                epmc_payload(hit_count=2, results=[item("1"), item("2")])
+            )
+        ]
+        client, _, _, _ = make_client(script)
+        result = client.search("q", page_size=1)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.failure, "malformed_response")
+
+    def test_over_collection_is_caught_early_not_at_the_page_cap(self):
+        # hitCount 2 but the first page already returns three rows with an
+        # advancing cursor: fail immediately instead of requesting more pages.
+        script = [
+            json_response(
+                epmc_payload(
+                    hit_count=2,
+                    results=[item("1"), item("2"), item("3")],
+                    next_cursor="C1",
+                )
+            ),
+            json_response(epmc_payload(hit_count=2, results=[])),
+        ]
+        client, fake, _, _ = make_client(script)
+        result = client.search("q", max_pages=5)
+
+        self.assertFalse(result.complete)
+        self.assertEqual(result.failure, "malformed_response")
+        self.assertEqual(len(fake.calls), 1)
+
     def test_changing_total_count_is_malformed_and_incomplete(self):
         script = [
             json_response(
@@ -363,7 +465,8 @@ class ConsistencyTests(unittest.TestCase):
 # Cursor anomalies
 # --------------------------------------------------------------------------- #
 class CursorTests(unittest.TestCase):
-    def test_repeated_cursor_is_malformed(self):
+    def test_unchanged_cursor_at_total_is_a_complete_terminal(self):
+        # Solr-derived terminal signal: nextCursorMark equals the cursorMark sent.
         script = [
             json_response(
                 epmc_payload(hit_count=2, results=[item("1")], next_cursor="C1")
@@ -374,14 +477,49 @@ class CursorTests(unittest.TestCase):
         ]
         client, _, _, _ = make_client(script)
         result = client.search("q")
+        self.assertTrue(result.complete)
+        self.assertEqual(result.stop_reason, "completed")
+        self.assertEqual(len(result.pages), 2)
+
+    def test_unchanged_cursor_before_total_is_incomplete(self):
+        script = [
+            json_response(
+                epmc_payload(hit_count=3, results=[item("1")], next_cursor="C1")
+            ),
+            json_response(
+                epmc_payload(hit_count=3, results=[item("2")], next_cursor="C1")
+            ),
+        ]
+        client, _, _, _ = make_client(script)
+        result = client.search("q")
         self.assertFalse(result.complete)
         self.assertEqual(result.failure, "malformed_response")
         self.assertEqual(len(result.pages), 2)
 
-    def test_cursor_looping_back_to_initial_is_malformed(self):
+    def test_advancing_cursor_after_total_is_a_complete_terminal(self):
+        # The provider still offers an advancing cursor, but every declared hit
+        # has been collected exactly once: no truncation, so complete.
         script = [
             json_response(
-                epmc_payload(hit_count=2, results=[item("1")], next_cursor="*")
+                epmc_payload(hit_count=2, results=[item("1")], next_cursor="C1")
+            ),
+            json_response(
+                epmc_payload(hit_count=2, results=[item("2")], next_cursor="C2")
+            ),
+        ]
+        client, _, _, _ = make_client(script)
+        result = client.search("q")
+        self.assertTrue(result.complete)
+        self.assertEqual(result.stop_reason, "completed")
+        self.assertEqual(result.pages[-1].next_cursor, "C2")
+
+    def test_cursor_loop_to_a_previous_value_is_malformed(self):
+        script = [
+            json_response(
+                epmc_payload(hit_count=3, results=[item("1")], next_cursor="C1")
+            ),
+            json_response(
+                epmc_payload(hit_count=3, results=[item("2")], next_cursor="*")
             ),
         ]
         client, _, _, _ = make_client(script)
@@ -400,7 +538,7 @@ class CursorTests(unittest.TestCase):
         self.assertFalse(result.complete)
         self.assertEqual(result.failure, "malformed_response")
 
-    def test_empty_page_with_a_next_cursor_is_malformed(self):
+    def test_empty_page_with_an_advancing_cursor_is_malformed(self):
         script = [
             json_response(
                 epmc_payload(hit_count=2, results=[], next_cursor="C1")
@@ -410,6 +548,18 @@ class CursorTests(unittest.TestCase):
         result = client.search("q")
         self.assertFalse(result.complete)
         self.assertEqual(result.failure, "malformed_response")
+
+    def test_empty_terminal_page_with_no_results_is_complete(self):
+        # hitCount 0 with an unchanged cursor is a legitimate empty terminal.
+        script = [
+            json_response(
+                epmc_payload(hit_count=0, results=[], next_cursor="*")
+            )
+        ]
+        client, _, _, _ = make_client(script)
+        result = client.search("q")
+        self.assertTrue(result.complete)
+        self.assertEqual(result.records, ())
 
     def test_over_long_cursor_is_malformed(self):
         script = [
@@ -519,6 +669,21 @@ class MalformedTests(unittest.TestCase):
         self.assertEqual(len(result.pages[0].attempts), 1)
         self.assertEqual(result.pages[0].attempts[0].outcome, "ok")
         self.assertEqual(len(result.attempts), 1)
+
+    def test_deeply_nested_json_is_malformed_and_keeps_attempts(self):
+        # Deep nesting exhausts the JSON parser's recursion budget; it must be an
+        # explicit malformed_response, not a RecursionError, with provenance kept.
+        depth = 100_000
+        body = b"[" * depth + b"]" * depth
+        script = [response(200, body)]
+        client, _, _, _ = make_client(script)
+        result = client.search("q")
+        self.assertFalse(result.complete)
+        self.assertEqual(result.stop_reason, "failure")
+        self.assertEqual(result.failure, "malformed_response")
+        self.assertEqual(len(result.pages), 1)
+        self.assertEqual(len(result.pages[0].attempts), 1)
+        self.assertEqual(result.pages[0].attempts[0].outcome, "ok")
 
 
 # --------------------------------------------------------------------------- #

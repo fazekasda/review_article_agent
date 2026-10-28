@@ -51,25 +51,51 @@ What this is **not**
 * **Not a broad-search authorization runner or a CLI.** It is a library only; a
   later Step 05 task owns scope/query-plan approval and workflow integration.
 
+Terminal cursor semantics
+-------------------------
+
+Europe PMC's ``cursorMark``/``nextCursorMark`` pagination is Solr-derived. The
+documented terminal signal is either an **absent** ``nextCursorMark`` or a
+``nextCursorMark`` **equal to the cursorMark that was sent** (unchanged, possibly
+with an empty final page); Solr's guide states the returned ``nextCursorMark``
+matches the ``cursorMark`` used once there are no more documents. This adapter
+therefore treats both as terminal, and also completes when the collected count
+exactly equals the stable ``hitCount`` even if the provider still offers an
+advancing cursor — every declared hit has been collected exactly once, so there
+is no truncation. A missing or repeating cursor *before* the declared total
+stays an explicit incomplete ``malformed_response``.
+
 Explicit incomplete outcomes
 ----------------------------
 
 A malformed or untrustworthy response never becomes a silent success. A missing
-or wrong-typed field, a changed ``hitCount``, an empty page that still offers a
-cursor, a repeated/looping cursor, an over-long cursor, or a final page whose
-collected record count disagrees with ``hitCount`` yields an explicit
-``malformed_response`` failure page and an incomplete result. A transport failure
-retains the earlier successful pages plus the failed page's full attempt
-provenance. Reaching ``max_pages`` while the provider still offers a cursor yields
-``page_limit`` and is never ``complete``.
+or wrong-typed field, an over-long cursor, deeply nested JSON that exhausts the
+parser, a changed ``hitCount``, a page larger than the requested ``pageSize``, a
+repeated provider identity (within or across pages), more collected records than
+``hitCount``, an empty page that still offers an advancing cursor, a cursor that
+loops to a previous value, or a terminal page whose collected count disagrees
+with ``hitCount`` yields an explicit ``malformed_response`` failure page and an
+incomplete result. A transport failure retains the earlier successful pages plus
+the failed page's full attempt provenance. Reaching ``max_pages`` while the
+provider still offers a cursor yields ``page_limit`` and is never ``complete``.
 
-No network, no credential, and no paid call happen here: the injected transport
-owns bounded retries, rate handling, and the allowlist.
+Request boundary
+----------------
+
+This module opens no socket itself and makes no implicit or automatic request:
+every request is one **explicit** library :meth:`EuropePMCClient.search` call
+routed through the injected transport, which owns the fixed allowlist, bounded
+retries, rate handling, the response-size cap, and the no-credential policy.
+Given a real :class:`~review_article_agent.discovery.transport.DiscoveryTransport`
+the adapter therefore *does* issue public, unauthenticated GETs to Europe PMC;
+the committed tests inject a scripted transport, so the test suite makes no
+network call. No credential and no paid call are ever used.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -128,6 +154,11 @@ DEFAULT_MAX_PAGES = 10
 MAX_QUERY_LEN = 4096
 MAX_CURSOR_LEN = 4096
 MAX_ID_LEN = 256
+
+#: The documented Europe PMC native-source alphabet: a short uppercase ASCII
+#: alphanumeric token (``MED``/``PMC``/``PPR``/...). It deliberately excludes
+#: ``:`` so the composed ``source_id`` is unambiguous.
+_NATIVE_SOURCE_RE = re.compile(r"[A-Z][A-Z0-9]*")
 
 
 # --------------------------------------------------------------------------- #
@@ -241,18 +272,22 @@ def _optional_year(item: dict[str, Any], key: str) -> int | None:
 
 
 def _native_source(item: dict[str, Any]) -> str:
-    """Read the required native provider source (``MED``/``PMC``/``PPR``/...)."""
+    """Read the required native provider source token (``MED``/``PMC``/``PPR``/...).
+
+    Europe PMC native source codes are short **uppercase ASCII alphanumeric**
+    tokens. Requiring that alphabet (and rejecting ``:``) keeps the composed
+    ``source_id`` unambiguous: because the native source never contains ``:``,
+    the first ``:`` always delimits source from id, so ``source="MED:A", id="B"``
+    (rejected) can never collide with ``source="MED", id="A:B"``.
+    """
     value = item.get("source")
     if not isinstance(value, str):
         raise _MalformedResponse("source: missing")
     value = value.strip()
     if not value or len(value) > MAX_ID_LEN:
         raise _MalformedResponse("source: invalid")
-    if any(ch.isspace() for ch in value) or "/" in value or "\\" in value:
+    if _NATIVE_SOURCE_RE.fullmatch(value) is None:
         raise _MalformedResponse("source: invalid")
-    for ch in value:
-        if ord(ch) < 0x20 or ord(ch) == 0x7F:
-            raise _MalformedResponse("source: invalid")
     return value
 
 
@@ -273,6 +308,10 @@ def _parse_page(body: bytes) -> tuple[int, tuple[MetadataRecord, ...], str | Non
         payload = json.loads(text)
     except (json.JSONDecodeError, ValueError) as exc:
         raise _MalformedResponse("body: not json") from exc
+    except RecursionError as exc:
+        # Deeply nested JSON exhausts the parser's recursion budget; treat it as
+        # an explicit malformed response rather than letting it escape.
+        raise _MalformedResponse("body: too deeply nested") from exc
     if not isinstance(payload, dict):
         raise _MalformedResponse("body: not an object")
 
@@ -321,6 +360,28 @@ def _parse_page(body: bytes) -> tuple[int, tuple[MetadataRecord, ...], str | Non
         except DiscoveryRecordError as exc:
             raise _MalformedResponse("record: invalid") from exc
     return hit_count, tuple(records), next_cursor
+
+
+def _has_duplicate_identity(
+    records: tuple[MetadataRecord, ...], seen: set[str]
+) -> bool:
+    """True when a provider-native identity repeats within the page or a prior page.
+
+    Only ``source_id`` (the composed native source + id) is an identity. A record
+    whose native id is missing has no identity: it stays explicit and is never
+    merged or fabricated, and a title is never treated as an identity. A repeated
+    identity is an explicit malformed response — the observations are preserved
+    (no scientific deduplication) and the result is never complete.
+    """
+    local: set[str] = set()
+    for record in records:
+        source_id = record.source_id
+        if source_id is None:
+            continue
+        if source_id in seen or source_id in local:
+            return True
+        local.add(source_id)
+    return False
 
 
 def _failed_page(
@@ -373,8 +434,8 @@ class EuropePMCClient:
     :meth:`search` validates the query, ``page_size`` (``1..1000``), and
     ``max_pages`` (``1..1000``) **before** any request, so an invalid parameter
     causes zero network activity. It returns a shared immutable
-    :class:`SearchResult`; a page limit or any anomaly is an explicit incomplete
-    outcome, never a silent success.
+    :class:`SearchResult`; a page limit, a repeated provider identity, or any
+    protocol anomaly is an explicit incomplete outcome, never a silent success.
     """
 
     def __init__(
@@ -411,12 +472,17 @@ class EuropePMCClient:
         exact requested URL, the UTC retrieval time, the provider ``hitCount``,
         the page records, the next cursor, and every transport attempt.
 
-        Completion requires the provider to signal the natural end (no
-        ``nextCursorMark``) **and** the collected record count to equal the stable
-        ``hitCount``. A changed ``hitCount``, an empty page that still offers a
-        cursor, a repeated/looping/over-long cursor, a malformed or missing field,
-        a final count mismatch (including overlap), a transport failure, or
-        reaching ``max_pages`` all yield an explicit incomplete result.
+        Completion requires the collected record count to equal the stable
+        ``hitCount`` and the provider to have reached a natural end: no
+        ``nextCursorMark``, an unchanged ``nextCursorMark`` (the Solr-derived
+        terminal signal), or an advancing cursor after the declared total has
+        been collected exactly once (no truncation). A changed ``hitCount``, a
+        page larger than the requested ``pageSize``, a repeated provider identity,
+        more collected records than ``hitCount``, an empty page that still offers
+        an advancing cursor, a repeated/looping/over-long cursor, a malformed or
+        missing field (including deeply nested JSON), a short terminal page, a
+        transport failure, or reaching ``max_pages`` all yield an explicit
+        incomplete result.
         """
         validated_query = _validate_query(query)
         validated_page_size = _require_bounded_int(
@@ -431,6 +497,7 @@ class EuropePMCClient:
         collected: list[MetadataRecord] = []
         cursor = EPMC_INITIAL_CURSOR
         seen_cursors = {EPMC_INITIAL_CURSOR}
+        seen_identities: set[str] = set()
         hit_count: int | None = None
         stop_reason: str | None = None
         failure: str | None = None
@@ -489,17 +556,30 @@ class EuropePMCClient:
             if hit_count is None:
                 hit_count = page_hit_count
 
+            # A Solr-derived cursor protocol signals the end either by omitting
+            # nextCursorMark or by returning the cursorMark it was sent
+            # (unchanged, possibly with an empty page).
+            is_terminal = next_cursor is None or next_cursor == cursor
+            new_total = len(collected) + len(page_records)
+
             anomaly: str | None = None
-            if page_hit_count != hit_count:
+            if len(page_records) > validated_page_size:
+                anomaly = "page returned more records than requested"
+            elif page_hit_count != hit_count:
                 anomaly = "hitCount changed between pages"
-            elif not page_records and next_cursor is not None:
-                anomaly = "empty page with a next cursor"
-            elif next_cursor is not None and next_cursor in seen_cursors:
-                anomaly = "cursor repeated"
+            elif _has_duplicate_identity(page_records, seen_identities):
+                anomaly = "duplicate provider identity"
+            elif new_total > hit_count:
+                anomaly = "more records collected than hitCount"
+            elif not page_records and not is_terminal:
+                anomaly = "empty page with an advancing cursor"
             elif (
-                next_cursor is None
-                and len(collected) + len(page_records) != hit_count
+                next_cursor is not None
+                and next_cursor != cursor
+                and next_cursor in seen_cursors
             ):
+                anomaly = "cursor looped to a previous value"
+            elif is_terminal and new_total != hit_count:
                 anomaly = "final count disagrees with hitCount"
 
             if anomaly is not None:
@@ -538,10 +618,19 @@ class EuropePMCClient:
                 )
             )
             collected.extend(page_records)
+            seen_identities.update(
+                record.source_id
+                for record in page_records
+                if record.source_id is not None
+            )
 
-            if next_cursor is None:
+            if new_total == hit_count:
+                # Every declared hit has been collected exactly once, so the
+                # bounded retrieval is complete with no truncation even when the
+                # provider still offers an advancing cursor.
                 stop_reason = "completed"
                 break
+            # Not terminal and still short: follow the advancing cursor.
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         else:
