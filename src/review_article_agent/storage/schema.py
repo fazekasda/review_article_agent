@@ -42,7 +42,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 6
+STORE_SCHEMA_VERSION = 7
 
 #: Registry maps project IDs to names and locations, records the single
 #: *selected* project, and records durable **execution activation** (which
@@ -837,6 +837,140 @@ def _store_v6(conn: sqlite3.Connection) -> None:
         )
 
 
+def _store_v7(conn: sqlite3.Connection) -> None:
+    """Add the durable **exact named-gate human approval** tables (C02 §1.3/§2/§3/§6.1).
+
+    These tables back :mod:`review_article_agent.storage.human_approvals`: an
+    append-only out-of-band owner-auth evidence row, the immutable human approval
+    it authorizes, and the exact dependency-snapshot entries the approval binds.
+
+    Only new tables and triggers are added; migrations 1-6 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, the runtime task/session/proposal
+    mappings, and the runtime dispatch/cost ledger) are never rewritten, so their
+    exact bytes/refs are preserved across the upgrade (``ARCH-ASSETS``; step doc
+    line 21).
+
+    Design notes enforced at the database:
+
+    * **Append-only.** Every row is immutable (never ``UPDATE``d/``DELETE``d), so
+      a change is always a **new** approval row; a re-approval never revises an
+      existing row, and a historical ``stale``/``superseded`` row is preserved.
+    * **Authority is out-of-band, never a column a payload can set.** ``actor_kind``
+      is pinned to ``'human'`` and ``authority`` to ``'owner_authenticated'``, and
+      ``authorizes_execution``/``authorizes_export`` are pinned to ``0`` by
+      ``CHECK`` constraints. The approval only *points at* its out-of-band
+      ``owner_auth_evidence`` row (C02 §1.3/§11.0).
+    * **Exact project/target binding.** Composite foreign keys pin the target and
+      every snapshot entry to an existing same-project revision and pin the
+      approval to the exact owner-auth evidence row, so a failed transaction can
+      leave no dangling reference.
+
+    The schema deliberately stores **no** challenge, credential, or capability: the
+    evidence is a safe projection (auth id, method, owner uid, time, action digest)
+    and the snapshot holds only digests and pinned refs, never source bytes
+    (spec lines 62-63; ``docs/storage.md``).
+    """
+    conn.execute(
+        """
+        CREATE TABLE owner_auth_evidence (
+            project_id      TEXT NOT NULL,
+            auth_id         TEXT NOT NULL,
+            method          TEXT NOT NULL,
+            owner_uid       INTEGER NOT NULL,
+            action_digest   TEXT NOT NULL,
+            verified_at_utc TEXT NOT NULL,
+            canonical       BLOB NOT NULL,
+            content_sha256  TEXT NOT NULL,
+            created_at_utc  TEXT NOT NULL,
+            PRIMARY KEY (project_id, auth_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE human_approval (
+            project_id               TEXT NOT NULL,
+            approval_id              TEXT NOT NULL,
+            target_artifact_id       TEXT NOT NULL,
+            target_revision_id       TEXT NOT NULL,
+            gate_kind                TEXT NOT NULL,
+            gate_id                  TEXT NOT NULL,
+            decision                 TEXT NOT NULL
+                                     CHECK (decision IN ('approved', 'rejected')),
+            rationale                TEXT NOT NULL,
+            granted_at_utc           TEXT NOT NULL,
+            snapshot_id              TEXT NOT NULL,
+            snapshot_digest          TEXT NOT NULL,
+            snapshot_canonical       BLOB NOT NULL,
+            snapshot_schema_version  INTEGER NOT NULL,
+            storage_schema_version   INTEGER NOT NULL,
+            version_set_canonical    BLOB NOT NULL,
+            owner_auth_id            TEXT NOT NULL,
+            owner_auth_method        TEXT NOT NULL,
+            owner_auth_action_digest TEXT NOT NULL,
+            owner_uid                INTEGER NOT NULL,
+            actor_kind               TEXT NOT NULL DEFAULT 'human'
+                                     CHECK (actor_kind = 'human'),
+            authority                TEXT NOT NULL DEFAULT 'owner_authenticated'
+                                     CHECK (authority = 'owner_authenticated'),
+            authorizes_execution     INTEGER NOT NULL DEFAULT 0
+                                     CHECK (authorizes_execution = 0),
+            authorizes_export        INTEGER NOT NULL DEFAULT 0
+                                     CHECK (authorizes_export = 0),
+            created_at_utc           TEXT NOT NULL,
+            PRIMARY KEY (project_id, approval_id),
+            FOREIGN KEY (project_id, target_artifact_id, target_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id),
+            FOREIGN KEY (project_id, owner_auth_id)
+                REFERENCES owner_auth_evidence (project_id, auth_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE human_approval_entry (
+            project_id             TEXT NOT NULL,
+            approval_id            TEXT NOT NULL,
+            entry_index            INTEGER NOT NULL,
+            artifact_id            TEXT NOT NULL,
+            revision_id            TEXT NOT NULL,
+            role                   TEXT NOT NULL,
+            content_sha256         TEXT NOT NULL,
+            byte_size              INTEGER NOT NULL,
+            rights_id              TEXT NOT NULL,
+            rights_record_revision INTEGER NOT NULL,
+            rights_digest          TEXT NOT NULL,
+            PRIMARY KEY (project_id, approval_id, entry_index),
+            FOREIGN KEY (project_id, approval_id)
+                REFERENCES human_approval (project_id, approval_id),
+            FOREIGN KEY (project_id, artifact_id, revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+
+    for table in ("owner_auth_evidence", "human_approval", "human_approval_entry"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
@@ -844,6 +978,7 @@ STORE_MIGRATIONS: Mapping[int, Migration] = {
     4: _store_v4,
     5: _store_v5,
     6: _store_v6,
+    7: _store_v7,
 }
 
 

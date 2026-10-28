@@ -1107,14 +1107,15 @@ class CostExposureFailClosedTest(DispatchTestBase):
 
 
 class MissingLedgerTableFailClosedTest(DispatchTestBase):
-    """A schema-6 store missing a ledger table must not report zero exposure."""
+    """A current-schema store missing a ledger table must not report zero exposure."""
 
     def test_missing_identity_and_operational_tables_fail_closed(self) -> None:
         conn = self.store.connection
         conn.execute("DROP TABLE runtime_dispatch_state")
         conn.execute("DROP TABLE runtime_dispatch")
         self.assertEqual(
-            int(conn.execute("PRAGMA user_version").fetchone()[0]), 6
+            int(conn.execute("PRAGMA user_version").fetchone()[0]),
+            schema.STORE_SCHEMA_VERSION,
         )
         with self.assertRaises(DispatchCorruptionError) as ctx:
             runtime_reserve_exposure(conn, self.pid)
