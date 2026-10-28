@@ -33,10 +33,14 @@ add subcommands without reworking dispatch. This module also exposes:
   ``authorizes_execution=false``, ``authorizes_export=false`` and
   ``scientific_validation=false``; no real protocol/pilot/outline/release gate
   and no in-band actor/authority flag is accepted.
-
-No ``run``/``worker``/``model`` or **scientific** ``approve`` command exists
-here: those belong to later steps once their execution and scientific-approval
-layers are integrated.
+* ``worker`` — **lifecycle control only** (``start``/``status``/``stop``) over
+  :mod:`review_article_agent.worker.process` and the owner-only local control
+  socket. ``worker start`` reports readiness (never job completion) and
+  ``worker stop`` routes an authenticated control request (never a signal);
+  selection/starts are not execution. No ``run``/``attach``/job-control,
+  ``model``, or scientific-``approve`` command exists here: those belong to
+  later steps once their execution and scientific-approval layers are
+  integrated.
 """
 
 from __future__ import annotations
@@ -88,6 +92,11 @@ from .config import (
     load_config_file,
     load_strict_json,
     resolve_data_dir,
+)
+from .worker import (
+    WORKER_COMMANDS,
+    build_worker_parser,
+    WorkerControlError,
 )
 
 PROG = "review-article-agent"
@@ -227,6 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_artifact_parser(sub)
     _build_backup_parser(sub)
     _build_fixture_parser(sub)
+    build_worker_parser(sub)
 
     return parser
 
@@ -925,6 +935,12 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
         except KeyError as exc:  # pragma: no cover - argparse enforces choices
             raise CliUsageError(f"unknown fixture command {args.fixture_command!r}") from exc
         return handler(args, ctx)
+    if args.command == "worker":
+        try:
+            handler = WORKER_COMMANDS[args.worker_command]
+        except KeyError as exc:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(f"unknown worker command {args.worker_command!r}") from exc
+        return handler(args, ctx)
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -971,6 +987,17 @@ _BACKUP_CONFLICT_MESSAGE = (
     "target whose data directory does not already hold that identity."
 )
 
+#: Worker lifecycle error categories mapped to the CLI's stable exit codes:
+#: ``validation`` (2, a bad option value), ``conflict`` (3, a foreign endpoint
+#: occupies the control path), ``storage`` (4, an unavailable/unconfirmed
+#: lifecycle outcome). ``worker`` raises :class:`WorkerControlError` with a
+#: curated, value-free message.
+_WORKER_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+
 
 def _emit_result(result: object, stdout: TextIO | None = None) -> None:
     out = stdout if stdout is not None else sys.stdout
@@ -994,6 +1021,8 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
     """Map an exception to a stable ``(category, exit_code)`` pair."""
     if isinstance(exc, (CliUsageError, ConfigError)):
         return "usage", EXIT_USAGE
+    if isinstance(exc, WorkerControlError):
+        return exc.category, _WORKER_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1024,6 +1053,9 @@ def _error_message(exc: BaseException, category: str) -> str:
     """
     if category == "internal":
         return _INTERNAL_MESSAGE
+    if isinstance(exc, WorkerControlError):
+        # Authored in ``cli.worker``; a static, curated, value-free message.
+        return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):
             return str(exc)

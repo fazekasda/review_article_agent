@@ -1,17 +1,27 @@
-# CLI contract — `review-article-agent` (Step 02)
+# CLI contract — `review-article-agent` (Step 02, with the Step 03 worker-lifecycle slice)
 
-> **Scope: Step 02 only.** This document is the **contract** for the command-line
-> surface over the durable local project foundation. It describes exactly what the
-> commands accept, what they print, and how they fail. It is **not** a scientific
-> or approval contract and it claims **no** scientific validation.
+> **Scope: Step 02, plus one clearly bounded Step 03 addition.** This document is
+> the **contract** for the command-line surface over the durable local project
+> foundation. It describes exactly what the commands accept, what they print, and
+> how they fail. It is **not** a scientific or approval contract and it claims
+> **no** scientific validation.
 >
 > It covers: projects/registry, immutable artifact revisions, a **private local
-> storage snapshot** (`backup`/`export`) and **non-authorizing local
-> storage-fixture review state** (`fixture`). The `fixture` commands record a
-> local *fixture* only; they are **never** a real protocol/pilot/outline/final
-> release approval and never authorize execution, export, or science. No
-> agent-execution (`run`/`worker`/`model`) or scientific-`approve` command exists
-> here.
+> storage snapshot** (`backup`/`export`), **non-authorizing local storage-fixture
+> review state** (`fixture`), and — the Step 03 addition — the **worker
+> lifecycle** commands `worker start|status|stop` over the already-integrated
+> detached-worker process layer. The `fixture` commands record a local *fixture*
+> only; they are **never** a real protocol/pilot/outline/final release approval
+> and never authorize execution, export, or science. The `worker` commands
+> manage the worker **process lifecycle** only: they start/probe/stop-by-request
+> a detached worker and do **not** run a job, execute an agent, attach to a task,
+> or accept any model/provider/credential setting. No `run`/`attach`/job-control
+> command and no scientific-`approve` command exists here.
+>
+> **This is not Step 03 complete.** Only the worker *lifecycle* CLI slice is
+> described. Durable job states, run/attach/job control, budgets, recovery, and
+> project activation are out of scope here; every worker command is synthetic and
+> local, uses no real model, and performs or implies no scientific approval.
 
 The contract was decided in task T6a; the exact spellings below are the T6a
 decision. The behavior boundaries are fixed by
@@ -341,38 +351,106 @@ $ review-article-agent --data-dir ./other-state backup restore ./snap-1 ./restor
 $ review-article-agent --data-dir "$DD" export ./snap-1b --project <PROJECT_ID>   # same private format
 ```
 
-## 9. Explicit exclusions (Step 02)
+## 9. Worker lifecycle — `worker` (Step 03 boundary)
 
-* No scientific `approve`/`reject` and no `run`/`pause`/`resume`, `worker`, or
-  `model`/provider command exists here. Those depend on later steps' execution
-  and scientific-approval layers and are **not** reimplemented in the CLI.
+`worker` manages the **process lifecycle** of the detached background worker over
+the already-integrated launcher
+[`review_article_agent.worker.process`](../src/review_article_agent/worker/process.py)
+and the owner-only local control socket
+([`review_article_agent.runtime.ipc`](../src/review_article_agent/runtime/ipc.py)).
+It is **lifecycle control only**. It is the *only* command group that acts on the
+worker; no ordinary command starts or stops a worker (see below).
+
+| Command | Synopsis |
+| --- | --- |
+| `worker start [--timeout SECONDS]` | Ensure a detached worker is running for the resolved data directory. Idempotent: if a verified worker already answers, no process is launched. Reports **readiness**, never job completion. |
+| `worker status [--timeout SECONDS]` | Show the **verified** worker status for the data directory. |
+| `worker stop [--timeout SECONDS]` | Stop the worker by **authenticated control request** (never a signal, never a PID file, never a deletion of an ordinary service). |
+
+All three use the **global** data-directory resolution (`--data-dir` > config
+`data_dir` > XDG default, §2) and the same optional config file (§4). No worker
+command accepts a project, a model/provider/credential, or a budget setting.
+
+`--timeout SECONDS` is optional and bounded: it is parsed from the raw string and
+must be a finite number greater than `0` and at most `3600`. When omitted, the
+launcher's own default is used. The value is **never echoed** — an invalid or
+secret-looking token yields a static validation error (§3).
+
+**`worker start` — readiness, not execution.** On success the result carries
+`readiness="ready"`, `job_completion=false`, `scientific_validation=false`, and
+the verified `pid`/`state`; `started` is `true` only when this call launched the
+process (`false` for an idempotent re-start). Starting a worker runs no task and
+proves no job completed.
+
+**`worker status` — an explicit reason.** Output has `running` and `verified`
+plus, for a non-running result, an explicit curated `reason` (`not_running`,
+`foreign_endpoint`, or `unavailable`). `running=false` is **not** by itself proof
+that all is well; the `reason` distinguishes a cleanly stopped worker from an
+unavailable control plane or a foreign endpoint. `status` itself does not start,
+stop, or otherwise act on a worker.
+
+**`worker stop` — confirmed or not success.** The request is routed through the
+owner-authenticated control socket and is credited only when the socket is then
+**confirmed gone**:
+
+| Outcome | Result |
+| --- | --- |
+| Stop confirmed (worker acknowledged and the endpoint is gone) | exit `0`; `stopped=true`, `already_stopped=false`. |
+| Worker already confirmed **not running** | exit `0`; idempotent `stopped=true`, **`already_stopped=true`**. |
+| Stop **unconfirmed** (delivered but the worker never confirmed shutdown) | exit `4` (`storage`), not success. |
+| Control endpoint **unavailable** | exit `4` (`storage`), not success. |
+| A **foreign** endpoint occupies the control path (not our worker) | exit `3` (`conflict`), not success. |
+
+An unconfirmed, unavailable, or foreign stop is a **stable non-success** with a
+curated, actionable message; it is never reported as a successful stop, and no
+signal is ever sent. `worker start` that never becomes ready is exit `4`
+(`storage`). These typed errors use the existing exit taxonomy (§3):
+`validation` `2`, `conflict` `3`, `storage` `4`.
+
+**Selection is not execution.** `create`, `list`, `select`, and the top-level
+`status` never start, stop, or probe the worker; selecting or creating a project
+is not running it.
+
+## 10. Explicit exclusions (Step 02, and the Step 03 lifecycle boundary)
+
+* No `run`/`attach`/job-control, no `pause`/`resume`, and no scientific
+  `approve`/`reject` command exists here. The `worker` commands manage the worker
+  **process lifecycle** only (`start`/`status`/`stop`); durable jobs, run/attach,
+  budgets, recovery, and project activation belong to later work and are **not**
+  reimplemented in the CLI.
+* No `model`/provider/credential/budget command or setting exists here, and none
+  is read from the config file (§4). `worker` accepts no such setting.
 * `fixture` records a local, non-authorizing fixture only. No real
   protocol/pilot/outline/final-release gate and no in-band actor/authority is
   accepted; an imported document still cannot self-grant any approval.
 * No scientific acquisition, evidence validation, or approval is performed or
-  implied. All fixtures and archives are synthetic/private and non-authorizing.
+  implied. All fixtures and archives are synthetic/private and non-authorizing,
+  and the worker lifecycle is exercised only with owned disposable processes.
 * `backup`/`export` is a **private local storage snapshot**, not a manuscript
   (Markdown/BibTeX/RIS) or redistribution export; never publish an archive.
 
-## 10. Extension hooks
+## 11. Extension hooks
 
 Adding a subcommand is intentionally small:
 
 1. Add a parser in `build_parser()` (`review_article_agent/cli/main.py`).
 2. Add a handler `cmd_<name>(args, ctx) -> dict | RawBytes` that returns a
    JSON-ready object.
-3. Register it in `_COMMANDS`, `_ARTIFACT_COMMANDS`, `_BACKUP_COMMANDS`, or
-   `_FIXTURE_COMMANDS`.
+3. Register it in `_COMMANDS`, `_ARTIFACT_COMMANDS`, `_BACKUP_COMMANDS`,
+   `_FIXTURE_COMMANDS`, or `WORKER_COMMANDS` (the last in
+   `review_article_agent/cli/worker.py`).
 
 Handlers receive a `Context` holding the resolved `Registry`, the data directory,
 the parsed config, and the environment, and never touch global state. New exit
 categories are added to `classify_error()` and this table.
 
-## 11. Verification
+## 12. Verification
 
 * `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` — includes
   the real-subprocess CLI acceptance tests (`tests/test_cli.py`,
-  `tests/test_cli_snapshot.py`) and the config tests (`tests/test_config.py`).
+  `tests/test_cli_snapshot.py`), the config tests (`tests/test_config.py`), the
+  worker-lifecycle CLI tests (`tests/test_cli_worker.py`), and the real detached
+  worker-process tests (`tests/test_worker_process.py`).
 * `python3 scripts/check_contract_docs.py --self-test` — the Step 01 contract
   checks remain green (this document adds no fixtures or schema field semantics).
 * The packaged console script and the absence of an invented license are checked
