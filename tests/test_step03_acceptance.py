@@ -21,8 +21,13 @@ Coverage (``docs/implementation/03-durable-worker.md`` AC1-AC7 and
   (``attempts_total`` 1, one backend admission, no extra reserves). No
   exactly-once *external* claim is made: the synthetic backend state is
   explained by the engine's own journal, not a real provider.
-* **AC1 — detached submitter lifetime.** A separate ``python`` submitter process
-  exits before the background job completes; the worker finishes it anyway.
+* **AC1 — detached submitter lifetime.** A separate RPC-submitter process (it
+  speaks the owner-only control protocol directly, not the lifecycle CLI job
+  spellings) exits after its submit is durable; a deterministic ``before_dispatch``
+  stop-gate barrier proves the job is not yet completed and holds no accepted
+  result, and only after the submitter PID is gone is the worker's own child
+  resumed to finish the job. (Real product CLI job-run lifetime is T5c's
+  concern.)
 * **AC4 — one active project / safe switch.** Two concurrent project submitters
   cannot admit two projects; a switch while a remote is in flight is blocked and
   drains the old project, whose result is accepted **only** in the old store,
@@ -52,6 +57,7 @@ Every wait is bounded with backoff, every owned child is cleaned up in
 from __future__ import annotations
 
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -142,7 +148,12 @@ def _backend_dispatch_count(data_dir: object) -> int:
 # --------------------------------------------------------------------------- #
 # Disposable submitter programs (written to a temp dir; never added to the pkg)
 # --------------------------------------------------------------------------- #
+# A *process-level RPC submitter*: it speaks the owner-only UDS control protocol
+# directly (never the new lifecycle CLI job spellings), prints its own PID, and
+# exits. It is deliberately not the product CLI job command — the real product
+# CLI job-run lifetime is covered separately by T5c.
 _SUBMITTER = r'''
+import os
 import sys
 sys.path.insert(0, {src!r})
 from review_article_agent.runtime.ipc import WorkerIPCClient
@@ -158,14 +169,12 @@ res = client.request({{
     "stage": "s", "reserve_usd": "0.10",
 }})
 if res.get("ok"):
-    print("OK " + res["job"]["job_id"])
+    print("OK " + res["job"]["job_id"] + " " + str(os.getpid()))
 else:
     print("ERR " + str(res.get("code")))
 '''
 
-# A submit writer: when given a second argument it is the project id that must
-# have been accepted; otherwise prints the raw outcome. Nothing here is a model,
-# network, or scientific call.
+# The same RPC submitter is reused for the concurrent-activation race.
 _CONCURRENT_SUBMITTER = _SUBMITTER
 
 
@@ -451,14 +460,28 @@ class SigkillRestartMatrixTest(_AcceptanceBase):
 
 
 class DetachedSubmitterTest(_AcceptanceBase):
-    """AC1: a background job finishes after the submitting CLI process exits."""
+    """AC1: a background job finishes after the submitting CLI process exits.
+
+    Deterministic barrier rather than a timing delay: the worker is started with
+    the test-only ``before_dispatch`` stop gate, a separate *RPC submitter*
+    process submits one job and fully exits, the worker is proven stopped at the
+    seam (job persisted, not completed, no accepted result — admission is not
+    completion), and only then is the worker's own disposable child resumed with
+    ``SIGCONT``. A fresh client confirms completion while the original submitter
+    process is already gone. (The submitter speaks the owner-only control
+    protocol directly; real product CLI job-run lifetime is a separate T5c
+    concern.)
+    """
 
     def test_job_completes_after_submitter_process_exits(self) -> None:
         data_dir, _registry, info = self._fixture()
-        worker = self._start_worker(data_dir)
+        worker = self._start_worker(data_dir, pause_at="before_dispatch")
         worker.wait_ready()
         script = self._write_script("detached_submitter.py", _SUBMITTER)
 
+        # The submitter process runs to completion and exits while the worker is
+        # deterministically stopped at the seam (the submit is durable before the
+        # seam fires; the gate prevents any completion).
         completed = subprocess.run(
             [sys.executable, script, str(data_dir), info.project_id, "detached-1", "0"],
             capture_output=True,
@@ -466,25 +489,49 @@ class DetachedSubmitterTest(_AcceptanceBase):
             timeout=60,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        out = completed.stdout.strip()
-        self.assertTrue(out.startswith("OK "), out)
-        job_id = out.split(" ", 1)[1]
+        parts = completed.stdout.strip().split()
+        self.assertEqual(parts[0], "OK", completed.stdout)
+        job_id = parts[1]
+        submitter_pid = int(parts[2])
 
-        # The submitter process has fully exited (subprocess.run returned) while
-        # the independent worker process is still alive and serving.
-        self.assertIsNone(worker.proc.poll())
+        # The original submitter process has fully exited (its PID is gone).
+        self.assertIsNone(_proc_state(submitter_pid), "submitter process still alive")
+
+        # The worker is stopped precisely at before_dispatch: the job is durable
+        # but neither terminal nor accepted (a receipt is not a completion).
+        self.assertTrue(
+            worker.wait_state("T", timeout=25.0),
+            "worker never reached the before_dispatch gate",
+        )
+        view = self._disk_view(info, job_id)
+        self.assertIsNotNone(view["job"])
+        self.assertNotIn(view["job"].state, ("completed", "failed"))
+        self.assertIsNone(view["accepted"], "no result may be committed at the seam")
+
+        # Resume only our own disposable child past the seam.
+        worker.proc.send_signal(signal.SIGCONT)
+
+        fresh = WorkerIPCClient(str(data_dir), io_timeout=10.0)
 
         def _terminal() -> bool:
-            res = self._job_status(worker, info.project_id, job_id)
+            try:
+                res = fresh.request(
+                    _req("job_status", project_id=info.project_id, job_id=job_id)
+                )
+            except Exception:  # noqa: BLE001 - transport not up yet
+                return False
             return res.get("ok") and res["job"]["state"] in ("completed", "failed")
 
         self.assertTrue(
             self._wait_for(_terminal, timeout=25.0),
             "detached job did not complete after the submitter exited",
         )
-        final = self._job_status(worker, info.project_id, job_id)
+        final = fresh.request(
+            _req("job_status", project_id=info.project_id, job_id=job_id)
+        )
         self.assertEqual(final["job"]["state"], "completed")
         self.assertIsNotNone(final["job"]["accepted_result"])
+        self.assertIsNone(_proc_state(submitter_pid), "submitter resurfaced")
         worker.stop()
 
 
