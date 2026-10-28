@@ -37,10 +37,15 @@ add subcommands without reworking dispatch. This module also exposes:
   :mod:`review_article_agent.worker.process` and the owner-only local control
   socket. ``worker start`` reports readiness (never job completion) and
   ``worker stop`` routes an authenticated control request (never a signal);
-  selection/starts are not execution. No ``run``/``attach``/job-control,
-  ``model``, or scientific-``approve`` command exists here: those belong to
-  later steps once their execution and scientific-approval layers are
-  integrated.
+  selection/starts are not execution.
+* ``job`` — **synthetic durable job control** (``run``/``status``/``list``/
+  ``pause``/``resume``/``cancel``/``switch``/``drain``/``reconcile``/``attach``)
+  over the integrated worker engine, reached through the owner-authenticated
+  control transport. ``job run`` ensures a worker and submits one synthetic job
+  (admission only, never completion); ``job attach`` reads status snapshots and
+  never cancels on exit. There is **no** ``model`` or scientific-``approve``
+  command here: those belong to later steps once their execution and
+  scientific-approval layers are integrated.
 """
 
 from __future__ import annotations
@@ -97,6 +102,11 @@ from .worker import (
     WORKER_COMMANDS,
     build_worker_parser,
     WorkerControlError,
+)
+from .jobs import (
+    JOB_COMMANDS,
+    StreamNDJSON,
+    build_jobs_parser,
 )
 
 PROG = "review-article-agent"
@@ -237,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_backup_parser(sub)
     _build_fixture_parser(sub)
     build_worker_parser(sub)
+    build_jobs_parser(sub)
 
     return parser
 
@@ -941,6 +952,12 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
         except KeyError as exc:  # pragma: no cover - argparse enforces choices
             raise CliUsageError(f"unknown worker command {args.worker_command!r}") from exc
         return handler(args, ctx)
+    if args.command == "job":
+        try:
+            handler = JOB_COMMANDS[args.job_command]
+        except KeyError as exc:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(f"unknown job command {args.job_command!r}") from exc
+        return handler(args, ctx)
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -1001,6 +1018,20 @@ _WORKER_CATEGORY_EXITS = {
 
 def _emit_result(result: object, stdout: TextIO | None = None) -> None:
     out = stdout if stdout is not None else sys.stdout
+    if isinstance(result, StreamNDJSON):
+        # ``job attach --watch`` is the one documented exception to the
+        # single-JSON-document rule: one object per line, streamed as the watch
+        # polls. A closed downstream consumer (broken pipe) is a clean detach,
+        # not an error, and never triggers any worker control.
+        try:
+            for document in result.documents:
+                out.write(
+                    json.dumps(document, sort_keys=True, ensure_ascii=True) + "\n"
+                )
+                out.flush()
+        except BrokenPipeError:
+            return
+        return
     if isinstance(result, RawBytes):
         # ``artifact content`` deliberately emits stored bytes verbatim; this is
         # the one explicit content read, not an error/log path.
@@ -1126,11 +1157,17 @@ def main(
             env=dict(os.environ if env is None else env),
         )
         result = dispatch(args, ctx)
+    except KeyboardInterrupt:
+        # A Ctrl-C during a command (e.g. a job watch) detaches cleanly: no
+        # traceback, and no worker control is emitted by the CLI itself.
+        return 130
     except Exception as exc:  # noqa: BLE001 - convert every failure to JSON
         return _emit_error(exc, stderr)
 
     try:
         _emit_result(result, stdout)
+    except KeyboardInterrupt:
+        return 130
     except Exception as exc:  # noqa: BLE001 - an output failure is never a traceback
         return _emit_error(exc, stderr)
     return EXIT_SUCCESS
