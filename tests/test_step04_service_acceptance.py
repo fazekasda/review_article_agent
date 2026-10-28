@@ -23,24 +23,38 @@ What is real and what is a fixture (stated plainly)
 Deliberate non-goals (do not overclaim)
 --------------------------------------
 
-* A generic/saved tool permission is **not** app human approval. The application
-  has **no** human-approval implementation yet, so this suite does **not** claim
-  the real service enforces outline/pilot/exclusion approvals. It proves only
-  (a) the pure proposal boundary rejects authority/tool/scope fields, and
-  (b) the configured tool/permission deny is real.
+* A generic/saved tool permission is **not** app human approval. This suite
+  proves (a) the pure proposal boundary rejects authority/tool/scope fields,
+  (b) the configured tool/permission deny is real, and (c) a **real** saved
+  ``always`` grant never overrides that configured deny. The application's own
+  exact named-gate approval repository
+  (:class:`~review_article_agent.storage.human_approvals.HumanApprovalRepository`)
+  refuses a saved permission entry as a capability and grants no
+  outline/pilot/exclusion approval (proven against the real saved entry in
+  ``test_real_saved_always_grant_cannot_override_configured_deny``).
 * Same-UID containment is configuration, not an OS sandbox (see the
   ``runtime.service`` / ``runtime.roles`` module boundaries).
 * The suite never reads or prints OpenCode's private credential/registration
   bytes: it only hashes the *ordinary* service-registration files before/after to
   prove they are untouched.
 
-Evidence-only, clearly flagged as **UNRUN**: creating a *pre-existing* saved
-``always`` grant and then proving the configured deny still wins. The public
-permission API cannot establish such a grant while every evaluation is ``deny``
+Real, but bounded and explicitly scoped: creating a *pre-existing* saved
+``always`` grant and then proving the configured deny still wins. While every
+evaluation is ``deny`` the public permission API cannot establish such a grant
 (``POST`` returns ``effect=deny`` so no request exists; ``reply always`` is
-``404 PermissionNotFoundError``; the saved list stays empty), and reading or
-writing OpenCode's private permission storage is explicitly out of scope. See
-``test_saved_always_grant_override_is_unrun``.
+``404 PermissionNotFoundError``; the saved list stays empty). This suite
+therefore uses a **test-only, temporary** configuration bootstrap: it saves the
+owned config's exact bytes and private mode, temporarily makes exactly one
+synthetic ``read`` resource ``ask`` (dropping *only* the rules/policies that
+would otherwise match it, so every other action/resource stays denied), reloads
+the service through its documented ``POST /api/location/reload`` endpoint,
+drives one real ``always`` reply through the public permission API to create a
+durable saved grant, then restores the exact original bytes + mode and reloads
+**before** any teardown. It never reads or writes OpenCode's private permission
+database. The temporary widening is bounded to one synthetic resource, performs
+no model/tool action, and is fully reverted. See
+``test_real_saved_always_grant_cannot_override_configured_deny``, which also
+proves the app human-approval rejection of that exact real saved entry.
 
 Permission vocabulary (two distinct layers)
 -------------------------------------------
@@ -80,6 +94,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -109,9 +124,16 @@ from review_article_agent.runtime.roles import (  # noqa: E402
     RoleConfiguration,
     submit_proposal,
 )
+from review_article_agent.runtime.gates import prepare_gate_snapshot  # noqa: E402
 from review_article_agent.runtime.service import (  # noqa: E402
     LoopbackFixtureProvider,
     OpenCodeServiceManager,
+)
+from review_article_agent.storage import ArtifactRepository, ProjectStore  # noqa: E402
+from review_article_agent.storage import paths as store_paths  # noqa: E402
+from review_article_agent.storage.human_approvals import (  # noqa: E402
+    HumanApprovalDeniedError,
+    HumanApprovalRepository,
 )
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +297,22 @@ def _raw(
         return exc.code, payload
 
 
+def _post_status(base_url: str, path: str, password: str, body: object = None) -> int:
+    """POST and return only the HTTP status (``204`` carries no JSON body)."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(base_url.rstrip("/") + path, data=data, method="POST")
+    request.add_header("Authorization", _auth_header(password))
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
+            return response.status
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+        exc.close()
+        return code
+
+
 def _fingerprint(path: Path) -> str | None:
     """SHA-256 of a file's bytes, or ``None``; the bytes are never surfaced."""
     if not path.exists():
@@ -324,6 +362,153 @@ def _bounded_task(project_id: str = "prj_accept", role: str = "writer") -> Bound
             "step_limit": 4,
         },
         configuration=_role_config(),
+    )
+
+
+#: The single synthetic ``read`` resource the bounded test-only bootstrap makes
+#: ``ask`` so a *real* saved ``always`` grant can be created through the public
+#: permission API. It is a path (never a repository file), and no read is run.
+SAVED_GRANT_PROBE_RESOURCE = "/tmp/raa-saved-grant-probe-read"
+
+#: The C02 named gate kinds a saved generic tool permission must never satisfy.
+SCIENTIFIC_GATE_KINDS: tuple[str, ...] = ("pilot", "outline", "exclusion_set")
+
+#: Bounded reload attempts while the config/cache/plugin pipeline settles.
+_RELOAD_ATTEMPTS = 40
+_RELOAD_DELAY_S = 0.4
+
+_APPROVAL_OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
+
+
+def _saved_grant_bootstrap_config(raw_bytes: bytes, resource: str) -> bytes:
+    """A **test-only** configuration that keeps every deny but makes ``read`` ask.
+
+    The real V2 resolution is deny-overrides-anything: a matching deny rule, or a
+    matching ``tool.use`` policy (whose plugin turns a match into a deny hook),
+    would defeat an ``ask``. So this bootstrap drops *only* the rules that match
+    ``read <resource>`` — the catch-all ``*/*`` deny, the ``read/*`` deny, the
+    matching ``tool.use`` policy, and each agent's catch-all deny — and appends
+    one explicit ``ask`` for the exact synthetic resource. Every other
+    action/resource stays denied. The caller restores the exact original bytes
+    and mode and reloads before teardown.
+    """
+    document = json.loads(raw_bytes)
+    kept = [
+        rule
+        for rule in document["permissions"]
+        if not (rule.get("action") in ("*", "read") and rule.get("resource") == "*")
+    ]
+    ask = kept + [{"action": "read", "resource": resource, "effect": "ask"}]
+    document["permissions"] = ask
+    document["policies"] = [
+        rule
+        for rule in document["policies"]
+        if not (rule.get("action") == "tool.use" and rule.get("resource") in ("*", "read:*"))
+    ]
+    for agent in document.get("agents", {}).values():
+        agent["permissions"] = list(ask)
+    return json.dumps(document).encode("utf-8")
+
+
+def _permission_eval(client, url, password, directory, resource: str):
+    """Create a fresh session and evaluate ``read <resource>`` through the real API."""
+    session = client.create_session(agent="writer", model=WRITER_MODEL, directory=directory)
+    code, body = _raw(
+        "POST",
+        url,
+        f"/api/session/{session['id']}/permission",
+        password,
+        {"action": "read", "resources": [resource], "save": [resource], "agent": "writer"},
+    )
+    if code != 200 or not isinstance(body, dict) or "data" not in body:
+        raise AssertionError(f"permission evaluation failed: {code} {body!r}")
+    return session, body
+
+
+def _reload_until(client, url, password, directory, *, resource: str, want: str):
+    """Reload until the real evaluation reaches ``want`` (bounded, never a silent hang).
+
+    The service's config document, agent cache, and policy-plugin observer settle
+    over a small, bounded number of reloads; a fresh session is evaluated each
+    attempt. Never an unbounded poll. Returns the ``(session, evaluation)`` that
+    first reached ``want``.
+    """
+    last = None
+    for _ in range(_RELOAD_ATTEMPTS):
+        _post_status(url, "/api/location/reload", password)
+        time.sleep(_RELOAD_DELAY_S)
+        session, body = _permission_eval(client, url, password, directory, resource)
+        last = body["data"]
+        if last.get("effect") == want:
+            return session, body
+    raise AssertionError(f"permission evaluation never reached effect={want!r}: {last!r}")
+
+
+def _rights(project_id: str, artifact_id: str, revision_id: str) -> dict:
+    """A synthetic, fully valid ``RightsRecord`` bound to one exact revision."""
+    return {
+        "rights_id": f"RIGHTS-{revision_id}",
+        "project_id": project_id,
+        "record_revision": 1,
+        "subject": {
+            "kind": "source_revision",
+            "project_id": project_id,
+            "artifact_id": artifact_id,
+            "revision_id": revision_id,
+        },
+        "operations": {op: "allowed" for op in _APPROVAL_OPS},
+        "basis": {
+            op: {
+                "kind": "public_domain",
+                "evidence": {"ref": "lic:pd-syn", "provenance": "publisher:pd-list"},
+            }
+            for op in _APPROVAL_OPS
+        },
+        "authorization": None,
+        "restrictions": [],
+        "privacy": {"personal_data": False, "confidentiality": "public", "denial": False},
+        "recorded_by": "user",
+        "recorded_at": "2026-10-28T00:00:00Z",
+        "derived_status": "valid",
+    }
+
+
+def _approval_target(store, artifact_id: str, revision_id: str) -> dict:
+    return {
+        "project_id": store.project_id,
+        "artifact_id": artifact_id,
+        "revision_id": revision_id,
+    }
+
+
+def _approval_chain(store) -> None:
+    """A live ``document <- finding <- report`` closure for a synthetic store."""
+    repo = ArtifactRepository(store)
+    repo.create_artifact("a-base", kind="document")
+    repo.import_revision(
+        artifact_id="a-base",
+        content=b"synthetic-base-bytes",
+        origin_locator="import:synthetic",
+        rights=_rights(store.project_id, "a-base", "rev-base"),
+        revision_id="rev-base",
+    )
+    repo.create_artifact("a-find", kind="finding")
+    repo.import_revision(
+        artifact_id="a-find",
+        content=b"synthetic-find-bytes",
+        origin_locator="import:synthetic",
+        rights=_rights(store.project_id, "a-find", "rev-find"),
+        revision_id="rev-find",
+        dependencies=[_approval_target(store, "a-base", "rev-base")],
+    )
+    repo.create_artifact("a-rep", kind="report")
+    repo.import_revision(
+        artifact_id="a-rep",
+        content=b"synthetic-report-bytes",
+        origin_locator="import:synthetic",
+        rights=_rights(store.project_id, "a-rep", "rev-rep"),
+        revision_id="rev-rep",
+        dependencies=[_approval_target(store, "a-find", "rev-find")],
     )
 
 
@@ -950,29 +1135,167 @@ class RealServiceAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(body["data"]["effect"], "deny")
 
-    def test_saved_always_grant_override_is_unrun(self) -> None:
-        self.skipTest(
-            "UNRUN: a pre-existing saved 'always' grant cannot be created through the "
-            "public permission API while every evaluation is deny — POST permission "
-            "returns effect=deny (so no request exists), 'reply always' returns 404 "
-            "PermissionNotFoundError, and GET /api/permission/saved stays empty. "
-            "Seeding an 'ask' grant first would need an ask-configured service, but the "
-            "role/service config denies every built-in action and carries a generic */* "
-            "deny, so no ask request is producible through the public API. Exercising an "
-            "out-of-band saved grant would require reading/writing OpenCode's private "
-            "permission storage, which the specification forbids. This explicit UNRUN "
-            "placeholder is kept (never removed to hide the gap); the app-owned durable "
-            "approval criterion is proven separately."
+    def test_real_saved_always_grant_cannot_override_configured_deny(self) -> None:
+        """A **real** saved ``always`` grant never overrides the configured deny.
+
+        The public permission API alone cannot create a saved grant while every
+        evaluation is ``deny``, so this test uses a **bounded, fully reverted**
+        test-only configuration bootstrap: it saves the owned config's exact bytes
+        and private mode, temporarily makes exactly one synthetic ``read``
+        resource ``ask`` (every other action/resource stays denied), reloads
+        through the documented public endpoint, drives one real ``always`` reply
+        through the public permission API to create a **durable** saved grant,
+        then restores the exact original bytes + mode and reloads **before** any
+        teardown. It then proves the configured deny wins for the same
+        action/resource in the same project, that the saved grant persists, and
+        that the application's named-gate approval repository refuses that exact
+        saved entry as a capability (writing zero rows). It never touches
+        OpenCode's private permission database and performs no model/tool action.
+        """
+        resource = SAVED_GRANT_PROBE_RESOURCE
+        # Capture the validated connection and the owned location BEFORE the change
+        # (the manager refuses the drifted config once it is written).
+        url = self.base_url()
+        password = self.password()
+        loc = self.manager.location_for("prj_saved_grant")
+        config_file = self.manager.config_file
+        original = config_file.read_bytes()
+        original_mode = stat.S_IMODE(config_file.stat().st_mode)
+        self.assertEqual(original_mode & 0o077, 0, "the owned config is not owner-private")
+        client = OpenCodeV2Client(
+            url, auth="basic", username=service.SERVICE_USERNAME, password=password, timeout=60
         )
+        restored = False
+        try:
+            # (1) Bounded test-only bootstrap: exactly `read <resource>` -> ask.
+            config_file.write_bytes(_saved_grant_bootstrap_config(original, resource))
+            os.chmod(config_file, 0o600)
+            session, bootstrap = _reload_until(
+                client, url, password, loc.directory, resource=resource, want="ask"
+            )
+
+            # The manager refuses the drifted config until it is restored: the
+            # fingerprint is never spoofed and validation is never weakened.
+            with self.assertRaises(service.ServiceOwnershipError):
+                self.manager.connection()
+
+            # (2) One real human 'always' reply through the public API creates a
+            #     durable, project-scoped saved grant.
+            request_id = bootstrap["data"]["id"]
+            session_id = session["id"]
+            project_id = session["projectID"]
+            code, pending = _raw(
+                "GET", url, f"/api/session/{session_id}/permission", password
+            )
+            self.assertEqual(code, 200)
+            self.assertTrue(
+                any(item.get("id") == request_id for item in pending["data"]), pending
+            )
+            code = _post_status(
+                url,
+                f"/api/session/{session_id}/permission/{request_id}/reply",
+                password, {"decision": "always"},
+            )
+            self.assertEqual(code, 204)
+            code, saved = _raw(
+                "GET", url, f"/api/permission/saved?projectID={project_id}", password
+            )
+            self.assertEqual(code, 200)
+            self.assertEqual(len(saved["data"]), 1, saved)
+            row = saved["data"][0]
+            self.assertTrue(str(row["id"]).startswith("psv_"), row)
+            self.assertEqual(row["projectID"], project_id)
+            self.assertEqual(row["action"], "read")
+            self.assertEqual(row["resource"], resource)
+            saved_entry = {
+                key: row[key] for key in ("id", "projectID", "action", "resource")
+            }
+
+            # (3) Restore the EXACT original bytes + private mode, then reload.
+            config_file.write_bytes(original)
+            os.chmod(config_file, original_mode)
+            restored = True
+            _, after = _reload_until(
+                client, url, password, loc.directory, resource=resource, want="deny"
+            )
+
+            # The configured deny wins despite the durable REAL saved grant.
+            self.assertEqual(after["data"]["effect"], "deny")
+            self.assertNotEqual(after["data"]["id"], request_id)
+            code, saved_after = _raw(
+                "GET", url, f"/api/permission/saved?projectID={project_id}", password
+            )
+            self.assertEqual(code, 200)
+            self.assertEqual(saved_after["data"], saved["data"], "the saved grant must persist")
+            code, pending_after = _raw(
+                "GET", url,
+                f"/api/permission/request?location[directory]={loc.directory}", password,
+            )
+            self.assertEqual(code, 200)
+            self.assertEqual(pending_after["data"], [], "no pending request may remain")
+
+            # (4) The app human-approval boundary refuses that exact saved entry.
+            self._assert_saved_entry_is_not_an_approval(saved_entry)
+        finally:
+            if not restored:
+                config_file.write_bytes(original)
+                os.chmod(config_file, original_mode)
+            # Best-effort reload so the owned service is never left drifted; the
+            # manager's own validation still governs every later operation.
+            with contextlib.suppress(Exception):
+                _post_status(url, "/api/location/reload", password)
+
+    @staticmethod
+    def _approval_table_counts(store) -> dict:
+        conn = store.connection
+        return {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("owner_auth_evidence", "human_approval", "human_approval_entry")
+        }
+
+    def _assert_saved_entry_is_not_an_approval(self, saved_entry: dict) -> None:
+        """``record_decision`` refuses the real saved entry for every named gate.
+
+        The saved entry is passed as the **capability** argument (its original,
+        real shape) — a mapping can never stand in for the opaque out-of-band
+        capability. Each refusal is ``capability_invalid`` and writes **zero**
+        evidence/approval/entry rows.
+        """
+        app_dir = self.scratch / f"approval-store-{uuid.uuid4().hex[:8]}"
+        store = ProjectStore.create_at(str(app_dir), store_paths.new_project_id())
+        self.addCleanup(store.close)
+        _approval_chain(store)
+        approvals = HumanApprovalRepository(store)
+        counts_before = self._approval_table_counts(store)
+        self.assertEqual(
+            counts_before,
+            {"owner_auth_evidence": 0, "human_approval": 0, "human_approval_entry": 0},
+            counts_before,
+        )
+        target = _approval_target(store, "a-rep", "rev-rep")
+        for gate_kind in SCIENTIFIC_GATE_KINDS:
+            prepared = prepare_gate_snapshot(
+                store,
+                target,
+                gate_kind=gate_kind,
+                gate_id=f"gate_{gate_kind}_boundary",
+                decision="approved",
+                rationale="boundary probe: a saved tool permission is not authority",
+            )
+            with self.assertRaises(HumanApprovalDeniedError) as ctx:
+                approvals.record_decision(prepared, saved_entry)
+            self.assertEqual(ctx.exception.reason, "capability_invalid")
+        self.assertEqual(self._approval_table_counts(store), counts_before)
+        self.assertFalse(approvals.named_gate_satisfied("a-rep", gate_kind="pilot", gate_id="gate_pilot_1"))
 
     def test_generic_permission_is_not_app_human_approval(self) -> None:
         """A generic tool permission is data, never an outline/pilot/exclusion approval.
 
-        There is **no** application human-approval implementation yet, so this test
-        makes **no** claim that the real service enforces a scientific approval. It
-        proves only the pure boundary: a model payload can never construct authority
-        from a permission/tool/scope field, and a proposal is explicitly
-        non-authoritative.
+        This test proves only the pure boundary: a model payload can never
+        construct authority from a permission/tool/scope field, and a proposal is
+        explicitly non-authoritative. The application's exact named-gate approval
+        repository is exercised separately (a real saved entry is refused as a
+        capability); see ``test_real_saved_always_grant_cannot_override_configured_deny``.
         """
         self.assertFalse(roles.PROPOSAL_IS_AUTHORITATIVE)
         task = _bounded_task()
