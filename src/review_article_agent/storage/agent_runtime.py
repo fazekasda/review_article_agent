@@ -1489,7 +1489,44 @@ class RuntimeRepository:
         two identical task rows each keep their own proposal; a replay of the same
         persisted task + payload is idempotent; a divergent record under the same
         (task, machine proposal id) raises :class:`RuntimeConflictError`.
+
+        This public form owns its own transaction. A caller that must compose the
+        proposal with another write (the session runner's proposal+accepted-result
+        commit) uses :meth:`_record_proposal_in_transaction` inside one
+        caller-owned transaction instead.
         """
+        with self._store.transaction():
+            return self._record_proposal_in_transaction(
+                task,
+                payload,
+                configuration=configuration,
+                created_at_utc=created_at_utc,
+            )
+
+    def _require_own_transaction(self) -> None:
+        """Refuse a transaction-owned primitive invoked with no open transaction."""
+        if not self._conn().in_transaction:
+            raise RuntimeValidationError(
+                "this proposal transition must run inside a caller-owned store "
+                "transaction."
+            )
+
+    def _record_proposal_in_transaction(
+        self,
+        task: RuntimeTaskRecord | BoundedTask,
+        payload: object,
+        *,
+        configuration: RoleConfiguration,
+        created_at_utc: str | None = None,
+    ) -> RuntimeProposalRecord:
+        """The transaction-owned proposal primitive (caller owns the unit of work).
+
+        It opens no transaction (``ProjectStore.transaction`` cannot nest) and
+        therefore requires one already open on this connection. The persisted task
+        is re-read, the proposal is re-derived from trusted provenance, and the
+        insert is validated exactly as the public form does.
+        """
+        self._require_own_transaction()
         if not isinstance(configuration, RoleConfiguration):
             raise RuntimeValidationError(
                 "configuration: must be a validated RoleConfiguration"
@@ -1507,45 +1544,44 @@ class RuntimeRepository:
             else _require_utc_timestamp(created_at_utc, "created_at_utc")
         )
 
-        with self._store.transaction():
-            existing = self._proposal_row_for(record.task_id, proposal.proposal_id)
-            if existing is not None:
-                self._validate_proposal_row(existing)
-                if bytes(existing["canonical"]) != canonical:
-                    raise RuntimeConflictError(
-                        "proposal: a different proposal is already recorded for "
-                        "this task; refusing a divergent replay."
-                    )
-                return self._validate_proposal_row(existing)
-            self._conn().execute(
-                "INSERT INTO runtime_proposal "
-                "(project_id, record_id, proposal_id, task_id, role, provider_id, "
-                " model_id, variant, target_artifact_id, target_revision_id, "
-                " task_digest, input_digest, payload_digest, stored_digest, "
-                " canonical, created_at_utc) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    self.project_id,
-                    record_id,
-                    proposal.proposal_id,
-                    record.task_id,
-                    proposal.role,
-                    proposal.model.provider_id,
-                    proposal.model.model_id,
-                    proposal.model.variant,
-                    proposal.target["artifact_id"],
-                    proposal.target["revision_id"],
-                    proposal.task_digest,
-                    proposal.input_digest,
-                    proposal.payload_digest,
-                    stored_digest,
-                    canonical,
-                    created,
-                ),
-            )
-        stored = self.get_proposal(record_id)
-        assert stored is not None  # just committed
-        return stored
+        existing = self._proposal_row_for(record.task_id, proposal.proposal_id)
+        if existing is not None:
+            self._validate_proposal_row(existing)
+            if bytes(existing["canonical"]) != canonical:
+                raise RuntimeConflictError(
+                    "proposal: a different proposal is already recorded for "
+                    "this task; refusing a divergent replay."
+                )
+            return self._validate_proposal_row(existing)
+        self._conn().execute(
+            "INSERT INTO runtime_proposal "
+            "(project_id, record_id, proposal_id, task_id, role, provider_id, "
+            " model_id, variant, target_artifact_id, target_revision_id, "
+            " task_digest, input_digest, payload_digest, stored_digest, "
+            " canonical, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self.project_id,
+                record_id,
+                proposal.proposal_id,
+                record.task_id,
+                proposal.role,
+                proposal.model.provider_id,
+                proposal.model.model_id,
+                proposal.model.variant,
+                proposal.target["artifact_id"],
+                proposal.target["revision_id"],
+                proposal.task_digest,
+                proposal.input_digest,
+                proposal.payload_digest,
+                stored_digest,
+                canonical,
+                created,
+            ),
+        )
+        return self._validate_proposal_row(
+            self._proposal_row_for(record.task_id, proposal.proposal_id)
+        )
 
     def _derive_proposal(
         self, record: RuntimeTaskRecord, payload: object, configuration: RoleConfiguration
