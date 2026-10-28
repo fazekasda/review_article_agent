@@ -102,6 +102,7 @@ __all__ = [
     "OwnerIdentityError",
     "OwnerChallengeError",
     "InvalidCapabilityError",
+    "CrossProcessCapabilityError",
     "ActionDigestMismatch",
     "ApprovalExpired",
     "ApprovalAlreadyConsumed",
@@ -173,9 +174,13 @@ MAX_CHALLENGE_LINE_CHARS = 64
 MAX_ACTION_IDENTIFIER_CHARS = 512
 MAX_RATIONALE_CHARS = 8192
 
-#: Hard bound on the rendered prompt bytes (defensive; the field bounds above
-#: keep it far below this).
+#: Hard bound on the rendered prompt bytes, **enforced** on the actual rendered
+#: (escaped) text before any write. The field bounds above keep it below this.
 MAX_PROMPT_BYTES = 65536
+
+#: Bounded terminal write chunk. Writes are non-blocking and looped under the
+#: write deadline, so a full terminal output queue cannot block the prompt.
+WRITE_CHUNK_BYTES = 1024
 
 #: The controlling terminal path. This is opened directly and is **not** a
 #: parameter: the boundary must never fall back to standard input.
@@ -187,7 +192,9 @@ _CHALLENGE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 _CHALLENGE_GROUP_LENGTH = 4
 _CHALLENGE_GROUPS = 4
 
-_DIGEST_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
+#: Matched with :meth:`re.Pattern.fullmatch`, so a trailing newline (which ``$``
+#: would allow before the end) is rejected.
+_DIGEST_RE = re.compile(r"(?:sha256:)?([0-9a-f]{64})")
 
 
 # --------------------------------------------------------------------------- #
@@ -254,6 +261,15 @@ class InvalidCapabilityError(OwnerAuthError):
     """
 
 
+class CrossProcessCapabilityError(OwnerAuthError):
+    """The capability was minted in a different process.
+
+    ``os.fork`` duplicates the capability object into the child; the capability
+    is bound to the minting process (pid **and** a per-process token refreshed
+    after fork), so a forked child can neither consume nor replay it.
+    """
+
+
 class ActionDigestMismatch(OwnerAuthError):
     """The offered action does not match the one the capability was minted for."""
 
@@ -276,7 +292,7 @@ class OwnerUidMismatch(OwnerAuthError):
 def _normalize_digest(value: object, field: str) -> str:
     if not isinstance(value, str):
         raise OwnerActionError(f"{field} must be a string.")
-    match = _DIGEST_RE.match(value)
+    match = _DIGEST_RE.fullmatch(value)
     if match is None:
         raise OwnerActionError(
             f"{field} must be a lowercase hex SHA-256 digest "
@@ -354,6 +370,17 @@ def _validate_and_normalize(
             "the action's target reference is invalid or cross-project; it "
             "cannot be confirmed."
         ) from exc
+    # Bound *every* target identifier, not just the action's project_id/gate_id:
+    # a 10k-character artifact/revision id must be rejected before any rendering.
+    if any(
+        len(normalized_target[key]) > MAX_ACTION_IDENTIFIER_CHARS
+        for key in ("project_id", "artifact_id", "revision_id")
+    ):
+        raise OwnerActionError(
+            "the action's target reference has a field that exceeds the "
+            f"{MAX_ACTION_IDENTIFIER_CHARS}-character bound; it cannot be "
+            "confirmed."
+        )
     frozen_target = types.MappingProxyType(dict(normalized_target))
     if gate_kind not in APPROVAL_GATE_KINDS:
         raise OwnerActionError(
@@ -518,6 +545,8 @@ class OwnerApproval:
         "_expires_at",
         "_created_monotonic",
         "_expires_monotonic",
+        "_mint_pid",
+        "_process_token",
         "_consumed",
         "_lock",
     )
@@ -532,6 +561,8 @@ class OwnerApproval:
         expires_at: datetime,
         created_monotonic: float,
         expires_monotonic: float,
+        mint_pid: int,
+        process_token: str,
     ) -> None:
         if _guard is not _MINT:
             raise OwnerAuthError(
@@ -545,6 +576,8 @@ class OwnerApproval:
         self._expires_at = expires_at
         self._created_monotonic = created_monotonic
         self._expires_monotonic = expires_monotonic
+        self._mint_pid = mint_pid
+        self._process_token = process_token
         self._consumed = False
         self._lock = threading.Lock()
 
@@ -562,6 +595,8 @@ class OwnerApproval:
         expires_at: datetime,
         created_monotonic: float,
         expires_monotonic: float,
+        mint_pid: int,
+        process_token: str,
     ) -> "OwnerApproval":
         return cls(
             _MINT,
@@ -571,6 +606,8 @@ class OwnerApproval:
             expires_at=expires_at,
             created_monotonic=created_monotonic,
             expires_monotonic=expires_monotonic,
+            mint_pid=mint_pid,
+            process_token=process_token,
         )
 
     # -- non-serializable / non-copyable ----------------------------------- #
@@ -654,6 +691,32 @@ def _real_uid() -> int:
     return os.getuid()
 
 
+# Per-process token, refreshed in a forked child (see ``register_at_fork``). A
+# capability is bound to (minting pid, this token), so ``os.fork`` — which
+# duplicates the capability object into the child — cannot yield two independent
+# consumptions. The token is stronger than the pid alone (it also catches pid
+# reuse within the process tree).
+_PROCESS_TOKEN = [uuid.uuid4().hex]
+
+
+def _refresh_process_token_after_fork() -> None:  # pragma: no cover - fork hook
+    _PROCESS_TOKEN[0] = uuid.uuid4().hex
+
+
+if hasattr(os, "register_at_fork"):  # pragma: no cover - platform hook
+    os.register_at_fork(after_in_child=_refresh_process_token_after_fork)
+
+
+def _current_process_token() -> str:
+    """The current process's token. A patchable seam."""
+    return _PROCESS_TOKEN[0]
+
+
+def _current_pid() -> int:
+    """The current process id. A patchable seam."""
+    return os.getpid()
+
+
 def _new_challenge() -> str:
     """Generate a fresh random per-operation challenge. A patchable seam."""
     groups = [
@@ -670,42 +733,64 @@ class _RealTty:
 
     def __init__(self, fd: int) -> None:
         self._fd = fd
+        # Non-blocking on our own file description (a fresh open of /dev/tty is
+        # a private description, so this affects only this handle). Combined with
+        # the select+deadline loops below, no single write or read can block past
+        # the deadline: this flag is what makes the deadline control the I/O
+        # itself, not merely a preceding select.
+        try:
+            os.set_blocking(self._fd, False)
+        except OSError:  # pragma: no cover - defensive; keep the fd usable
+            pass
 
     def is_tty(self) -> bool:
         return os.isatty(self._fd)
 
     def write(self, text: str, *, deadline: float | None = None) -> None:
-        """Write ``text``, abandoning the write past ``deadline`` (monotonic).
+        """Write ``text`` in bounded non-blocking chunks until ``deadline``.
 
-        The write is bounded by the caller's text bounds **and** by a
-        select-writable deadline budget, so an unread terminal cannot hang the
-        prompt indefinitely. A write that cannot complete in time raises a
-        curated :class:`OwnerAuthTtyUnavailable`.
+        Because the fd is non-blocking, ``os.write`` never blocks: it either
+        writes a chunk or raises ``EAGAIN``, in which case we wait for
+        writability under the remaining deadline. A full terminal output queue
+        with no reader therefore fails closed with a curated
+        :class:`OwnerAuthTtyUnavailable` at the deadline instead of hanging.
         """
-        data = text.encode("utf-8", "strict")
-        while data:
-            if deadline is not None:
-                remaining = deadline - _monotonic()
-                if remaining <= 0:
-                    raise OwnerAuthTtyUnavailable(
-                        "the controlling terminal write exceeded its deadline."
-                    )
-                try:
-                    _, writable, _ = select.select([], [self._fd], [], remaining)
-                except InterruptedError:
-                    continue
-                except (OSError, ValueError) as exc:
-                    raise OwnerAuthTtyUnavailable(
-                        "the controlling terminal could not be written to."
-                    ) from exc
-                if not writable:
-                    raise OwnerAuthTtyUnavailable(
-                        "the controlling terminal write exceeded its deadline."
-                    )
+        view = memoryview(text.encode("utf-8", "strict"))
+        while view:
+            if deadline is not None and _monotonic() >= deadline:
+                raise OwnerAuthTtyUnavailable(
+                    "the controlling terminal write exceeded its deadline."
+                )
             try:
-                written = os.write(self._fd, data)
+                written = os.write(self._fd, view[:WRITE_CHUNK_BYTES])
             except OSError as exc:
                 if exc.errno == errno.EINTR:
+                    continue
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    if deadline is None:
+                        # No deadline: wait for writability with a bounded poll.
+                        try:
+                            select.select([], [self._fd], [], 1.0)
+                        except (InterruptedError, OSError, ValueError):
+                            pass
+                        continue
+                    remaining = deadline - _monotonic()
+                    if remaining <= 0:
+                        raise OwnerAuthTtyUnavailable(
+                            "the controlling terminal write exceeded its deadline."
+                        )
+                    try:
+                        _, writable, _ = select.select([], [self._fd], [], remaining)
+                    except InterruptedError:
+                        continue
+                    except (OSError, ValueError) as exc2:
+                        raise OwnerAuthTtyUnavailable(
+                            "the controlling terminal could not be written to."
+                        ) from exc2
+                    if not writable:
+                        raise OwnerAuthTtyUnavailable(
+                            "the controlling terminal write exceeded its deadline."
+                        )
                     continue
                 raise OwnerAuthTtyUnavailable(
                     "the controlling terminal could not be written to."
@@ -714,7 +799,7 @@ class _RealTty:
                 raise OwnerAuthTtyUnavailable(
                     "the controlling terminal could not be written to."
                 )
-            data = data[written:]
+            view = view[written:]
 
     def read_line(self, *, max_chars: int, deadline: float):
         """Read one challenge line, or ``None`` on EOF/timeout/over-length."""
@@ -727,7 +812,7 @@ class _RealTty:
                 ready, _, _ = select.select([self._fd], [], [], remaining)
             except InterruptedError:
                 continue
-            except OSError:
+            except (OSError, ValueError):
                 return None
             if not ready:
                 return None
@@ -736,6 +821,8 @@ class _RealTty:
             except OSError as exc:
                 if exc.errno == errno.EINTR:
                     continue
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue  # spurious readiness; re-select under deadline
                 return None
             if not chunk:
                 return None
@@ -846,6 +933,28 @@ def _render_retry(challenge: str) -> str:
     )
 
 
+def _enforce_prompt_cap(prompt: str) -> str:
+    """Refuse a rendered prompt whose **actual UTF-8 bytes** exceed the cap.
+
+    This measures the escaped text as it will be written (so control/surrogate
+    escaping that expands a field is accounted for), and fails closed with a
+    static :class:`OwnerActionError` before any terminal I/O.
+    """
+    try:
+        size = len(prompt.encode("utf-8", "strict"))
+    except UnicodeError as exc:  # a lone surrogate could not be written anyway
+        raise OwnerActionError(
+            "the action summary cannot be encoded for display; it cannot be "
+            "confirmed."
+        ) from exc
+    if size > MAX_PROMPT_BYTES:
+        raise OwnerActionError(
+            f"the rendered action summary exceeds the {MAX_PROMPT_BYTES}-byte "
+            "bound; it cannot be confirmed."
+        )
+    return prompt
+
+
 # --------------------------------------------------------------------------- #
 # Bounded confirmation knobs (checked before any float conversion)
 # --------------------------------------------------------------------------- #
@@ -937,6 +1046,9 @@ def request_owner_confirmation(
     challenge = _new_challenge()
     deadline = _monotonic() + timeout
 
+    prompt = _enforce_prompt_cap(_render_prompt(frozen, digest, challenge))
+    retry = _render_retry(challenge)
+
     terminal = _open_controlling_tty()
     try:
         if not terminal.is_tty():
@@ -945,7 +1057,7 @@ def request_owner_confirmation(
                 "confirmation fails closed rather than reading standard input."
             )
 
-        terminal.write(_render_prompt(frozen, digest, challenge), deadline=deadline)
+        terminal.write(prompt, deadline=deadline)
         confirmed = False
         for _ in range(attempts):
             typed = terminal.read_line(
@@ -962,7 +1074,7 @@ def request_owner_confirmation(
             ):
                 confirmed = True
                 break
-            terminal.write(_render_retry(challenge), deadline=deadline)
+            terminal.write(retry, deadline=deadline)
         if not confirmed:
             raise OwnerChallengeError(
                 "the exact owner challenge was not entered within the allowed "
@@ -984,6 +1096,8 @@ def request_owner_confirmation(
         expires_at=expires_at,
         created_monotonic=created_monotonic,
         expires_monotonic=created_monotonic + ttl,
+        mint_pid=_current_pid(),
+        process_token=_current_process_token(),
     )
 
 
@@ -997,7 +1111,8 @@ def consume_owner_approval(
     """Verify and consume a capability once, returning safe evidence.
 
     Fails closed with a static typed error for a forged/absent capability, a
-    mismatched action digest, a changed owner UID, a replayed (already consumed)
+    capability that has crossed a process boundary (fork), a mismatched action
+    digest, a changed/elevated owner identity, a replayed (already consumed)
     capability, or an expired one. The returned :class:`OwnerAuthEvidence`
     contains no challenge and no secret; the capability is consumed atomically.
     """
@@ -1006,6 +1121,18 @@ def consume_owner_approval(
             "only a capability minted by a successful owner confirmation can "
             "authorize an action; a flag, string, mapping, or copied object "
             "grants nothing."
+        )
+
+    # Process binding: ``os.fork`` duplicates the capability object into the
+    # child, so identity is checked before anything else. Both the pid and a
+    # per-process token (refreshed in a forked child) must match the mint.
+    if (
+        _current_pid() != capability._mint_pid
+        or _current_process_token() != capability._process_token
+    ):
+        raise CrossProcessCapabilityError(
+            "this owner confirmation was minted in a different process; a "
+            "forked or otherwise foreign process cannot consume it."
         )
 
     digest = action_digest(action)
@@ -1019,6 +1146,13 @@ def consume_owner_approval(
         raise OwnerUidMismatch(
             "the effective owner identity no longer matches the confirmed owner "
             "UID; refusing to honor the capability."
+        )
+    # Re-check at consumption that the process has not become elevated/setuid
+    # since the confirmation.
+    if _current_owner_uid() != _real_uid():
+        raise OwnerIdentityError(
+            "the process's effective identity is elevated relative to its real "
+            "identity; refusing to honor the capability."
         )
 
     if not capability._consume_once():

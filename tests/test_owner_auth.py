@@ -200,26 +200,21 @@ class TestMinting(OwnerAuthTestBase):
 
     def test_direct_construction_cannot_mint_authority(self):
         now = _BASE_TIME
+        kwargs = dict(
+            action_digest="a" * 64,
+            owner_uid=_FIXED_OWNER_UID,
+            created_at=now,
+            expires_at=now + timedelta(seconds=60),
+            created_monotonic=0.0,
+            expires_monotonic=60.0,
+            mint_pid=os.getpid(),
+            process_token="tok",
+        )
         with self.assertRaises(OwnerAuthError):
-            OwnerApproval(
-                object(),
-                action_digest="a" * 64,
-                owner_uid=_FIXED_OWNER_UID,
-                created_at=now,
-                expires_at=now + timedelta(seconds=60),
-                created_monotonic=0.0,
-                expires_monotonic=60.0,
-            )
+            OwnerApproval(object(), **kwargs)
         # Missing the private sentinel entirely is a TypeError.
         with self.assertRaises(TypeError):
-            OwnerApproval(
-                action_digest="a" * 64,
-                owner_uid=_FIXED_OWNER_UID,
-                created_at=now,
-                expires_at=now + timedelta(seconds=60),
-                created_monotonic=0.0,
-                expires_monotonic=60.0,
-            )
+            OwnerApproval(**kwargs)
 
     def test_wrong_challenge_fails_closed_and_mints_nothing(self):
         tty = _FakeTty(replies=["WRONG-0000", "WRONG-0000", "WRONG-0000"])
@@ -457,6 +452,49 @@ class TestActionValidation(unittest.TestCase):
         with self.assertRaises(OwnerActionError):
             _action(rationale=too_long)
 
+    def test_all_target_identifiers_are_bounded(self):
+        # The coordinator repro: a 10k-character artifact id was accepted and
+        # rendered; every target identifier is now bounded and rejected.
+        for key in ("artifact_id", "revision_id"):
+            target = {
+                "project_id": "prj_syn",
+                "artifact_id": "art_syn",
+                "revision_id": "rev_syn",
+            }
+            target[key] = "x" * 10000
+            with self.subTest(key=key):
+                with self.assertRaises(OwnerActionError):
+                    _action(target=target)
+        with self.assertRaises(OwnerActionError):
+            OwnerAction(
+                project_id="p",
+                target={
+                    "project_id": "p",
+                    "artifact_id": "x" * 10000,
+                    "revision_id": "r",
+                },
+                snapshot_digest=_SNAPSHOT,
+                gate_kind="pilot",
+                gate_id="g",
+                decision="approved",
+                rationale="ok",
+            )
+
+    def test_target_identifier_at_bound_is_accepted(self):
+        at_bound = "a" * owner_auth.MAX_ACTION_IDENTIFIER_CHARS
+        action = _action(
+            target={
+                "project_id": "prj_syn",
+                "artifact_id": at_bound,
+                "revision_id": "rev_syn",
+            }
+        )
+        self.assertEqual(action.target["artifact_id"], at_bound)
+
+    def test_snapshot_digest_rejects_trailing_newline(self):
+        with self.assertRaises(OwnerActionError):
+            _action(snapshot_digest="a" * 64 + "\n")
+
 
 # --------------------------------------------------------------------------- #
 # Bounded confirmation knobs (no raw OverflowError; no unbounded caller text)
@@ -505,6 +543,24 @@ class TestBoundedKnobs(OwnerAuthTestBase):
         with self.assertRaises(owner_auth.OwnerAuthConfigError):
             request_owner_confirmation(_action(), timeout_seconds=10**1000)
         self.assertEqual(tty.written, [])
+
+    def test_prompt_byte_cap_enforced_before_io(self):
+        tty = self._installed()
+        with mock.patch.object(owner_auth, "MAX_PROMPT_BYTES", 10):
+            with self.assertRaises(OwnerActionError):
+                request_owner_confirmation(_action())
+        self.assertEqual(tty.written, [])
+
+    def test_worst_case_escaped_rationale_within_prompt_cap(self):
+        # A rationale of control characters expands ~4x under escaping; the
+        # rendered prompt must still be within the byte cap and be accepted.
+        tty = self._installed()
+        action = _action(rationale="\x01" * owner_auth.MAX_RATIONALE_CHARS)
+        request_owner_confirmation(action)
+        rendered = tty.written[0]
+        self.assertLessEqual(
+            len(rendered.encode("utf-8")), owner_auth.MAX_PROMPT_BYTES
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -587,6 +643,45 @@ class TestConsumption(OwnerAuthTestBase):
             with self.assertRaises(OwnerUidMismatch):
                 consume_owner_approval(cap, action)
 
+    def test_elevated_identity_at_consumption_fails_closed(self):
+        action, cap = self._minted()
+        with mock.patch.object(
+            owner_auth, "_current_owner_uid", lambda: _FIXED_OWNER_UID
+        ), mock.patch.object(
+            owner_auth, "_real_uid", lambda: _FIXED_OWNER_UID - 1
+        ):
+            with self.assertRaises(OwnerIdentityError):
+                consume_owner_approval(cap, action)
+
+    def test_forked_child_cannot_consume_capability(self):
+        action, cap = self._minted()
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - child process
+            os.close(read_fd)
+            try:
+                consume_owner_approval(cap, action)
+                os.write(write_fd, b"CONSUMED")
+            except owner_auth.CrossProcessCapabilityError:
+                os.write(write_fd, b"CROSSPROCESS")
+            except BaseException as exc:  # noqa: BLE001 - report the class
+                os.write(write_fd, ("OTHER:" + type(exc).__name__).encode())
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        try:
+            data = os.read(read_fd, 64)
+        finally:
+            os.close(read_fd)
+            os.waitpid(pid, 0)
+        self.assertEqual(data, b"CROSSPROCESS")
+        # The minting process can still consume it exactly once.
+        evidence = consume_owner_approval(cap, action)
+        self.assertEqual(evidence.action_digest, action_digest(action))
+        with self.assertRaises(ApprovalAlreadyConsumed):
+            consume_owner_approval(cap, action)
+
     def test_forged_values_fail_closed(self):
         action, _ = self._minted()
         for forged in (True, False, None, "human", "owner_authenticated", {}, [], 1):
@@ -645,6 +740,35 @@ class TestRealTtyReader(unittest.TestCase):
         with self.assertRaises(OwnerAuthTtyUnavailable):
             tty.write("prompt", deadline=time.monotonic() - 1)
 
+    def test_write_to_full_undrained_pipe_fails_closed_before_deadline(self):
+        # The read end is never drained, so the pipe fills (a stand-in for a PTY
+        # output queue with no reader). A large write must fail closed under the
+        # deadline instead of blocking forever.
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        tty = owner_auth._RealTty(write_fd)
+        self.assertFalse(os.get_blocking(write_fd))  # non-blocking handle
+        start = time.monotonic()
+        with self.assertRaises(OwnerAuthTtyUnavailable):
+            tty.write("P" * 200000, deadline=time.monotonic() + 0.5)
+        self.assertLess(time.monotonic() - start, 5.0)
+
+    def test_write_is_chunked_and_nonblocking(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        tty = owner_auth._RealTty(write_fd)
+        payload = "A" * (owner_auth.WRITE_CHUNK_BYTES + 7)
+        tty.write(payload, deadline=time.monotonic() + 2)
+        received = b""
+        while len(received) < len(payload):
+            chunk = os.read(read_fd, len(payload) - len(received))
+            if not chunk:
+                break
+            received += chunk
+        self.assertEqual(received, payload.encode())
+
 
 # --------------------------------------------------------------------------- #
 # Real controlling terminal (acceptance): a forkpty child on a real /dev/tty
@@ -676,6 +800,40 @@ def _child_script(digest: str) -> str:
     return _CHILD_SCRIPT.replace("__SRC__", repr(str(SRC))).replace(
         "__DIGEST__", repr(digest)
     )
+
+
+#: Fills a real PTY's output queue (master never drained) then writes a large
+#: payload through ``_RealTty``; must fail closed at the deadline, never hang.
+_PTY_FILL_SCRIPT = """
+import os, sys, time
+sys.path.insert(0, __SRC__)
+from review_article_agent.runtime import owner_auth as oa
+master, slave = os.openpty()
+os.set_blocking(slave, False)
+while True:
+    try:
+        os.write(slave, b"x" * 8192)
+    except BlockingIOError:
+        break
+tty = oa._RealTty(slave)  # owned handle; sets non-blocking
+start = time.monotonic()
+try:
+    tty.write("P" * 20000, deadline=time.monotonic() + 1.0)
+    sys.stdout.write("WROTE\\n")
+except oa.OwnerAuthTtyUnavailable:
+    sys.stdout.write("BOUNDED %.2f\\n" % (time.monotonic() - start))
+finally:
+    try:
+        os.close(master)
+        os.close(slave)
+    except OSError:
+        pass
+sys.stdout.flush()
+"""
+
+
+def _pty_fill_script() -> str:
+    return _PTY_FILL_SCRIPT.replace("__SRC__", repr(str(SRC)))
 
 
 def _drive_pty(master_fd: int, *, mode: str, deadline: float) -> str:
@@ -791,6 +949,21 @@ class TestRealControllingTerminal(unittest.TestCase):
         )
         self.assertIn("ERROR OwnerAuthTtyUnavailable", proc.stdout, proc.stdout + proc.stderr)
         self.assertNotIn("RESULT ", proc.stdout)
+
+    @unittest.skipUnless(hasattr(os, "openpty"), "requires os.openpty")
+    def test_full_pty_output_queue_write_is_bounded_not_hanging(self):
+        # Real owned PTY with a filled output queue and no reader: the write must
+        # fail closed at the deadline. The subprocess has a hard timeout, so a
+        # regression to a blocking write fails the test instead of hanging.
+        proc = subprocess.run(
+            [sys.executable, "-c", _pty_fill_script()],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+        )
+        self.assertIn("BOUNDED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("WROTE", proc.stdout)
 
     @unittest.skipUnless(hasattr(os, "forkpty"), "requires os.forkpty")
     def test_real_pty_device_owner_is_a_multiplexor_not_asserted(self):
