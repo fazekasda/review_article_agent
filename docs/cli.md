@@ -23,8 +23,10 @@
 > commands preview or record **one exact named-gate human decision**; a recorded
 > approval never authorizes global execution, manuscript export, or scientific
 > validity, and no named gate — including `final_release` — waives scientific
-> validation. The wider Step 04 execution surface — real provider sessions, Jev
-> runners, and result persistence — is **still pending** and is not exposed here.
+> validation. The wider Step 04 execution surface — production paid provider
+> sessions and hosted transfer — **remains blocked**, and the integrated restricted
+> runtime (the bounded `submit_session_turn`/`reconcile_session_turn` library path,
+> the Jev adapter, and durable result persistence) is **not exposed as a CLI** here.
 >
 > **This is not a real-execution product.** Every task is a bounded *synthetic
 > numeric* task or a synthetic *waiting-human* gate. Durable job states, run/
@@ -654,7 +656,9 @@ $ review-article-agent --data-dir "$DD" gate list --project <PROJECT_ID>
   `result` payload is accepted. `job reconcile` takes only the fixed owner
   dispositions in §10. `gate confirm` records a named-gate human approval only; it
   performs no scientific validation and authorizes no execution, export, or
-  final-release waiver. Real agent integration follows in a later step.
+  final-release waiver. The restricted runtime is integrated as a **library**, but no
+  model-task CLI/executor exists; a model/scientific run surface follows in a later
+  step.
 * No `model`/provider/credential/budget command or setting exists here, and none
   is read from the config file (§4). `worker`, `job`, and `gate` accept no such
   setting.

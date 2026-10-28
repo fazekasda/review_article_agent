@@ -26,6 +26,14 @@
   human vs model. No real agent runs in this slice: role-restricted model tools and scientific
   owner-approval gates belong to Step 04, and the engine's owner-control/audit record is not an
   `Approval`.
+- **Runtime arbitration is shared, not duplicated**: the Step 04 bounded session runner
+  ([`runtime/session_runner.py`](../src/review_article_agent/runtime/session_runner.py):
+  `submit_session_turn`/`reconcile_session_turn`) is a **library** path, not a second worker, scheduler,
+  or CLI. It shares this engine's single serial remote slot and its activation/switch-blocking
+  arbitration: an outstanding runtime `opencode_session` dispatch (`submitted`/`admitted`/`unknown`)
+  blocks a new synthetic dispatch and a safe switch, and an outstanding synthetic attempt blocks a
+  competing runtime send. The Step 03 worker itself still executes **synthetic** tasks only and does
+  **not** natively schedule model tasks; the runtime ledger's rows are **not** synthetic jobs.
 - **Private runtime paths**: the control transport validates existing paths before mutating them —
   `<data_dir>/runtime/` must be owner-private (`0700`) and the socket/lock `0600`; a symlink, a
   non-owner file/dir, or a foreign live endpoint at the control path is refused and left untouched,
@@ -158,7 +166,9 @@ provider with no real egress:
 - **One serial synthetic executor**: at most one synthetic dispatch at a time for the active project
   — within the approved **at most 2 simultaneous external model calls** cap (C02 §5.6). A job
   occupying the serial slot (unresolved, `waiting_external`, admitted/running, or a queued attempt
-  carrying continuity) blocks all other dispatch, including new jobs.
+  carrying continuity) blocks all other dispatch, including new jobs. The same single slot is shared
+  with the Step 04 runtime dispatch ledger (§1): an outstanding runtime `opencode_session` dispatch
+  occupies it and blocks a new synthetic dispatch.
 - **No dispatch while held, capped, or recovery-blocked**: not while paused/draining/cancelled, not
   when a cap would be exceeded, not while an unreadable/other-store blocker exists.
 - **No busy loop**: a `waiting_human`/unknown outcome is never polled; the loop blocks until an owner

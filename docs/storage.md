@@ -27,9 +27,10 @@ completed HTTP 200 result as the dispatch's single local result, fail a document
 definitive pre-billing rejection as `not_incurred`, or reconcile an ambiguous
 outcome to `unknown` with the reserve retained. Neither path is a transport: no
 network call, no new identity, and no claim of remote quiescence. Production live
-generation and hosted transfer remain blocked, and runner/CLI integration is not
-done, so no snapshot or restore API carries, executes, resumes, or retries a
-runner. A schema-10 row records the exact pre-transport session-turn correlation;
+generation and hosted transfer remain blocked. The bounded session-runner library
+path (`submit_session_turn`/`reconcile_session_turn`) is now integrated, but no
+snapshot or restore API carries, executes, resumes, or retries a runner. A
+schema-10 row records the exact pre-transport session-turn correlation;
 it grants no admission, approval, or execution authority and is never a
 completion.
 
@@ -390,16 +391,17 @@ its reserve and is never re-declared resolved or automatically retried. Its remo
 amount (never `0`). A recorded cost is bookkeeping only and never proves the remote
 operation has quiesced.
 
-The durable runtime surface in Step 04 is still partial. A schema-8 intent records
+The durable runtime surface in Step 04 is integrated. A schema-8 intent records
 the **exact pre-dispatch question and request binding** before submission, a
 schema-9 row records the trusted direct-call result, and a schema-10 row records the
 exact pre-transport session-turn correlation; the atomic local accept/transition
-bridge (`commit_result`) is implemented. Real provider sessions, the Jev runner,
-and runner/CLI integration are not done, and production live generation/hosted
-transfer remains blocked, so no snapshot or restore API claims to execute, carry,
-accept, resume, or retry a runner. A restored snapshot is a storage artifact only;
-it is not proof of remote quiescence. Step 04 is **not** declared complete and no
-runner is live.
+bridge (`commit_result`) is implemented, and the bounded session-runner library path
+(`submit_session_turn`/`reconcile_session_turn`) is integrated. No production paid
+generation or hosted transfer is authorized, so no snapshot or restore API claims to
+execute, carry, accept, resume, or retry a runner. A restored snapshot is a storage
+artifact only; it is not proof of remote quiescence. Step 04's acceptance evidence is
+complete but final repository verification is pending, so Step 04 is **not** declared
+complete and no autonomous/unattended runner is live.
 
 **Restore proves storage integrity, not remote quiescence.** A restored snapshot
 records admitted/ambiguous durable attempts but is **not** proof that any external
@@ -483,9 +485,9 @@ module. A restore never fabricates a scientific or model approval.
   recorded transition exactly but never performs an accept, retries/resubmits, or
   claims remote quiescence. The canonical bytes are never published or
   redistributed; the public manifest and static verification errors never carry the
-  per-question or request-state text. The Jev runner and runner/CLI integration are
-  not done, production live generation/hosted transfer remains blocked, and no
-  runner is live.
+  per-question or request-state text. There is no Jev runner daemon or direct CLI
+  loop; production live generation/hosted transfer remains blocked, and no
+  autonomous/unattended runner is live.
 - A **schema-10** session-turn intent is an append-only, immutable correlation of
   one reserved `opencode_session` turn's deterministic specification, recorded
   **before** transport. It stores the exact canonical plan/message bytes and their
