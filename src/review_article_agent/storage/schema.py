@@ -42,7 +42,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 7
+STORE_SCHEMA_VERSION = 8
 
 #: Registry maps project IDs to names and locations, records the single
 #: *selected* project, and records durable **execution activation** (which
@@ -971,6 +971,104 @@ def _store_v7(conn: sqlite3.Connection) -> None:
         )
 
 
+def _store_v8(conn: sqlite3.Connection) -> None:
+    """Add the durable **pre-dispatch Jev decision request intent** table (C02 §6.1/§6.2/§6.3/§8.1.1).
+
+    This table backs :mod:`review_article_agent.storage.decision_intents`: the
+    immutable, canonical record of the **exact question** a future direct Jev
+    dispatch intends to ask, recorded **before** the dispatch is submitted so a
+    later runner/result can prove the exact question refs/versions and the exact
+    request binding.
+
+    Only new tables and triggers are added; migrations 1-7 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, the runtime task/session/proposal
+    mappings, the runtime dispatch/cost ledger, and the human approvals) are never
+    rewritten, so their exact bytes/refs are preserved across the upgrade
+    (``ARCH-ASSETS``; step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **One immutable intent per logical dispatch.** The row is keyed by the
+      same-project ``(project_id, dispatch_id)`` and foreign-keys the existing
+      ``runtime_dispatch`` identity and its ``runtime_bounded_task``, so an intent
+      can never name a foreign project, a missing dispatch, or a task other than
+      the one the dispatch already pins.
+    * **Append-only.** The row is immutable (never ``UPDATE``d/``DELETE``d), so a
+      request's pinned question refs, versions, request digest/bytes/bound/pricing,
+      and canonical bytes can never be rewritten; a change is always a **new**
+      intent (which cannot happen for the same dispatch — divergence is refused by
+      the repository).
+    * **Canonical bytes are the truth.** ``canonical`` holds the exact canonical
+      JSON of the recorded intent and ``content_digest`` is its recomputed SHA-256;
+      the projected columns (target ref, ``request_sha256``, ``version_digest``, …)
+      must agree with the canonical bytes on every read, so a tampered column is
+      detected rather than trusted.
+    * **No credential, capability, or response content.** Only opaque ids, exact
+      decimal amounts, SHA-256 digests, and the bounded canonical request/question
+      metadata are stored (spec lines 62-63; ``docs/storage.md``).
+
+    ``route`` is pinned to ``direct_call``: only the direct Jev route has a
+    request intent recorded here (§8.1.1).
+    """
+    conn.execute(
+        """
+        CREATE TABLE decision_request_intent (
+            project_id            TEXT NOT NULL,
+            dispatch_id           TEXT NOT NULL,
+            intent_id             TEXT NOT NULL,
+            schema_version        INTEGER NOT NULL,
+            task_id               TEXT NOT NULL,
+            task_fingerprint      TEXT NOT NULL,
+            route                 TEXT NOT NULL CHECK (route = 'direct_call'),
+            stage                 TEXT NOT NULL,
+            input_digest          TEXT NOT NULL,
+            version_digest        TEXT NOT NULL,
+            reserve_usd           TEXT NOT NULL,
+            bound_evidence_digest TEXT NOT NULL,
+            request_sha256        TEXT NOT NULL,
+            request_bytes         INTEGER NOT NULL,
+            cost_upper_bound_usd  TEXT NOT NULL,
+            pricing_version       TEXT NOT NULL,
+            prompt_version        TEXT NOT NULL,
+            target_artifact_id    TEXT NOT NULL,
+            target_revision_id    TEXT NOT NULL,
+            question_count        INTEGER NOT NULL,
+            canonical             BLOB NOT NULL,
+            content_digest        TEXT NOT NULL,
+            created_at_utc        TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            UNIQUE (project_id, intent_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES runtime_dispatch (project_id, dispatch_id),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id),
+            FOREIGN KEY (project_id, target_artifact_id, target_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TRIGGER decision_request_intent_no_update
+        BEFORE UPDATE ON decision_request_intent
+        BEGIN
+            SELECT RAISE(ABORT, 'decision_request_intent rows are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER decision_request_intent_no_delete
+        BEFORE DELETE ON decision_request_intent
+        BEGIN
+            SELECT RAISE(ABORT, 'decision_request_intent rows are immutable');
+        END
+        """
+    )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
@@ -979,6 +1077,7 @@ STORE_MIGRATIONS: Mapping[int, Migration] = {
     5: _store_v5,
     6: _store_v6,
     7: _store_v7,
+    8: _store_v8,
 }
 
 
