@@ -84,7 +84,18 @@ content digest, projected columns, the exact question refs/versions, the parent
 dispatch/task links, and the recomputed request binding) via the shared
 :func:`~review_article_agent.storage.decision_intents.decision_intent_integrity_problems`
 sweep — never requiring the intent to still name the *current* head revision and
-never reading a credential, capability, or authority.
+never reading a credential, capability, or authority. Under store schema 9 it
+additionally re-validates every durable full per-question Jev decision-result
+observation (the whole-call set row and each per-question record independently,
+re-deriving the canonical bytes/digest, the projected columns, the parent
+dispatch/task/intent pins, the exact complete ordered question set against the
+recorded intent, and the per-record refs/versions/cost/provider envelope) via the
+shared
+:func:`~review_article_agent.storage.decision_results.decision_result_integrity_problems`
+sweep — never requiring the target to still name the *current* head revision,
+never reading a credential, capability, or authority, and never treating the
+observation as an accepted result, an execution, or a retry (an ``unknown`` cost
+stays ``unknown``, never ``0``).
 
 Restore validates first and is atomic
 -------------------------------------
@@ -97,15 +108,17 @@ and no stale approvals remain, and unrelated files in the target root are
 preserved. It never creates a new scientific identity: the restored project keeps
 the snapshot's exact ``project_id``.
 
-Supported store schemas are **3 through 8**. Schema 3 is the pre-Step-03 schema
+Supported store schemas are **3 through 9**. Schema 3 is the pre-Step-03 schema
 (identity, artifacts, revisions, rights, dependencies, import requests, and local
 fixture approvals); schema 4 adds the durable worker's synthetic job/attempt/
 accepted-result/budget tables (``runtime/jobs.py``); schema 5 adds the durable
 runtime configuration/session/task/proposal mapping tables
 (``storage/agent_runtime.py``); schema 6 adds the runtime dispatch/cost ledger
 (``runtime/dispatch.py``); schema 7 adds the out-of-band human approvals
-(``storage/human_approvals.py``); and schema 8 adds the immutable durable
-pre-dispatch Jev decision-request intent (``storage/decision_intents.py``). Each is
+(``storage/human_approvals.py``); schema 8 adds the immutable durable
+pre-dispatch Jev decision-request intent (``storage/decision_intents.py``); and
+schema 9 adds the immutable durable full per-question Jev decision-result
+observation (``storage/decision_results.py``). Each is
 validated against the exact schema the
 canonical migrations generate for **that** version. A schema-4 snapshot
 additionally re-validates every job row read-only (identity and parameter/result
@@ -196,6 +209,11 @@ _HUMAN_APPROVAL_SCHEMA_VERSION = 7
 #: pre-dispatch Jev decision-request intent table exists and must be
 #: inner-validated.
 _INTENT_SCHEMA_VERSION = 8
+
+#: The store schema version at (or above) which the immutable durable
+#: full per-question Jev decision-result observation tables (the set row and its
+#: per-question rows) exist and must be inner-validated.
+_DECISION_RESULT_SCHEMA_VERSION = 9
 
 #: Store schema versions whose *recorded* approval ``storage_schema_version`` is
 #: accepted (the historical version survives a restore where supported; an
@@ -1869,6 +1887,60 @@ def _verify_intent_relations(conn: sqlite3.Connection, project_id: str) -> None:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Durable full per-question decision-result observation inner validation (schema 9)
+# --------------------------------------------------------------------------- #
+def _verify_decision_result_relations(
+    conn: sqlite3.Connection, project_id: str
+) -> None:
+    """Read-only re-validation of the schema-9 durable decision-result rows.
+
+    The shared
+    :func:`~review_article_agent.storage.decision_results.decision_result_integrity_problems`
+    sweep independently re-validates every recorded observation: the whole-call
+    set row (its exact canonical bytes/content digest, projected columns, parent
+    dispatch/task/intent pins, the single dispatch cost, and the provider
+    envelope) **and** each per-question row on its own (the question rebuilt from
+    the recorded refs, the descriptor digest, options/levels/kind, the version set
+    and consumed slots, the request pin, the per-record cost and provider
+    envelope, and the exact complete ordered question set measured against the
+    recorded intent's own questions — never the set's own array alone). A foreign
+    row, a dangling/orphan or partial set, and a corrupt set/record row are all
+    reported, so a corrupt archive whose outer database hash was rewritten still
+    fails inner verification.
+
+    The sweep imposes **no** current-head requirement (a legitimate observation
+    whose target head has since advanced is preserved), performs **no** accept,
+    execution, or retry, and never reads a credential, capability, or authority:
+    only the recorded provider/cost/ref/version metadata and opaque ids/digests
+    are revalidated. These rows are an inert **observation**, not an accepted
+    local result; an ``unknown`` cost stays ``unknown`` with no amount (never a
+    silent ``0``). Any boundary failure of the helper is converted into a curated
+    :class:`BackupError`, so a raw result/credential exception is never surfaced.
+    """
+    # The helper already scans every row in both result tables and reports a
+    # foreign-project row (and an orphan/partial set) itself, so no separate
+    # table foreign-row scan is duplicated here.
+    try:
+        from .decision_results import decision_result_integrity_problems
+
+        problems = decision_result_integrity_problems(conn, project_id)
+    except BackupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a boundary failure is a refusal
+        raise BackupError(
+            "the snapshot's durable decision result observations could not be "
+            "revalidated; refusing."
+        ) from exc
+    if problems:
+        # ``decision_result_integrity_problems`` returns static, value-free strings.
+        raise BackupError(
+            "the snapshot's durable decision result observations do not revalidate ("
+            + "; ".join(problems)
+            + "); refusing."
+        )
+
+
 #: Ordered ``(minimum_store_schema_version, validator)`` hook. Each validator is
 #: applied for a snapshot whose recorded schema is **at or above** its minimum, so
 #: a later schema checkpoint can append a validator here without touching the
@@ -1880,6 +1952,7 @@ _SCHEMA_VALIDATORS = (
     (_DISPATCH_SCHEMA_VERSION, _verify_dispatch_relations),
     (_HUMAN_APPROVAL_SCHEMA_VERSION, _verify_human_approval_relations),
     (_INTENT_SCHEMA_VERSION, _verify_intent_relations),
+    (_DECISION_RESULT_SCHEMA_VERSION, _verify_decision_result_relations),
 )
 
 

@@ -13,10 +13,15 @@ by the Step 03 synthetic worker and the Step 04 durable runtime/human-approval
 slices: schema 4 (jobs/attempts/results/budgets), schema 5 (runtime
 configuration/session/task/proposal mappings), schema 6 (durable runtime dispatch
 and cost ledger), schema 7 (out-of-band human approvals and their exact
-snapshots), and schema 8 (the immutable pre-dispatch Jev decision request intent).
-The extension is strictly additive — migrations 1-7 are never rewritten — and the
-manifest `format_version` stays `1`. Schema 9 (result observation) is **not** part
-of this contract yet and its fields are not asserted here.
+snapshots), schema 8 (the immutable pre-dispatch Jev decision request intent), and
+schema 9 (the immutable, complete per-question Jev decision-result observation).
+The extension is strictly additive — earlier migrations are never rewritten — and
+the manifest `format_version` stays `1`. The schema-9 rows are an inert
+**OBSERVATION**, not an accepted local result: the module records what a trusted
+direct-call result contained and grants no approval, execution, or completion
+claim. The Jev runner and the atomic accept/transition bridge are **not yet
+implemented**, so no snapshot or restore API carries, executes, resumes, or retries
+a runner.
 
 Related authority: the accepted `ARCH-MIGRATE` direction
 ([`03-policy-decisions.md` §ARCH-MIGRATE](contracts/03-policy-decisions.md)) —
@@ -37,9 +42,10 @@ store plus a manifest.
   synthetic job/attempt/accepted-result/budget rows under store schema 4, the
   durable runtime configuration/session/task/proposal mappings under schema 5,
   the durable runtime dispatch identity/operational/cost ledger under schema 6,
-  the exact named-gate human-approval/evidence/entry rows under schema 7, and the
-  immutable pre-dispatch decision request intent rows under schema 8), suitable
-  for restoring that project later.
+  the exact named-gate human-approval/evidence/entry rows under schema 7, the
+  immutable pre-dispatch decision request intent rows under schema 8, and the
+  immutable complete per-question decision-result observation rows under schema 9),
+  suitable for restoring that project later.
 - It **is not**: a manuscript export, a redistribution package, or a portable
   interchange format. **Never publish an archive** and **never store credentials
   as artifact content**. Private storage backup is distinct from manuscript
@@ -55,8 +61,13 @@ store plus a manifest.
   credential, capability, or authority is *automatically* serialized by the
   application, but this module cannot prove the absence of a secret a caller placed
   into the request state or artifact content: never put credentials in artifact
-  content or a request state. The public manifest and static verification errors do
-  not carry the state text (see §3 and §5).
+  content or a request state. A **schema-9** result observation's canonical bytes
+  similarly carry source-derived per-question text — the provider envelope, a score
+  `legend`, and the declared `options`/`levels` — and its referenced question
+  instructions/source bytes stay in the private revision BLOBs. This module is
+  **not** a secret scanner and makes **no** "never contains source" promise; the
+  public manifest and static verification errors do not carry that per-question or
+  request-state text (see §3 and §5).
 
 Mechanism: a backup is produced with SQLite's **online backup API**
 (`sqlite3.Connection.backup`) into a fresh, staged snapshot database. The live
@@ -97,16 +108,18 @@ the schema the canonical migrations generate **for that version** in memory. The
 supported snapshot store-schema versions are **3 through the current store schema**
 (the authoritative value is `STORE_SCHEMA_VERSION` in
 [`storage/schema.py`](../src/review_article_agent/storage/schema.py); currently
-**8**), and the versions are:
+**9**), and the versions are:
 **3** (identity, artifacts, revisions, rights, dependencies, import requests, and
 local fixture approvals); **4** (adds the durable worker's synthetic
 job/attempt/accepted-result/budget tables); **5** (adds the immutable runtime
 configuration/session/task/proposal mappings); **6** (adds the immutable runtime
 dispatch identity row and its mutable operational state row, with the
 route-separated cost ledger); **7** (adds the append-only owner-auth evidence,
-human-approval, and human-approval-entry rows); and **8** (adds the append-only
-pre-dispatch Jev decision request intent row keyed by its direct dispatch). Any
-other ("external") table, a
+human-approval, and human-approval-entry rows); **8** (adds the append-only
+pre-dispatch Jev decision request intent row keyed by its direct dispatch); and
+**9** (adds the append-only ``decision_result_set`` observation row keyed by its
+direct dispatch, plus one ``decision_result_question`` canonical C02 §6.2 row per
+question). Any other ("external") table, a
 missing or altered object, or a hidden added column is refused, so a forged
 database that merely reuses the right table names (and would pass
 `foreign_key_check`) is never accepted.
@@ -132,11 +145,13 @@ All output is owner-private: the backup directory is `0o700`, and
 
 The `counts.approvals`/`counts.approval_entries` and `approvals` manifest fields
 describe the **local fixture approvals only** (the pre-existing storage-fixture
-rows). Durable schema-7 named-gate human approvals and durable schema-8 decision
-request intents are not duplicated into the manifest; they are inner-validated
-read-only from the snapshot database, exactly like the schema-4/5/6 rows. The
-manifest therefore never carries a schema-8 intent's request state text (or any
-artifact/request BLOB content) — only ids, counts, and aggregate digests.
+rows). Durable schema-7 named-gate human approvals, durable schema-8 decision
+request intents, and durable schema-9 decision-result observations are not
+duplicated into the manifest; they are inner-validated read-only from the snapshot
+database, exactly like the schema-4/5/6 rows. The manifest therefore never carries
+a schema-8 intent's request state text, a schema-9 per-question answer/legend/option
+text, or any artifact/request BLOB content — only ids, counts, and aggregate
+digests.
 
 ## 4. Public API
 
@@ -245,13 +260,34 @@ newer manifest/store schema) on any of:
   state text: its problems are static and value-free. It does not scan the
   caller-provided state for secrets, so a secret the caller put into the state
   remains in the private snapshot.
+- **schema 9 and above** — every durable decision-result observation is
+  re-validated read-only, the whole-call set row and each per-question record
+  independently: the recomputed canonical bytes/content digest and projected
+  columns; the parent dispatch/task/intent pins; the single dispatch cost and the
+  provider envelope; and, for each question, the record rebuilt from the recorded
+  refs, the descriptor digest, options/levels/kind, the version set/consumed slots,
+  the request pin, the per-record cost and provider envelope, and the exact
+  **complete ordered** question set measured against the recorded intent's own
+  questions — never the set's own array alone. A foreign-project row, a
+  dangling/orphan or partial set, a self-consistent subset whose set array matches
+  its surviving rows, and a corrupt set/record row all fail closed. A legitimate
+  observation whose target head has since advanced remains structurally valid
+  (history is preserved). It imposes **no** current-head requirement, performs
+  **no** accept/execution/retry, and reads no credential/capability/authority
+  field (none exists). The observation is inert: an `unknown` cost stays `unknown`
+  with **no** amount (never `0`), and a whole-call failure keeps the dispatch in
+  its submitted/unknown state. The per-question canonical may contain
+  source-derived provider/legend/options text; the module is not a secret scanner
+  and makes no "never contains source" promise. Its problems are static and
+  value-free.
 
 The schema-specific inner hooks are selected by **minimum version**: a snapshot
 records exactly one schema version and is always compared against the canonical
 schema for that version, and it runs every read-only hook whose minimum version is
 at or below its recorded version (so a schema-6 snapshot runs the schema-4/5/6
 hooks but not the schema-7 approval hook; a schema-7 snapshot runs the schema-4/5/6/7
-hooks; and a schema-8 snapshot runs all five). The hook list is an ordered
+hooks; a schema-8 snapshot runs all five earlier hooks but not the schema-9
+result hook; and a schema-9 snapshot runs all six). The hook list is an ordered
 `_SCHEMA_VALIDATORS` table keyed by minimum version; a later schema must add its
 own explicit read-only validator entry, and this document does not promise that
 future schema fields are validated automatically.
@@ -290,12 +326,15 @@ its **first open**; it is never rewritten in place by the backup module. A
 **schema-4** snapshot keeps its completed job results, unresolved attempts, and
 budget reserves; a **schema-5** snapshot keeps its runtime mappings; a **schema-6**
 snapshot keeps its dispatch identity/state and cost ledger; a **schema-7** snapshot
-keeps its owner-auth evidence and human approvals; and a **schema-8** snapshot
-keeps its pre-dispatch decision request intents. A schema-7 snapshot's
+keeps its owner-auth evidence and human approvals; a **schema-8** snapshot keeps
+its pre-dispatch decision request intents; and a **schema-9** snapshot keeps its
+immutable complete per-question decision-result observations. A schema-7 snapshot's
 `stale`/`superseded` approval history is preserved and remains structurally valid.
 A schema-8 intent is restored exactly as recorded and is **not** executed, resumed,
 retried, or promoted to a result; the restored store records intent only. A
-schema-6/7/8 `unknown`
+schema-9 observation is likewise restored exactly as recorded and is **not**
+accepted, executed, resumed, or retried: it is an **OBSERVATION NOT ACCEPTED**, and
+the dispatch keeps its submitted/unknown state. A schema-6/7/8/9 `unknown`
 dispatch keeps its reserve and is never re-declared resolved or automatically
 retried. Its remote *state* and its settled *cost* are separate: an unresolved
 dispatch may carry a `known`/`estimated` amount, and a genuinely unknown cost
@@ -303,12 +342,13 @@ stays `unknown` with no amount (never `0`). A recorded cost is bookkeeping only
 and never proves the remote operation has quiesced.
 
 The durable runtime surface in Step 04 is still partial. A schema-8 intent records
-the **exact pre-dispatch question and request binding** before submission, but real
-provider sessions, the Jev runner, and result persistence/observation are **not yet
-implemented** (the schema-9 result-observation slice is not integrated), so no
-snapshot or restore API claims to execute, carry, or resume them. A restored
-snapshot is a storage artifact only; it is not proof of remote quiescence. Step 04
-is **not** declared complete and no runner is live.
+the **exact pre-dispatch question and request binding** before submission and a
+schema-9 row records the trusted direct-call result as an inert observation, but
+real provider sessions, the Jev runner, and the atomic accept/transition bridge are
+**not yet implemented**, so no snapshot or restore API claims to execute, carry,
+accept, resume, or retry them. A restored snapshot is a storage artifact only; it
+is not proof of remote quiescence. Step 04 is **not** declared complete and no
+runner is live.
 
 **Restore proves storage integrity, not remote quiescence.** A restored snapshot
 records admitted/ambiguous durable attempts but is **not** proof that any external
@@ -322,16 +362,17 @@ module. A restore never fabricates a scientific or model approval.
 ## 7. Compatibility and limitations
 
 - The supported store schema versions are **3 through the current store schema**
-  (`STORE_SCHEMA_VERSION`, currently **8**). A newer store schema is refused
+  (`STORE_SCHEMA_VERSION`, currently **9**). A newer store schema is refused
   clearly. Older snapshots are upgraded to the current schema by the ordinary
   `ProjectStore` open on **first open after restore**; the `2 -> 3` through
-  `7 -> 8` migrations are tested separately and are not part of this module. A
+  `8 -> 9` migrations are tested separately and are not part of this module. A
   fixture approval's *recorded* `storage_schema_version` is validated against the
   supported range (`1..current`), so a historical version is preserved where
   supported while an arbitrary/unknown version is refused. Determining the
-  version-specific canonical schema and the schema-4/5/6/7/8 row validation reuse
+  version-specific canonical schema and the schema-4/5/6/7/8/9 row validation reuse
   the canonical migration, `runtime.jobs`, `storage.agent_runtime`,
-  `runtime.dispatch`, `storage.human_approvals`, and `storage.decision_intents`
+  `runtime.dispatch`, `storage.human_approvals`, `storage.decision_intents`, and
+  `storage.decision_results`
   definitions, so a schema change cannot silently desynchronise verification.
   An upgraded predecessor store preserves its prior artifact bytes and rows exactly;
   only the later empty tables are added on the first open.
@@ -365,11 +406,32 @@ module. A restore never fabricates a scientific or model approval.
   or execution right: it records intent only, and an `unknown` dispatch that carries
   an intent keeps its reserve and is never re-declared resolved, executed, or
   automatically retried.
+- A **schema-9** decision-result observation is an append-only, immutable record of
+  **one** trusted direct Jev dispatch's **complete** per-question result set: one
+  set row (keyed by its direct dispatch, carrying the ordered per-question
+  record-id/digest array, the whole-call status/diagnostic, the single dispatch
+  cost, and the provider envelope) plus one canonical C02 §6.2 `DecisionRecord` row
+  per question. Its canonical bytes are **private** and may contain source-derived
+  per-question text — the provider envelope, a score `legend`, and the declared
+  `options`/`levels` — while the referenced question `instructions` and target
+  source bytes stay in the private revision BLOBs. The module is **not** a secret
+  scanner and makes **no** "never contains source" promise: a caller who submits
+  source text into a request state or artifact content places it in the private
+  archive. The observation grants **no** authority and makes **no** completion
+  claim: it is an **OBSERVATION NOT ACCEPTED**, never an accepted local result and
+  never a claim of remote quiescence. It never calls `accept_result`/`recover`/
+  `settle_cost`, never advances the dispatch state machine, and never turns an
+  `unknown` cost into `0`. The canonical bytes are never published or redistributed;
+  the public manifest and static verification errors never carry the per-question
+  or request-state text. The Jev runner and the atomic accept/transition bridge are
+  **not yet implemented**, so this row is storage history only and no runner is
+  live.
 - `verify_backup` re-validates stored rights records and recomputes content
   digests; from schema 4 upward it additionally re-validates the durable
   job/attempt/result/budget rows, from schema 5 upward the runtime mappings, from
   schema 6 upward the dispatch/cost ledger, from schema 7 upward the human-approval
-  rows, and from schema 8 upward the pre-dispatch decision request intents. It is a
+  rows, from schema 8 upward the pre-dispatch decision request intents, and from
+  schema 9 upward the full per-question decision-result observations. It is a
   structural/integrity check, not a scientific, rights, or remote-quiescence
   decision. A later schema that adds a new table must add its own explicit
   read-only inner validator; verification does not infer that a future schema's

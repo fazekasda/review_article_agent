@@ -525,7 +525,12 @@ class RoundTripTest(IntentBackupBase):
         report = verify_backup(dest)
         self.assertTrue(report["ok"])
         self.assertEqual(report["store_schema_version"], schema.STORE_SCHEMA_VERSION)
-        self.assertEqual(report["store_schema_version"], 8)
+        # The recorded schema is at least the schema-8 intent threshold, so the
+        # version-specific intent hook remains active for this snapshot (dynamic,
+        # not a literal "8" masquerading as the current store schema).
+        self.assertGreaterEqual(
+            report["store_schema_version"], backup_mod._INTENT_SCHEMA_VERSION
+        )
 
         restored, info = self._restore(dest, "restored-reserved")
         self.assertEqual(info.project_id, self.pid)
@@ -785,8 +790,13 @@ class InnerValidationTest(IntentBackupBase):
         try:
             # The tamper dropped and exactly restored the intent triggers, so the
             # canonical schema comparison still passes: the refusal below can only
-            # come from the inner checker, not the schema-shape check.
-            backup_mod._assert_known_schema(conn, 8)
+            # come from the inner checker, not the schema-shape check. Compare
+            # against the snapshot's *actual* recorded schema version so the gate
+            # is not hardcoded to "8"; the expected current version is asserted
+            # separately.
+            actual_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(actual_version, schema.STORE_SCHEMA_VERSION)
+            backup_mod._assert_known_schema(conn, actual_version)
             with self.assertRaises(BackupError):
                 backup_mod._verify_intent_relations(conn, self.pid)
         finally:
@@ -1005,7 +1015,7 @@ class SchemaCompatibilityTest(IntentBackupBase):
 
         upgraded = ProjectStore.open_at(app_dir, expected_project_id=pid)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.schema_version, 8)
+        self.assertEqual(upgraded.schema_version, schema.STORE_SCHEMA_VERSION)
 
         # Predecessor rows and bytes are preserved exactly; only the new empty
         # tables are added on first open.
@@ -1026,7 +1036,7 @@ class SchemaCompatibilityTest(IntentBackupBase):
         create_backup(upgraded, dest)
         report = verify_backup(dest)
         self.assertTrue(report["ok"])
-        self.assertEqual(report["store_schema_version"], 8)
+        self.assertEqual(report["store_schema_version"], schema.STORE_SCHEMA_VERSION)
 
 
 class DynamicHookTest(IntentBackupBase):
@@ -1034,15 +1044,17 @@ class DynamicHookTest(IntentBackupBase):
         minimums = [minimum for minimum, _ in backup_mod._SCHEMA_VALIDATORS]
         self.assertEqual(minimums, sorted(minimums))
         self.assertEqual(len(minimums), len(set(minimums)))
-        # The schema-8 intent hook is the current last entry, but the table is a
-        # plain ordered threshold table, not a hardcoded "must be exactly 8" check.
-        self.assertEqual(minimums[-1], backup_mod._INTENT_SCHEMA_VERSION)
+        # The newest hook sits at the current supported schema, but the table is a
+        # plain ordered threshold table, not a hardcoded "must be exactly current"
+        # check. The schema-8 intent hook stays pinned at its own version-specific
+        # minimum even after a later checkpoint appends its own validator.
+        self.assertEqual(minimums[-1], schema.STORE_SCHEMA_VERSION)
         self.assertIn(8, minimums)
         self.assertEqual(backup_mod._INTENT_SCHEMA_VERSION, 8)
+        self.assertIn(backup_mod._INTENT_SCHEMA_VERSION, minimums)
         self.assertEqual(
             backup_mod.SUPPORTED_STORE_SCHEMA_VERSION, schema.STORE_SCHEMA_VERSION
         )
-        self.assertEqual(backup_mod.SUPPORTED_STORE_SCHEMA_VERSION, 8)
         self.assertEqual(
             backup_mod.SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS,
             frozenset(range(3, schema.STORE_SCHEMA_VERSION + 1)),
@@ -1058,14 +1070,19 @@ class DynamicHookTest(IntentBackupBase):
         def future_validator(conn, project_id):
             called.append(project_id)
 
-        extended = backup_mod._SCHEMA_VALIDATORS + ((99, future_validator),)
+        # A genuinely later checkpoint is CURRENT+1, never a literal "9" that is
+        # now itself a real registered hook.
+        later = schema.STORE_SCHEMA_VERSION + 1
+        extended = backup_mod._SCHEMA_VALIDATORS + ((later, future_validator),)
         with mock.patch.object(backup_mod, "_SCHEMA_VALIDATORS", extended):
             conn = self.store.connection
-            # At the current recorded schema 8 the appended later hook does not run...
-            backup_mod._verify_schema_specific(conn, self.pid, 8)
+            # At the current recorded schema the appended later hook does not run...
+            backup_mod._verify_schema_specific(
+                conn, self.pid, schema.STORE_SCHEMA_VERSION
+            )
             self.assertEqual(called, [])
             # ...and at a hypothetical later recorded schema it runs by threshold alone.
-            backup_mod._verify_schema_specific(conn, self.pid, 99)
+            backup_mod._verify_schema_specific(conn, self.pid, later)
             self.assertEqual(called, [self.pid])
 
     def test_schema8_hook_runs_at_8_and_not_at_7(self) -> None:
