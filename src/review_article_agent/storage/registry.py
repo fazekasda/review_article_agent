@@ -572,9 +572,17 @@ class Registry:
             "SELECT * FROM execution_activation WHERE singleton = 1"
         ).fetchone()
         if row is None:
-            # The migration always seeds the singleton row; a missing row is a
-            # honest ``none`` (never a fabricated active state) and fail-closed.
-            return ExecutionActivation("none", None, None, None, None)
+            # Migration 2 seeds exactly this row. Its absence is corruption, and
+            # reporting a fabricated ``none`` would be fail-open: it would let a
+            # new dispatch activate (overwriting the durable record) or a stale
+            # engine treat the boundary as free. Refuse and surface a curated
+            # error instead (C02 §8.5; step 03 AC4).
+            raise StoreError(
+                "the application registry is missing its execution-activation "
+                "record (the 'execution_activation' singleton row); refusing to "
+                "guess an activation state. Repair the registry (or restore it "
+                "from backup) before running any worker."
+            )
         return ExecutionActivation(
             state=row["state"],
             active_project_id=row["active_project_id"],
@@ -617,12 +625,17 @@ class Registry:
             token = "act_" + secrets.token_hex(16)
             now = _utc_now()
             with transaction(conn):
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE execution_activation SET state = 'active', "
                     "active_project_id = ?, activation_token = ?, "
                     "activated_at_utc = ?, updated_at_utc = ? WHERE singleton = 1",
                     (project_id, token, now, now),
                 )
+                # The write must have durably landed before a token is returned:
+                # a zero-row update (row missing/removed) must never yield a
+                # usable token that could authorize remote dispatch without a
+                # persisted activation.
+                self._assert_activation_written(cursor, "activate")
             return ExecutionActivation("active", project_id, token, now, now)
 
     def begin_drain(self, token: str) -> ExecutionActivation:
@@ -644,11 +657,12 @@ class Registry:
                 return current
             now = _utc_now()
             with transaction(conn):
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE execution_activation SET state = 'draining', "
                     "updated_at_utc = ? WHERE singleton = 1",
                     (now,),
                 )
+                self._assert_activation_written(cursor, "drain")
             return ExecutionActivation(
                 "draining",
                 current.active_project_id,
@@ -676,39 +690,65 @@ class Registry:
                 )
             now = _utc_now()
             with transaction(conn):
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE execution_activation SET state = 'none', "
                     "active_project_id = NULL, activation_token = NULL, "
                     "activated_at_utc = NULL, updated_at_utc = ? WHERE singleton = 1",
                     (now,),
                 )
+                self._assert_activation_written(cursor, "release")
             return ExecutionActivation("none", None, None, None, now)
+
+    @staticmethod
+    def _assert_activation_written(cursor: sqlite3.Cursor, action: str) -> None:
+        """Fail the transaction if an activation UPDATE changed no row.
+
+        A missing singleton row must never silently succeed: a fabricated
+        token/state would be fail-open. Raising inside the ``transaction`` block
+        rolls the whole update back.
+        """
+        if cursor.rowcount != 1:
+            raise StoreError(
+                f"could not {action} execution activation: the registry's "
+                f"execution-activation record is missing or could not be "
+                f"updated; no durable activation was written. Repair the "
+                f"registry before running any worker."
+            )
 
     @contextmanager
     def execution_write_guard(
-        self, token: str, project_id: str
+        self, token: str, project_id: str, *, allow_draining: bool = False
     ) -> Iterator[ExecutionActivation]:
         """Authorize one accepted per-project write under the registry lock.
 
         Holds the exclusive registry lock for the duration of the block while
-        confirming that execution is ``active`` for ``project_id`` **and** the
-        token matches.  Because ``begin_drain``/``release_execution``/``select``
-        take the same lock, a release or switch cannot interleave a local
-        commit: either the write is fenced-in first or the release wins and the
-        write is refused.  Lock order is registry before project store
-        (``_session`` first, then the caller opens the store).  The engine must
-        *not* hold this guard across external (remote) work — only across the
-        local commit.
+        confirming that execution belongs to ``project_id`` **and** the token
+        matches.  Because ``begin_drain``/``release_execution``/``select`` take
+        the same lock, a release or switch cannot interleave a local commit:
+        either the write is fenced-in first or the release wins and the write is
+        refused.  Lock order is registry before project store (``_session``
+        first, then the caller opens the store).  The engine must *not* hold this
+        guard across external (remote) work — only across the local commit.
+
+        ``allow_draining`` defaults to ``False`` (active only), which is what a
+        **new dispatch** must use: once execution is ``draining`` no new work may
+        be dispatched.  ``allow_draining=True`` is **reconciliation-only**: it
+        additionally permits the *matching* still-draining project/token to
+        finish committing writes it had already accepted *before* the drain, so a
+        safe switch can complete without stranding an accepted local result.
+        Never use ``allow_draining=True`` to dispatch new work (C02 §8.3/§8.5;
+        step 03 AC4/AC5).
         """
         paths.validate_project_id(project_id)
         with self._session() as conn:
             current = self._read_activation(conn)
-            if current.state != "active" or current.active_project_id != project_id:
+            permitted = ("active", "draining") if allow_draining else ("active",)
+            if current.state not in permitted or current.active_project_id != project_id:
+                expected = "execution-active" if not allow_draining else "active/draining"
                 raise ProjectConflict(
                     f"refusing to authorize a write for {project_id!r}: it is "
-                    f"not the execution-active project (state "
-                    f"{current.state!r}, active "
-                    f"{current.active_project_id!r})."
+                    f"not the {expected} project (state {current.state!r}, "
+                    f"active {current.active_project_id!r})."
                 )
             if not secrets.compare_digest(current.activation_token or "", token or ""):
                 raise ProjectConflict(

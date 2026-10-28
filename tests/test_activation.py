@@ -185,6 +185,61 @@ class ActivationTest(unittest.TestCase):
             with reg.execution_write_guard(token, a):
                 pass
 
+    def test_missing_activation_row_is_fail_closed(self) -> None:
+        """A missing singleton row is corruption, never a fabricated ``none``."""
+        reg, a, _ = self._two_projects()
+        conn = schema.open_connection(reg.registry_path)
+        try:
+            conn.execute("DELETE FROM execution_activation")
+        finally:
+            conn.close()
+
+        # No read, no token, no release: every path refuses rather than guessing.
+        with self.assertRaises(StoreError):
+            reg.activation()
+        with self.assertRaises(StoreError):
+            reg.activate_execution(a)
+        with self.assertRaises(StoreError):
+            reg.release_execution("act_" + "0" * 32)
+
+        # No fabricated row was written as a side effect.
+        conn = schema.open_connection(reg.registry_path)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM execution_activation").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n, 0)
+
+    def test_reconciliation_guard_allows_draining_but_not_new_dispatch(self) -> None:
+        reg, a, b = self._two_projects()
+        token = reg.activate_execution(a).activation_token
+        reg.begin_drain(token)
+
+        # New dispatch (default guard) is refused once draining.
+        with self.assertRaises(ProjectConflict):
+            with reg.execution_write_guard(token, a):
+                pass
+
+        # Reconciliation-only guard permits the matching draining project/token
+        # so an already-accepted local write can commit before the switch.
+        with reg.execution_write_guard(token, a, allow_draining=True) as act:
+            self.assertEqual(act.state, "draining")
+            self.assertEqual(act.active_project_id, a)
+
+        # Still token- and project-fenced.
+        with self.assertRaises(ProjectConflict):
+            with reg.execution_write_guard(token, b, allow_draining=True):
+                pass
+        with self.assertRaises(ProjectConflict):
+            with reg.execution_write_guard("act_" + "f" * 32, a, allow_draining=True):
+                pass
+
+        # After release, even reconciliation writes are refused.
+        reg.release_execution(token)
+        with self.assertRaises(ProjectConflict):
+            with reg.execution_write_guard(token, a, allow_draining=True):
+                pass
+
     def test_release_cannot_race_accepted_write(self) -> None:
         """A release waits for the guarded local commit; it cannot interleave."""
         reg, a, _ = self._two_projects()
@@ -220,6 +275,50 @@ class ActivationTest(unittest.TestCase):
             self.assertTrue(
                 exit_.exists(),
                 "release completed while the guarded local commit was open",
+            )
+            self.assertGreaterEqual(elapsed, 0.3)
+            self.assertEqual(reg.activation().state, "none")
+        finally:
+            proc.wait(timeout=10)
+
+    def test_release_cannot_race_draining_reconciliation(self) -> None:
+        """A release waits for a draining reconciliation commit too."""
+        reg, a, _ = self._two_projects()
+        token = reg.activate_execution(a).activation_token
+        reg.begin_drain(token)
+        enter = self.tmp / "d-enter"
+        exit_ = self.tmp / "d-exit"
+        script = textwrap.dedent(
+            """
+            import sys, time
+            from review_article_agent.storage import Registry
+            with Registry(sys.argv[1]).execution_write_guard(
+                sys.argv[2], sys.argv[3], allow_draining=True
+            ):
+                open(sys.argv[4], "w").close()
+                time.sleep(float(sys.argv[5]))
+                open(sys.argv[6], "w").close()
+            """
+        )
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-c", script, str(self.data_dir), token, a,
+                str(enter), "0.8", str(exit_),
+            ],
+            env=_child_env(),
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not enter.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(enter.exists(), "child never entered reconciliation guard")
+
+            start = time.monotonic()
+            reg.release_execution(token)  # must block until reconciliation exits
+            elapsed = time.monotonic() - start
+            self.assertTrue(
+                exit_.exists(),
+                "release completed while a draining reconciliation commit was open",
             )
             self.assertGreaterEqual(elapsed, 0.3)
             self.assertEqual(reg.activation().state, "none")
