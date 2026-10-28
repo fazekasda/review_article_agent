@@ -589,10 +589,16 @@ class WorkerIPCTest(unittest.TestCase):
                     client.request({"x": 1})
 
     def test_client_error_code_allowlist(self) -> None:
-        # A curated transport code is surfaced...
+        # A curated transport code is surfaced with our static message, never
+        # the peer-supplied one.
+        secret = "s3cr3t-canary-77"
+
         def curated(conn: socket.socket) -> None:
             conn.sendall(
-                b'{"ok":false,"error":{"code":"malformed_request","message":"bad input"}}\n'
+                json.dumps(
+                    {"ok": False, "error": {"code": "malformed_request", "message": secret}}
+                ).encode()
+                + b"\n"
             )
 
         self._fake_server(curated)
@@ -600,6 +606,8 @@ class WorkerIPCTest(unittest.TestCase):
         with self.assertRaises(ipc.IPCRequestError) as cm:
             client.request({"x": 1})
         self.assertEqual(cm.exception.code, "malformed_request")
+        self.assertEqual(cm.exception.message, "the request was malformed")
+        self.assertNotIn(secret, str(cm.exception))
 
         # ...but an unknown code is never trusted as curated.
         def uncurated(conn: socket.socket) -> None:
@@ -612,6 +620,37 @@ class WorkerIPCTest(unittest.TestCase):
         with self.assertRaises(ipc.IPCError) as cm2:
             client.request({"x": 1})
         self.assertNotIsInstance(cm2.exception, ipc.IPCRequestError)
+        self.assertNotIn("leak", str(cm2.exception))
+
+    def test_client_unhashable_error_code_is_clean_curated_error(self) -> None:
+        for bad_code in (b'["x"]', b'{"a":1}', b'1', b'true', b'null'):
+            with self.subTest(code=bad_code):
+                body = (
+                    b'{"ok":false,"error":{"code":' + bad_code + b',"message":"m"}}\n'
+                )
+
+                def responder(conn: socket.socket, _body=body) -> None:
+                    conn.sendall(_body)
+
+                self._fake_server(responder)
+                client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+                with self.assertRaises(ipc.IPCError) as cm:
+                    client.request({"x": 1})
+                self.assertNotIsInstance(cm.exception, ipc.IPCRequestError)
+
+    def test_client_rejects_non_dict_success_result(self) -> None:
+        for result in (b'[1,2]', b'"str"', b'1', b'true', b'null'):
+            with self.subTest(result=result):
+                body = b'{"ok":true,"result":' + result + b'}\n'
+
+                def responder(conn: socket.socket, _body=body) -> None:
+                    conn.sendall(_body)
+
+                self._fake_server(responder)
+                client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+                with self.assertRaises(ipc.IPCError) as cm:
+                    client.request({"x": 1})
+                self.assertNotIsInstance(cm.exception, ipc.IPCRequestError)
 
     def test_client_connect_refused_is_worker_not_running(self) -> None:
         runtime = self._private_runtime()

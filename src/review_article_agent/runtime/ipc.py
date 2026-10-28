@@ -118,19 +118,21 @@ _CODE_UNAUTHORIZED = "unauthorized_peer"
 _CODE_HANDLER = "handler_error"
 _CODE_INVALID = "invalid_response"
 
-#: The only error codes a client will surface as a curated transport error. An
-#: unknown code is never reflected (it cannot be trusted as curated), and any
-#: structured application result is passed through the ``ok`` success path.
-_CURATED_CODES = frozenset(
-    {
-        _CODE_MALFORMED,
-        _CODE_TOO_LARGE,
-        _CODE_TIMEOUT,
-        _CODE_UNAUTHORIZED,
-        _CODE_HANDLER,
-        _CODE_INVALID,
-    }
-)
+#: The only error codes a client will surface as a curated transport error, each
+#: mapped to a **static** curated message. The peer's own ``message`` is never
+#: surfaced (it could reflect arbitrary content), and an unknown code is never
+#: trusted as curated. Any structured application result is passed through the
+#: ``ok`` success path.
+_CURATED_MESSAGES = {
+    _CODE_MALFORMED: "the request was malformed",
+    _CODE_TOO_LARGE: "the request was too large",
+    _CODE_TIMEOUT: "the request timed out",
+    _CODE_UNAUTHORIZED: "control is restricted to the owner",
+    _CODE_HANDLER: "the request could not be handled",
+    _CODE_INVALID: "the server returned an invalid result",
+}
+
+_CURATED_CODES = frozenset(_CURATED_MESSAGES)
 
 
 # --------------------------------------------------------------------------- #
@@ -960,16 +962,20 @@ class WorkerIPCClient:
         if ok is True:
             if "result" not in response:
                 raise IPCError("the server returned an invalid response")
-            return response["result"]
+            result = response["result"]
+            # The server contract is a dict result; anything else is invalid.
+            if not isinstance(result, dict):
+                raise IPCError("the server returned an invalid response")
+            return result
         if ok is False:
             error = response.get("error")
             code = error.get("code") if isinstance(error, dict) else None
-            message = error.get("message") if isinstance(error, dict) else None
-            # Only a code from the static transport allowlist, with a string
-            # message, is surfaced as a curated error. Anything else is not
-            # trusted (it could be arbitrary reflected content).
-            if code in _CURATED_CODES and isinstance(message, str):
-                raise IPCRequestError(code, message)
+            # Only a string code from the static transport allowlist is
+            # surfaced, always with our own static message; the peer-supplied
+            # message is never reflected, and an unhashable/unknown code yields
+            # a clean IPCError rather than a TypeError.
+            if isinstance(code, str) and code in _CURATED_MESSAGES:
+                raise IPCRequestError(code, _CURATED_MESSAGES[code])
             raise IPCError("the server rejected the request")
         # Not a real boolean: never coerce truthiness from untrusted input.
         raise IPCError("the server returned an invalid response")
