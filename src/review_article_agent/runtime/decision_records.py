@@ -57,6 +57,15 @@ What this module **is not** (the boundary)
   digest. A predicate probability is the raw ``noul`` value with **no** cutoff;
   a missing/malformed/refused/omitted/unsupported/uncertain decision keeps the
   candidate and its diagnostic and is never an exclusion.
+* It **reconciles only one adapter quirk**: the typed adapter reports an
+  *answerless* ``partial_error`` for a missing answer and for a defensive
+  ``type:"error"`` provider error, but §6.2 permits an ``answer`` iff the outcome
+  is ``answered`` or ``partial_error``. The projection maps exactly those two
+  genuine reasons to canonical ``omitted`` (a literally absent answer), retaining
+  the original ``PerQuestionError`` and ``Diagnostic`` verbatim and preserving the
+  source literal in the optional ``adapter_outcome`` audit field. It invents no
+  answer and asserts no scientific uncertainty; every other literal, and every
+  answerless ``partial_error`` with a foreign/malformed/missing error, is refused.
 * It performs **no** ledger aggregation: the same ``CostRecord`` (one dispatch)
   is referenced by every question's record; the charge is counted **once** per
   dispatch, never summed per question.
@@ -106,6 +115,8 @@ __all__ = [
     "DECISION_WIRE_TYPES",
     "DIAGNOSTIC_OUTCOMES",
     "PER_QUESTION_ERROR_OUTCOMES",
+    "ANSWERLESS_PARTIAL_ERROR_REASONS",
+    "NORMALIZED_ADAPTER_OUTCOME",
     "JEV_CONSUMED_SLOTS",
     "OPTIONAL_CONSUMED_SLOTS",
     "MAX_DECISION_RECORD_BYTES",
@@ -147,6 +158,21 @@ DIAGNOSTIC_OUTCOMES = ("partial_error", "refusal", "malformed", "unsupported")
 
 #: Outcomes that MUST carry a ``PerQuestionError`` (a per-question failure).
 PER_QUESTION_ERROR_OUTCOMES = ("partial_error", "refusal", "malformed", "unsupported")
+
+#: The typed adapter reports an **answerless** ``partial_error`` for a missing
+#: answer and for a defensive ``type:"error"`` provider error. C02 §6.2 allows an
+#: ``answer`` iff the outcome is ``answered`` or ``partial_error``, so an
+#: answerless ``partial_error`` cannot be projected verbatim. The projection
+#: reconciles it to canonical ``omitted`` (a literally absent answer) **only** for
+#: these two genuine per-question reasons, and never invents an answer or a
+#: scientific uncertainty. The source adapter outcome is preserved in the optional
+#: :data:`NORMALIZED_ADAPTER_OUTCOME` audit field.
+ANSWERLESS_PARTIAL_ERROR_REASONS = ("missing_answer", "provider_error")
+
+#: The only adapter outcome the projection normalizes to a different canonical
+#: outcome (``partial_error`` -> ``omitted``), preserved in the optional
+#: ``adapter_outcome`` audit field.
+NORMALIZED_ADAPTER_OUTCOME = "partial_error"
 
 #: Version slots every Jev/typed-decision stage consumes (§6.1).
 JEV_CONSUMED_SLOTS = ("model", "prompt", "adapter")
@@ -260,6 +286,14 @@ _M_RECORD_SHAPE = "a decision record mapping is not a portable, bounded JSON obj
 _M_REF_SINGLE = "a single ref is accepted only for a single-question projection"
 _M_REF_COVERAGE = "the per-question refs must cover exactly the declared questions"
 _M_COST_CONFLICT = "the same dispatch is referenced with divergent cost metadata"
+_M_ADAPTER_OUTCOME = "the adapter outcome audit field is inconsistent with the canonical outcome"
+_M_PARTIAL_ERROR_NO_ANSWER = (
+    "an answerless partial error must retain a genuine per-question "
+    "missing-answer or provider-error reason"
+)
+_M_REASON_REQUIRED = (
+    "an uncertain or omitted decision must retain a diagnostic or per-question error"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -616,6 +650,44 @@ def _project_diagnostic(diagnostic: jev.Diagnostic) -> dict[str, Any]:
     }
 
 
+def _normalize_outcome(outcome: jev.DecisionOutcome, question_id: str) -> tuple[str, str | None]:
+    """Reconcile one typed outcome to its canonical ``DecisionRecord`` literal.
+
+    Returns ``(canonical_outcome, adapter_outcome)`` where ``adapter_outcome`` is
+    the preserved source literal **iff** the projection normalized it.
+
+    The typed adapter (:func:`review_article_agent.runtime.jev.validate_response`)
+    reports an **answerless** ``partial_error`` for a missing answer
+    (``reason = missing_answer``) and for a defensive ``type:"error"`` provider
+    error (``reason = provider_error``). C02 §6.2 permits an ``answer`` iff the
+    outcome is ``answered`` or ``partial_error``, so such an outcome cannot be
+    projected verbatim. The projection reconciles **only** those two genuine
+    per-question reasons to canonical ``omitted`` — a literally absent answer that
+    invents no probability/choice/score and asserts **no** scientific uncertainty.
+    The original :class:`~review_article_agent.runtime.jev.PerQuestionError` and
+    :class:`~review_article_agent.runtime.jev.Diagnostic` are retained exactly, and
+    the source adapter outcome is preserved in the optional ``adapter_outcome``
+    audit field. A ``partial_error`` that **carries a real answer** (or any other
+    literal) is returned unchanged. An answerless ``partial_error`` whose retained
+    per-question error is missing, malformed, foreign (a different question), or
+    carries any other reason is refused: no answer or error is ever fabricated.
+    """
+    literal = outcome.outcome
+    if literal != NORMALIZED_ADAPTER_OUTCOME or outcome.answer is not None:
+        return literal, None
+    error = outcome.per_question_error
+    diagnostic = outcome.diagnostic
+    if not isinstance(error, jev.PerQuestionError) or not isinstance(
+        diagnostic, jev.Diagnostic
+    ):
+        _err(_M_PARTIAL_ERROR_NO_ANSWER)
+    if error.question_id != question_id:
+        _err(_M_BAD_OUTCOME)
+    if error.reason not in ANSWERLESS_PARTIAL_ERROR_REASONS:
+        _err(_M_PARTIAL_ERROR_NO_ANSWER)
+    return "omitted", NORMALIZED_ADAPTER_OUTCOME
+
+
 def _project_provider(result: jev.DispatchResult) -> dict[str, Any]:
     """Record the real provider model/version metadata from the trusted result."""
     usage = result.usage
@@ -802,7 +874,9 @@ _REQUIRED_KEYS = frozenset(
         "grants_eligibility",
     }
 )
-_OPTIONAL_KEYS = frozenset({"answer", "per_question_error", "diagnostics"})
+_OPTIONAL_KEYS = frozenset(
+    {"answer", "per_question_error", "diagnostics", "adapter_outcome"}
+)
 
 
 def _check_options_levels(mapping: Mapping[str, Any]) -> tuple[list[str], list[str]]:
@@ -1126,6 +1200,7 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
     answer = mapping.get("answer")
     pqe = mapping.get("per_question_error")
     diagnostic = mapping.get("diagnostics")
+    adapter_outcome = mapping.get("adapter_outcome")
 
     if answer is not None:
         if kind == "box":
@@ -1141,6 +1216,16 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
             _err(_M_BOX_OUTCOME)
     elif outcome == "unsupported":
         _err(_M_UNSUPPORTED_KIND)
+
+    # The optional ``adapter_outcome`` audit field preserves the source adapter
+    # literal when the projection normalized it. Its relation to the canonical
+    # outcome is strict: it is present only for the one documented reconciliation
+    # (an answerless adapter ``partial_error`` -> canonical ``omitted``).
+    if adapter_outcome is not None:
+        if adapter_outcome not in jev.OUTCOMES:
+            _err(_M_OUTCOME_LITERAL)
+        if outcome != "omitted" or adapter_outcome != NORMALIZED_ADAPTER_OUTCOME:
+            _err(_M_ADAPTER_OUTCOME)
 
     # C02 §6.2 presence union: ``answer`` is present iff the outcome is
     # ``answered`` or ``partial_error``.
@@ -1158,6 +1243,12 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
             _err(_M_DIAGNOSTIC_REQUIRED)
         if pqe is None:
             _err(_M_PQE_REQUIRED)
+    elif outcome in ("uncertain", "omitted"):
+        # §6.2 never-exclusion: an uncertain or omitted failure is retained with a
+        # persisted reason (a diagnostic **or** a per-question error); a silent,
+        # reasonless failure is refused.
+        if diagnostic is None and pqe is None:
+            _err(_M_REASON_REQUIRED)
 
     return _thaw(mapping)
 
@@ -1279,6 +1370,12 @@ def project_decision_records(
         descriptor_digest = question_descriptor_digest(question)
         _match_binding(binding_map[qid], question)
 
+        # Reconcile the typed adapter outcome to its canonical literal. Only an
+        # answerless adapter ``partial_error`` with a genuine missing-answer /
+        # provider-error reason becomes canonical ``omitted``; nothing is
+        # invented, and the retained error/diagnostic are projected verbatim.
+        canonical_outcome, adapter_outcome = _normalize_outcome(outcome, qid)
+
         mapping: dict[str, Any] = {
             "schema_version": DECISION_RECORD_SCHEMA_VERSION,
             "decision_id": _decision_id(project, dispatch, context, qid),
@@ -1291,7 +1388,7 @@ def project_decision_records(
             "options": list(question.options),
             "levels": list(question.levels),
             "question_def_digest": descriptor_digest,
-            "outcome": outcome.outcome,
+            "outcome": canonical_outcome,
             "versions": version_map,
             "consumed_versions": list(consumed_slots),
             "route": DECISION_ROUTE,
@@ -1302,6 +1399,8 @@ def project_decision_records(
             "retains_candidate": True,
             "grants_eligibility": False,
         }
+        if adapter_outcome is not None:
+            mapping["adapter_outcome"] = adapter_outcome
         if outcome.answer is not None:
             if not isinstance(outcome.answer, jev.Answer):
                 _err(_M_BAD_OUTCOME)

@@ -383,15 +383,76 @@ class OutcomeRetentionTest(unittest.TestCase):
         )
         return project(result=make_result({qid: outcome}), qs=[q])[0].as_mapping()
 
-    def test_partial_error_without_answer_denied(self):
+    def test_raw_answerless_partial_error_denied_by_validator(self):
         # C02 §6.2 presence union: ``answer`` is present iff the outcome is
-        # ``answered`` or ``partial_error`` — a partial_error MUST carry an answer.
+        # ``answered`` or ``partial_error`` — a raw canonical ``partial_error``
+        # MUST carry an answer. The strict mapping validator still refuses it
+        # (this contract is **not** weakened); the typed adapter->canonical
+        # projection reconciles the real answerless adapter outcome separately.
+        mapping = project()[0].as_mapping()
+        del mapping["answer"]
+        mapping["outcome"] = "partial_error"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_answerless_partial_error_missing_answer_normalizes_to_omitted(self):
+        # The typed adapter reports an answerless ``partial_error`` for a missing
+        # answer; the projection reconciles it to canonical ``omitted`` with the
+        # source literal preserved, never an invented answer or uncertainty.
+        mapping = self._single(
+            error_outcome("p", jev.PREDICATE, "partial_error", "missing_answer"),
+            jev.PREDICATE,
+            "p",
+        )
+        self.assertEqual(mapping["outcome"], "omitted")
+        self.assertEqual(mapping["adapter_outcome"], "partial_error")
+        self.assertNotIn("answer", mapping)
+        self.assertEqual(mapping["per_question_error"]["reason"], "missing_answer")
+        self.assertIn("diagnostics", mapping)
+        self.assertFalse(mapping["is_exclusion"])
+        self.assertTrue(mapping["retains_candidate"])
+        self.assertFalse(mapping["grants_eligibility"])
+
+    def test_answerless_partial_error_provider_error_normalizes_to_omitted(self):
+        mapping = self._single(
+            error_outcome("p", jev.PREDICATE, "partial_error", "provider_error"),
+            jev.PREDICATE,
+            "p",
+        )
+        self.assertEqual(mapping["outcome"], "omitted")
+        self.assertEqual(mapping["adapter_outcome"], "partial_error")
+        self.assertNotIn("answer", mapping)
+        self.assertEqual(mapping["per_question_error"]["reason"], "provider_error")
+
+    def test_answerless_partial_error_foreign_reason_refused(self):
+        # Only a genuine missing_answer/provider_error reason is reconciled; any
+        # other reason on an answerless partial_error is refused (no fabrication).
         with self.assertRaises(dr.DecisionRecordValidationError):
             self._single(
-                error_outcome("p", jev.PREDICATE, "partial_error", "missing_answer"),
+                error_outcome("p", jev.PREDICATE, "partial_error", "malformed_answer"),
                 jev.PREDICATE,
                 "p",
             )
+
+    def test_answerless_partial_error_without_reason_refused(self):
+        forged = jev.DecisionOutcome(
+            question_id="p", question_kind=jev.PREDICATE, outcome="partial_error"
+        )
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            self._single(forged, jev.PREDICATE, "p")
+
+    def test_answerless_partial_error_foreign_question_refused(self):
+        forged = jev.DecisionOutcome(
+            question_id="p",
+            question_kind=jev.PREDICATE,
+            outcome="partial_error",
+            per_question_error=jev.PerQuestionError(
+                question_id="other", reason="missing_answer", message_redacted="static"
+            ),
+            diagnostic=jev.Diagnostic(code="c", detail_redacted="d", raised_at=RAISED_AT),
+        )
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            self._single(forged, jev.PREDICATE, "p")
 
     def test_partial_error_retains_candidate_with_answer(self):
         forged = jev.DecisionOutcome(
@@ -426,15 +487,33 @@ class OutcomeRetentionTest(unittest.TestCase):
                 self.assertTrue(mapping["retains_candidate"])
                 self.assertFalse(mapping["grants_eligibility"])
 
-    def test_uncertain_and_omitted_have_no_answer(self):
+    def test_uncertain_and_omitted_have_no_answer_with_reason(self):
+        # §6.2 never-exclusion: an uncertain/omitted failure is retained with a
+        # persisted reason (a diagnostic or a per-question error) and no answer.
+        for outcome in ("uncertain", "omitted"):
+            with self.subTest(outcome=outcome):
+                forged = jev.DecisionOutcome(
+                    question_id="p",
+                    question_kind=jev.PREDICATE,
+                    outcome=outcome,
+                    diagnostic=jev.Diagnostic(
+                        code="c", detail_redacted="d", raised_at=RAISED_AT
+                    ),
+                )
+                mapping = self._single(forged, jev.PREDICATE, "p")
+                self.assertNotIn("answer", mapping)
+                self.assertFalse(mapping["is_exclusion"])
+
+    def test_uncertain_and_omitted_without_reason_denied(self):
+        # No silent, reasonless failure: an uncertain/omitted outcome with neither
+        # a diagnostic nor a per-question error is refused.
         for outcome in ("uncertain", "omitted"):
             with self.subTest(outcome=outcome):
                 forged = jev.DecisionOutcome(
                     question_id="p", question_kind=jev.PREDICATE, outcome=outcome
                 )
-                mapping = self._single(forged, jev.PREDICATE, "p")
-                self.assertNotIn("answer", mapping)
-                self.assertFalse(mapping["is_exclusion"])
+                with self.assertRaises(dr.DecisionRecordValidationError):
+                    self._single(forged, jev.PREDICATE, "p")
 
     def test_answered_requires_an_answer(self):
         forged = jev.DecisionOutcome(
@@ -902,6 +981,54 @@ class MappingValidatorTest(unittest.TestCase):
     def test_rejects_tampered_answer(self):
         mapping = project()[1].as_mapping()
         mapping["answer"]["choice"] = "not-an-option"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def _omitted_mapping(self):
+        # A canonical ``omitted`` record with a persisted reason, built from a
+        # projected record (the decision id binds only the task inputs).
+        mapping = project()[0].as_mapping()
+        del mapping["answer"]
+        mapping["outcome"] = "omitted"
+        mapping["per_question_error"] = {
+            "question_id": "is_original_report",
+            "reason": "missing_answer",
+            "message_redacted": "static",
+        }
+        mapping["diagnostics"] = {
+            "code": "c",
+            "detail_redacted": "d",
+            "raised_at": RAISED_AT,
+        }
+        return mapping
+
+    def test_adapter_outcome_consistent_relation_accepted(self):
+        mapping = self._omitted_mapping()
+        mapping["adapter_outcome"] = "partial_error"
+        self.assertEqual(dr.validate_decision_record_mapping(mapping), mapping)
+
+    def test_adapter_outcome_on_non_omitted_denied(self):
+        mapping = project()[0].as_mapping()  # answered
+        mapping["adapter_outcome"] = "partial_error"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_adapter_outcome_wrong_value_denied(self):
+        mapping = self._omitted_mapping()
+        mapping["adapter_outcome"] = "uncertain"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_adapter_outcome_unknown_literal_denied(self):
+        mapping = self._omitted_mapping()
+        mapping["adapter_outcome"] = "nope"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_omitted_without_reason_denied_by_validator(self):
+        mapping = self._omitted_mapping()
+        del mapping["per_question_error"]
+        del mapping["diagnostics"]
         with self.assertRaises(dr.DecisionRecordValidationError):
             dr.validate_decision_record_mapping(mapping)
 
