@@ -662,6 +662,43 @@ class WorkerIPCTest(unittest.TestCase):
         with self.assertRaises(ipc.WorkerNotRunning):
             client.request({"x": 1})
 
+    # -- R2: kernel peer-PID binding ----------------------------------------- #
+    def test_client_expected_peer_pid_match_and_last_verified(self) -> None:
+        self._serve()
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+        self.assertIsNone(client.last_verified_peer)
+        result = client.request({"x": 9}, expected_peer_pid=os.getpid())
+        self.assertEqual(result["echo"], 9)
+        self.assertIsNotNone(client.last_verified_peer)
+        # Verified from SO_PEERCRED, i.e. this test process.
+        self.assertEqual(client.last_verified_peer.pid, os.getpid())
+        self.assertEqual(client.last_verified_peer.uid, os.getuid())
+
+    def test_client_expected_peer_pid_mismatch_sends_nothing(self) -> None:
+        self._serve()
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+        with self.assertRaises(ipc.PeerIdentityMismatch):
+            client.request({"x": 1}, expected_peer_pid=os.getpid() + 424242)
+        # Refused before any control byte: the handler never ran.
+        self.assertEqual(self.handler.calls, [])
+        self.assertIsNone(client.last_verified_peer)
+
+    def test_client_expected_peer_pid_validation(self) -> None:
+        self._serve()
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+        for bad in (0, -1, True, 1.5, "23"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ipc.IPCError):
+                    client.request({"x": 1}, expected_peer_pid=bad)
+        self.assertEqual(self.handler.calls, [])
+
+    def test_client_last_verified_peer_is_kernel_not_payload(self) -> None:
+        # A payload that claims a PID never influences the kernel-verified peer.
+        self._serve()
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+        client.request({"pid": 1, "uid": 0}, expected_peer_pid=os.getpid())
+        self.assertEqual(client.last_verified_peer.pid, os.getpid())
+
     # -- R1 repairs: handler result contract --------------------------------- #
     def test_server_rejects_non_dict_result(self) -> None:
         def list_handler(request, peer):

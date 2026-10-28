@@ -60,6 +60,7 @@ __all__ = [
     "WorkerAlreadyRunning",
     "WorkerNotRunning",
     "PeerNotAuthorized",
+    "PeerIdentityMismatch",
     "RequestError",
     "IPCRequestError",
     "PeerCredentials",
@@ -156,6 +157,16 @@ class WorkerNotRunning(IPCError):
 
 class PeerNotAuthorized(IPCError):
     """The peer on the other end is not the owning user."""
+
+
+class PeerIdentityMismatch(IPCError):
+    """The control-socket peer is not the expected process.
+
+    Raised by the client when a caller supplies ``expected_peer_pid`` and the
+    kernel-reported peer PID (``SO_PEERCRED``) differs, so control is never sent
+    to a replaced or foreign listener at the same path. This is a *kernel*
+    binding, not a value taken from the request or response payload.
+    """
 
 
 class RequestError(IPCError):
@@ -888,6 +899,7 @@ class WorkerIPCClient:
         )
         self._io_timeout = _validate_timeout(io_timeout, what="io_timeout")
         self._owner_uid = os.getuid() if owner_uid is None else owner_uid
+        self._last_verified_peer: PeerCredentials | None = None
 
     @property
     def runtime_dir(self) -> str:
@@ -897,16 +909,44 @@ class WorkerIPCClient:
     def socket_path(self) -> str:
         return os.path.join(self.runtime_dir, self._socket_filename)
 
-    def request(self, request: dict[str, Any], *, timeout: float | None = None) -> Any:
+    @property
+    def last_verified_peer(self) -> PeerCredentials | None:
+        """Kernel-verified credentials of the peer of the most recent request.
+
+        ``None`` until a request has verified a peer; reset at the start of each
+        request, so a caller can rely on it belonging to the request just made.
+        Callers can bind an in-band PID from a response to this out-of-band,
+        kernel-reported PID rather than trusting the response alone.
+        """
+        return self._last_verified_peer
+
+    def request(
+        self,
+        request: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        expected_peer_pid: int | None = None,
+    ) -> Any:
         """Send one request and return the handler's result.
 
         Raises :class:`WorkerNotRunning` if no worker is listening,
         :class:`PeerNotAuthorized` if the server is not the owner,
-        :class:`IPCRequestError` for a curated transport error response, and
-        :class:`IPCError` for any other transport or protocol failure.
+        :class:`PeerIdentityMismatch` if ``expected_peer_pid`` is supplied and
+        the kernel-reported peer PID differs (checked **before** any control
+        byte is sent), :class:`IPCRequestError` for a curated transport error
+        response, and :class:`IPCError` for any other transport or protocol
+        failure.
         """
         if not isinstance(request, dict):
             raise RequestError("request must be a JSON object")
+        if expected_peer_pid is not None:
+            if (
+                isinstance(expected_peer_pid, bool)
+                or not isinstance(expected_peer_pid, int)
+                or expected_peer_pid <= 0
+            ):
+                raise IPCError("expected_peer_pid must be a positive process id")
+        self._last_verified_peer = None
         payload = _encode_json(request) + b"\n"
         effective_timeout = (
             self._io_timeout
@@ -940,6 +980,12 @@ class WorkerIPCClient:
                     "the control socket is not owned by this user; refusing to "
                     "trust its responses."
                 )
+            if expected_peer_pid is not None and peer.pid != expected_peer_pid:
+                raise PeerIdentityMismatch(
+                    "the control socket is not served by the expected process "
+                    "(kernel-reported peer differs); refusing to send control."
+                )
+            self._last_verified_peer = peer
             sock.sendall(payload)
             line = self._read_bounded_response(sock, effective_timeout)
         finally:

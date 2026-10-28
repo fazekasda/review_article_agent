@@ -17,6 +17,7 @@ No engine, CLI, jobs, schema, or documentation module is imported.
 from __future__ import annotations
 
 import concurrent.futures
+import gc
 import json
 import os
 import stat
@@ -25,6 +26,7 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -116,6 +118,9 @@ def _status_body():
             "state": "running"}
     if mode == "nopid":
         body.pop("pid")
+    if mode == "pidmismatch":
+        # Correct marker/protocol but an in-band PID that is not the kernel peer.
+        body["pid"] = os.getpid() + 424242
     return json.dumps({"ok": True, "result": body}).encode()
 
 
@@ -157,6 +162,84 @@ while True:
     time.sleep(0.2)
 '''
 
+# A worker whose handler delays every response, to prove the launcher honours a
+# caller's small timeout end to end instead of a fixed five-second probe.
+SLOW_WORKER = r'''
+import os
+import sys
+import time
+
+from review_article_agent.runtime import ipc
+
+data_dir = sys.argv[1]
+delay = float(sys.argv[2])
+
+
+def _handler(request, peer):
+    time.sleep(delay)
+    op = request.get("op")
+    if op == "status":
+        return {"app": "review_article_agent.worker", "protocol_version": 1,
+                "pid": os.getpid(), "state": "running"}
+    if op == "stop":
+        return {"app": "review_article_agent.worker", "protocol_version": 1,
+                "stopping": True}
+    raise ValueError("op")
+
+
+server = ipc.WorkerIPCServer(data_dir, _handler, io_timeout=30.0)
+server.start()
+try:
+    while True:
+        server.serve_once(0.1)
+finally:
+    server.close()
+'''
+
+# A worker that acknowledges a stop in ways that must not be credited: a
+# malformed marker, or by going unresponsive while keeping the socket open.
+SUBTLE_WORKER = r'''
+import os
+import sys
+import threading
+import time
+
+from review_article_agent.runtime import ipc
+
+data_dir = sys.argv[1]
+mode = sys.argv[2]
+marker = sys.argv[3]
+_hang = threading.Event()
+
+
+def _handler(request, peer):
+    op = request.get("op")
+    if op == "status":
+        if _hang.is_set():
+            time.sleep(30.0)
+        return {"app": "review_article_agent.worker", "protocol_version": 1,
+                "pid": os.getpid(), "state": "running"}
+    if op == "stop":
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("stop")
+        if mode == "hangafterstop":
+            _hang.set()
+        if mode == "badstopmarker":
+            return {"stopping": True}
+        return {"app": "review_article_agent.worker", "protocol_version": 1,
+                "stopping": True}
+    raise ValueError("op")
+
+
+server = ipc.WorkerIPCServer(data_dir, _handler, io_timeout=30.0)
+server.start()
+try:
+    while True:
+        server.serve_once(0.1)
+finally:
+    server.close()
+'''
+
 # A launcher that runs this checkout's launcher in a separate process and exits;
 # used to prove the daemon outlives the process that started it.
 LAUNCHER = r'''
@@ -182,6 +265,8 @@ class WorkerProcessTest(unittest.TestCase):
         self.foreign_marker = str(self.tmp / "stop-marker")
         self.worker_script = self._write("fixture_worker.py", FIXTURE_WORKER)
         self.foreign_script = self._write("foreign_server.py", FOREIGN_SERVER)
+        self.slow_script = self._write("slow_worker.py", SLOW_WORKER)
+        self.subtle_script = self._write("subtle_worker.py", SUBTLE_WORKER)
         self.launcher_script = self._write(
             "launcher.py", LAUNCHER.format(src=str(SRC), fixture=self.worker_script)
         )
@@ -213,6 +298,18 @@ class WorkerProcessTest(unittest.TestCase):
         child = subprocess.Popen(
             [sys.executable, self.foreign_script, self.data_dir,
              self.foreign_marker, mode],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._children.append(child)
+        self._wait_for_socket()
+        return child
+
+    def _start_script(self, script: str, *args: str) -> subprocess.Popen:
+        """Start a fixture worker directly (holding its Popen) and await its socket."""
+        child = subprocess.Popen(
+            [sys.executable, script, *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -419,6 +516,106 @@ class WorkerProcessTest(unittest.TestCase):
         self.assertTrue(status["running"])
         self.assertEqual(status["pid"], daemon_pid)
         self.assertTrue(process.stop_worker(self.data_dir, timeout=10.0)["stopped"])
+
+    # -- R1: bounded timeout, stop confirmation, peer binding ---------------- #
+    def test_status_honors_small_timeout_with_slow_endpoint(self) -> None:
+        self._start_script(self.slow_script, self.data_dir, "2.0")
+        started = time.monotonic()
+        status = process.worker_status(self.data_dir, timeout=0.3)
+        elapsed = time.monotonic() - started
+        self.assertFalse(status["running"])
+        self.assertEqual(status["reason"], "unavailable")
+        self.assertLess(elapsed, 1.5)  # not a fixed five-second probe
+
+    def test_start_worker_honors_small_timeout_with_slow_endpoint(self) -> None:
+        with mock.patch.object(
+            process,
+            "_build_command",
+            lambda d: [sys.executable, self.slow_script, d, "2.0"],
+        ):
+            started = time.monotonic()
+            with self.assertRaises(process.WorkerStartError) as cm:
+                process.start_worker(self.data_dir, timeout=0.5)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.5)
+        pid = cm.exception.child_pid
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("slow child was not terminated")
+
+    def test_stop_not_credited_when_endpoint_becomes_unavailable(self) -> None:
+        child = self._start_script(
+            self.subtle_script, self.data_dir, "hangafterstop", self.foreign_marker
+        )
+        result = process.stop_worker(self.data_dir, timeout=1.0)
+        self.assertFalse(result["stopped"])
+        self.assertTrue(result["unresolved"])
+        self.assertIn(result["reason"], ("stop_unconfirmed", "stop_unavailable"))
+        # The stop *was* delivered (our worker acknowledged) ...
+        self.assertTrue(os.path.exists(self.foreign_marker))
+        # ... but the endpoint never confirmed gone, and was never signalled.
+        self.assertIsNone(child.poll())
+
+    def test_stop_malformed_marker_not_credited(self) -> None:
+        child = self._start_script(
+            self.subtle_script, self.data_dir, "badstopmarker", self.foreign_marker
+        )
+        result = process.stop_worker(self.data_dir, timeout=1.0)
+        self.assertFalse(result["stopped"])
+        self.assertTrue(result["unresolved"])
+        self.assertEqual(result["reason"], "foreign_endpoint")
+        self.assertTrue(os.path.exists(self.foreign_marker))
+        self.assertIsNone(child.poll())
+
+    def test_status_pid_must_match_kernel_peer(self) -> None:
+        child = self._start_foreign("pidmismatch")
+        try:
+            status = process.worker_status(self.data_dir)
+            self.assertFalse(status["running"])
+            self.assertEqual(status["reason"], "foreign_endpoint")
+            # A mismatched in-band PID means no control is ever delivered.
+            result = process.stop_worker(self.data_dir, timeout=1.0)
+            self.assertFalse(result["stopped"])
+            self.assertFalse(result["was_running"])
+            self.assertIsNone(child.poll())
+            self.assertFalse(os.path.exists(self.foreign_marker))
+        finally:
+            child.terminate()
+            child.wait(timeout=3)
+
+    # -- R1: daemon reaping (no zombie / ResourceWarning) -------------------- #
+    def test_reap_in_background_reaps_child(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"])
+        thread = process._reap_in_background(child)
+        self.assertTrue(thread.daemon)
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertIsNotNone(child.returncode)
+
+    def test_successful_start_leaves_no_warning_or_zombie(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with mock.patch.object(process, "_build_command", self._worker_command()):
+                started = process.start_worker(self.data_dir, timeout=10.0)
+            gc.collect()
+            stopped = process.stop_worker(self.data_dir, timeout=10.0)
+            # Let the background reaper observe the exit, then force collection.
+            time.sleep(0.5)
+            gc.collect()
+        self.assertTrue(started["running"])
+        self.assertTrue(stopped["stopped"])
+        resource = [
+            w for w in caught
+            if issubclass(w.category, ResourceWarning)
+            and "still running" in str(w.message)
+        ]
+        self.assertEqual(resource, [], [str(w.message) for w in resource])
 
     # -- argument validation ------------------------------------------------- #
     def test_argument_validation(self) -> None:
