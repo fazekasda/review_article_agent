@@ -1004,9 +1004,14 @@ class MigrationTest(IntentTestBase):
             decision_intent_integrity_problems(reopened.connection, pid), []
         )
 
-    def test_schema_version_is_eight(self) -> None:
-        self.assertEqual(schema.STORE_SCHEMA_VERSION, 8)
-        self.assertEqual(self.store.schema_version, 8)
+    def test_schema_version_is_current(self) -> None:
+        # Dynamic: additive later migrations (schema 9 adds the full decision
+        # result set) keep this assertion true without rewriting intent rows.
+        self.assertEqual(
+            schema.STORE_SCHEMA_VERSION, max(schema.STORE_MIGRATIONS)
+        )
+        self.assertGreaterEqual(schema.STORE_SCHEMA_VERSION, 8)
+        self.assertEqual(self.store.schema_version, schema.STORE_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":  # pragma: no cover

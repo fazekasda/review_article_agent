@@ -42,7 +42,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 8
+STORE_SCHEMA_VERSION = 9
 
 #: Registry maps project IDs to names and locations, records the single
 #: *selected* project, and records durable **execution activation** (which
@@ -1069,6 +1069,133 @@ def _store_v8(conn: sqlite3.Connection) -> None:
     )
 
 
+def _store_v9(conn: sqlite3.Connection) -> None:
+    """Add the durable, immutable **full per-question Jev result observation** (C02 §6.2/§6.3/§8.1.1).
+
+    These tables back :mod:`review_article_agent.storage.decision_results`: one
+    immutable observation per direct Jev dispatch holding the **complete** array
+    of per-question ``DecisionRecord`` rows plus each row's canonical bytes, so a
+    later atomic bridge can accept/transition the dispatch alongside rows without
+    ever observing a partial set.
+
+    Only new tables and triggers are added; migrations 1-8 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, the runtime task/session/proposal
+    mappings, the runtime dispatch/cost ledger, the human approvals, and the
+    pre-dispatch decision request intent) are never rewritten, so their exact
+    bytes/refs are preserved across the upgrade (``ARCH-ASSETS``; step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **One observation per dispatch.** ``decision_result_set`` is keyed by the
+      same-project ``(project_id, dispatch_id)`` and foreign-keys the existing
+      ``runtime_dispatch`` identity, its ``runtime_bounded_task``, and the
+      ``decision_request_intent`` recorded before dispatch. A result can never
+      name a foreign project, a missing dispatch/task/intent, or an intent for a
+      different dispatch.
+    * **Complete set + queryable rows.** ``decision_result_question`` holds the
+      canonical C02 §6.2 record for each question, keyed by its content-derived
+      ``record_id`` and unique per ``(project_id, dispatch_id, question_id)``; the
+      set row's canonical bytes carry the complete ordered ``(record_id, digest)``
+      array and its ``question_count``, so a partial set is detectable.
+    * **Append-only.** Every row is immutable (never ``UPDATE``d/``DELETE``d), so a
+      result can never be rewritten; an identical replay returns the stored row and
+      a divergent replay is refused by the repository.
+    * **Canonical bytes are the truth.** ``canonical`` holds the exact canonical
+      JSON and ``content_digest`` its recomputed SHA-256; projected columns must
+      agree with the canonical bytes on every read.
+    * **No unknown cost 0.** A ``known``/``estimated`` cost requires an amount and
+      every other cost state forbids one, so an ambiguous cost is never stored as a
+      silent ``0``.
+    * **No credential or source bytes.** Only opaque ids, exact-decimal amounts,
+      redacted diagnostics, and SHA-256 digests are stored (spec lines 62-63;
+      ``docs/storage.md``).
+    """
+    conn.execute(
+        """
+        CREATE TABLE decision_result_set (
+            project_id            TEXT NOT NULL,
+            dispatch_id           TEXT NOT NULL,
+            result_id             TEXT NOT NULL,
+            schema_version        INTEGER NOT NULL,
+            task_id               TEXT NOT NULL,
+            intent_id             TEXT NOT NULL,
+            intent_digest         TEXT NOT NULL,
+            input_digest          TEXT NOT NULL,
+            version_digest        TEXT NOT NULL,
+            request_sha256        TEXT NOT NULL,
+            request_bytes         INTEGER NOT NULL,
+            cost_upper_bound_usd  TEXT NOT NULL,
+            reserve_usd           TEXT NOT NULL,
+            status                TEXT NOT NULL,
+            attempt_no            INTEGER NOT NULL CHECK (attempt_no = 1),
+            prior_outcome         TEXT NOT NULL CHECK (prior_outcome = 'none'),
+            cost_state            TEXT NOT NULL CHECK (cost_state IN (
+                'known', 'estimated', 'unknown', 'not_incurred')),
+            cost_amount_usd       TEXT,
+            question_count        INTEGER NOT NULL,
+            canonical             BLOB NOT NULL,
+            content_digest        TEXT NOT NULL,
+            created_at_utc        TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            UNIQUE (project_id, result_id),
+            CHECK ((cost_state IN ('known', 'estimated'))
+                   = (cost_amount_usd IS NOT NULL)),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES runtime_dispatch (project_id, dispatch_id),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES decision_request_intent (project_id, dispatch_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE decision_result_question (
+            project_id      TEXT NOT NULL,
+            dispatch_id     TEXT NOT NULL,
+            result_id       TEXT NOT NULL,
+            record_id       TEXT NOT NULL,
+            question_id     TEXT NOT NULL,
+            question_kind   TEXT NOT NULL,
+            outcome         TEXT NOT NULL,
+            ordinal         INTEGER NOT NULL,
+            request_sha256  TEXT NOT NULL,
+            canonical       BLOB NOT NULL,
+            content_digest  TEXT NOT NULL,
+            created_at_utc  TEXT NOT NULL,
+            PRIMARY KEY (project_id, record_id),
+            UNIQUE (project_id, dispatch_id, question_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES decision_result_set (project_id, dispatch_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES decision_request_intent (project_id, dispatch_id)
+        )
+        """
+    )
+
+    for table in ("decision_result_set", "decision_result_question"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
@@ -1078,6 +1205,7 @@ STORE_MIGRATIONS: Mapping[int, Migration] = {
     6: _store_v6,
     7: _store_v7,
     8: _store_v8,
+    9: _store_v9,
 }
 
 
