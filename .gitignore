@@ -2,3 +2,24 @@
 .env
 .env.*
 !.env.example
+
+# Python build/runtime caches (stdlib-only core; no compiled artifacts committed)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local per-project application store (created inside a user's project directory)
+.review_article_agent/
+.review_article_agent.staging-*/
