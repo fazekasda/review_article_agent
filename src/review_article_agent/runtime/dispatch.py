@@ -54,11 +54,20 @@ What it guarantees
   recursive budget loop is involved.
 * **Explicit safe states, no blind retry.** A dispatch is one of ``reserved``,
   ``submitted``, ``admitted`` (``opencode_session`` only), ``completed``,
-  ``failed``, ``unknown``. ``submitted`` is recorded **before** any future I/O.
-  On a restart an outstanding ``submitted`` becomes ``unknown`` (never reset,
-  never retried) while an existing ``opencode_session`` admission is retained for
-  same-identity reconciliation. The direct route never carries a durable
-  admission.
+  ``failed``, ``unknown``. ``submitted`` is recorded **before** any future I/O and
+  is **single-use** — only the caller that won the send claim may proceed, and a
+  second caller is refused rather than handed a record it did not win. On a
+  restart an outstanding ``submitted`` becomes ``unknown`` (never reset, never
+  retried, never reclassified as a definitive failure) while an existing
+  ``opencode_session`` admission is retained for same-identity reconciliation.
+  The direct route never carries a durable admission. Initial scope allows **at
+  most one logical dispatch per task**: a different ``request_id`` for the same
+  task is refused in every state (including ``completed``/``failed``); a retry
+  would be a separate, explicitly authorized future task.
+* **Monotonic cost settlement.** Once a cost is submitted the dispatch can never
+  claim ``not_incurred``, and an established ``known``/``estimated`` amount can
+  never be discarded or lowered, so an overrun is never erased by a later weaker
+  settlement (C02 §5.6/§6.3).
 * **One fenced accepted local result.** :meth:`RuntimeDispatchRepository.accept_result`
   requires the dispatch's current fence; an identical replay is idempotent and a
   divergent replay is refused.
@@ -66,11 +75,16 @@ What it guarantees
   and pinned at the database (``direct_call`` ⇔ ``direct_call``), so a direct-call
   cost can never be aggregated into OpenCode session statistics.
 * **Fail-closed stored rows.** Every read/replay path revalidates the stored row
-  (identity, digests, exact-decimal amounts, state/result/cost consistency, and
-  the linked task) and raises :class:`DispatchCorruptionError` on any mismatch.
-  :func:`runtime_dispatch_integrity_problems` exports the same revalidation so a
-  later backup verifier can reuse it (foreign, dangling, or corrupt rows are
-  reported).
+  (identity, digests, exact-decimal amounts, state/result/cost consistency,
+  operational consistency — admitted ⇔ durable admission, direct route never
+  admits, in-flight never ``not_incurred``, reserved/terminal timestamp shape,
+  the single initial fence — and the linked task revalidated in full) and raises
+  :class:`DispatchCorruptionError` on any mismatch.
+  :func:`runtime_dispatch_integrity_problems` exports the same revalidation plus
+  an operational-row sweep so a later backup verifier can reuse it (foreign,
+  dangling/orphan, or corrupt rows are reported). :func:`runtime_reserve_exposure`
+  likewise fails closed on a missing/malformed operational row instead of
+  quietly counting the bare reserve.
 
 No credential, endpoint, or response content is ever stored (spec lines 62-63;
 ``docs/storage.md``).
@@ -237,7 +251,8 @@ def _require_nonempty_str(value: object, field: str, *, max_len: int | None = No
 
 def _require_enum(value: object, allowed: tuple[str, ...], field: str) -> str:
     if value not in allowed:
-        raise DispatchValidationError(f"{field}: {value!r} is not one of {list(allowed)}")
+        # Static message: never echo the caller-supplied value.
+        raise DispatchValidationError(f"{field}: is not one of the allowed values")
     return value  # type: ignore[return-value]
 
 
@@ -412,6 +427,22 @@ def _table_present(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _counted_exposure(
+    reserve_usd: str, cost_state: str, amount_usd: str | None
+) -> Decimal:
+    """The conservative exposure one dispatch contributes (C02 §5.6).
+
+    The immutable reserve is always counted, and a ``known``/``estimated`` amount
+    that overran it is counted instead, so an overrun is never under-counted.
+    ``unknown``/``not_incurred`` costs contribute no separate amount (their reserve
+    bound is retained).
+    """
+    counted = Decimal(reserve_usd)
+    if cost_state in _COST_STATES_WITH_AMOUNT and amount_usd is not None:
+        counted = max(counted, Decimal(amount_usd))
+    return counted
+
+
 def runtime_reserve_exposure(
     conn: sqlite3.Connection, project_id: str, *, stage: str | None = None
 ) -> Decimal:
@@ -426,14 +457,18 @@ def runtime_reserve_exposure(
     (C02 §5.6). ``unknown``/``not_incurred`` costs contribute no separate amount
     (their reserve bound is retained).
 
-    Every stored value is re-validated as a bounded exact decimal, so a malformed
-    stored value fails closed rather than mis-summing. A store that predates the
-    runtime ledger (no ``runtime_dispatch`` table) contributes nothing.
+    Fail closed: a dispatch whose operational state row is **missing**, whose
+    stored ``cost_state`` is unknown, or whose stored cost state/amount disagree
+    is **not** silently counted at its bare reserve — the whole read raises
+    :class:`DispatchCorruptionError` instead (a malformed ledger must never
+    under-count exposure). Every stored amount is re-validated as a bounded exact
+    decimal. A store that predates the runtime ledger (no ``runtime_dispatch``
+    table) contributes nothing.
     """
     if not _table_present(conn, "runtime_dispatch"):
         return Decimal("0")
     sql = (
-        "SELECT d.reserve_usd, s.cost_amount_usd "
+        "SELECT d.reserve_usd, s.cost_state, s.cost_amount_usd "
         "FROM runtime_dispatch d "
         "LEFT JOIN runtime_dispatch_state s ON s.project_id = d.project_id "
         "AND s.dispatch_id = d.dispatch_id "
@@ -445,11 +480,27 @@ def runtime_reserve_exposure(
         params.append(stage)
     total = Decimal("0")
     for row in conn.execute(sql, params).fetchall():
+        reserve_raw, cost_state, amount_raw = row[0], row[1], row[2]
+        if cost_state is None:
+            raise DispatchCorruptionError(
+                "runtime dispatch ledger: an operational state row is missing; "
+                "refusing to count its reserve."
+            )
+        if cost_state not in COST_STATES:
+            raise DispatchCorruptionError(
+                "runtime dispatch ledger: a stored cost state is malformed; "
+                "refusing to count it."
+            )
+        if (cost_state in _COST_STATES_WITH_AMOUNT) != (amount_raw is not None):
+            raise DispatchCorruptionError(
+                "runtime dispatch ledger: a stored cost amount is inconsistent with "
+                "its cost state; refusing to count it."
+            )
         try:
-            counted = _bounded_decimal_amount(row[0], "stored runtime reserve")
-            if row[1] is not None:
+            counted = _bounded_decimal_amount(reserve_raw, "stored runtime reserve")
+            if amount_raw is not None:
                 actual = _bounded_decimal_amount(
-                    row[1], "stored runtime cost amount"
+                    amount_raw, "stored runtime cost amount"
                 )
                 counted = max(counted, actual)
         except (ValueError, TypeError) as exc:
@@ -531,10 +582,13 @@ class RuntimeDispatchRepository:
            fingerprint (a missing/foreign/relabelled task is refused);
         2. returns the existing row when ``request_id`` already names the **same**
            identity (idempotent, **no** double reserve) or refuses a divergent one;
-        3. checks the cumulative project and stage caps — which count **both** the
+        3. refuses a **different** ``request_id`` for a task that already has any
+           dispatch (initial scope: at most one logical dispatch per task, no
+           retries);
+        4. checks the cumulative project and stage caps — which count **both** the
            synthetic job reserves and this ledger's reserves — and refuses a
            reserve that would breach either;
-        4. writes the immutable identity row and its initial ``reserved`` state.
+        5. writes the immutable identity row and its initial ``reserved`` state.
 
         ``reserve_usd`` must be an exact, strictly positive decimal string;
         ``bound_evidence_digest`` (the digest of the defensible upper-bound
@@ -586,11 +640,11 @@ class RuntimeDispatchRepository:
                 record = self._validate_dispatch_row(existing, self._state_row(dispatch_id))
                 if record.identity_tuple() != identity:
                     raise DispatchConflictError(
-                        f"request {request_id!r} was already reserved with a "
-                        f"different dispatch identity; refusing a divergent retry."
+                        "request was already reserved with a different dispatch "
+                        "identity; refusing a divergent retry."
                     )
                 return record
-            self._assert_no_inflight_attempt(persisted.task_id)
+            self._assert_no_other_dispatch_for_task(persisted.task_id)
             self._check_dispatch_caps(stage=stage, amount=reserve)
             self._conn().execute(
                 "INSERT INTO runtime_dispatch "
@@ -645,25 +699,28 @@ class RuntimeDispatchRepository:
             )
         return stored
 
-    def _assert_no_inflight_attempt(self, task_id: str) -> None:
-        """Refuse a new logical call while the task has an in-flight/ambiguous one.
+    def _assert_no_other_dispatch_for_task(self, task_id: str) -> None:
+        """Refuse a second logical dispatch for the same task (initial scope).
 
-        Initial scope permits **no retries**: once a dispatch for this task has
-        been submitted (or is in-flight/admitted or restart-orphaned/unknown),
-        another dispatch for the same task MUST NOT start (C02 §8.1.1/§8.3).
+        Initial scope permits **no retries**: at most one logical dispatch may
+        exist per task. A repeated reserve with the *same* ``request_id`` is an
+        idempotent replay (handled earlier) and remains allowed; a *different*
+        logical-call key is refused while the existing dispatch is reserved,
+        submitted, in-flight/admitted, restart-orphaned/unknown, or even after it
+        completed or failed. An explicitly authorized retry is a separate future
+        task; it must never be smuggled in through a new request key here
+        (C02 §8.1.1/§8.3).
         """
         row = self._conn().execute(
-            "SELECT d.dispatch_id, s.state FROM runtime_dispatch d "
-            "JOIN runtime_dispatch_state s ON s.project_id = d.project_id "
-            "AND s.dispatch_id = d.dispatch_id "
-            "WHERE d.project_id = ? AND d.task_id = ? "
-            "AND s.state IN ('submitted', 'admitted', 'unknown') LIMIT 1",
+            "SELECT 1 FROM runtime_dispatch d WHERE d.project_id = ? "
+            "AND d.task_id = ? LIMIT 1",
             (self.project_id, task_id),
         ).fetchone()
         if row is not None:
             raise DispatchStateError(
-                "this task already has a submitted/ambiguous dispatch; initial "
-                "scope permits no retry. Reconcile the existing dispatch instead."
+                "this task already has a recorded dispatch; initial scope permits "
+                "at most one logical dispatch per task and no retry. Reconcile or "
+                "escalate the existing dispatch instead of starting a new one."
             )
 
     def _check_dispatch_caps(self, *, stage: str, amount: str) -> None:
@@ -682,14 +739,13 @@ class RuntimeDispatchRepository:
         want = Decimal(amount)
         if _add_exact(project_reserved, want) > project_cap:
             raise BudgetExceededError(
-                f"reserving {amount} would exceed the project cap {usage.project_cap_usd} "
-                f"(already reserved {usage.project_reserved_usd}); refusing to dispatch."
+                "reserving this dispatch would exceed the project cost cap; "
+                "refusing to dispatch."
             )
         if _add_exact(stage_reserved, want) > stage_cap:
             raise BudgetExceededError(
-                f"reserving {amount} would exceed the stage cap {usage.stage_cap_usd} "
-                f"for stage {stage!r} (already reserved "
-                f"{usage.stage_reserved_usd}); refusing to dispatch."
+                "reserving this dispatch would exceed the stage cost cap; "
+                "refusing to dispatch."
             )
 
     # -- reads --------------------------------------------------------------- #
@@ -726,23 +782,34 @@ class RuntimeDispatchRepository:
         """Record that the dispatch is submitted — **before** any future I/O.
 
         A ``reserved`` dispatch becomes ``submitted`` (the reserve is now held
-        against a call that may be issued). Idempotent for an already-submitted
-        dispatch; refused from any later state (a submitted dispatch can never be
-        reopened as ``reserved``).
+        against a call that may be issued) and its cost state is upgraded from
+        ``not_incurred`` to ``unknown``: once a submission is recorded the remote
+        outcome is not yet known, so the dispatch can never claim no cost was
+        incurred (C02 §6.3/§8.3). An already-settled ``known``/``estimated`` cost
+        is left untouched.
+
+        The submission is **single-use**: it is the one durable "send claim". A
+        second caller (an already-``submitted`` dispatch, or any other state) is
+        refused with :class:`DispatchStateError` rather than handed back a
+        ``submitted`` record it did not win — otherwise two callers would each
+        believe they hold the claim and might both issue I/O. Read/reconcile
+        (:meth:`recover`, :meth:`get_dispatch`) is what may be replayed, never the
+        send claim.
         """
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         with self._store.transaction():
             record = self._require_dispatch(dispatch_id)
-            if record.state == "submitted":
-                return record
             if record.state != "reserved":
                 raise DispatchStateError(
-                    f"dispatch {dispatch_id!r} is {record.state!r}; only a reserved "
-                    f"dispatch may be submitted."
+                    "only a reserved dispatch may be submitted, and a submission is "
+                    "single-use; this caller did not win the send claim. Reconcile "
+                    "the existing dispatch instead of issuing I/O."
                 )
             now = _utc_now()
             self._conn().execute(
                 "UPDATE runtime_dispatch_state SET state = 'submitted', "
+                " cost_state = CASE WHEN cost_state = 'not_incurred' THEN 'unknown' "
+                " ELSE cost_state END, "
                 " started_at_utc = COALESCE(started_at_utc, ?), updated_at_utc = ? "
                 "WHERE project_id = ? AND dispatch_id = ?",
                 (now, now, self.project_id, dispatch_id),
@@ -778,8 +845,8 @@ class RuntimeDispatchRepository:
                 return record
             if record.state != "submitted":
                 raise DispatchStateError(
-                    f"dispatch {dispatch_id!r} is {record.state!r}; only a submitted "
-                    f"dispatch may record an admission."
+                    "only a submitted dispatch may record an admission; refusing to "
+                    "claim a durable admission in this state."
                 )
             self._conn().execute(
                 "UPDATE runtime_dispatch_state SET state = 'admitted', "
@@ -819,9 +886,8 @@ class RuntimeDispatchRepository:
             record = self._require_dispatch(dispatch_id)
             if fence != record.current_fence:
                 raise DispatchStaleFenceError(
-                    f"fence {fence} is not the current fence "
-                    f"{record.current_fence} of dispatch {dispatch_id!r}; a stale "
-                    f"attempt cannot accept a result."
+                    "the supplied fence is not the dispatch's current fence; a stale "
+                    "attempt cannot accept a result."
                 )
             if record.state == "completed":
                 if (
@@ -831,12 +897,12 @@ class RuntimeDispatchRepository:
                 ) == (result_kind, result_ref, result_digest):
                     return record
                 raise DispatchConflictError(
-                    f"dispatch {dispatch_id!r} already has a different accepted result."
+                    "the dispatch already has a different accepted result."
                 )
             if record.state not in _ACCEPTABLE_STATES:
                 raise DispatchStateError(
-                    f"dispatch {dispatch_id!r} is {record.state!r}; a local result can "
-                    f"only follow a recorded submission."
+                    "a local result can only follow a recorded submission; this "
+                    "dispatch is not in an acceptable state."
                 )
             now = _utc_now()
             self._conn().execute(
@@ -859,7 +925,11 @@ class RuntimeDispatchRepository:
     def mark_failed(self, dispatch_id: str) -> DispatchRecord:
         """Record a definitive failure (no accepted local result).
 
-        Idempotent for an already-failed dispatch; refused for a completed one.
+        Idempotent for an already-failed dispatch; refused for a completed one and
+        — critically — refused for an **ambiguous** (``unknown``) dispatch: an
+        unresolved remote outcome must never be reclassified as a definitive
+        failure, because that would make an ambiguous dispatch look retry-eligible
+        (C02 §8.1.1/§8.3). Reconcile or escalate instead.
         """
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         with self._store.transaction():
@@ -868,7 +938,12 @@ class RuntimeDispatchRepository:
                 return record
             if record.state == "completed":
                 raise DispatchStateError(
-                    f"dispatch {dispatch_id!r} already completed; cannot mark it failed."
+                    "the dispatch already completed; it cannot be marked failed."
+                )
+            if record.state == "unknown":
+                raise DispatchStateError(
+                    "an ambiguous (unknown) dispatch cannot be turned into a "
+                    "definitive failure; reconcile or escalate it instead."
                 )
             now = _utc_now()
             self._conn().execute(
@@ -911,32 +986,39 @@ class RuntimeDispatchRepository:
         cost_state: str,
         amount_usd: str | None = None,
     ) -> DispatchRecord:
-        """Settle the dispatch's reserved cost (C02 §6.3).
+        """Settle the dispatch's reserved cost, monotonically (C02 §5.6/§6.3).
 
         The reserve is **never reduced**: the original upper bound stays counted
         for ``known``/``estimated``/``unknown``/``not_incurred`` (conservative
         usage), so a later estimate/known transition can never silently shrink a
         held reserve. A ``known``/``estimated`` amount that **exceeds** the reserve
-        is counted at the larger actual, so an overrun is never under-counted
-        (C02 §5.6). An ``unknown`` cost records **no** amount (never zero) and
-        retains its reserve; ``not_incurred`` records no amount either.
+        is counted at the larger actual, so an overrun is never under-counted.
+
+        Settlement is **monotonic**: an established amount can never be discarded
+        (``known``/``estimated`` → ``unknown``/``not_incurred``) or lowered
+        (``known 2.00`` → ``known 1.00``), and an ``unknown`` cost can never be
+        re-declared as ``not_incurred``. This is what stops an overrun from being
+        erased by a later weaker settlement (a ``known 2.00`` over a ``0.10``
+        reserve must never fall back to ``0.10``). A refused downgrade raises
+        :class:`DispatchConflictError` and changes nothing.
         """
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         _require_enum(cost_state, COST_STATES, "cost_state")
         if cost_state in _COST_STATES_WITH_AMOUNT:
             if amount_usd is None:
                 raise DispatchValidationError(
-                    f"cost_state {cost_state!r} requires an exact amount_usd."
+                    "a known/estimated cost requires an exact amount_usd."
                 )
             recorded: str | None = _require_exact_decimal(amount_usd, "amount_usd")
         else:
             if amount_usd is not None:
                 raise DispatchValidationError(
-                    f"cost_state {cost_state!r} must not carry an amount_usd."
+                    "an unknown/not_incurred cost must not carry an amount_usd."
                 )
             recorded = None
         with self._store.transaction():
-            self._require_dispatch(dispatch_id)
+            current = self._require_dispatch(dispatch_id)
+            self._assert_cost_settlement_monotonic(current, cost_state, recorded)
             self._conn().execute(
                 "UPDATE runtime_dispatch_state SET cost_state = ?, "
                 " cost_amount_usd = ?, updated_at_utc = ? "
@@ -944,6 +1026,39 @@ class RuntimeDispatchRepository:
                 (cost_state, recorded, _utc_now(), self.project_id, dispatch_id),
             )
         return self._require_dispatch(dispatch_id)
+
+    def _assert_cost_settlement_monotonic(
+        self,
+        current: DispatchRecord,
+        new_state: str,
+        new_amount: str | None,
+    ) -> None:
+        """Refuse a settlement that would weaken or lower an established cost."""
+        if new_state == "not_incurred" and current.cost_state != "not_incurred":
+            raise DispatchConflictError(
+                "an incurred or unknown cost cannot be re-declared as not incurred; "
+                "refusing to release the reserve."
+            )
+        if current.cost_amount_usd is not None:
+            if new_amount is None:
+                raise DispatchConflictError(
+                    "an established cost amount cannot be discarded; refusing a "
+                    "cost downgrade."
+                )
+            if Decimal(new_amount) < Decimal(current.cost_amount_usd):
+                raise DispatchConflictError(
+                    "an established cost amount cannot be reduced; refusing a cost "
+                    "downgrade."
+                )
+        if _counted_exposure(current.reserve_usd, new_state, new_amount) < (
+            _counted_exposure(
+                current.reserve_usd, current.cost_state, current.cost_amount_usd
+            )
+        ):
+            raise DispatchConflictError(
+                "a cost settlement cannot reduce the dispatch's counted exposure; "
+                "refusing the downgrade."
+            )
 
     # -- shared budget view --------------------------------------------------- #
     def budget_usage(self, *, stage: str | None = None) -> BudgetUsage:
@@ -979,7 +1094,7 @@ class RuntimeDispatchRepository:
         row = self._dispatch_row(dispatch_id)
         if row is None:
             raise DispatchStateError(
-                f"dispatch {dispatch_id!r} does not exist in this project."
+                "no such dispatch exists in this project."
             )
         return self._validate_dispatch_row(row, self._state_row(dispatch_id))
 
@@ -1018,17 +1133,24 @@ class RuntimeDispatchRepository:
             identity_row["bound_evidence_digest"], "bound_evidence_digest"
         )
         _require_utc_timestamp(identity_row["created_at_utc"], "created_at_utc")
-        # The linked persisted task must exist and match the pinned fingerprint.
-        task_row = self._conn().execute(
-            "SELECT fingerprint FROM runtime_bounded_task WHERE project_id = ? "
-            "AND task_id = ?",
-            (self.project_id, task_id),
-        ).fetchone()
-        if task_row is None:
-            raise DispatchCorruptionError("dispatch: task link row is missing.")
-        if task_row["fingerprint"] != fingerprint:
+        # The linked persisted task must fully revalidate, not merely carry a
+        # matching fingerprint column: a malformed task row (tampered canonical
+        # bytes or projected columns) must not survive behind an intact pin.
+        try:
+            linked_task = self._runtime.get_task(task_id)
+        except RuntimeCorruptionError as exc:
             raise DispatchCorruptionError(
-                "dispatch: task fingerprint does not match the linked task."
+                "dispatch: the linked runtime task is corrupt."
+            ) from exc
+        if linked_task is None:
+            raise DispatchCorruptionError("dispatch: task link row is missing.")
+        if (
+            linked_task.project_id != self.project_id
+            or linked_task.task_id != task_id
+            or linked_task.fingerprint != fingerprint
+        ):
+            raise DispatchCorruptionError(
+                "dispatch: linked runtime task does not match the pinned identity."
             )
         if state_row is None:
             raise DispatchCorruptionError("dispatch: operational state row is missing.")
@@ -1043,18 +1165,33 @@ class RuntimeDispatchRepository:
         if state not in DISPATCH_STATES:
             raise DispatchCorruptionError("dispatch: unknown state.")
         fence = state_row["current_fence"]
-        if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
-            raise DispatchCorruptionError("dispatch: invalid current fence.")
+        # Initial scope has exactly one fence: no re-fencing exists yet.
+        if isinstance(fence, bool) or not isinstance(fence, int) or fence != 1:
+            raise DispatchCorruptionError(
+                "dispatch: the fence is not the initial single fence."
+            )
         admission_id = state_row["admission_id"]
         admission_ref = state_row["admission_ref"]
-        if admission_id is not None:
-            validate_identifier(admission_id, "admission_id")
-            if route != "opencode_session":
+        if route == "direct_call":
+            # The direct route has no durable/idempotent admission at all.
+            if admission_id is not None or admission_ref is not None:
                 raise DispatchCorruptionError(
                     "dispatch: a direct_call dispatch carries a durable admission."
                 )
-        if admission_ref is not None:
-            validate_identifier(admission_ref, "admission_ref")
+        else:  # opencode_session
+            if admission_id is not None:
+                validate_identifier(admission_id, "admission_id")
+            if admission_ref is not None:
+                if admission_id is None:
+                    raise DispatchCorruptionError(
+                        "dispatch: an admission ref without an admission id is "
+                        "malformed."
+                    )
+                validate_identifier(admission_ref, "admission_ref")
+        if state == "admitted" and admission_id is None:
+            raise DispatchCorruptionError(
+                "dispatch: an admitted state requires a durable admission."
+            )
         result_kind = state_row["result_kind"]
         result_ref = state_row["result_ref"]
         result_digest = state_row["result_digest"]
@@ -1084,10 +1221,42 @@ class RuntimeDispatchRepository:
             )
         if cost_amount is not None:
             _exact_decimal(cost_amount, "cost_amount_usd")
+        # A submitted/in-flight/ambiguous dispatch has already left the
+        # not-yet-dispatched world, so it can never claim no cost was incurred.
+        if (
+            state in ("submitted", "admitted", "unknown")
+            and cost_state == "not_incurred"
+        ):
+            raise DispatchCorruptionError(
+                "dispatch: a submitted/ambiguous dispatch cannot claim no cost "
+                "incurred."
+            )
         _require_utc_timestamp(state_row["updated_at_utc"], "updated_at_utc")
+        started = state_row["started_at_utc"]
+        ended = state_row["ended_at_utc"]
         for optional_field in ("started_at_utc", "ended_at_utc"):
             if state_row[optional_field] is not None:
                 _require_utc_timestamp(state_row[optional_field], optional_field)
+        if state == "reserved":
+            if started is not None or ended is not None:
+                raise DispatchCorruptionError(
+                    "dispatch: a reserved dispatch must not have started or ended."
+                )
+        elif state in ("submitted", "admitted", "unknown"):
+            if started is None or ended is not None:
+                raise DispatchCorruptionError(
+                    "dispatch: an in-flight/ambiguous dispatch needs a start and no "
+                    "end."
+                )
+        else:  # completed / failed
+            if ended is None:
+                raise DispatchCorruptionError(
+                    "dispatch: a terminal dispatch needs an end timestamp."
+                )
+            if state == "completed" and started is None:
+                raise DispatchCorruptionError(
+                    "dispatch: a completed dispatch needs a start timestamp."
+                )
         return DispatchRecord(
             project_id=identity_row["project_id"],
             dispatch_id=dispatch_id,
@@ -1141,6 +1310,26 @@ class RuntimeDispatchRepository:
             except Exception:  # noqa: BLE001 - a corrupt row must not abort the sweep
                 problems.append(
                     f"runtime_dispatch: row {index} failed integrity revalidation"
+                )
+        # The identity sweep above never visits a state row whose identity row is
+        # missing (dangling/orphan) or foreign, so sweep the operational rows too.
+        state_rows = self._conn().execute(
+            "SELECT * FROM runtime_dispatch_state ORDER BY rowid"
+        ).fetchall()
+        for index, state_row in enumerate(state_rows):
+            if state_row["project_id"] != self.project_id:
+                problems.append(
+                    f"runtime_dispatch_state: row {index} is a foreign project row"
+                )
+                continue
+            identity = self._conn().execute(
+                "SELECT 1 FROM runtime_dispatch WHERE project_id = ? "
+                "AND dispatch_id = ?",
+                (self.project_id, state_row["dispatch_id"]),
+            ).fetchone()
+            if identity is None:
+                problems.append(
+                    f"runtime_dispatch_state: row {index} is an orphan operational row"
                 )
         return problems
 

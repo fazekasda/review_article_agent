@@ -710,9 +710,14 @@ def _store_v6(conn: sqlite3.Connection) -> None:
       (accounting_bucket = 'direct_call'))`` makes a ``direct_call`` cost
       un-aggregatable into OpenCode session statistics (C02 §6.3).
     * **No durable admission on the direct route.** A trigger aborts any
-      ``runtime_dispatch_state`` row that carries an ``admission_id`` while its
-      dispatch's route is ``direct_call`` (C02 §8.1/§8.1.1) — the direct Jev route
-      has no proven durable/idempotent admission.
+      ``runtime_dispatch_state`` row that carries an ``admission_id`` **or** an
+      ``admission_ref`` while its dispatch's route is ``direct_call`` (C02
+      §8.1/§8.1.1) — the direct Jev route has no proven durable/idempotent
+      admission.
+    * **Submitted means something was spent-or-maybe-spent.** A ``CHECK`` forbids
+      a ``submitted``/``admitted``/``unknown`` row from claiming ``cost_state =
+      'not_incurred'`` (C02 §6.3/§8.3), and the initial scope has exactly one
+      fence (``current_fence = 1``); re-fencing is not part of this step.
     * **Conservative cost accounting.** The exact-decimal ``reserve_usd`` is
       recorded before dispatch and counted until settlement; an ``unknown``/
       ``not_incurred`` cost records **no** amount (never ``0``) and retains its
@@ -756,7 +761,7 @@ def _store_v6(conn: sqlite3.Connection) -> None:
             state           TEXT NOT NULL CHECK (state IN (
                 'reserved', 'submitted', 'admitted', 'completed', 'failed',
                 'unknown')),
-            current_fence   INTEGER NOT NULL DEFAULT 1 CHECK (current_fence >= 1),
+            current_fence   INTEGER NOT NULL DEFAULT 1 CHECK (current_fence = 1),
             admission_id    TEXT,
             admission_ref   TEXT,
             result_kind     TEXT,
@@ -774,6 +779,11 @@ def _store_v6(conn: sqlite3.Connection) -> None:
             CHECK ((result_ref IS NULL) = (result_digest IS NULL)),
             CHECK ((cost_state IN ('known', 'estimated'))
                    = (cost_amount_usd IS NOT NULL)),
+            CHECK (admission_ref IS NULL OR admission_id IS NOT NULL),
+            -- A dispatch that has been submitted (or is in-flight/ambiguous) can
+            -- never claim that no cost was incurred (C02 §6.3/§8.3).
+            CHECK (state NOT IN ('submitted', 'admitted', 'unknown')
+                   OR cost_state <> 'not_incurred'),
             FOREIGN KEY (project_id, dispatch_id)
                 REFERENCES runtime_dispatch (project_id, dispatch_id)
         )
@@ -802,14 +812,14 @@ def _store_v6(conn: sqlite3.Connection) -> None:
     )
 
     # The direct route has no proven durable/idempotent admission, so no
-    # operational row may ever carry an admission for a direct_call dispatch
-    # (C02 §8.1/§8.1.1).
+    # operational row may ever carry an admission id *or* ref for a direct_call
+    # dispatch (C02 §8.1/§8.1.1).
     for event in ("INSERT", "UPDATE"):
         conn.execute(
             f"""
             CREATE TRIGGER runtime_dispatch_state_direct_no_admission_{event.lower()}
             BEFORE {event} ON runtime_dispatch_state
-            WHEN NEW.admission_id IS NOT NULL
+            WHEN (NEW.admission_id IS NOT NULL OR NEW.admission_ref IS NOT NULL)
               AND (SELECT route FROM runtime_dispatch
                    WHERE project_id = NEW.project_id
                      AND dispatch_id = NEW.dispatch_id) = 'direct_call'

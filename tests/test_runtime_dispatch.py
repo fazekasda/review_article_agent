@@ -11,18 +11,25 @@ These tests cover the additive ``runtime/dispatch.py`` layer and store schema 6:
   reserve), and a divergent-retry refusal;
 * route/accounting-bucket separation (``opencode_session``/``session_statistics``
   vs ``direct_call``/``direct_call``);
-* explicit safe states, ``submitted`` recorded before I/O, no automatic retry,
-  and restart reconciliation (``submitted`` -> ``unknown``; an opencode admission
-  is retained);
-* the direct route has no durable admission (API + database trigger);
+* explicit safe states, ``submitted`` recorded before I/O and single-use (only the
+  winner of the send claim may proceed), no automatic retry, at most one logical
+  dispatch per task (a different request key is refused in every state), and
+  restart reconciliation (``submitted`` -> ``unknown`` with an ``unknown`` cost;
+  an opencode admission is retained);
+* the direct route has no durable admission (API + database trigger, id and ref);
 * one fenced accepted local result (identical replay idempotent, divergent/stale
   denied);
-* conservative cost accounting (unknown retains its reserve, a known overrun is
-  counted at the larger actual, low-precision decimals are preserved);
+* conservative, monotonic cost accounting (unknown retains its reserve and can
+  never become not_incurred; a known overrun is counted at the larger actual and
+  can never be erased by a later weaker/lower settlement; low-precision decimals
+  are preserved);
 * the shared cumulative caps counting **both** synthetic job reserves and runtime
   reserves in both directions (including concurrent cap checks);
 * database-level identity immutability and a reusable read-only integrity sweep
-  that detects foreign/dangling/corrupt rows;
+  that detects foreign/dangling/orphan/corrupt rows and malformed linked tasks;
+* a fail-closed exposure read (missing operational row, malformed cost state or
+  amount raises instead of silently counting the bare reserve);
+* static, curated error messages that never echo raw ids/values;
 * a schema 5 -> 6 upgrade that leaves old artifacts, tasks, and jobs unchanged.
 
 Run with::
@@ -48,6 +55,7 @@ from review_article_agent.runtime.dispatch import (  # noqa: E402
     DISPATCH_GRANTS_AUTHORITY,
     DISPATCH_PERFORMS_NETWORK_IO,
     DispatchConflictError,
+    DispatchCorruptionError,
     DispatchStaleFenceError,
     DispatchStateError,
     DispatchValidationError,
@@ -319,15 +327,29 @@ class ReserveDispatchTest(DispatchTestBase):
 
 
 class StateTransitionTest(DispatchTestBase):
-    def test_submitted_before_io_records_started_at(self) -> None:
+    def test_submitted_before_io_records_started_at_and_unknown_cost(self) -> None:
         record = self.reserve()
         self.assertIsNone(record.started_at_utc)
+        self.assertEqual(record.cost_state, "not_incurred")
         submitted = self.dispatch.mark_submitted(record.dispatch_id)
         self.assertEqual(submitted.state, "submitted")
         self.assertIsNotNone(submitted.started_at_utc)
-        # Idempotent.
-        again = self.dispatch.mark_submitted(record.dispatch_id)
-        self.assertEqual(again.started_at_utc, submitted.started_at_utc)
+        # A submission is before any I/O, so the remote outcome is unknown: the
+        # cost can never default to not_incurred while the reserve is retained.
+        self.assertEqual(submitted.cost_state, "unknown")
+        self.assertIsNone(submitted.cost_amount_usd)
+        self.assertEqual(
+            runtime_reserve_exposure(self.store.connection, self.pid), Decimal("0.10")
+        )
+
+    def test_submission_is_single_use(self) -> None:
+        record = self.reserve()
+        first = self.dispatch.mark_submitted(record.dispatch_id)
+        self.assertEqual(first.state, "submitted")
+        # A second caller must NOT be handed a submitted record it did not win.
+        with self.assertRaises(DispatchStateError):
+            self.dispatch.mark_submitted(record.dispatch_id)
+        self.assertEqual(self.dispatch.get_dispatch(record.dispatch_id).state, "submitted")
 
     def test_reserved_cannot_accept_but_submitted_can(self) -> None:
         record = self.reserve()
@@ -370,6 +392,12 @@ class StateTransitionTest(DispatchTestBase):
         self.dispatch.mark_submitted(record.dispatch_id)
         recovered = self.dispatch.recover(record.dispatch_id)
         self.assertEqual(recovered.state, "unknown")
+        # The remote outcome is unknown, never "not incurred"; the reserve stays.
+        self.assertEqual(recovered.cost_state, "unknown")
+        self.assertIsNone(recovered.cost_amount_usd)
+        self.assertEqual(
+            runtime_reserve_exposure(self.store.connection, self.pid), Decimal("0.10")
+        )
         # A restart never resets it to reserved and never re-submits.
         with self.assertRaises(DispatchStateError):
             self.dispatch.mark_submitted(record.dispatch_id)
@@ -380,18 +408,22 @@ class StateTransitionTest(DispatchTestBase):
         record = self.reserve()
         self.assertEqual(self.dispatch.recover(record.dispatch_id).state, "reserved")
 
-    def test_inflight_task_cannot_start_another_attempt(self) -> None:
+    def test_second_request_for_task_denied_even_while_reserved(self) -> None:
+        # Regression: two reserves with different keys for the same task must not
+        # both succeed (a=reserve(); b=reserve(request_id='second-reserved')).
+        first = self.reserve(request_id="call-1")
+        self.assertEqual(first.state, "reserved")
+        with self.assertRaises(DispatchStateError):
+            self.reserve(request_id="second-reserved")
+        self.assertEqual(len(self.dispatch.list_dispatches()), 1)
+
+    def test_no_new_dispatch_for_task_after_completion_or_failure(self) -> None:
         first = self.reserve(request_id="call-1")
         self.dispatch.mark_submitted(first.dispatch_id)
-        # A *different* logical call for the same task must not start (no retries).
-        with self.assertRaises(DispatchStateError):
-            self.reserve(request_id="call-2")
-        # After a restart the outstanding submission is unknown and still blocks.
-        self.assertEqual(self.dispatch.recover(first.dispatch_id).state, "unknown")
+        self.dispatch.recover(first.dispatch_id)
+        # The restart-orphaned submission is ambiguous and still blocks.
         with self.assertRaises(DispatchStateError):
             self.reserve(request_id="call-3")
-        # Once the first dispatch completes definitively, a new logical call is
-        # no longer an ambiguous retry.
         self.dispatch.accept_result(
             first.dispatch_id,
             fence=1,
@@ -399,8 +431,31 @@ class StateTransitionTest(DispatchTestBase):
             result_ref="res_1",
             result_digest=_DIG_D,
         )
-        second = self.reserve(request_id="call-4")
-        self.assertEqual(second.state, "reserved")
+        # Even a completed dispatch blocks a *different* logical call for the task:
+        # initial scope permits no retry, only a separate authorized future task.
+        with self.assertRaises(DispatchStateError):
+            self.reserve(request_id="call-4")
+        self.assertEqual(len(self.dispatch.list_dispatches()), 1)
+        # Same-request replay remains idempotent (not a second dispatch).
+        replay = self.reserve(request_id="call-1")
+        self.assertEqual(replay.dispatch_id, first.dispatch_id)
+
+    def test_no_new_dispatch_for_task_after_failure(self) -> None:
+        first = self.reserve(request_id="call-1")
+        self.dispatch.mark_submitted(first.dispatch_id)
+        self.dispatch.mark_failed(first.dispatch_id)
+        with self.assertRaises(DispatchStateError):
+            self.reserve(request_id="call-2")
+        self.assertEqual(len(self.dispatch.list_dispatches()), 1)
+
+    def test_mark_failed_refuses_ambiguous_unknown(self) -> None:
+        record = self.reserve()
+        self.dispatch.mark_submitted(record.dispatch_id)
+        self.assertEqual(self.dispatch.recover(record.dispatch_id).state, "unknown")
+        # An ambiguous outcome must never be reclassified as a definitive failure.
+        with self.assertRaises(DispatchStateError):
+            self.dispatch.mark_failed(record.dispatch_id)
+        self.assertEqual(self.dispatch.get_dispatch(record.dispatch_id).state, "unknown")
 
     def test_mark_failed_is_terminal_and_idempotent(self) -> None:
         record = self.reserve()
@@ -416,6 +471,14 @@ class StateTransitionTest(DispatchTestBase):
                 result_ref="res_1",
                 result_digest=_DIG_D,
             )
+
+    def test_reserved_can_fail_before_io_and_stays_consistent(self) -> None:
+        record = self.reserve()
+        failed = self.dispatch.mark_failed(record.dispatch_id)
+        self.assertEqual(failed.state, "failed")
+        self.assertIsNone(failed.started_at_utc)
+        self.assertIsNotNone(failed.ended_at_utc)
+        self.assertEqual(self.dispatch.verify_all_integrity(), [])
 
 
 class AcceptedResultTest(DispatchTestBase):
@@ -548,7 +611,9 @@ class CostLedgerTest(DispatchTestBase):
 
     def test_route_cost_separation(self) -> None:
         opencode = self.reserve(request_id="oc", route="opencode_session")
-        direct = self.reserve(request_id="dc", route="direct_call")
+        direct = self.reserve(
+            request_id="dc", route="direct_call", task=self.make_task("task-dc")
+        )
         self.assertEqual(opencode.accounting_bucket, "session_statistics")
         self.assertEqual(direct.accounting_bucket, "direct_call")
         # A direct-call row can never be relabelled into a session-statistics bucket.
@@ -558,6 +623,68 @@ class CostLedgerTest(DispatchTestBase):
                 "WHERE project_id = ? AND dispatch_id = ?",
                 (self.pid, direct.dispatch_id),
             )
+
+    def test_cost_settlement_is_monotonic_both_routes(self) -> None:
+        for index, route in enumerate(("opencode_session", "direct_call")):
+            with self.subTest(route=route):
+                task = self.task if index == 0 else self.make_task("task-monotonic")
+                record = self.reserve(
+                    request_id=f"mono-{route}", route=route, task=task
+                )
+                self.dispatch.mark_submitted(record.dispatch_id)
+                self.dispatch.settle_cost(
+                    record.dispatch_id, cost_state="known", amount_usd="2.00"
+                )
+                # A later weaker settlement must never erase the overrun.
+                with self.assertRaises(DispatchConflictError):
+                    self.dispatch.settle_cost(
+                        record.dispatch_id, cost_state="unknown"
+                    )
+                with self.assertRaises(DispatchConflictError):
+                    self.dispatch.settle_cost(
+                        record.dispatch_id, cost_state="not_incurred"
+                    )
+                with self.assertRaises(DispatchConflictError):
+                    self.dispatch.settle_cost(
+                        record.dispatch_id, cost_state="known", amount_usd="1.00"
+                    )
+                self.assertEqual(
+                    self.dispatch.get_dispatch(record.dispatch_id).cost_amount_usd, "2.00"
+                )
+        # Both routes contribute; the overrun is retained for each.
+        self.assertEqual(
+            runtime_reserve_exposure(self.store.connection, self.pid), Decimal("4.00")
+        )
+
+    def test_estimated_then_lower_known_refused_higher_allowed(self) -> None:
+        record = self.reserve(reserve_usd="0.10")
+        self.dispatch.mark_submitted(record.dispatch_id)
+        self.dispatch.settle_cost(
+            record.dispatch_id, cost_state="estimated", amount_usd="1.50"
+        )
+        with self.assertRaises(DispatchConflictError):
+            self.dispatch.settle_cost(
+                record.dispatch_id, cost_state="known", amount_usd="1.00"
+            )
+        settled = self.dispatch.settle_cost(
+            record.dispatch_id, cost_state="known", amount_usd="1.60"
+        )
+        self.assertEqual(settled.cost_amount_usd, "1.60")
+        self.assertEqual(
+            runtime_reserve_exposure(self.store.connection, self.pid), Decimal("1.60")
+        )
+
+    def test_unknown_cannot_become_not_incurred(self) -> None:
+        record = self.reserve(reserve_usd="0.10")
+        self.dispatch.mark_submitted(record.dispatch_id)
+        self.assertEqual(
+            self.dispatch.get_dispatch(record.dispatch_id).cost_state, "unknown"
+        )
+        with self.assertRaises(DispatchConflictError):
+            self.dispatch.settle_cost(record.dispatch_id, cost_state="not_incurred")
+        self.assertEqual(
+            runtime_reserve_exposure(self.store.connection, self.pid), Decimal("0.10")
+        )
 
 
 class SharedCapsTest(DispatchTestBase):
@@ -589,9 +716,19 @@ class SharedCapsTest(DispatchTestBase):
         self.jobs.set_budget_policy(project_cap_usd="25", stage_cap_usd="10")
         self.reserve(request_id="rt-1", stage="critique", reserve_usd="8")
         with self.assertRaises(BudgetExceededError):
-            self.reserve(request_id="rt-2", stage="critique", reserve_usd="3")
+            self.reserve(
+                request_id="rt-2",
+                stage="critique",
+                reserve_usd="3",
+                task=self.make_task("task-rt2"),
+            )
         # A different stage still has its own stage ceiling.
-        other = self.reserve(request_id="rt-3", stage="review", reserve_usd="8")
+        other = self.reserve(
+            request_id="rt-3",
+            stage="review",
+            reserve_usd="8",
+            task=self.make_task("task-rt3"),
+        )
         self.assertEqual(other.stage, "review")
 
     def test_combined_budget_usage_reports_both(self) -> None:
@@ -612,7 +749,10 @@ class SharedCapsTest(DispatchTestBase):
         self.jobs.set_budget_policy(project_cap_usd="25", stage_cap_usd="25")
         app_dir = self.store.app_dir
         pid = self.pid
-        task = self.task
+        tasks = {
+            "rt-a": self.make_task("task-conc-a"),
+            "rt-b": self.make_task("task-conc-b"),
+        }
         results: list[str] = []
         barrier = threading.Barrier(2)
 
@@ -623,7 +763,7 @@ class SharedCapsTest(DispatchTestBase):
                 barrier.wait(timeout=10)
                 try:
                     repo.reserve_dispatch(
-                        task,
+                        tasks[request_id],
                         request_id=request_id,
                         route="direct_call",
                         stage="s1",
@@ -671,7 +811,9 @@ class ImmutableAndIntegrityTest(DispatchTestBase):
 
     def test_integrity_of_valid_store_is_empty(self) -> None:
         self.reserve(request_id="oc", route="opencode_session")
-        self.reserve(request_id="dc", route="direct_call")
+        self.reserve(
+            request_id="dc", route="direct_call", task=self.make_task("task-dc")
+        )
         self.assertEqual(self.dispatch.verify_all_integrity(), [])
         self.assertEqual(
             runtime_dispatch_integrity_problems(self.store.connection, self.pid), []
@@ -727,6 +869,187 @@ class ImmutableAndIntegrityTest(DispatchTestBase):
         conn.execute("PRAGMA foreign_keys = ON")
         problems = runtime_dispatch_integrity_problems(conn, self.pid)
         self.assertTrue(any("foreign" in problem for problem in problems))
+
+    def test_integrity_revalidates_linked_task_not_only_fingerprint_column(self) -> None:
+        # Regression: only the task.fingerprint column used to be compared, so a
+        # malformed task row survived behind an intact pin. Tamper a projected
+        # column while leaving the fingerprint column unchanged.
+        record = self.reserve()
+        conn = self.store.connection
+        conn.execute("DROP TRIGGER runtime_bounded_task_no_update")
+        conn.execute(
+            "UPDATE runtime_bounded_task SET prompt_version = 'tampered.v9' "
+            "WHERE project_id = ? AND task_id = ?",
+            (self.pid, record.task_id),
+        )
+        problems = runtime_dispatch_integrity_problems(conn, self.pid)
+        self.assertTrue(any("integrity" in problem for problem in problems))
+        self.assertFalse(self.dispatch.verify_dispatch(record.dispatch_id))
+
+    def test_integrity_detects_orphan_operational_row(self) -> None:
+        self.reserve()
+        conn = self.store.connection
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
+            "INSERT INTO runtime_dispatch_state "
+            "(project_id, dispatch_id, state, current_fence, cost_state, "
+            " updated_at_utc) "
+            "VALUES (?, 'disp_orphan', 'reserved', 1, 'not_incurred', "
+            " '2026-01-01T00:00:00+00:00')",
+            (self.pid,),
+        )
+        conn.execute("PRAGMA foreign_keys = ON")
+        problems = runtime_dispatch_integrity_problems(conn, self.pid)
+        self.assertTrue(any("orphan" in problem for problem in problems))
+
+    def test_integrity_detects_foreign_operational_row(self) -> None:
+        self.reserve()
+        conn = self.store.connection
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
+            "INSERT INTO runtime_dispatch_state "
+            "(project_id, dispatch_id, state, current_fence, cost_state, "
+            " updated_at_utc) "
+            "VALUES ('other-project', 'disp_foreign_state', 'reserved', 1, "
+            " 'not_incurred', '2026-01-01T00:00:00+00:00')"
+        )
+        conn.execute("PRAGMA foreign_keys = ON")
+        problems = runtime_dispatch_integrity_problems(conn, self.pid)
+        self.assertTrue(any("foreign" in problem for problem in problems))
+
+    def _inject_state(self, dispatch_id: str, assignments: str) -> None:
+        conn = self.store.connection
+        conn.execute("PRAGMA ignore_check_constraints = ON")
+        try:
+            conn.execute(
+                f"UPDATE runtime_dispatch_state SET {assignments} "
+                "WHERE project_id = ? AND dispatch_id = ?",
+                (self.pid, dispatch_id),
+            )
+        finally:
+            conn.execute("PRAGMA ignore_check_constraints = OFF")
+
+    def test_integrity_detects_non_initial_fence(self) -> None:
+        record = self.reserve()
+        self._inject_state(record.dispatch_id, "current_fence = 2")
+        problems = runtime_dispatch_integrity_problems(self.store.connection, self.pid)
+        self.assertTrue(problems)
+        self.assertFalse(self.dispatch.verify_dispatch(record.dispatch_id))
+
+    def test_integrity_detects_submitted_without_incurred_cost(self) -> None:
+        record = self.reserve()
+        self.dispatch.mark_submitted(record.dispatch_id)
+        self._inject_state(
+            record.dispatch_id, "cost_state = 'not_incurred', cost_amount_usd = NULL"
+        )
+        problems = runtime_dispatch_integrity_problems(self.store.connection, self.pid)
+        self.assertTrue(problems)
+
+    def test_integrity_detects_admitted_without_admission(self) -> None:
+        record = self.reserve()
+        self.dispatch.mark_submitted(record.dispatch_id)
+        self.dispatch.mark_admitted(record.dispatch_id, admission_id="adm-1")
+        self._inject_state(
+            record.dispatch_id, "admission_id = NULL, admission_ref = NULL"
+        )
+        problems = runtime_dispatch_integrity_problems(self.store.connection, self.pid)
+        self.assertTrue(problems)
+
+
+class CostExposureFailClosedTest(DispatchTestBase):
+    def test_missing_operational_state_row_fails_closed(self) -> None:
+        record = self.reserve(reserve_usd="0.10")
+        conn = self.store.connection
+        conn.execute(
+            "DELETE FROM runtime_dispatch_state WHERE project_id = ? AND dispatch_id = ?",
+            (self.pid, record.dispatch_id),
+        )
+        with self.assertRaises(DispatchCorruptionError):
+            runtime_reserve_exposure(conn, self.pid)
+
+    def test_malformed_cost_state_fails_closed(self) -> None:
+        record = self.reserve(reserve_usd="0.10")
+        conn = self.store.connection
+        conn.execute("PRAGMA ignore_check_constraints = ON")
+        try:
+            conn.execute(
+                "UPDATE runtime_dispatch_state SET cost_state = 'bogus' "
+                "WHERE project_id = ? AND dispatch_id = ?",
+                (self.pid, record.dispatch_id),
+            )
+        finally:
+            conn.execute("PRAGMA ignore_check_constraints = OFF")
+        with self.assertRaises(DispatchCorruptionError):
+            runtime_reserve_exposure(conn, self.pid)
+
+    def test_inconsistent_cost_state_amount_fails_closed(self) -> None:
+        record = self.reserve(reserve_usd="0.10")
+        conn = self.store.connection
+        conn.execute("PRAGMA ignore_check_constraints = ON")
+        try:
+            conn.execute(
+                "UPDATE runtime_dispatch_state SET cost_state = 'known', "
+                "cost_amount_usd = NULL WHERE project_id = ? AND dispatch_id = ?",
+                (self.pid, record.dispatch_id),
+            )
+        finally:
+            conn.execute("PRAGMA ignore_check_constraints = OFF")
+        with self.assertRaises(DispatchCorruptionError):
+            runtime_reserve_exposure(conn, self.pid)
+
+    def test_malformed_cost_amount_fails_closed(self) -> None:
+        record = self.reserve(reserve_usd="0.10")
+        conn = self.store.connection
+        conn.execute("PRAGMA ignore_check_constraints = ON")
+        try:
+            conn.execute(
+                "UPDATE runtime_dispatch_state SET cost_state = 'known', "
+                "cost_amount_usd = 'not-a-decimal' "
+                "WHERE project_id = ? AND dispatch_id = ?",
+                (self.pid, record.dispatch_id),
+            )
+        finally:
+            conn.execute("PRAGMA ignore_check_constraints = OFF")
+        with self.assertRaises(DispatchCorruptionError):
+            runtime_reserve_exposure(conn, self.pid)
+
+
+class StaticMessageTest(DispatchTestBase):
+    def test_errors_never_echo_raw_inputs(self) -> None:
+        record = self.reserve(request_id="secret-request-value")
+        with self.assertRaises(DispatchConflictError) as conflict:
+            self.reserve(request_id="secret-request-value", reserve_usd="0.20")
+        self.assertNotIn("secret-request-value", str(conflict.exception))
+
+        with self.assertRaises(DispatchValidationError) as enum_error:
+            self.reserve(route="raw-route-value")
+        self.assertNotIn("raw-route-value", str(enum_error.exception))
+
+        with self.assertRaises(DispatchValidationError) as cost_error:
+            self.dispatch.settle_cost(record.dispatch_id, cost_state="bogus-state")
+        self.assertNotIn("bogus-state", str(cost_error.exception))
+
+        self.dispatch.mark_submitted(record.dispatch_id)
+        with self.assertRaises(DispatchStateError) as state_error:
+            self.dispatch.mark_submitted(record.dispatch_id)
+        self.assertNotIn(record.dispatch_id, str(state_error.exception))
+
+        missing = "disp_" + "0" * 32
+        with self.assertRaises(DispatchStateError) as missing_error:
+            self.dispatch.mark_submitted(missing)
+        self.assertNotIn(missing, str(missing_error.exception))
+
+    def test_cost_downgrade_error_never_echoes_amount(self) -> None:
+        record = self.reserve(reserve_usd="0.10")
+        self.dispatch.mark_submitted(record.dispatch_id)
+        self.dispatch.settle_cost(
+            record.dispatch_id, cost_state="known", amount_usd="2.00"
+        )
+        with self.assertRaises(DispatchConflictError) as conflict:
+            self.dispatch.settle_cost(
+                record.dispatch_id, cost_state="known", amount_usd="1.00"
+            )
+        self.assertNotIn("1.00", str(conflict.exception))
 
 
 class ReopenTest(DispatchTestBase):
