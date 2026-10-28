@@ -35,8 +35,11 @@ unauthenticated listener is required"; ``docs/contracts/02-gates-and-runtime.md`
   never reads or writes a PID file. On a launch failure it may terminate only
   its **own** still-live child process object.
 * Concurrent starts may race: the server's singleton ``flock`` selects exactly
-  one worker, and the losers reconnect to the already-running, same-application
-  worker idempotently.
+  one worker. Each losing starter cleans up its **own** spawned child (reaping
+  it, or terminating it if it has not yet exited) before reporting success, so a
+  child that has not yet attempted to bind can never later acquire the freed
+  lock and become a second singleton once the winner is stopped; callers
+  reconnect idempotently to the already-running, same-application worker.
 * Only owner-only local control is used: no TCP listener, no root, no public
   surface. Durable state and activation semantics remain the engine's concern;
   ``stop`` only routes control.
@@ -409,9 +412,13 @@ def start_worker(
     If a verified worker already answers, this is idempotent: no process is
     spawned and ``started`` is ``False``. Otherwise the worker is launched
     detached (new session, ``DEVNULL`` stdio, no shell, no PID file) and this
-    call waits, with bounded backoff, for it to become ready. On success a
-    daemon reaper thread takes ownership of the child so a persistent CLI never
-    leaks a zombie; it never blocks process exit.
+    call waits, with bounded backoff, for it to become ready. When the verified
+    worker is our own child, a daemon reaper thread takes ownership of it so a
+    persistent CLI never leaks a zombie; it never blocks process exit. When the
+    verified worker is *another* starter's child, our child is the loser of the
+    singleton race: it is reaped (or terminated if it has not yet exited) before
+    this call returns, so it can never become a second singleton after the
+    winner is later stopped.
 
     Returns the verified status mapping (as :func:`worker_status`) plus a
     ``started`` key indicating whether this call launched the process.
@@ -438,7 +445,18 @@ def start_worker(
             break
         status = _probe_status(normalized, _probe_budget(deadline))
         if status["running"]:
-            _reap_in_background(child)
+            if status["pid"] == child.pid:
+                # Our child won the singleton race; leave the daemon running and
+                # reap it only when it eventually exits.
+                _reap_in_background(child)
+            else:
+                # Our child lost the singleton race. The verified worker holds
+                # the lock, so our child can never bind while it lives; but a
+                # child that has not yet attempted ``start()`` would acquire the
+                # freed lock and bind a *second* singleton as soon as the winner
+                # is later stopped. Terminate our own losing child before
+                # returning so the "one worker" guarantee holds after the stop.
+                _terminate_own_child(child)
             return {**status, "started": True}
         now = time.monotonic()
         if now >= deadline:
