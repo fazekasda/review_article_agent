@@ -17,7 +17,8 @@ configuration/session/task/proposal tables added by store schema 5
 * a corrupt backup is rejected before any restore registration and leaves no
   partial restore;
 * schema-3 and schema-4 snapshots remain verifiable (format-1 compatibility), and
-  the schema-validator hook is additive for a later schema 6.
+  the schema-validator hook is additive for a future schema beyond the current
+  one.
 
 Synthetic data only (no secrets, no licensed source text, no model call).
 
@@ -616,21 +617,32 @@ class RuntimeFailClosedTest(RuntimeBackupBase):
         finally:
             snapshot.close()
 
-        # A later validator appended at schema 6 applies only at >= 6.
+        # A validator appended *above* the live schema applies only at its own
+        # threshold and beyond, never to the historical paths. The threshold is
+        # derived from the current schema so the hook stays future-only as the
+        # schema advances (``create_backup`` internally re-verifies at the
+        # store's current version, so a threshold at that version would fire).
+        future_version = schema.STORE_SCHEMA_VERSION + 1
         calls: list[int] = []
         original = backup_mod._SCHEMA_VALIDATORS
         backup_mod._SCHEMA_VALIDATORS = original + (
-            (6, lambda _conn, _pid: calls.append(6)),
+            (future_version, lambda _conn, _pid: calls.append(future_version)),
         )
         try:
             clean = self.tmp / "clean-backup"
             create_backup(store, clean)
             conn = self._snapshot_conn(clean)
             try:
-                backup_mod._verify_schema_specific(conn, store.project_id, 5)
+                # Below its threshold the appended validator must not run.
+                backup_mod._verify_schema_specific(
+                    conn, store.project_id, future_version - 1
+                )
                 self.assertEqual(calls, [])
-                backup_mod._verify_schema_specific(conn, store.project_id, 6)
-                self.assertEqual(calls, [6])
+                # At its own threshold it applies.
+                backup_mod._verify_schema_specific(
+                    conn, store.project_id, future_version
+                )
+                self.assertEqual(calls, [future_version])
             finally:
                 conn.close()
         finally:
