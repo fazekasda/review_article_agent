@@ -1,24 +1,30 @@
-# CLI contract — `review-article-agent` (Step 02, with the Step 03 worker + job-control slice)
+# CLI contract — `review-article-agent` (Step 02, with bounded Step 03 and Step 04 additions)
 
-> **Scope: Step 02, plus clearly bounded Step 03 additions.** This document is
-> the **contract** for the command-line surface over the durable local project
-> foundation. It describes exactly what the commands accept, what they print, and
-> how they fail. It is **not** a scientific or approval contract and it claims
-> **no** scientific validation.
+> **Scope: Step 02, plus clearly bounded Step 03 and Step 04 additions.** This
+> document is the **contract** for the command-line surface over the durable local
+> project foundation. It describes exactly what the commands accept, what they
+> print, and how they fail. It is **not** a scientific or approval contract and it
+> claims **no** scientific validation.
 >
 > It covers: projects/registry, immutable artifact revisions, a **private local
 > storage snapshot** (`backup`/`export`), **non-authorizing local storage-fixture
 > review state** (`fixture`), the **worker lifecycle** commands
 > `worker start|status|stop` over the already-integrated detached-worker process
-> layer, and — the later Step 03 addition — **synthetic durable job control**
+> layer, the later Step 03 addition of **synthetic durable job control**
 > (`job run|status|list|pause|resume|cancel|switch|drain|reconcile|attach`) over
-> the integrated synthetic worker engine. The `fixture` commands record a local
-> *fixture* only; they are **never** a real protocol/pilot/outline/final release
-> approval and never authorize execution, export, or science. The `worker`
-> commands manage the worker **process lifecycle** only. The `job` commands run
-> and control **bounded synthetic** tasks only: they accept **no** real model,
-> provider, credential, or budget setting, make no network call, and perform or
-> imply no scientific approval.
+> the integrated synthetic worker engine, and the bounded Step 04 addition of
+> **app-owned exact named-gate human approvals** (`gate prepare|confirm|status|
+> list`). The `fixture` commands record a local *fixture* only; they are **never**
+> a real protocol/pilot/outline/final release approval and never authorize
+> execution, export, or science. The `worker` commands manage the worker **process
+> lifecycle** only. The `job` commands run and control **bounded synthetic** tasks
+> only: they accept **no** real model, provider, credential, or budget setting,
+> make no network call, and perform or imply no scientific approval. The `gate`
+> commands preview or record **one exact named-gate human decision**; a recorded
+> approval never authorizes global execution, manuscript export, or scientific
+> validity, and no named gate — including `final_release` — waives scientific
+> validation. The wider Step 04 execution surface — real provider sessions, Jev
+> runners, and result persistence — is **still pending** and is not exposed here.
 >
 > **This is not a real-execution product.** Every task is a bounded *synthetic
 > numeric* task or a synthetic *waiting-human* gate. Durable job states, run/
@@ -537,24 +543,132 @@ unknown/unresolved outcome, raise a budget cap, or bypass a waiting gate; it
 reports the visible job state instead. `job cancel` stops scheduling but never
 terminal-clears an ambiguous remote outcome.
 
-## 11. Explicit exclusions (Step 02, and the Step 03 boundary)
+## 11. App-owned human-gate approvals — `gate` (Step 04 addition)
+
+`gate` records and reads back **one exact named-gate human approval** over the
+integrated [`review_article_agent.runtime.gates`](../src/review_article_agent/runtime/gates.py)
+and [`review_article_agent.storage.human_approvals`](../src/review_article_agent/storage/human_approvals.py)
+layer. It is an app-owned, local metadata approval: it starts no worker, dispatches
+no model/tool call, requires no runtime activation, and holds no registry execution
+guard. A recorded approval satisfies **only** its one named gate instance
+(`gate_kind` + `gate_id` + target artifact); it is **never** a global execution,
+manuscript-export, scientific-correctness, or final-release-validation claim. No
+named gate — including `final_release` — waives scientific validation.
+
+| Command | Synopsis |
+| --- | --- |
+| `gate prepare --artifact-id A --revision-id R --gate-kind KIND --gate-id G --decision approved\|rejected --rationale TEXT [--project ID]` | **Read-only preview** of the exact gate snapshot over the target plus its full transitive dependency closure. Records **no** approval, mints no authority, and writes nothing. |
+| `gate confirm … --snapshot-digest SHA256 [--timeout-seconds SECONDS]` | Re-prepare the exact snapshot, require the caller to echo the **exact** previewed `--snapshot-digest`, confirm out of band on the **controlling terminal**, then record **one** durable human approval. |
+| `gate status --approval-id ID [--project ID]` | Read-only computed lifecycle status of one approval. |
+| `gate list [--project ID]` | Read-only list of this project's approvals with their computed status. |
+
+`--gate-kind` accepts only the approved C02 enum values (`protocol`, `pilot`,
+`outline`, `framework`, `exclusion_set`, `artifact_revision`, `batch`,
+`final_release`); a generic tool permission is never a gate kind. `--decision`
+accepts only `approved`/`rejected`. An unrecognized value is rejected by
+`argparse` and its raw value is not echoed. The optional `--project` defaults to
+the active project; the store is opened through the registry with an expected
+project id, so a path/identity mismatch is refused before any read.
+
+**`prepare` is a preview, not an approval.** It prints a safe summary with the
+exact project/target, gate kind/id, proposed decision, snapshot id/digest and
+schema versions, the version set, the dependency count and each dependency pin's
+identity/role/digest/byte size/rights key and digest. It never includes source or
+rights bytes, a secret, a capability, or the caller's rationale text. Every
+summary carries `approval_recorded`, `authorizes_execution=false`,
+`authorizes_export=false`, and `scientific_validation=false`. There is
+deliberately no raw actor/authority flag in this command group.
+
+**`confirm` binds to the exact previewed pins and takes authority only from the
+terminal.** It prepares the snapshot read-only and closes the store **before** any
+terminal wait; it then refuses a malformed or mismatched `--snapshot-digest`
+*first*, without opening the terminal. The expected digest is a *check*, never
+authority. The confirmation opens `/dev/tty` (never standard input, so piped input
+can never confirm), uses no `--yes`/actor/authenticated/capability flag, and accepts
+no imported approval or in-band authority value; those flags are rejected as usage
+errors. `--timeout-seconds` is optional and bounded by the owner-auth validators; an
+out-of-range value is a `validation` failure before the terminal. A missing
+controlling terminal, a cancelled/expired confirmation, or a failed owner check is
+refused with a stable category. After confirmation, `confirm` opens a **fresh**
+verified store and hands the exact prepared snapshot plus the minted capability to
+`HumanApprovalRepository.record_decision`, which **revalidates inside one write
+transaction** and consumes the capability once. If a live input or rights record
+mutated, or the prepared snapshot became stale/superseded, the approval is denied
+and **zero** rows are written; the caller must re-prepare and confirm again. A
+failed write leaves no owner-auth evidence, approval, or entry row behind. The
+successful result prints the safe gate summary with `approval_recorded=true` plus a
+safe approval summary (identity, out-of-band `owner_auth_ref` pointer, computed
+status); it still carries the three non-authorizing `false` constants.
+
+**Status/list are computed history, not stored verdicts.** Each read recomputes the
+lifecycle status (`active`/`stale`/`superseded`/`invalidated`) and returns retained
+historical rows. `satisfies_named_gate` is the only satisfaction claim and is `true`
+only for an `active` + `approved` exact named-gate instance. `gate status`/`gate
+list` expose curated computed `reasons` and `superseded_by`, but **not** the stored
+rationale text; `rationale` is bound into the digest and stored but never echoed by
+any gate command. `gate list` fails the whole read closed as `storage` if a stored
+row is corrupt rather than silently skipping it; `gate status` reports a corrupt
+approval as `invalidated`. `gate status` for an unknown approval id is a
+`validation` error.
+
+**Error categories.** Failures use the stable CLI taxonomy in §3: `validation`
+(exit 2) for a malformed/unknown gate identity or target, malformed digest, or
+missing revision; `conflict` (exit 3) for a stale/superseded/cross-project pin, a
+digest mismatch, a cancelled/expired/replayed/mismatched confirmation; `storage`
+(exit 4) for a corrupt/missing pinned revision or rights record, an unsupported
+schema, or an unavailable controlling terminal. Messages are static and curated;
+they never echo a raw exception, store content, or a caller-supplied value (a caller
+may have pasted a credential into an argument).
+
+### Copyable synthetic named-gate example
+
+All placeholders only; no real source upload, no live provider call, and no paid
+test. `--gate-kind protocol` below is an approved enum value, but the decision is a
+synthetic local approval for demonstration and authorizes nothing global.
+
+```console
+$ review-article-agent --data-dir "$DD" gate prepare \
+    --artifact-id art-syn --revision-id rev-syn-1 \
+    --gate-kind protocol --gate-id gate-proto-1 \
+    --decision approved --rationale "synthetic named-gate preview; not a scientific approval" \
+    --project <PROJECT_ID>
+# Copy the printed "snapshot_digest" value into the next command:
+$ review-article-agent --data-dir "$DD" gate confirm \
+    --artifact-id art-syn --revision-id rev-syn-1 \
+    --gate-kind protocol --gate-id gate-proto-1 \
+    --decision approved --rationale "synthetic named-gate preview; not a scientific approval" \
+    --snapshot-digest <SNAPSHOT_DIGEST> \
+    --timeout-seconds 120 --project <PROJECT_ID>
+# The owner types the displayed challenge on the controlling terminal (/dev/tty);
+# piped stdin and a --yes/actor/imported-approval flag cannot confirm.
+$ review-article-agent --data-dir "$DD" gate status --approval-id apv_… --project <PROJECT_ID>
+$ review-article-agent --data-dir "$DD" gate list --project <PROJECT_ID>
+```
+
+## 12. Explicit exclusions (Step 02, and the Step 03/Step 04 boundaries)
 
 * No scientific `approve`/`reject` command exists here, and no arbitrary job
   `result` payload is accepted. `job reconcile` takes only the fixed owner
-  dispositions in §10. Real agent integration follows in a later step.
+  dispositions in §10. `gate confirm` records a named-gate human approval only; it
+  performs no scientific validation and authorizes no execution, export, or
+  final-release waiver. Real agent integration follows in a later step.
 * No `model`/provider/credential/budget command or setting exists here, and none
-  is read from the config file (§4). `worker` and `job` accept no such setting.
+  is read from the config file (§4). `worker`, `job`, and `gate` accept no such
+  setting.
 * `fixture` records a local, non-authorizing fixture only. No real
   protocol/pilot/outline/final-release gate and no in-band actor/authority is
-  accepted; an imported document still cannot self-grant any approval.
-* No scientific acquisition, evidence validation, or approval is performed or
-  implied. All jobs, fixtures, and archives are synthetic/private and
-  non-authorizing, and the worker lifecycle and job control are exercised only
-  with owned disposable processes.
+  accepted; an imported document still cannot self-grant any approval. The `gate`
+  command group is the separate exact named-gate path and does not turn a fixture
+  into a real approval.
+* No scientific acquisition or evidence validation is performed or implied. All
+  jobs, fixtures, and archives are synthetic/private and non-authorizing, and the
+  worker lifecycle and job control are exercised only with owned disposable
+  processes. A `gate` approval is a local metadata decision, not scientific
+  correctness.
 * `backup`/`export` is a **private local storage snapshot**, not a manuscript
   (Markdown/BibTeX/RIS) or redistribution export; never publish an archive.
 
-## 12. Extension hooks
+## 13. Extension hooks
 
 Adding a subcommand is intentionally small:
 
@@ -563,21 +677,24 @@ Adding a subcommand is intentionally small:
    returns a JSON-ready object (or a newline-delimited stream for a `--watch`).
 3. Register it in `_COMMANDS`, `_ARTIFACT_COMMANDS`, `_BACKUP_COMMANDS`,
    `_FIXTURE_COMMANDS`, `WORKER_COMMANDS` (in
-   `review_article_agent/cli/worker.py`), or `JOB_COMMANDS` (in
-   `review_article_agent/cli/jobs.py`).
+   `review_article_agent/cli/worker.py`), `JOB_COMMANDS` (in
+   `review_article_agent/cli/jobs.py`), or `GATE_COMMANDS` (in
+   `review_article_agent/cli/gates.py`).
 
 Handlers receive a `Context` holding the resolved `Registry`, the data directory,
 the parsed config, and the environment, and never touch global state. New exit
 categories are added to `classify_error()` and this table.
 
-## 13. Verification
+## 14. Verification
 
 * `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` — includes
   the real-subprocess CLI acceptance tests (`tests/test_cli.py`,
   `tests/test_cli_snapshot.py`), the config tests (`tests/test_config.py`), the
   worker-lifecycle CLI tests (`tests/test_cli_worker.py`), the real
-  detached worker-process tests (`tests/test_worker_process.py`), and the
-  real-subprocess job-control CLI tests (`tests/test_cli_jobs.py`).
+  detached worker-process tests (`tests/test_worker_process.py`), the
+  real-subprocess job-control CLI tests (`tests/test_cli_jobs.py`), and the
+  human-gate CLI tests (`tests/test_cli_human_gates.py`, including a real-PTY
+  controlling-terminal case).
 * `python3 scripts/check_contract_docs.py --self-test` — the Step 01 contract
   checks remain green (this document adds no fixtures or schema field semantics).
 * The packaged console script and the absence of an invented license are checked
