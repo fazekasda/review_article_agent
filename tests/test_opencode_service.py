@@ -38,6 +38,7 @@ call, or source upload is made**.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import http.server
 import json
@@ -1130,6 +1131,145 @@ class Repair2ContainmentTests(_ServiceCase):
         (manager.home / "AGENTS.md").write_text("evil", encoding="utf-8")
         with self.assertRaises(ServiceOwnershipError):
             manager.start()
+
+
+# --------------------------------------------------------------------------- #
+# Repair R3: managed-file proof, shared-writable chains, non-blocking reads
+# --------------------------------------------------------------------------- #
+
+
+class Repair3ManagedFileProofTests(_ServiceCase):
+    """Exact regressions for the three remaining service boundary causes (R3).
+
+    Each test targets one reviewed hole: ``connection()``/``descriptor()``/
+    idempotent ``start`` trusting in-memory bytes while the on-disk config is
+    missing; a silently skipped symlinked internal config directory; a
+    group/other-writable internal or root directory treated as owned; and an
+    ``os.open`` of a planted FIFO blocking a lifecycle read forever.
+    """
+
+    def _mock_owned(self, manager: OpenCodeServiceManager, record: dict) -> object:
+        """Patch a manager to look like a live owned instance without a process."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(manager, "_process_state", return_value="ours"))
+        stack.enter_context(mock.patch.object(manager, "_read_pid_record", return_value=("ok", record)))
+        stack.enter_context(mock.patch.object(manager, "_read_port", return_value=record.get("port")))
+        return stack
+
+    def test_connection_and_descriptor_require_on_disk_config(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_missing_cfg")  # creates + marks the owned root
+        manager._write_config()
+        manager.config_file.unlink()  # in-memory bytes remain valid; disk document is gone
+        record = {"port": 45678}
+        with self._mock_owned(manager, record):
+            with self.assertRaises(ServiceOwnershipError):
+                manager.connection()
+            with self.assertRaises(ServiceOwnershipError):
+                manager.descriptor()
+        # Restoring the exact on-disk document makes the same proof succeed, so
+        # the refusal is about the missing document, not a blanket rejection.
+        manager._write_config()
+        with self._mock_owned(manager, record):
+            self.assertEqual(manager.connection().base_url, "http://127.0.0.1:45678")
+
+    def test_idempotent_start_requires_on_disk_config(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_start_cfg")
+        manager._write_config()
+        manager.config_file.unlink()
+        record = {
+            "port": 45678,
+            "configFingerprint": manager.config_fingerprint,
+            "instanceFence": manager.instance_fence,
+        }
+        with mock.patch.object(manager, "_process_state", return_value="ours"):
+            with mock.patch.object(
+                manager, "_read_pid_record", return_value=("ok", record)
+            ):
+                with self.assertRaises(ServiceOwnershipError):
+                    manager.start()
+
+    def test_symlinked_internal_config_dir_refused(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_sym_cfg")
+        manager._write_config()
+        external = self.data_dir / "external-config"
+        external.mkdir()
+        # Byte-identical config in the target: only the symlinked directory is
+        # the problem, and it must be refused rather than silently skipped.
+        (external / "opencode.json").write_bytes(manager._config_disk_bytes)
+        config_dir = manager.config_file.parent
+        shutil.rmtree(config_dir)
+        os.symlink(external, config_dir)
+        with self._mock_owned(manager, {"port": 45678}):
+            with self.assertRaises(ServiceOwnershipError):
+                manager.connection()
+        # The external target was never read or modified through the symlink.
+        self.assertEqual(
+            (external / "opencode.json").read_bytes(), manager._config_disk_bytes
+        )
+
+    def test_shared_writable_dir_chain_rejected(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_shared")
+        manager._write_config()
+        manager.port_file.write_bytes(b"45678")
+        os.chmod(manager.port_file, 0o600)
+        self.assertTrue(manager._dir_chain_ok(manager.run))
+        os.chmod(manager.run, 0o777)
+        try:
+            self.assertFalse(manager._dir_chain_ok(manager.run))
+            # Even with a matching live record and port, a shared-writable run
+            # chain is refused: the port read cannot be trusted through it.
+            with mock.patch.object(manager, "_process_state", return_value="ours"):
+                with mock.patch.object(
+                    manager, "_read_pid_record", return_value=("ok", {"port": 45678})
+                ):
+                    with self.assertRaises(ServiceProcessError):
+                        manager.connection()
+        finally:
+            os.chmod(manager.run, 0o700)
+        # The owned root itself is subject to the same shared-writable refusal.
+        os.chmod(manager.root, 0o777)
+        try:
+            self.assertFalse(manager._dir_chain_ok(manager.root))
+        finally:
+            os.chmod(manager.root, 0o700)
+
+    def test_fifo_read_denied_without_blocking(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_fifo")
+        fifo = manager.run / "probe-fifo"
+        os.mkfifo(fifo)
+        program = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(SRC)!r})\n"
+            "from pathlib import Path\n"
+            "from review_article_agent.runtime.roles import RoleConfiguration\n"
+            "from review_article_agent.runtime.service import OpenCodeServiceManager\n"
+            "cfg = RoleConfiguration.from_mapping({'schema_version': 1, 'roles': {"
+            "'writer': {'provider_id': 'openrouter', "
+            "'model_id': 'deepseek/deepseek-v4.1-flash'}, "
+            "'section_critic': {'provider_id': 'anthropic', "
+            "'model_id': 'claude-sonnet-5-5'}}})\n"
+            f"m = OpenCodeServiceManager(data_dir={str(self.data_dir)!r}, configuration=cfg)\n"
+            f"print('RESULT', m._read_owned_file(Path({str(fifo)!r}), max_bytes=64))\n"
+        )
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        elapsed = time.monotonic() - started
+        # A blocking open would hang this child until the timeout; the bounded
+        # read must return a static denial well before that.
+        self.assertLess(elapsed, 2.0, proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RESULT None", proc.stdout)
 
 
 if __name__ == "__main__":  # pragma: no cover

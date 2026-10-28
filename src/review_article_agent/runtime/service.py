@@ -1235,7 +1235,12 @@ class OpenCodeServiceManager:
 
     def _dir_chain_ok(self, directory: Path) -> bool:
         """True when ``directory`` and every ancestor up to the owned root are
-        real, owner-owned, non-symlink directories."""
+        real, owner-owned, non-symlink, and **not shared-writable** directories.
+
+        A group/other-writable component is refused: another user could then
+        swap a leaf inside it, so a value read through that chain is never
+        trusted (and the directory is never ``chmod``-ed as if it were ours).
+        """
         root = self.root
         try:
             rel = directory.relative_to(root)
@@ -1253,6 +1258,7 @@ class OpenCodeServiceManager:
                 or stat.S_ISLNK(st.st_mode)
                 or not stat.S_ISDIR(st.st_mode)
                 or st.st_uid != os.getuid()
+                or (st.st_mode & 0o022)
             ):
                 return False
         return True
@@ -1307,12 +1313,26 @@ class OpenCodeServiceManager:
         """Bounded read of a managed file whose whole directory chain is owned.
 
         Returns ``None`` (a static denial) when any component of the path is a
-        symlink or foreign directory, when the leaf is not a regular owner file
-        within the bound, or — with ``private`` — when it is not owner-only.
+        symlink, a foreign directory, or a shared-writable directory; when the
+        leaf is not a regular owner file within the bound; or — with ``private``
+        — when it is not owner-only.
+
+        The leaf is ``lstat``-checked as a regular file *before* it is opened and
+        the open carries ``O_NONBLOCK``: opening a non-regular entry (a FIFO, a
+        device, a socket) can never block the caller, so a planted FIFO is
+        denied promptly instead of hanging a lifecycle operation.
         """
         if not self._file_chain_ok(path):
             return None
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        pre = _lstat(str(path))
+        if pre is None or stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode):
+            return None
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         try:
             fd = os.open(str(path), flags)
         except OSError:
@@ -1726,6 +1746,26 @@ class OpenCodeServiceManager:
             raise ServiceConfigError("config_drift", _MSG_CONFIG_DRIFT)
         return expected
 
+    def _verify_on_disk_config(self) -> bytes:
+        """Prove the *on-disk* config is exactly this manager's own document.
+
+        The in-memory comparison in :meth:`_verify_expected_config` cannot see a
+        deleted or swapped config file. This proof additionally requires the
+        whole managed chain down to the config file to be real and owned (so a
+        symlinked internal config directory is **refused**, never silently
+        skipped) and the bytes on disk to equal the canonical expected config
+        plus its trailing newline. A missing, symlinked, foreign, or drifted
+        document is refused before an idempotent reuse, a connection, or a
+        descriptor value is derived from disk state.
+        """
+        if not self._file_chain_ok(self.config_file):
+            raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
+        expected = self._verify_expected_config() + b"\n"
+        on_disk = self._read_owned_file(self.config_file, max_bytes=MAX_RECORD_BYTES)
+        if on_disk != expected:
+            raise ServiceOwnershipError("config_disk", _MSG_TREE_DIRTY)
+        return on_disk
+
     def _write_config(self) -> None:
         data = self._verify_expected_config()
         expected = data + b"\n"
@@ -2064,7 +2104,7 @@ class OpenCodeServiceManager:
             # match the owned record. A drifted tree/port is refused, never
             # reported as a usable running instance.
             self._assert_tree_clean()
-            self._verify_expected_config()
+            self._verify_on_disk_config()
             if self._validated_base_url(record) is None:
                 raise ServiceProcessError("not_running", _MSG_PROBE)
             return self._running_status(inspect=False)
@@ -2350,7 +2390,7 @@ class OpenCodeServiceManager:
         if self._process_state() != "ours":
             raise ServiceProcessError("not_running", _MSG_PROBE)
         self._assert_tree_clean()
-        self._verify_expected_config()
+        self._verify_on_disk_config()
         _, record = self._read_pid_record()
         record = record or {}
         if self._validated_base_url(record) is None:
