@@ -47,11 +47,16 @@ Safety
 
 * The journal is a **separate** SQLite database owned by this backend — never the
   project store — because it represents *external* state.
-* The runtime directory and journal file are created **owner-private** (``0o700``
-  / ``0o600``); a symlinked or group/world-accessible journal is refused.
-* A marker table plus ``PRAGMA user_version`` are checked **read-only before any
-  write/migration**. A foreign file, a newer schema, or a non-SQLite file is
-  refused and left **byte-identical**.
+* Existing paths are validated **read-only before any chmod/pragma/migration**:
+  the data directory and runtime directory must not be symlinks of the wrong
+  type, and an existing runtime directory / journal must already be
+  owner-private (``0o700`` / ``0o600``).
+* An existing journal is proven ours by **all** of: the exact marker table
+  *value*, the exact ``PRAGMA user_version``, a canonical schema fingerprint
+  (the SQLite schema must equal a freshly migrated reference), exactly one valid
+  ``backend_identity`` row, and well-formed dispatch rows (bounded numerics,
+  known mode, expected result marker/cost). A foreign, malformed, or newer-schema
+  file is refused and left **byte-identical**.
 * Inputs are ids and bounded integers only; there is **no** file/shell/code/
   string-document payload, and none is executed.
 
@@ -59,12 +64,20 @@ Identity continuity
 -------------------
 
 Absence of a journal may only be read as "definitively absent" when nothing could
-have been admitted. If a journal was previously observed (in this process) or the
-caller knows the journal's ``continuity_id`` (``expected_continuity_id``), then a
-lost/foreign journal makes :meth:`SyntheticBackend.lookup` return ``unknown``
-rather than ``absent`` — the absence is **not** proof, and the engine should
-escalate. :meth:`SyntheticBackend.same_identity_dispatch_allowed` is ``True`` only
-when the lookup is **definitively** ``absent``.
+have been admitted. An engine should call :meth:`SyntheticBackend.initialize`
+**before** it sends any work: it creates or validates the (possibly empty)
+journal and returns a durable ``continuity_id`` the engine persists before its
+first dispatch checkpoint, so a crash after the first admission but before the
+engine could record the generation is still recoverable.
+
+The constructor stays read-only. If a caller knows the journal's
+``continuity_id`` (``expected_continuity_id``) or the journal was observed in this
+process, then a lost/replaced journal makes ``initialize``/``admit`` refuse and
+``lookup`` return ``unknown`` rather than ``absent`` — the absence is **not**
+proof. A ``dispatch_id`` belongs to exactly one project, so a lookup by a
+**different** project is an identity conflict (``unknown``, escalate), never a
+definitive absence. :meth:`SyntheticBackend.same_identity_dispatch_allowed` is
+``True`` only for a **definitively absent** identity.
 """
 
 from __future__ import annotations
@@ -97,6 +110,7 @@ __all__ = [
     "MAX_STEPS",
     "MIN_DELAY_MS",
     "MIN_STEPS",
+    "REQUIRED_TABLES",
     "RUNTIME_DIR_NAME",
     "SyntheticBackend",
     "SyntheticBackendError",
@@ -123,9 +137,13 @@ JOURNAL_FILENAME = "synthetic.sqlite3"
 SYNTHETIC_SCHEMA_VERSION = 1
 
 #: Marker table/value proving the journal belongs to this backend before any
-#: write. Checked read-only together with ``PRAGMA user_version``.
+#: write. Checked read-only together with ``PRAGMA user_version`` and a schema
+#: fingerprint.
 MARKER_TABLE = "synthetic_marker"
 MARKER_VALUE = "review_article_agent.synthetic_backend.v1"
+
+#: Tables a valid journal must contain.
+REQUIRED_TABLES = frozenset({MARKER_TABLE, "backend_identity", "dispatch"})
 
 #: Bounded synthetic parameter ranges (no document/payload parameters exist).
 MIN_STEPS = 1
@@ -151,6 +169,11 @@ ACTUAL_EXTERNAL_COST_USD_ZERO = "0"
 #: Safe, bounded dispatch-id shape: no path separators or payload characters.
 DISPATCH_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
+#: Bounded continuity-id shape. Continuity ids are minted by this backend as
+#: ``uuid4().hex`` (32 lowercase hex characters); an existing journal whose
+#: identity is anything else is malformed and refused.
+_CONTINUITY_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+
 
 # --------------------------------------------------------------------------- #
 # Errors
@@ -175,9 +198,10 @@ class SyntheticConflict(SyntheticBackendError):
 class SyntheticContinuityError(SyntheticBackendError):
     """The provider journal was lost or replaced; identity continuity is broken.
 
-    A dispatch must **not** be (re-)admitted when the durable journal that
-    recorded it cannot be shown to be the same one, because that could duplicate
-    external work. The engine should reconcile or escalate instead.
+    A dispatch must **not** be (re-)admitted — and a replacement journal must
+    **not** be minted — when the durable journal that recorded prior work cannot
+    be shown to be the same one, because that could duplicate external work. The
+    engine should reconcile or escalate instead.
     """
 
 
@@ -295,6 +319,144 @@ _LABEL = "synthetic provider journal"
 
 
 # --------------------------------------------------------------------------- #
+# Canonical schema fingerprint (read-only), derived from our own migration
+# --------------------------------------------------------------------------- #
+def _canonical_schema(conn: sqlite3.Connection) -> tuple[tuple[str, str, str], ...]:
+    """Return a canonical fingerprint of a journal's SQLite schema.
+
+    Using ``sqlite_master`` (type, name, SQL) rather than only table *names*
+    means a foreign file that merely reuses a table name — or a malformed schema
+    with missing constraints/columns — cannot masquerade as our journal.
+    """
+    rows = conn.execute(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE type IN ('table', 'index', 'trigger', 'view') "
+        "ORDER BY type, name"
+    ).fetchall()
+    return tuple((str(r[0]), str(r[1]), str(r[2])) for r in rows)
+
+
+_REFERENCE_SCHEMA: tuple[tuple[str, str, str], ...] | None = None
+
+
+def _reference_schema() -> tuple[tuple[str, str, str], ...]:
+    """Lazily migrate a throwaway in-memory DB to fingerprint our own schema.
+
+    This avoids hand-maintaining a second copy of the DDL: the expected schema is
+    always exactly what :data:`SYNTHETIC_MIGRATIONS` produces.
+    """
+    global _REFERENCE_SCHEMA
+    if _REFERENCE_SCHEMA is None:
+        conn = sqlite3.connect(":memory:", isolation_level=None)
+        try:
+            schema.migrate(
+                conn,
+                target_version=SYNTHETIC_SCHEMA_VERSION,
+                migrations=SYNTHETIC_MIGRATIONS,
+                label=_LABEL,
+            )
+            _REFERENCE_SCHEMA = _canonical_schema(conn)
+        finally:
+            conn.close()
+    return _REFERENCE_SCHEMA
+
+
+# --------------------------------------------------------------------------- #
+# Journal content validation (read-only)
+# --------------------------------------------------------------------------- #
+def _validate_continuity_value(value: object) -> str:
+    if not isinstance(value, str) or _CONTINUITY_ID_PATTERN.fullmatch(value) is None:
+        raise StoreError(
+            "the synthetic provider journal records a malformed continuity id; "
+            "refusing to use it."
+        )
+    return value
+
+
+def _validate_identity_rows(conn: sqlite3.Connection) -> str:
+    """Return the journal's single, valid ``continuity_id`` or raise."""
+    rows = conn.execute(
+        "SELECT singleton, continuity_id, created_at_utc FROM backend_identity"
+    ).fetchall()
+    if len(rows) != 1:
+        raise StoreError(
+            "the synthetic provider journal must contain exactly one backend "
+            "identity row; refusing to use it."
+        )
+    singleton, continuity_id, created_at = rows[0]
+    if singleton != 1:
+        raise StoreError(
+            "the synthetic provider journal's backend identity singleton must be "
+            "1; refusing to use it."
+        )
+    _validate_continuity_value(continuity_id)
+    if not isinstance(created_at, str) or not created_at:
+        raise StoreError(
+            "the synthetic provider journal's backend identity is missing its "
+            "created timestamp; refusing to use it."
+        )
+    return str(continuity_id)
+
+
+def _validate_dispatch_row(row: sqlite3.Row) -> None:
+    """Validate one dispatch row's identity, bounds, mode, and numeric fields."""
+
+    def _bad(what: str) -> None:
+        raise StoreError(
+            f"the synthetic provider journal contains a malformed dispatch row "
+            f"({what}); refusing to use it."
+        )
+
+    dispatch_id = row["dispatch_id"]
+    project_id = row["project_id"]
+    if not isinstance(dispatch_id, str) or DISPATCH_ID_PATTERN.fullmatch(dispatch_id) is None:
+        _bad("dispatch_id")
+    if (
+        not isinstance(project_id, str)
+        or paths.PROJECT_ID_PATTERN.fullmatch(project_id) is None
+    ):
+        _bad("project_id")
+    if row["mode"] not in DISPATCH_MODES:
+        _bad("mode")
+    steps = row["steps"]
+    delay_ms = row["delay_ms"]
+    if isinstance(steps, bool) or not isinstance(steps, int) or not (MIN_STEPS <= steps <= MAX_STEPS):
+        _bad("steps")
+    if (
+        isinstance(delay_ms, bool)
+        or not isinstance(delay_ms, int)
+        or not (MIN_DELAY_MS <= delay_ms <= MAX_DELAY_MS)
+    ):
+        _bad("delay_ms")
+    if row["result_marker"] != RESULT_MARKER:
+        _bad("result_marker")
+    if row["actual_external_cost_usd"] != ACTUAL_EXTERNAL_COST_USD_ZERO:
+        _bad("actual_external_cost_usd")
+    if row["synthetic"] != 1 or row["not_a_scientific_result"] != 1:
+        _bad("synthetic flags")
+    result_value = row["result_value"]
+    if (
+        isinstance(result_value, bool)
+        or not isinstance(result_value, int)
+        or not (0 <= result_value < 1_000_000)
+    ):
+        _bad("result_value")
+    admitted_epoch = row["admitted_epoch_s"]
+    ready_epoch = row["ready_epoch_s"]
+    for name, value in (("admitted_epoch_s", admitted_epoch), ("ready_epoch_s", ready_epoch)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            _bad(name)
+        if value != value or value in (float("inf"), float("-inf")):
+            _bad(name)
+    if float(ready_epoch) < float(admitted_epoch):
+        _bad("ready_epoch_s < admitted_epoch_s")
+    for name in ("admitted_at_utc", "ready_at_utc"):
+        value = row[name]
+        if not isinstance(value, str) or not value:
+            _bad(name)
+
+
+# --------------------------------------------------------------------------- #
 # Results
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -344,7 +506,8 @@ class LookupResult:
     ``status`` is one of ``absent`` / ``admitted`` / ``completed`` / ``failed`` /
     ``unknown``. ``definitive`` is ``True`` only when the absence or terminal is
     *proven* (a definitively absent record, or a proven terminal outcome); a lost
-    or ambiguous case is ``definitive = False`` and requires escalation.
+    journal, an ambiguous outcome, or an identity owned by another project is
+    ``definitive = False`` and requires escalation.
     """
 
     dispatch_id: str
@@ -362,6 +525,8 @@ class LookupResult:
     definitive_failure: bool = False
     non_billing: bool = False
     actual_external_cost_known_zero: bool = False
+    #: ``True`` when the ``dispatch_id`` exists but belongs to a different project.
+    identity_conflict: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -385,10 +550,13 @@ class SyntheticBackend:
 
     ``SyntheticBackend(data_dir)`` stores its journal at
     ``<data_dir>/runtime/synthetic.sqlite3``. Construction is **read-only**: an
-    existing journal is validated (marker + ``user_version``) and never written.
-    Pass ``expected_continuity_id`` when the engine knows the journal's
-    continuity id from a previous run, so a lost/foreign journal is *not* read as
-    absent. Pass ``clock`` (seconds float) to make time deterministic in tests.
+    existing journal is validated (marker value + exact ``user_version`` + schema
+    fingerprint + identity + rows) and never written. Pass
+    ``expected_continuity_id`` when the engine knows the journal's continuity id
+    from a previous run, so a lost/foreign journal is *not* read as absent. Pass
+    ``clock`` (seconds float) to make time deterministic in tests. Call
+    :meth:`initialize` before the first dispatch to obtain the durable continuity
+    id.
     """
 
     def __init__(
@@ -417,8 +585,7 @@ class SyntheticBackend:
         self._observed_continuity_id: str | None = None
 
         if os.path.lexists(self._journal_path):
-            self._preflight_readonly()
-            self._observed_continuity_id = self._read_continuity_id()
+            self._observed_continuity_id = self._preflight_readonly()
 
     # -- paths / identity ---------------------------------------------------- #
     @property
@@ -452,17 +619,55 @@ class SyntheticBackend:
     def journal_present(self) -> bool:
         return os.path.lexists(self._journal_path)
 
-    # -- preflight / continuity --------------------------------------------- #
-    def _preflight_readonly(self) -> None:
-        """Validate an existing journal **read-only**; refuse foreign/unsafe ones.
+    # -- layout (read-only) / preflight ------------------------------------- #
+    def _validate_layout_readonly(self) -> None:
+        """Validate the data/runtime directories read-only before mutating them.
 
-        Never writes, migrates, or chmods. A symlink, a non-regular file, a
-        non-owner-private file, a non-SQLite file, a file without our marker, or a
-        newer schema is refused so a foreign target is left byte-identical.
+        Never creates, chmods, or follows a symlink. This runs *before* any
+        ``ensure``/open so an existing hostile or malformed layout is refused
+        rather than being repaired.
+        """
+        data_dir = self._data_dir
+        if os.path.lexists(data_dir):
+            if os.path.islink(data_dir):
+                raise StoreError(
+                    f"the synthetic backend data directory {data_dir!r} is a "
+                    f"symlink; refusing to use it."
+                )
+            if not os.path.isdir(data_dir):
+                raise StoreError(
+                    f"the synthetic backend data path {data_dir!r} is not a "
+                    f"directory; refusing to use it."
+                )
+        runtime_dir = self._runtime_dir
+        if os.path.lexists(runtime_dir):
+            if os.path.islink(runtime_dir):
+                raise StoreError(
+                    f"the synthetic backend runtime directory {runtime_dir!r} is a "
+                    f"symlink; refusing to use it."
+                )
+            if not os.path.isdir(runtime_dir):
+                raise StoreError(
+                    f"the synthetic backend runtime path {runtime_dir!r} is not a "
+                    f"directory; refusing to use it."
+                )
+            paths.assert_owner_private_dir(
+                runtime_dir, what="synthetic backend runtime directory"
+            )
+
+    def _preflight_readonly(self) -> str | None:
+        """Validate an existing journal **read-only**; return its continuity id.
+
+        Never writes, migrates, or chmods. A symlink, a non-regular or
+        non-owner-private file, a non-SQLite file, a wrong marker *value*, a
+        missing required table, a non-canonical schema, a wrong ``user_version``,
+        a malformed/multiple/absent identity, or a malformed dispatch row is
+        refused so a foreign target is left byte-identical. Returns ``None`` when
+        no journal exists yet.
         """
         path = self._journal_path
         if not os.path.lexists(path):
-            return
+            return None
         paths.assert_not_symlink(path, what="synthetic provider journal")
         if not os.path.isfile(path):
             raise StoreError(
@@ -470,31 +675,61 @@ class SyntheticBackend:
                 f"file; refusing to use it."
             )
         paths.assert_owner_private_file(path, what="synthetic provider journal")
-        version, tables = schema.read_only_probe(path)
-        if MARKER_TABLE not in tables:
-            raise StoreError(
-                f"the file at {path!r} is not a review_article_agent synthetic "
-                f"provider journal (marker table {MARKER_TABLE!r} missing); "
-                f"refusing to read or write it."
-            )
-        if version > SYNTHETIC_SCHEMA_VERSION:
-            raise UnsupportedSchemaVersion(
-                label=_LABEL,
-                found=version,
-                supported=SYNTHETIC_SCHEMA_VERSION,
-            )
+
+        conn = _readonly_connect(path)
+        try:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            tables = {
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if not REQUIRED_TABLES <= tables:
+                raise StoreError(
+                    f"the file at {path!r} is not a review_article_agent synthetic "
+                    f"provider journal (required tables missing); refusing to read "
+                    f"or write it."
+                )
+            if version > SYNTHETIC_SCHEMA_VERSION:
+                raise UnsupportedSchemaVersion(
+                    label=_LABEL,
+                    found=version,
+                    supported=SYNTHETIC_SCHEMA_VERSION,
+                )
+            if version != SYNTHETIC_SCHEMA_VERSION:
+                raise StoreError(
+                    f"the file at {path!r} records unsupported synthetic provider "
+                    f"journal schema version {version} (expected "
+                    f"{SYNTHETIC_SCHEMA_VERSION}); refusing to use it."
+                )
+            if _canonical_schema(conn) != _reference_schema():
+                raise StoreError(
+                    f"the file at {path!r} has a non-canonical synthetic provider "
+                    f"journal schema; refusing to use it."
+                )
+            marker = conn.execute(
+                "SELECT value FROM synthetic_marker WHERE name = 'backend'"
+            ).fetchone()
+            if marker is None or str(marker[0]) != MARKER_VALUE:
+                raise StoreError(
+                    f"the file at {path!r} is not a review_article_agent synthetic "
+                    f"provider journal (marker value mismatch); refusing to read or "
+                    f"write it."
+                )
+            continuity_id = _validate_identity_rows(conn)
+            for row in conn.execute("SELECT * FROM dispatch"):
+                _validate_dispatch_row(row)
+            return continuity_id
+        finally:
+            conn.close()
 
     def _read_continuity_id(self) -> str | None:
         if not os.path.lexists(self._journal_path):
             return None
         conn = _readonly_connect(self._journal_path)
         try:
-            row = conn.execute(
-                "SELECT continuity_id FROM backend_identity WHERE singleton = 1"
-            ).fetchone()
-            return None if row is None else str(row[0])
-        except sqlite3.DatabaseError:
-            return None
+            return _validate_identity_rows(conn)
         finally:
             conn.close()
 
@@ -509,12 +744,121 @@ class SyntheticBackend:
         observed = self._observed_continuity_id
         if expected is None and observed is None:
             return "ok"
-        current = self._read_continuity_id()
+        try:
+            current = self._read_continuity_id()
+        except ReviewAgentError:
+            return "broken"
         if expected is not None and current != expected:
             return "broken"
         if observed is not None and current != observed:
             return "broken"
         return "ok"
+
+    # -- initialize ---------------------------------------------------------- #
+    def initialize(self) -> str:
+        """Create or validate the journal and return its durable continuity id.
+
+        The engine calls this **before** it sends any work, then persists the
+        returned id before its first dispatch/attempt checkpoint. This closes the
+        crash-after-first-admission window. It never creates a dispatch row, and
+        it never mints a replacement journal when a journal was expected or was
+        previously observed but is now lost/changed.
+        """
+        self._validate_layout_readonly()
+        if self.journal_present:
+            current = self._preflight_readonly()
+            assert current is not None  # present ⇒ preflight returns an id
+            if self._expected_continuity_id is not None and current != self._expected_continuity_id:
+                raise SyntheticContinuityError(
+                    f"the provider journal's continuity id ({current!r}) does not "
+                    f"match the expected one ({self._expected_continuity_id!r}); "
+                    f"refusing to initialize over a replaced journal."
+                )
+            if self._observed_continuity_id is not None and current != self._observed_continuity_id:
+                raise SyntheticContinuityError(
+                    f"the provider journal's continuity id changed since it was "
+                    f"observed ({self._observed_continuity_id!r} -> {current!r}); "
+                    f"refusing to initialize over a replaced journal."
+                )
+            self._observed_continuity_id = current
+            return current
+        # No journal: only a truly fresh backend may create one.
+        if self._expected_continuity_id is not None:
+            raise SyntheticContinuityError(
+                f"no provider journal exists but continuity id "
+                f"{self._expected_continuity_id!r} was expected; refusing to mint a "
+                f"replacement journal (reconcile or escalate instead)."
+            )
+        if self._observed_continuity_id is not None:
+            raise SyntheticContinuityError(
+                f"the provider journal was observed ({self._observed_continuity_id!r}) "
+                f"but is now missing; refusing to mint a replacement journal."
+            )
+        return self._create_journal()
+
+    def _create_journal(self) -> str:
+        """Create a fresh owner-private journal with a new durable identity."""
+        paths.ensure_owner_private_dir(self._runtime_dir)
+        conn = schema.open_connection(self._journal_path)
+        try:
+            schema.migrate(
+                conn,
+                target_version=SYNTHETIC_SCHEMA_VERSION,
+                migrations=SYNTHETIC_MIGRATIONS,
+                label=_LABEL,
+            )
+            paths.ensure_owner_private_file(self._journal_path)
+            with transaction(conn):
+                continuity_id = self._mint_identity(conn)
+            self._observed_continuity_id = continuity_id
+            return continuity_id
+        finally:
+            conn.close()
+
+    def _mint_identity(self, conn: sqlite3.Connection) -> str:
+        """Insert a new identity row. The caller must hold a transaction."""
+        continuity_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO backend_identity (singleton, continuity_id, created_at_utc) "
+            "VALUES (1, ?, ?)",
+            (continuity_id, _iso_from_epoch(float(self._clock()))),
+        )
+        return continuity_id
+
+    def _ensure_identity_locked(self, conn: sqlite3.Connection, *, allow_mint: bool) -> str:
+        """Return the existing identity, minting only for a brand-new journal.
+
+        A pre-existing journal with zero, multiple, or malformed identity rows is
+        **never** silently repaired or re-minted.
+        """
+        rows = conn.execute(
+            "SELECT singleton, continuity_id, created_at_utc FROM backend_identity"
+        ).fetchall()
+        if len(rows) == 1:
+            singleton, continuity_id, created_at = rows[0]
+            if singleton != 1:
+                raise StoreError(
+                    "the synthetic provider journal's backend identity singleton "
+                    "must be 1; refusing to repair it."
+                )
+            _validate_continuity_value(continuity_id)
+            if not isinstance(created_at, str) or not created_at:
+                raise StoreError(
+                    "the synthetic provider journal's backend identity is missing "
+                    "its created timestamp; refusing to repair it."
+                )
+            return str(continuity_id)
+        if len(rows) == 0:
+            if allow_mint:
+                return self._mint_identity(conn)
+            raise StoreError(
+                "the existing synthetic provider journal has no backend identity; "
+                "refusing to mint a replacement identity for it."
+            )
+        raise StoreError(
+            "the synthetic provider journal must contain exactly one backend "
+            "identity row; refusing to repair it."
+        )
 
     # -- admit --------------------------------------------------------------- #
     def admit(
@@ -529,10 +873,14 @@ class SyntheticBackend:
         """Durably admit a synthetic dispatch and return a non-completion receipt.
 
         Identical repeated admission (same ``dispatch_id``, same project, same
-        parameters) is idempotent. A divergent project or divergent parameters
-        under the same ``dispatch_id`` raises :class:`SyntheticConflict`. If the
-        journal cannot be shown to be the same one that recorded prior work,
-        :class:`SyntheticContinuityError` is raised instead of duplicating work.
+        parameters) is idempotent even under concurrency: the identity
+        initialization, the existing-record read, and the insert all run inside a
+        single ``BEGIN IMMEDIATE`` transaction, and a unique-key race re-reads to
+        return the idempotent/conflicting outcome instead of failing. A divergent
+        project or divergent parameters under the same ``dispatch_id`` raises
+        :class:`SyntheticConflict`. If the journal cannot be shown to be the same
+        one that recorded prior work, :class:`SyntheticContinuityError` is raised
+        instead of duplicating work.
         """
         did = _validate_dispatch_id(dispatch_id)
         pid = paths.validate_project_id(project_id)
@@ -540,16 +888,18 @@ class SyntheticBackend:
         delay_ms = _bounded_int(delay_ms, name="delay_ms", lo=MIN_DELAY_MS, hi=MAX_DELAY_MS)
         mode = _validate_mode(outcome)
 
+        self._validate_layout_readonly()
+        # Read-only validation of an existing journal before any chmod/pragma.
+        self._preflight_readonly()
         if self._continuity_status() == "broken":
             raise SyntheticContinuityError(
                 f"the provider journal for dispatch {did!r} is missing or is not "
                 f"the journal that recorded prior work; refusing to re-admit "
                 f"(reconcile or escalate instead of duplicating external work)."
             )
+        existed = self.journal_present
 
         paths.ensure_owner_private_dir(self._runtime_dir)
-        self._preflight_readonly()
-
         conn = schema.open_connection(self._journal_path)
         try:
             schema.migrate(
@@ -560,50 +910,78 @@ class SyntheticBackend:
             )
             paths.ensure_owner_private_file(self._journal_path)
 
-            continuity_id = self._ensure_identity(conn)
-            self._observed_continuity_id = continuity_id
-
-            existing = conn.execute(
-                "SELECT * FROM dispatch WHERE dispatch_id = ?", (did,)
-            ).fetchone()
-            if existing is not None:
-                self._assert_same_request(existing, pid=pid, mode=mode, steps=steps, delay_ms=delay_ms)
-                return _receipt_from_row(existing, idempotent=True)
-
-            now = float(self._clock())
-            ready = now + delay_ms / 1000.0
-            value = _result_value(did, pid, steps)
             with transaction(conn):
-                conn.execute(
-                    """
-                    INSERT INTO dispatch (
-                        dispatch_id, project_id, mode, steps, delay_ms,
-                        admitted_at_utc, ready_at_utc, admitted_epoch_s,
-                        ready_epoch_s, result_value, result_marker,
-                        actual_external_cost_usd
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        did,
-                        pid,
-                        mode,
-                        steps,
-                        delay_ms,
-                        _iso_from_epoch(now),
-                        _iso_from_epoch(ready),
-                        now,
-                        ready,
-                        value,
-                        RESULT_MARKER,
-                        ACTUAL_EXTERNAL_COST_USD_ZERO,
-                    ),
+                continuity_id = self._ensure_identity_locked(
+                    conn, allow_mint=not existed
                 )
-            row = conn.execute(
-                "SELECT * FROM dispatch WHERE dispatch_id = ?", (did,)
-            ).fetchone()
-            return _receipt_from_row(row, idempotent=False)
+                self._observed_continuity_id = continuity_id
+
+                existing = conn.execute(
+                    "SELECT * FROM dispatch WHERE dispatch_id = ?", (did,)
+                ).fetchone()
+                if existing is not None:
+                    return self._replay_or_conflict(
+                        existing, pid=pid, mode=mode, steps=steps, delay_ms=delay_ms
+                    )
+
+                now = float(self._clock())
+                ready = now + delay_ms / 1000.0
+                value = _result_value(did, pid, steps)
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO dispatch (
+                            dispatch_id, project_id, mode, steps, delay_ms,
+                            admitted_at_utc, ready_at_utc, admitted_epoch_s,
+                            ready_epoch_s, result_value, result_marker,
+                            actual_external_cost_usd
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            did,
+                            pid,
+                            mode,
+                            steps,
+                            delay_ms,
+                            _iso_from_epoch(now),
+                            _iso_from_epoch(ready),
+                            now,
+                            ready,
+                            value,
+                            RESULT_MARKER,
+                            ACTUAL_EXTERNAL_COST_USD_ZERO,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    # A concurrent identical admission won the unique key; re-read
+                    # and return the idempotent (or conflicting) outcome.
+                    raced = conn.execute(
+                        "SELECT * FROM dispatch WHERE dispatch_id = ?", (did,)
+                    ).fetchone()
+                    if raced is None:
+                        raise
+                    return self._replay_or_conflict(
+                        raced, pid=pid, mode=mode, steps=steps, delay_ms=delay_ms
+                    )
+                row = conn.execute(
+                    "SELECT * FROM dispatch WHERE dispatch_id = ?", (did,)
+                ).fetchone()
+                return _receipt_from_row(row, idempotent=False)
         finally:
             conn.close()
+
+    def _replay_or_conflict(
+        self,
+        row: sqlite3.Row,
+        *,
+        pid: str,
+        mode: str,
+        steps: int,
+        delay_ms: int,
+    ) -> AdmissionReceipt:
+        _validate_dispatch_row(row)
+        self._assert_same_request(row, pid=pid, mode=mode, steps=steps, delay_ms=delay_ms)
+        return _receipt_from_row(row, idempotent=True)
 
     @staticmethod
     def _assert_same_request(
@@ -623,28 +1001,15 @@ class SyntheticBackend:
                 f"overwrite a divergent request."
             )
 
-    def _ensure_identity(self, conn: sqlite3.Connection) -> str:
-        row = conn.execute(
-            "SELECT continuity_id FROM backend_identity WHERE singleton = 1"
-        ).fetchone()
-        if row is not None:
-            return str(row[0])
-        continuity_id = uuid.uuid4().hex
-        with transaction(conn):
-            conn.execute(
-                "INSERT INTO backend_identity (singleton, continuity_id, created_at_utc) "
-                "VALUES (1, ?, ?)",
-                (continuity_id, _iso_from_epoch(float(self._clock()))),
-            )
-        return continuity_id
-
     # -- lookup -------------------------------------------------------------- #
     def lookup(self, dispatch_id: str, project_id: str) -> LookupResult:
         """Authoritatively look up a dispatch identity, read-only.
 
         Returns ``absent`` / ``admitted`` / ``completed`` / ``failed`` /
         ``unknown``. Never initializes, migrates, or overwrites the journal; a
-        foreign target is refused and left untouched.
+        foreign target is refused and left untouched. A ``dispatch_id`` that
+        belongs to another project is an ``unknown`` identity conflict, never a
+        definitive ``absent``.
         """
         did = _validate_dispatch_id(dispatch_id)
         pid = paths.validate_project_id(project_id)
@@ -676,11 +1041,25 @@ class SyntheticBackend:
         finally:
             conn.close()
 
-        if row is None or row["project_id"] != pid:
+        if row is None:
             return LookupResult(
                 dispatch_id=did, project_id=pid, status="absent", definitive=True
             )
+        if row["project_id"] != pid:
+            # The identity exists but is owned by another project: absence is not
+            # proof, and the engine must not re-dispatch under this identity.
+            return LookupResult(
+                dispatch_id=did,
+                project_id=pid,
+                status="unknown",
+                definitive=False,
+                reason="identity_owned_by_another_project",
+                outcome_unresolved=True,
+                escalation_required=True,
+                identity_conflict=True,
+            )
 
+        _validate_dispatch_row(row)
         return self._materialize(row)
 
     def _materialize(self, row: sqlite3.Row) -> LookupResult:
@@ -741,8 +1120,8 @@ class SyntheticBackend:
         """``True`` only when the dispatch is **definitively** absent.
 
         Proving durable absence is the *only* safe basis for dispatching under an
-        identity that may already exist. A lost journal or an indeterminate
-        outcome returns ``False``.
+        identity that may already exist. A lost journal, an identity conflict, or
+        an indeterminate outcome returns ``False``.
         """
         result = self.lookup(dispatch_id, project_id)
         return result.status == "absent" and result.definitive

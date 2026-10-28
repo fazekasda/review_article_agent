@@ -23,7 +23,9 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -81,6 +83,39 @@ class SyntheticBackendTest(unittest.TestCase):
 
     def journal_path(self) -> Path:
         return self.data_dir / RUNTIME_DIR_NAME / JOURNAL_FILENAME
+
+    # -- raw journal helpers (owned, disposable fixtures) ---------------- #
+    def _runtime(self) -> Path:
+        runtime = self.data_dir / RUNTIME_DIR_NAME
+        runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(runtime, 0o700)
+        return runtime
+
+    def _write_journal_script(self, script: str) -> None:
+        """Create a journal file directly from SQL, owner-private."""
+        journal = self.journal_path()
+        conn = sqlite3.connect(str(journal))
+        try:
+            conn.executescript(script)
+            conn.commit()
+        finally:
+            conn.close()
+        os.chmod(journal, 0o600)
+
+    def _tamper(self, mutate) -> None:  # type: ignore[no-untyped-def]
+        conn = sqlite3.connect(str(self.journal_path()))
+        try:
+            mutate(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _dispatch_row_count(self) -> int:
+        conn = sqlite3.connect(str(self.journal_path()))
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM dispatch").fetchone()[0])
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------ #
     # journal location / owner-private safety
@@ -213,13 +248,19 @@ class SyntheticBackendTest(unittest.TestCase):
         self.assertIsNone(result.result)
 
     # ------------------------------------------------------------------ #
-    # wrong project
+    # cross-project identity conflict (never a definitive absence)
     # ------------------------------------------------------------------ #
-    def test_wrong_project_lookup_is_absent_and_admit_conflicts(self) -> None:
+    def test_cross_project_lookup_is_unknown_conflict_not_absence(self) -> None:
         backend = self.backend()
         backend.admit("d-proj", self.project_a, steps=2, delay_ms=0)
+        # The dispatch_id exists but belongs to project A: for project B this is
+        # an identity conflict, not a proven absence.
         other = backend.lookup("d-proj", self.project_b)
-        self.assertEqual(other.status, "absent")
+        self.assertEqual(other.status, "unknown")
+        self.assertFalse(other.definitive)
+        self.assertTrue(other.escalation_required)
+        self.assertTrue(other.identity_conflict)
+        self.assertFalse(backend.same_identity_dispatch_allowed("d-proj", self.project_b))
         with self.assertRaises(SyntheticConflict):
             backend.admit("d-proj", self.project_b, steps=2, delay_ms=0)
 
@@ -357,6 +398,217 @@ class SyntheticBackendTest(unittest.TestCase):
         backend = self.backend()
         backend.admit("d-min", self.project_a, steps=1, delay_ms=0)
         backend.admit("d-max", self.project_a, steps=MAX_STEPS, delay_ms=MAX_DELAY_MS)
+
+    # ------------------------------------------------------------------ #
+    # initialize(): continuity id before the first dispatch
+    # ------------------------------------------------------------------ #
+    def backend_in(self, name: str, **kwargs: object) -> SyntheticBackend:
+        kwargs.setdefault("clock", self.clock)  # type: ignore[arg-type]
+        return SyntheticBackend(self.tmp / name, **kwargs)  # type: ignore[arg-type]
+
+    def test_initialize_returns_stable_id_with_no_admissions(self) -> None:
+        backend = self.backend()
+        first = backend.initialize()
+        self.assertRegex(first, r"[0-9a-f]{32}")
+        self.assertEqual(backend.initialize(), first)
+        self.assertTrue(backend.journal_present)
+        self.assertEqual(self._dispatch_row_count(), 0)
+        self.assertEqual(backend.continuity_id, first)
+
+        # Authoritative absence holds with a present but empty journal.
+        result = backend.lookup("d-none", self.project_a)
+        self.assertEqual(result.status, "absent")
+        self.assertTrue(result.definitive)
+
+        # Reopening with the known id supports the same authoritative absence.
+        reopened = self.backend(expected_continuity_id=first)
+        self.assertEqual(reopened.initialize(), first)
+        self.assertEqual(reopened.lookup("d-none", self.project_a).status, "absent")
+
+    def test_initialize_refuses_when_journal_lost_or_replaced(self) -> None:
+        backend = self.backend()
+        continuity_id = backend.initialize()
+        self.journal_path().unlink()
+
+        # Same instance (observed) refuses and reports unknown, never absent.
+        with self.assertRaises(SyntheticContinuityError):
+            backend.initialize()
+        self.assertEqual(backend.lookup("d-none", self.project_a).status, "unknown")
+
+        # A fresh instance that knows the id also refuses to mint a replacement.
+        aware = self.backend(expected_continuity_id=continuity_id)
+        with self.assertRaises(SyntheticContinuityError):
+            aware.initialize()
+        self.assertEqual(aware.lookup("d-none", self.project_a).status, "unknown")
+
+        # A replaced journal (a different continuity id) is refused too.
+        replacement = self.backend()
+        new_id = replacement.initialize()
+        self.assertNotEqual(new_id, continuity_id)
+        with self.assertRaises(SyntheticContinuityError):
+            self.backend(expected_continuity_id=continuity_id).initialize()
+
+    # ------------------------------------------------------------------ #
+    # journal content validation (marker value / schema / identity / rows)
+    # ------------------------------------------------------------------ #
+    def test_wrong_marker_value_refused_and_untouched(self) -> None:
+        self.backend().initialize()
+        self._tamper(
+            lambda c: c.execute("UPDATE synthetic_marker SET value = 'not-ours'")
+        )
+        before = self.journal_path().read_bytes()
+        with self.assertRaises(StoreError):
+            self.backend()
+        self.assertEqual(self.journal_path().read_bytes(), before)
+
+    def test_same_table_names_but_foreign_schema_refused_and_untouched(self) -> None:
+        self._runtime()
+        self._write_journal_script(
+            """
+            PRAGMA user_version = 1;
+            CREATE TABLE synthetic_marker (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO synthetic_marker VALUES
+                ('backend', 'review_article_agent.synthetic_backend.v1');
+            CREATE TABLE backend_identity (
+                singleton INTEGER PRIMARY KEY, continuity_id TEXT, created_at_utc TEXT);
+            CREATE TABLE dispatch (dispatch_id TEXT PRIMARY KEY, project_id TEXT, mode TEXT);
+            """
+        )
+        before = self.journal_path().read_bytes()
+        with self.assertRaises(StoreError):
+            self.backend()
+        self.assertEqual(self.journal_path().read_bytes(), before)
+
+    def test_required_table_missing_refused(self) -> None:
+        self._runtime()
+        self._write_journal_script(
+            """
+            PRAGMA user_version = 1;
+            CREATE TABLE synthetic_marker (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO synthetic_marker VALUES
+                ('backend', 'review_article_agent.synthetic_backend.v1');
+            CREATE TABLE backend_identity (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                continuity_id TEXT NOT NULL, created_at_utc TEXT NOT NULL);
+            """
+        )
+        with self.assertRaises(StoreError):
+            self.backend()
+
+    def test_wrong_user_version_refused(self) -> None:
+        self.backend().initialize()
+        self._tamper(lambda c: c.execute("PRAGMA user_version = 0"))
+        with self.assertRaises(StoreError):
+            self.backend()
+
+    def test_missing_identity_row_refused_and_never_repaired(self) -> None:
+        backend = self.backend()
+        backend.initialize()
+        self._tamper(lambda c: c.execute("DELETE FROM backend_identity"))
+        before = self.journal_path().read_bytes()
+        with self.assertRaises(StoreError):
+            self.backend()
+        self.assertEqual(self.journal_path().read_bytes(), before)
+        # admit must not silently mint a replacement identity either.
+        with self.assertRaises(StoreError):
+            backend.admit("d-x", self.project_a, steps=1, delay_ms=0)
+
+    def test_invalid_continuity_id_refused(self) -> None:
+        self.backend().initialize()
+        self._tamper(
+            lambda c: c.execute("UPDATE backend_identity SET continuity_id = 'not-hex'")
+        )
+        with self.assertRaises(StoreError):
+            self.backend()
+
+    def test_malformed_dispatch_row_refused(self) -> None:
+        for column, value in (
+            ("result_marker", "'tampered'"),
+            ("actual_external_cost_usd", "'9.99'"),
+            ("steps", "999999"),
+            ("result_value", "999999999"),
+        ):
+            with self.subTest(column=column):
+                backend = self.backend_in(f"j-{column}")
+                backend.admit("d-x", self.project_a, steps=1, delay_ms=0)
+                self._tamper_dir(
+                    f"j-{column}",
+                    lambda c, col=column, val=value: c.execute(
+                        f"UPDATE dispatch SET {col} = {val}"
+                    ),
+                )
+                with self.assertRaises(StoreError):
+                    backend.lookup("d-x", self.project_a)
+
+    def test_dispatch_mode_is_constrained_by_the_schema(self) -> None:
+        # An unknown mode cannot even be stored: the canonical schema CHECK
+        # rejects it (defense in depth alongside the read-time validation).
+        backend = self.backend()
+        backend.admit("d-mode", self.project_a, steps=1, delay_ms=0)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._tamper(
+                lambda c: c.execute("UPDATE dispatch SET mode = 'bogus'")
+            )
+
+    def _tamper_dir(self, name: str, mutate) -> None:  # type: ignore[no-untyped-def]
+        path = self.tmp / name / RUNTIME_DIR_NAME / JOURNAL_FILENAME
+        conn = sqlite3.connect(str(path))
+        try:
+            mutate(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ #
+    # directory safety before mutating
+    # ------------------------------------------------------------------ #
+    def test_runtime_dir_symlink_refused_and_target_untouched(self) -> None:
+        self.data_dir.mkdir(mode=0o700)
+        os.chmod(self.data_dir, 0o700)
+        real = self.tmp / "real-runtime"
+        real.mkdir(mode=0o700)
+        os.chmod(real, 0o700)
+        os.symlink(real, self.data_dir / RUNTIME_DIR_NAME)
+        with self.assertRaises(StoreError):
+            self.backend().initialize()
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_data_dir_symlink_refused(self) -> None:
+        real = self.tmp / "real-data"
+        real.mkdir(mode=0o700)
+        os.chmod(real, 0o700)
+        os.symlink(real, self.data_dir)
+        with self.assertRaises(StoreError):
+            self.backend().initialize()
+
+    def test_non_owner_private_runtime_dir_refused(self) -> None:
+        runtime = self.data_dir / RUNTIME_DIR_NAME
+        runtime.mkdir(parents=True, mode=0o755)
+        os.chmod(runtime, 0o755)
+        with self.assertRaises(ProjectPathError):
+            self.backend().initialize()
+
+    # ------------------------------------------------------------------ #
+    # concurrent identical admission is a single idempotent row
+    # ------------------------------------------------------------------ #
+    def test_simultaneous_identical_admit_is_single_idempotent_row(self) -> None:
+        backend = self.backend()
+        backend.initialize()
+        backend.lookup("warm", self.project_a)  # warm the reference schema
+
+        workers = 8
+        barrier = threading.Barrier(workers)
+
+        def run() -> AdmissionReceipt:
+            barrier.wait()
+            return backend.admit("d-race", self.project_a, steps=11, delay_ms=5000)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            receipts = list(pool.map(lambda _: run(), range(workers)))
+
+        self.assertEqual(self._dispatch_row_count(), 1)
+        self.assertEqual(len({r.admitted_at_utc for r in receipts}), 1)
+        self.assertEqual(len([r for r in receipts if not r.idempotent]), 1)
 
 
 if __name__ == "__main__":
