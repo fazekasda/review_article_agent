@@ -905,6 +905,29 @@ class MappingValidatorTest(unittest.TestCase):
         with self.assertRaises(dr.DecisionRecordValidationError):
             dr.validate_decision_record_mapping(mapping)
 
+    def test_returns_no_list_alias(self):
+        # The validator promises a fresh plain copy; every list descendant
+        # (options/levels/consumed_versions) must be copied, not aliased.
+        mapping = project()[1].as_mapping()  # choice question -> options/levels lists
+        returned = dr.validate_decision_record_mapping(mapping)
+        for key in ("options", "levels", "consumed_versions"):
+            self.assertIsInstance(returned[key], list)
+            self.assertIsNot(returned[key], mapping[key])
+        returned["options"].append("MUTATED")
+        returned["consumed_versions"].append("MUTATED")
+        self.assertNotIn("MUTATED", mapping["options"])
+        self.assertNotIn("MUTATED", mapping["consumed_versions"])
+
+    def test_returns_no_nested_list_alias(self):
+        # Nested lists are copied recursively too (not only Mapping/tuple).
+        source = {"a": [1, [2, 3]], "b": (4, 5)}
+        copied = dr._thaw(source)
+        self.assertEqual(copied, {"a": [1, [2, 3]], "b": [4, 5]})
+        self.assertIsNot(copied["a"], source["a"])
+        self.assertIsNot(copied["a"][1], source["a"][1])
+        copied["a"][1].append(99)
+        self.assertEqual(source["a"][1], [2, 3])
+
 
 # --------------------------------------------------------------------------- #
 # Boundary: an untrusted mapping is bounded before any walk/thaw/freeze
@@ -1110,6 +1133,25 @@ class PresenceEnvelopeTest(unittest.TestCase):
         mapping["schema_version"] = True
         with self.assertRaises(dr.DecisionRecordValidationError):
             dr.validate_decision_record_mapping(mapping)
+
+    def test_float_schema_version_denied(self):
+        # 1.0 == 1 but is not an actual int; a versioned representation must be
+        # an exact integer literal, never a float.
+        mapping = project()[0].as_mapping()
+        mapping["schema_version"] = 1.0
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_string_schema_version_denied(self):
+        mapping = project()[0].as_mapping()
+        mapping["schema_version"] = "1"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_int_schema_version_accepted(self):
+        mapping = project()[0].as_mapping()
+        self.assertEqual(mapping["schema_version"], 1)
+        self.assertEqual(dr.validate_decision_record_mapping(mapping), mapping)
 
 
 # --------------------------------------------------------------------------- #

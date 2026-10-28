@@ -378,7 +378,7 @@ def _deep_freeze(value: Any) -> Any:
 def _thaw(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {key: _thaw(item) for key, item in value.items()}
-    if isinstance(value, tuple):
+    if isinstance(value, (list, tuple)):
         return [_thaw(item) for item in value]
     return value
 
@@ -1051,7 +1051,11 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
     if keys - (_REQUIRED_KEYS | _OPTIONAL_KEYS) or _REQUIRED_KEYS - keys:
         _err(_M_RECORD_KEYS)
     schema_version = mapping["schema_version"]
-    if isinstance(schema_version, bool) or schema_version != DECISION_RECORD_SCHEMA_VERSION:
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != DECISION_RECORD_SCHEMA_VERSION
+    ):
         _err(_M_RECORD_VERSION)
 
     decision_id = mapping["decision_id"]
