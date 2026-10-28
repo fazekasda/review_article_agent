@@ -975,6 +975,55 @@ class JobRepository:
             self._set_job_state(job_id, "waiting_external", preserve_held=True)
         return self._require_job(job_id)
 
+    # -- trusted same-attempt resume (proven undispatched only) -------------- #
+    def resume_proven_undispatched(self, attempt_id: str) -> Attempt:
+        """Return a *proven-never-dispatched* current attempt to ``queued``.
+
+        This is the **only** trusted operation that reopens an existing attempt
+        identity after an interruption. It is valid only when the caller has
+        proven — by ordering (no continuity/admission checkpoint was durably
+        recorded before the crash a dispatch could have been issued) or by an
+        authoritative backend ``absent`` lookup — that the external request was
+        **never** issued. It:
+
+        * refuses a stale (non-current) attempt and any attempt that carries an
+          external admission (``admission_id`` is not ``None``): a missing local
+          receipt alone is never proof that nothing was dispatched;
+        * keeps the **same** ``attempt_id``/``fence`` — no new identity, no new
+          reserve, no fence bump;
+        * clears the job's unresolved bit and returns it to ``queued`` unless the
+          job is scheduling-held (``paused``/``cancelled``), whose state is
+          preserved (a resume still cannot bypass an explicit pause/cancel).
+        """
+        attempt_id = validate_identifier(attempt_id, "attempt_id")
+        with self._store.transaction():
+            attempt = self._require_attempt(attempt_id)
+            job = self._require_current_attempt(attempt)
+            if attempt.admission_id is not None:
+                raise JobStateError(
+                    f"attempt {attempt_id!r} carries an external admission; it "
+                    f"cannot be reopened as an undispatched same attempt."
+                )
+            if attempt.state == "queued":
+                return attempt  # already reopened (idempotent)
+            if attempt.state not in ("interrupted", "ambiguous"):
+                raise JobStateError(
+                    f"attempt {attempt_id!r} is {attempt.state!r}; only an "
+                    f"interrupted/ambiguous undispatched attempt may be reopened."
+                )
+            self._conn().execute(
+                "UPDATE job_attempt SET state = 'queued', outcome_unresolved = 0, "
+                " ended_at_utc = NULL WHERE project_id = ? AND attempt_id = ?",
+                (self.project_id, attempt_id),
+            )
+            self._conn().execute(
+                "UPDATE job SET outcome_unresolved = 0 "
+                "WHERE project_id = ? AND job_id = ?",
+                (self.project_id, job.job_id),
+            )
+            self._set_job_state(job.job_id, "queued", preserve_held=True)
+        return self._require_attempt(attempt_id)
+
     # -- recovery / reconciliation ------------------------------------------- #
     def recover(self, attempt_id: str) -> RecoveryOutcome:
         """Recover the current attempt after a worker restart, from durable state.

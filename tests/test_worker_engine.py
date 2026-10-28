@@ -1,0 +1,566 @@
+"""Standalone worker engine tests (Step 03, task T4).
+
+Covers ``docs/implementation/03-durable-worker.md`` deliverables/ACs and
+``docs/contracts/02-gates-and-runtime.md`` §5.6/§6.3/§8 against the integrated
+engine (``review_article_agent.worker.engine``):
+
+* strict request validation (version / op whitelist / known keys / no trusted
+  ``uid``/``actor`` field) and curated static error results (never a raw trace);
+* the T5a launcher contract: ``status`` and ``stop`` over a real UDS server, and
+  the detached ``python -m review_article_agent.worker`` entry point;
+* one numeric completion with exactly one accepted result;
+* an ambiguous outcome is never resent under a new identity;
+* pause / budget cap stop new dispatch (and are visible, not a false success);
+* a waiting-human gate does not busy-loop;
+* a safe switch quiesces the old project before another project executes.
+
+The comprehensive SIGKILL restart matrix is a separate task by design; this file
+uses the in-process fault seams and the test-only SIGSTOP gate only where the
+seam is exercised.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from review_article_agent.runtime.ipc import WorkerIPCClient, WorkerIPCServer  # noqa: E402
+from review_article_agent.runtime.jobs import JobStateError  # noqa: E402
+from review_article_agent.storage import Registry  # noqa: E402
+from review_article_agent.worker.engine import (  # noqa: E402
+    APP_NAME,
+    PROTOCOL_VERSION,
+    SYNTHETIC_NUMERIC_TASK,
+    SYNTHETIC_WAITING_HUMAN_TASK,
+    WorkerEngine,
+)
+
+
+def _req(op: str, **kw: object) -> dict:
+    return {"version": PROTOCOL_VERSION, "op": op, **kw}
+
+
+class EngineTestBase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="raa-engine-")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.data_dir = self.tmp / "state"
+        self.registry = Registry(self.data_dir)
+        self.project = self.registry.create_project(self.tmp / "a", name="A")
+        self.engine = WorkerEngine(str(self.data_dir), registry=self.registry)
+        self.addCleanup(self.engine.close)
+
+    def _activate(self) -> None:
+        self.registry.activate_execution(self.project.project_id)
+        # Engine re-reads activation lazily; refresh its cached activation.
+        self.engine.handle(_req("switch", project_id=self.project.project_id))
+
+    def _drain_engine(self, max_ticks: int = 2000) -> None:
+        """Run the scheduler until it reports no pending work (bounded)."""
+        for _ in range(max_ticks):
+            timeout = self.engine.tick()
+            if timeout is None:
+                return
+            if timeout > 0:
+                time.sleep(min(timeout, 0.02))
+        self.fail("engine did not settle within the tick budget")
+
+    def _submit_numeric(self, request_id: str, **kw: object) -> dict:
+        params = {
+            "request_id": request_id,
+            "task_kind": SYNTHETIC_NUMERIC_TASK,
+            "steps": kw.pop("steps", 10),
+            "delay_ms": kw.pop("delay_ms", 0),
+            "outcome": kw.pop("outcome", "complete"),
+            "stage": kw.pop("stage", "stage-1"),
+            "reserve_usd": kw.pop("reserve_usd", "0.10"),
+        }
+        params.update(kw)
+        return self.engine.handle(_req("submit", project_id=self.project.project_id, **params))
+
+
+class ValidationTest(EngineTestBase):
+    def test_status_and_unknown_op_and_version(self) -> None:
+        self._activate()
+        ok = self.engine.handle(_req("status"))
+        self.assertTrue(ok["ok"])
+        self.assertEqual(ok["app"], APP_NAME)
+        self.assertEqual(ok["protocol_version"], PROTOCOL_VERSION)
+        self.assertEqual(ok["pid"], os.getpid())
+        self.assertTrue(ok["state"])
+
+        bad_version = self.engine.handle({"version": 2, "op": "status"})
+        self.assertFalse(bad_version["ok"])
+        self.assertEqual(bad_version["code"], "unsupported_version")
+
+        unknown = self.engine.handle({"version": PROTOCOL_VERSION, "op": "rm -rf"})
+        self.assertFalse(unknown["ok"])
+        self.assertEqual(unknown["code"], "unknown_op")
+
+    def test_unknown_field_is_rejected_never_trusted(self) -> None:
+        self._activate()
+        # A caller-supplied authority/actor field must never be accepted.
+        for field in ("uid", "actor", "role"):
+            res = self.engine.handle(
+                {"version": PROTOCOL_VERSION, "op": "status", field: "owner"}
+            )
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["code"], "unknown_key")
+
+    def test_errors_are_curated_static_and_never_raise(self) -> None:
+        self._activate()
+        # missing required submit field returns a static typed code, not a raise.
+        res = self.engine.handle(_req("submit", project_id=self.project.project_id))
+        self.assertFalse(res["ok"])
+        self.assertIn(res["code"], {"bad_value", "missing_key"})
+        self.assertTrue(res["message"])
+
+    def test_submit_before_activation_is_denied(self) -> None:
+        res = self._submit_numeric("r0")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["code"], "not_activated")
+
+    def test_submit_for_other_project_is_rejected(self) -> None:
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        self._activate()
+        res = self.engine.handle(
+            _req(
+                "submit",
+                project_id=other.project_id,
+                request_id="r0",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                steps=1,
+                delay_ms=0,
+                outcome="complete",
+                stage="s",
+                reserve_usd="0.1",
+            )
+        )
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["code"], "wrong_project")
+
+    def test_out_of_range_and_bad_payload_are_rejected(self) -> None:
+        self._activate()
+        self.assertEqual(self._submit_numeric("r1", steps=0)["code"], "bad_value")
+        self.assertEqual(self._submit_numeric("r2", steps=1001)["code"], "bad_value")
+        self.assertEqual(self._submit_numeric("r3", delay_ms=60001)["code"], "bad_value")
+        self.assertEqual(self._submit_numeric("r4", outcome="explode")["code"], "bad_value")
+        self.assertEqual(self._submit_numeric("r5", reserve_usd="-1")["code"], "bad_value")
+        self.assertEqual(self._submit_numeric("r6", reserve_usd=0.1)["code"], "bad_type")
+
+
+class NumericCompletionTest(EngineTestBase):
+    def test_one_numeric_completion_yields_one_accepted_result(self) -> None:
+        self._activate()
+        submitted = self._submit_numeric("req-1", steps=42, delay_ms=0)
+        self.assertTrue(submitted["ok"])
+        job_id = submitted["job"]["job_id"]
+
+        self._drain_engine()
+
+        res = self.engine.handle(
+            _req("job_status", project_id=self.project.project_id, job_id=job_id)
+        )
+        self.assertTrue(res["ok"])
+        job = res["job"]
+        self.assertEqual(job["state"], "completed")
+        self.assertFalse(job["outcome_unresolved"])
+        self.assertEqual(job["attempts_total"], 1)
+        self.assertIsNotNone(job["accepted_result"])
+        self.assertEqual(job["accepted_result"]["result_kind"], "synthetic_numeric")
+        # exactly one accepted result row.
+        repo = self.engine._repo_for(self.project.project_id)
+        self.assertEqual(len(repo.attempts(job_id)), 1)
+
+    def test_idempotent_resubmit_does_not_create_second_job(self) -> None:
+        self._activate()
+        first = self._submit_numeric("dup", steps=5)
+        self._drain_engine()
+        second = self._submit_numeric("dup", steps=5)
+        self.assertEqual(first["job"]["job_id"], second["job"]["job_id"])
+        listing = self.engine.handle(
+            _req("job_list", project_id=self.project.project_id)
+        )
+        self.assertEqual(len(listing["jobs"]), 1)
+
+
+class AmbiguousTest(EngineTestBase):
+    def test_ambiguous_outcome_never_resent_and_escalates(self) -> None:
+        self._activate()
+        submitted = self._submit_numeric("am-1", outcome="ambiguous")
+        job_id = submitted["job"]["job_id"]
+        self._drain_engine()
+        res = self.engine.handle(
+            _req("job_status", project_id=self.project.project_id, job_id=job_id)
+        )
+        job = res["job"]
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertTrue(job["outcome_unresolved"])
+        self.assertEqual(job["attempts_total"], 1)
+        # No new identity: still exactly one attempt.
+        repo = self.engine._repo_for(self.project.project_id)
+        self.assertEqual(len(repo.attempts(job_id)), 1)
+
+    def test_failed_outcome_is_explicit_and_terminal(self) -> None:
+        self._activate()
+        submitted = self._submit_numeric("fail-1", outcome="failure")
+        job_id = submitted["job"]["job_id"]
+        self._drain_engine()
+        res = self.engine.handle(
+            _req("job_status", project_id=self.project.project_id, job_id=job_id)
+        )
+        job = res["job"]
+        self.assertEqual(job["state"], "failed")
+        self.assertFalse(job["outcome_unresolved"])
+
+
+class PauseAndBudgetTest(EngineTestBase):
+    def test_pause_stops_new_dispatch(self) -> None:
+        self._activate()
+        paused = self.engine.handle(
+            _req("pause", project_id=self.project.project_id)
+        )
+        self.assertTrue(paused["ok"])
+        denied = self._submit_numeric("p-1")
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["code"], "denied")
+        resumed = self.engine.handle(_req("resume", project_id=self.project.project_id))
+        self.assertTrue(resumed["ok"])
+        allowed = self._submit_numeric("p-2")
+        self.assertTrue(allowed["ok"])
+
+    def test_budget_cap_stops_dispatch_with_visible_reason(self) -> None:
+        self._activate()
+        repo = self.engine._repo_for(self.project.project_id)
+        repo.set_budget_policy(project_cap_usd="0.05", stage_cap_usd="0.05")
+        submitted = self._submit_numeric("b-1", reserve_usd="0.10")
+        job_id = submitted["job"]["job_id"]
+        self._drain_engine()
+        res = self.engine.handle(
+            _req("job_status", project_id=self.project.project_id, job_id=job_id)
+        )
+        job = res["job"]
+        # Not a false success: the job is waiting_human with an explicit reason.
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertEqual(job["wait_reason"], "budget_exceeded")
+        self.assertNotEqual(job["state"], "completed")
+
+
+class NoBusyLoopTest(EngineTestBase):
+    def test_waiting_human_gate_does_not_busy_loop(self) -> None:
+        self._activate()
+        submitted = self.engine.handle(
+            _req(
+                "submit",
+                project_id=self.project.project_id,
+                request_id="w-1",
+                task_kind=SYNTHETIC_WAITING_HUMAN_TASK,
+            )
+        )
+        self.assertTrue(submitted["ok"])
+        self.assertEqual(submitted["job"]["state"], "waiting_human")
+        # tick reports no pending work: the caller blocks instead of spinning.
+        self.assertIsNone(self.engine.tick())
+        self.assertIsNone(self.engine.tick())
+
+    def test_idle_engine_reports_no_pending_work(self) -> None:
+        self._activate()
+        self.assertIsNone(self.engine.tick())
+
+
+class SameAttemptResumeTest(EngineTestBase):
+    def test_resume_refuses_after_admission_but_reopens_proven_undispatched(self) -> None:
+        self._activate()
+        repo = self.engine._repo_for(self.project.project_id)
+
+        # (a) An attempt that was admitted may never be reopened same-identity.
+        job_a = repo.submit(
+            "resume-admitted",
+            task_kind=SYNTHETIC_NUMERIC_TASK,
+            parameters={"stage": "s", "reserve_usd": "0.1"},
+        )
+        att_a = repo.begin_attempt(
+            job_a.job_id, dispatch_kind="external_synthetic", stage="s", reserve_usd="0.1"
+        )
+        repo.mark_admitted(att_a.attempt_id, admission_id="adm-" + att_a.attempt_id)
+        repo.recover(att_a.attempt_id)
+        with self.assertRaises(JobStateError):
+            repo.resume_proven_undispatched(att_a.attempt_id)
+
+        # (b) A proven-undispatched interrupted attempt reopens the SAME identity.
+        job_b = repo.submit(
+            "resume-undispatched",
+            task_kind=SYNTHETIC_NUMERIC_TASK,
+            parameters={"stage": "s", "reserve_usd": "0.1"},
+        )
+        att_b = repo.begin_attempt(
+            job_b.job_id, dispatch_kind="external_synthetic", stage="s", reserve_usd="0.1"
+        )
+        repo.recover(att_b.attempt_id)
+        reopened = repo.resume_proven_undispatched(att_b.attempt_id)
+        self.assertEqual(reopened.attempt_id, att_b.attempt_id)
+        self.assertEqual(reopened.fence, att_b.fence)
+        self.assertEqual(reopened.state, "queued")
+        self.assertFalse(repo.get(job_b.job_id).outcome_unresolved)
+
+    def test_resume_preserves_pause(self) -> None:
+        self._activate()
+        repo = self.engine._repo_for(self.project.project_id)
+        job = repo.submit(
+            "resume-paused",
+            task_kind=SYNTHETIC_NUMERIC_TASK,
+            parameters={"stage": "s", "reserve_usd": "0.1"},
+        )
+        att = repo.begin_attempt(
+            job.job_id, dispatch_kind="external_synthetic", stage="s", reserve_usd="0.1"
+        )
+        repo.recover(att.attempt_id)
+        repo.pause(job.job_id)
+        reopened = repo.resume_proven_undispatched(att.attempt_id)
+        self.assertEqual(reopened.state, "queued")
+        # The explicit pause is preserved (never silently undone).
+        self.assertEqual(repo.get(job.job_id).state, "paused")
+
+
+class SwitchTest(EngineTestBase):
+    def test_safe_switch_quiesces_old_before_activating_new(self) -> None:
+        self._activate()
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        # An ambiguous (non-quiescent) old job must block the switch.
+        self._submit_numeric("sw-1", outcome="ambiguous")
+        self._drain_engine()
+        blocked = self.engine.handle(_req("switch", project_id=other.project_id))
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["code"], "switch_blocked")
+        # Arbitration stays with the old project.
+        self.assertEqual(
+            self.registry.activation().active_project_id, self.project.project_id
+        )
+
+    def test_switch_succeeds_after_prior_work_is_resolved(self) -> None:
+        self._activate()
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        submitted = self._submit_numeric("sw-2", outcome="complete")
+        job_id = submitted["job"]["job_id"]
+        self._drain_engine()
+        switched = self.engine.handle(_req("switch", project_id=other.project_id))
+        self.assertTrue(switched["ok"])
+        self.assertEqual(
+            self.registry.activation().active_project_id, other.project_id
+        )
+        # The old project's result stayed in its own store.
+        old_repo = self.engine._repo_for(self.project.project_id)
+        accepted = old_repo.accepted_result(job_id)
+        self.assertIsNotNone(accepted)
+
+
+class DetachedEntrypointTest(EngineTestBase):
+    def test_detached_worker_start_status_stop(self) -> None:
+        self.registry.activate_execution(self.project.project_id)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(SRC), env.get("PYTHONPATH", "")]
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "review_article_agent.worker", "--data-dir", str(self.data_dir)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(proc.kill)
+        self.addCleanup(self._close_proc, proc)
+        client = WorkerIPCClient(str(self.data_dir), io_timeout=5.0)
+        # Wait for the socket to come up.
+        deadline = time.monotonic() + 10.0
+        status = None
+        while time.monotonic() < deadline:
+            try:
+                status = client.request(_req("status"))
+                break
+            except Exception:  # not up yet
+                time.sleep(0.05)
+        self.assertIsNotNone(status, "worker did not become ready")
+        self.assertEqual(status["app"], APP_NAME)
+        self.assertEqual(status["protocol_version"], PROTOCOL_VERSION)
+        self.assertEqual(status["pid"], proc.pid)
+        self.assertTrue(status["state"])
+
+        # Submit a numeric task through the detached worker and let it complete.
+        sub = client.request(
+            _req(
+                "submit",
+                project_id=self.project.project_id,
+                request_id="detached-1",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                steps=3,
+                delay_ms=0,
+                outcome="complete",
+                stage="s",
+                reserve_usd="0.10",
+            )
+        )
+        self.assertTrue(sub["ok"])
+        job_id = sub["job"]["job_id"]
+        deadline = time.monotonic() + 10.0
+        final = None
+        while time.monotonic() < deadline:
+            final = client.request(
+                _req("job_status", project_id=self.project.project_id, job_id=job_id)
+            )
+            if final["job"]["state"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(final["job"]["state"], "completed")
+
+        # stop replies before the owned worker exits.
+        stop = client.request(_req("stop"))
+        self.assertTrue(stop["ok"])
+        self.assertTrue(stop["stopping"])
+        proc.wait(timeout=10)
+        self.assertEqual(proc.returncode, 0)
+
+    def test_sigkill_then_recover_no_silent_success(self) -> None:
+        """A worker killed before commit leaves the attempt non-terminal.
+
+        Uses the test-only SIGSTOP gate at ``before_commit`` to stop an owned
+        disposable worker mid-dispatch, then SIGKILLs it. The comprehensive
+        matrix lives in the separate restart task; this is a bounded smoke check.
+        """
+        self.registry.activate_execution(self.project.project_id)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join([str(SRC), env.get("PYTHONPATH", "")])
+        env["RAA_WORKER_TEST_PAUSE_AT"] = "before_commit"
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "review_article_agent.worker", "--data-dir", str(self.data_dir)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(proc.kill)
+        self.addCleanup(self._close_proc, proc)
+        client = WorkerIPCClient(str(self.data_dir), io_timeout=5.0)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                client.request(_req("status"))
+                break
+            except Exception:
+                time.sleep(0.05)
+        sub = client.request(
+            _req(
+                "submit",
+                project_id=self.project.project_id,
+                request_id="kill-1",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                steps=3,
+                delay_ms=0,
+                outcome="complete",
+                stage="s",
+                reserve_usd="0.10",
+            )
+        )
+        job_id = sub["job"]["job_id"]
+        # Wait until the worker is stopped at the before_commit seam.
+        deadline = time.monotonic() + 10.0
+        stopped = False
+        while time.monotonic() < deadline:
+            state = self._proc_state(proc.pid)
+            if state == "T":
+                stopped = True
+                break
+            time.sleep(0.05)
+        self.assertTrue(stopped, "worker never reached the before_commit gate")
+        proc.kill()
+        proc.wait(timeout=10)
+
+        # A fresh engine over the same store reconciles: the attempt is explicit,
+        # never a silent success.
+        engine2 = WorkerEngine(str(self.data_dir))
+        self.addCleanup(engine2.close)
+        engine2.reconcile_startup()
+        repo = engine2._repo_for(self.project.project_id)
+        job = repo.get(job_id)
+        accepted = repo.accepted_result(job_id)
+        self.assertIsNone(accepted)
+        self.assertIn(
+            job.state,
+            {"reconciliation_required", "interrupted", "admitted", "running", "queued"},
+        )
+        self.assertNotEqual(job.state, "completed")
+
+    @staticmethod
+    def _proc_state(pid: int) -> str | None:
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+                return handle.read().split(") ", 1)[1].split(" ", 1)[0]
+        except OSError:
+            return None
+
+    @staticmethod
+    def _close_proc(proc: subprocess.Popen) -> None:
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:  # pragma: no cover - defensive
+                    pass
+
+
+class UDSIntegrationTest(EngineTestBase):
+    def test_uds_engine_round_trip_and_stop(self) -> None:
+        self._activate()
+        server = WorkerIPCServer(str(self.data_dir), self.engine.handle)
+        server.start()
+        self.addCleanup(server.close)
+        client = WorkerIPCClient(str(self.data_dir), io_timeout=5.0)
+
+        results: dict[str, object] = {}
+        errors: list[BaseException] = []
+
+        def client_work() -> None:
+            try:
+                results["status"] = client.request(_req("status"))
+                # Non-owner field is rejected over the real transport too: the
+                # engine returns a curated structured error (outer transport ok).
+                rejected = client.request(_req("status", uid=0))
+                results["unknown_key_rejected"] = (
+                    rejected.get("ok") is False
+                    and rejected.get("code") == "unknown_key"
+                )
+                results["stop"] = client.request(_req("stop"))
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        # The engine loop runs in the MAIN thread so every store is opened and
+        # closed on the same thread (sqlite connections are not shared across
+        # threads); only the client runs in a helper thread.
+        worker = threading.Thread(target=client_work, daemon=True)
+        worker.start()
+        while not self.engine.stopping:
+            timeout = self.engine.tick()
+            wait = 0.05 if timeout is None else min(timeout, 0.05) if timeout > 0 else 0.0
+            server.serve_once(wait)
+        worker.join(5)
+
+        self.assertFalse(errors, f"client thread failed: {errors}")
+        self.assertEqual(results["status"]["app"], APP_NAME)
+        self.assertTrue(results["unknown_key_rejected"])
+        self.assertTrue(results["stop"]["stopping"])
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
