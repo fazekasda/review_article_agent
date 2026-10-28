@@ -38,12 +38,15 @@ for _path in (str(SRC), str(HERE)):
 
 from _opencode_mock import MockServer  # noqa: E402
 from review_article_agent.runtime.opencode import (  # noqa: E402
+    MAX_ID_LENGTH,
+    MAX_JSON_DEPTH,
     MAX_MESSAGE_LIMIT,
     MAX_MESSAGE_PAGES_CAP,
     MAX_REQUEST_BYTES_CAP,
     MAX_RESPONSE_BYTES_CAP,
     MAX_RETRY_INTERVAL,
     MAX_TIMEOUT,
+    MIN_RETRY_INTERVAL,
     Admission,
     AdmissionConflictError,
     AdmissionUnverifiedError,
@@ -55,6 +58,7 @@ from review_article_agent.runtime.opencode import (  # noqa: E402
     OpenCodeV2Client,
     QuiescenceTimeout,
     ReconcileResult,
+    validate_model_ref,
 )
 
 WRITER_MODEL = {"providerID": "openrouter", "id": "some/writer-model"}
@@ -837,6 +841,23 @@ class TestUrlSafeIdentifiers(unittest.TestCase):
         for good in ("ses_abc123", "ses-X_Y", "ses_0"):
             OpenCodeV2Client._require_session_id(good)
 
+    def test_trailing_newline_and_control_ids_rejected(self) -> None:
+        # ``re.match`` + ``$`` accepts a trailing newline; ``fullmatch`` does not.
+        for bad in ("ses_foo\n", "ses_foo\r", "ses_foo\t", "ses_foo\x00"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.client.get_session(bad)
+        for bad in ("msg_foo\n", "msg_foo\r"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.client.admit(self.sid, "x", bad)
+
+    def test_over_long_ids_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.client.get_session("ses_" + "a" * 200)
+        with self.assertRaises(ValueError):
+            self.client.admit(self.sid, "x", "msg_" + "a" * 200)
+        # exactly at the length bound the helper still accepts the id
+        OpenCodeV2Client._require_session_id("ses_" + "a" * (MAX_ID_LENGTH - 4))
+
     def test_pathlike_message_ids_rejected(self) -> None:
         for bad in ("msg_../x", "msg_a/b", "msg_a?b", "msg_%2f", "msg_", "msg_a b", "msg_a.b"):
             with self.assertRaises(ValueError, msg=bad):
@@ -893,6 +914,27 @@ class TestStrictJson(unittest.TestCase):
         deep = b"[" * 100000 + b"]" * 100000
         with self.assertRaises(OpenCodeProtocolError):
             OpenCodeV2Client._decode(deep)
+
+    def test_numeric_overflow_to_infinity_rejected(self) -> None:
+        # ``parse_constant`` alone misses a numeric literal that overflows to inf.
+        for body in (b'{"cost":1e999}', b'{"cost":-1e999}', b'{"cost":1e309}'):
+            with self.assertRaises(OpenCodeProtocolError, msg=body):
+                OpenCodeV2Client._decode(body)
+        self.assertEqual(OpenCodeV2Client._decode(b'{"cost":1e308}'), {"cost": 1e308})
+
+    def test_nesting_depth_is_capped(self) -> None:
+        with self.assertRaises(OpenCodeProtocolError):
+            OpenCodeV2Client._decode(
+                b"[" * (MAX_JSON_DEPTH + 1) + b"]" * (MAX_JSON_DEPTH + 1)
+            )
+        # exactly at the cap is still valid JSON
+        value = OpenCodeV2Client._decode(b"[" * MAX_JSON_DEPTH + b"]" * MAX_JSON_DEPTH)
+        self.assertIsInstance(value, list)
+
+    def test_brackets_inside_strings_do_not_count_toward_depth(self) -> None:
+        self.assertEqual(
+            OpenCodeV2Client._decode(b'{"s":"[[[[[[[[[[."}'), {"s": "[[[[[[[[[[."}
+        )
 
     def test_valid_json_round_trips_and_empty_is_none(self) -> None:
         self.assertIsNone(OpenCodeV2Client._decode(b""))
@@ -1090,6 +1132,123 @@ class TestStaticReasonsAndRepr(unittest.TestCase):
             {"outcome": "PEER_SECRET"},
         )
         self.assertNotIn("PEER_SECRET", repr(result))
+
+
+# ---------------------------------------------------------------------------
+# Repair R2: fullmatch IDs, numeric overflow, malformed idle, int bounds,
+# wait floor, typed static errors
+# ---------------------------------------------------------------------------
+class TestMalformedIdleOutcome(unittest.TestCase):
+    """A malformed idle is a static ``unknown``, never a raw TypeError."""
+
+    def _turn(self, messages: list) -> ReconcileResult:
+        return OpenCodeV2Client._reconcile_turn(messages, 0, "msg_x", None, False)
+
+    def test_non_string_or_unhashable_outcome_is_unknown(self) -> None:
+        for outcome in ([], {}, 1, None, True):
+            result = self._turn(
+                [{"type": "user", "id": "msg_x"}, {"type": "idle", "outcome": outcome}]
+            )
+            self.assertEqual(result.state, "unknown", msg=repr(outcome))
+            self.assertFalse(result.is_complete)
+            self.assertEqual(result.reason, "malformed idle outcome (not a string)")
+
+    def test_missing_outcome_is_unknown(self) -> None:
+        result = self._turn([{"type": "user", "id": "msg_x"}, {"type": "idle"}])
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual(result.reason, "malformed idle outcome (not a string)")
+
+    def test_non_dict_messages_are_ignored(self) -> None:
+        result = self._turn(
+            [
+                {"type": "user", "id": "msg_x"},
+                "garbage",
+                {"type": "idle", "outcome": "succeeded"},
+            ]
+        )
+        self.assertEqual(result.state, "completed")
+
+
+class TestIntegerBoundsNoOverflow(unittest.TestCase):
+    """A huge int is a clean ValueError, never a raw OverflowError."""
+
+    def test_huge_int_constructor_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client("http://127.0.0.1:1", token="t", timeout=10**1000)
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client("http://127.0.0.1:1", token="t", max_message_pages=10**1000)
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client("http://127.0.0.1:1", token="t", max_response_bytes=10**1000)
+
+    def test_huge_int_wait_bounds(self) -> None:
+        server = MockServer(token="t")
+        server.__enter__()
+        self.addCleanup(server.__exit__, None, None, None)
+        client = OpenCodeV2Client(server.base_url, token="t")
+        sid = client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+        for bad in (10**1000, -(10**1000)):
+            with self.assertRaises(ValueError, msg=repr(type(bad))):
+                client.wait(sid, timeout=bad)
+            with self.assertRaises(ValueError, msg=repr(type(bad))):
+                client.wait(sid, retry_interval=bad)
+
+
+class TestWaitMinimumInterval(unittest.TestCase):
+    """A tiny poll interval would busy-loop; a meaningful floor is enforced."""
+
+    def setUp(self) -> None:
+        self.server = MockServer(token="t")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.client = OpenCodeV2Client(self.server.base_url, token="t")
+        self.sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+
+    def test_interval_below_floor_is_refused(self) -> None:
+        for bad in (0.0000001, 0.009, 0.0, -0.01):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.client.wait(self.sid, retry_interval=bad)
+
+    def test_interval_at_floor_is_accepted(self) -> None:
+        self.server.state.wait_503_times = 1
+        self.assertTrue(
+            self.client.wait(self.sid, timeout=2.0, retry_interval=MIN_RETRY_INTERVAL)
+        )
+
+    def test_documented_floor_value(self) -> None:
+        self.assertEqual(MIN_RETRY_INTERVAL, 0.01)
+
+
+class TestTypedStaticErrors(unittest.TestCase):
+    """Local-value reflection must not raise a raw TypeError."""
+
+    def test_model_ref_mixed_type_keys_are_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_model_ref({"id": "x", "providerID": "y", "a": 1, 2: 3})
+        with self.assertRaises(ValueError):
+            validate_model_ref({1: 2})
+        with self.assertRaises(ValueError):
+            validate_model_ref({"id": "x"})  # no providerID
+
+    def test_model_ref_unknown_string_field_is_reported(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            validate_model_ref({"id": "x", "providerID": "y", "bogus": 1})
+        self.assertIn("bogus", str(ctx.exception))
+
+    def test_non_string_base_url_is_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeV2Client(123, token="t")  # type: ignore[arg-type]
+
+    def test_repr_never_contains_any_credential(self) -> None:
+        token_client = OpenCodeV2Client("http://127.0.0.1:1", token="tok-secret")
+        self.assertNotIn("tok-secret", repr(token_client))
+        basic_client = OpenCodeV2Client("http://127.0.0.1:1", auth="basic", password="pw-secret")
+        self.assertNotIn("pw-secret", repr(basic_client))
+        self.assertNotIn("pw-secret", repr(basic_client))
+        self.assertIsNone(basic_client.token)
+
+    def test_timeout_is_documented_as_a_per_operation_idle_timeout(self) -> None:
+        self.assertIn("per-operation", OpenCodeV2Client._request.__doc__ or "")
+        self.assertIn("wall-clock", OpenCodeV2Client.__doc__ or "")
 
 
 if __name__ == "__main__":

@@ -47,9 +47,12 @@ Safety properties:
 * Redirects are refused (the credential is never forwarded) and proxies are
   bypassed (``ProxyHandler({})``), so the credential cannot leave the origin.
 * Response **and** request bodies are bounded (``max_response_bytes`` /
-  ``max_request_bytes``), every request is time-bounded, message paging is
-  bounded, and every accepted limit (constructor or per-call override) is finite
-  and capped, so boundedness cannot be disabled or busy-looped.
+  ``max_request_bytes``), message paging is bounded, and every accepted limit
+  (constructor or per-call override) is finite and capped, so boundedness cannot
+  be disabled or busy-looped. The socket ``timeout`` is a per-operation idle
+  timeout, not a strict total wall-clock deadline (a trickling peer is bounded in
+  aggregate by the body-size bound and caller deadline loops, not by ``timeout``
+  alone).
 * Response JSON is parsed strictly: duplicate object keys, non-finite numbers
   (``NaN``/``Infinity``), and over-deep nesting are rejected as malformed.
 * Session/message IDs must be URL-safe opaques after their published prefix, so a
@@ -102,8 +105,15 @@ from typing import Any
 # an opaque, URL-safe charset after the documented prefix -- no ``/``, ``?``, ``#``,
 # ``%``, ``.``, whitespace, or control characters, which could otherwise steer the
 # request to a different resource (e.g. ``ses/../../api/anything?x=1``).
-SESSION_ID_RE = re.compile(r"^ses[A-Za-z0-9_-]+$")
-MESSAGE_ID_RE = re.compile(r"^msg_[A-Za-z0-9_-]+$")
+# NOTE: these are matched with ``fullmatch`` (never ``match`` + ``$``): ``$`` also
+# matches just before a trailing newline, so ``"ses_foo\n"`` would otherwise pass
+# ``match`` and be interpolated into a request path.
+SESSION_ID_RE = re.compile(r"ses[A-Za-z0-9_-]+")
+MESSAGE_ID_RE = re.compile(r"msg_[A-Za-z0-9_-]+")
+
+# A URL-safe opaque ID is also length-bounded, so a pathological identifier
+# cannot inflate a request path or a paging cursor.
+MAX_ID_LENGTH = 128
 
 # Response tags from the published error schemas (*ErrorEncoded) that the client
 # is willing to surface. An unknown tag is untrusted and is dropped (``None``), so
@@ -134,6 +144,13 @@ BASIC_DEFAULT_USERNAME = "opencode"
 # delimited positionally: its ``user`` message, then the next user/synthetic
 # message, with the authoritative ``idle`` terminal in between.
 TURN_OPENING_TYPES = ("user", "synthetic")
+# The observed ``Session.Message.Idle`` outcome -> reconciliation state. Keyed only
+# by a string; a non-string outcome is handled before this lookup.
+_IDLE_OUTCOME_STATES = {
+    "succeeded": "completed",
+    "failed": "failed",
+    "interrupted": "interrupted",
+}
 LOOPBACK_HOSTS = ("localhost",)
 
 # Bounds. Every accepted limit (including a per-call override) is finite and
@@ -141,6 +158,11 @@ LOOPBACK_HOSTS = ("localhost",)
 # its bound is refused before it is trusted; paging stops honestly at the bound.
 MAX_TIMEOUT = 3600.0
 MAX_RETRY_INTERVAL = 60.0
+# A poll interval must be a *meaningful* delay: too small lets ``wait`` busy-loop
+# (spinning request after request) even though each request is individually
+# bounded, so a floor is enforced alongside the ceiling.
+MIN_RETRY_INTERVAL = 0.01
+MAX_JSON_DEPTH = 64
 MAX_MESSAGE_PAGES_CAP = 10_000
 MAX_MESSAGE_LIMIT = 1_000
 MAX_RESPONSE_BYTES_CAP = 64 * 1024 * 1024
@@ -357,14 +379,35 @@ def assert_explicit_loopback_url(base_url: str) -> str:
     return base_url
 
 
-def _require_finite_positive_number(value: Any, name: str, maximum: float) -> float:
-    """Validate a finite, positive, capped duration or interval."""
+def _number_in_range(value: Any, name: str, minimum: float, maximum: float) -> float:
+    """Validate a finite number in ``[minimum, maximum]``, int-safe.
+
+    An ``int`` is range-checked **before** any ``float`` conversion, so a huge
+    value such as ``10**1000`` raises a clean :class:`ValueError` rather than a
+    raw ``OverflowError`` from ``float()``.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a number")
-    number = float(value)
-    if not math.isfinite(number) or number <= 0 or number > maximum:
+    if isinstance(value, int):
+        if value < minimum or value > maximum:
+            raise ValueError(f"{name} must be a finite number in [{minimum}, {maximum}]")
+        return float(value)
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        raise ValueError(f"{name} must be a finite number in [{minimum}, {maximum}]")
+    return value
+
+
+def _require_finite_positive_number(value: Any, name: str, maximum: float) -> float:
+    """Validate a finite, positive, capped duration (``0 < value <= maximum``)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    if isinstance(value, int):
+        if value <= 0 or value > maximum:
+            raise ValueError(f"{name} must be a finite number in (0, {maximum}]")
+        return float(value)
+    if not math.isfinite(value) or value <= 0 or value > maximum:
         raise ValueError(f"{name} must be a finite number in (0, {maximum}]")
-    return number
+    return value
 
 
 def _require_positive_int(value: Any, name: str, maximum: int) -> int:
@@ -381,7 +424,12 @@ class _DuplicateJsonKey(ValueError):
 
 
 class _NonFiniteJsonNumber(ValueError):
-    """Raised internally when JSON carries ``NaN``/``Infinity``/``-Infinity``."""
+    """Raised internally when JSON carries a non-finite number.
+
+    Covers both the ``NaN``/``Infinity``/``-Infinity`` literals (via
+    ``parse_constant``) and a numeric literal that overflows to infinity, such as
+    ``1e999`` (via ``parse_float``), which ``parse_constant`` alone does not see.
+    """
 
 
 def _json_object_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -397,24 +445,63 @@ def _json_reject_non_finite(token: str) -> Any:
     raise _NonFiniteJsonNumber(token)
 
 
+def _json_parse_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise _NonFiniteJsonNumber(token)
+    return value
+
+
+def _check_json_depth(text: str) -> None:
+    """Reject JSON nested deeper than :data:`MAX_JSON_DEPTH` (a static error).
+
+    A cheap string/escape-aware scan bounds nesting deterministically, instead of
+    depending on the interpreter recursion limit; the ``RecursionError`` guard in
+    :func:`_strict_json_loads` remains only as a backstop.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise OpenCodeProtocolError(_DETAIL_NOT_JSON)
+        elif char in "]}":
+            depth -= 1
+
+
 def _strict_json_loads(text: str) -> Any:
     """Parse JSON strictly, rejecting duplicate keys and non-finite numbers.
 
     ``json.loads`` defaults are lenient (last-key-wins, ``NaN``/``Infinity``
-    accepted), which would let a peer smuggle an ambiguous or non-finite value
-    past validation. Duplicate keys, non-finite constants, malformed text, and
-    over-deep nesting (a ``RecursionError`` from the decoder) all become a static
-    :class:`OpenCodeProtocolError`; no peer text is surfaced.
+    accepted, an overflow like ``1e999`` becomes ``inf``), which would let a peer
+    smuggle an ambiguous or non-finite value past validation. Duplicate keys,
+    non-finite constants, overflowing numbers, malformed text, and over-deep
+    nesting all become a static :class:`OpenCodeProtocolError`; no peer text is
+    surfaced.
     """
     try:
+        _check_json_depth(text)
         return json.loads(
             text,
             object_pairs_hook=_json_object_no_duplicates,
             parse_constant=_json_reject_non_finite,
+            parse_float=_json_parse_float,
         )
     except OpenCodeProtocolError:
         raise
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError, OverflowError):
         raise OpenCodeProtocolError(_DETAIL_NOT_JSON) from None
 
 
@@ -466,9 +553,17 @@ def resolve_auth(
 
 
 def validate_model_ref(model: dict[str, Any]) -> dict[str, Any]:
-    """Validate a ``Model.Ref`` (``{id, providerID, variant?}``). Never guess."""
+    """Validate a ``Model.Ref`` (``{id, providerID, variant?}``). Never guess.
+
+    Errors are static, typed, and safe: field names are required to be strings
+    before any set arithmetic or sorting, so a dict with non-string keys raises a
+    clean :class:`ValueError` instead of a raw ``TypeError`` from ``sorted``.
+    """
     if not isinstance(model, dict):
         raise ValueError("model must be a dict (Model.Ref)")
+    for key in model:
+        if not isinstance(key, str):
+            raise ValueError("model field names must be strings")
     for key in ("id", "providerID"):
         value = model.get(key)
         if not isinstance(value, str) or not value:
@@ -511,8 +606,9 @@ class OpenCodeV2Client:
     :param username: Basic username (default ``opencode``); ``basic`` only.
     :param password: Basic password (already resolved by the caller); ``basic``
         only.
-    :param timeout: per-request socket timeout in seconds; finite, in
-        ``(0, MAX_TIMEOUT]``.
+    :param timeout: per-operation socket timeout in seconds; finite, in
+        ``(0, MAX_TIMEOUT]``. This is an idle timeout applied to each blocking
+        socket operation, **not** a strict total wall-clock deadline.
     :param directory: absolute location directory pinned on session create.
     :param max_message_pages: hard bound on pages read while reconciling; a
         positive integer no larger than ``MAX_MESSAGE_PAGES_CAP``.
@@ -622,6 +718,16 @@ class OpenCodeV2Client:
         body: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> Any:
+        """Perform one request.
+
+        ``timeout`` is the socket timeout applied by ``urllib`` to the connection
+        and each blocking read/write, i.e. a **per-operation** idle timeout -- not
+        a strict total wall-clock deadline. A peer that trickles bytes faster than
+        the idle timeout can therefore keep one response open longer than
+        ``timeout``; the ``max_response_bytes`` bound and the caller's own
+        deadline-based loops (such as :meth:`wait`) are what keep that bounded in
+        aggregate.
+        """
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -703,14 +809,27 @@ class OpenCodeV2Client:
         return data
 
     @staticmethod
+    def _is_url_safe_id(value: Any, pattern: re.Pattern[str]) -> bool:
+        """A URL-safe opaque id: a string, length-bounded, and a ``fullmatch``.
+
+        ``fullmatch`` (not ``match``) is required: ``match`` + ``$`` also accepts a
+        trailing newline, which would be interpolated into a request path.
+        """
+        return (
+            isinstance(value, str)
+            and 0 < len(value) <= MAX_ID_LENGTH
+            and pattern.fullmatch(value) is not None
+        )
+
+    @staticmethod
     def _check_session_id(value: Any, context: str) -> str:
-        if not isinstance(value, str) or not SESSION_ID_RE.match(value):
+        if not OpenCodeV2Client._is_url_safe_id(value, SESSION_ID_RE):
             raise OpenCodeProtocolError(f"{context}: session id is not a valid Session.ID")
         return value
 
     @staticmethod
     def _check_message_id(value: Any, context: str) -> str:
-        if not isinstance(value, str) or not MESSAGE_ID_RE.match(value):
+        if not OpenCodeV2Client._is_url_safe_id(value, MESSAGE_ID_RE):
             raise OpenCodeProtocolError(f"{context}: message id is not a valid message id")
         return value
 
@@ -740,18 +859,21 @@ class OpenCodeV2Client:
 
     @staticmethod
     def _require_session_id(session_id: str) -> None:
-        # The published pattern is only the ``^ses`` prefix; a URL-safe opaque id
-        # is also required so a pathlike value cannot be interpolated into a path.
-        if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+        # The published pattern is only the ``^ses`` prefix; a URL-safe, length-
+        # bounded opaque id is also required so a pathlike value (or one with a
+        # trailing newline) cannot be interpolated into a path.
+        if not OpenCodeV2Client._is_url_safe_id(session_id, SESSION_ID_RE):
             raise ValueError(
-                "session_id must be a URL-safe ^ses id (letters, digits, '_', '-')"
+                "session_id must be a URL-safe ^ses id (letters, digits, '_', '-'), "
+                f"at most {MAX_ID_LENGTH} characters"
             )
 
     @staticmethod
     def _require_message_id(message_id: str) -> None:
-        if not isinstance(message_id, str) or not MESSAGE_ID_RE.match(message_id):
+        if not OpenCodeV2Client._is_url_safe_id(message_id, MESSAGE_ID_RE):
             raise ValueError(
-                "message id must be a URL-safe ^msg_ id (letters, digits, '_', '-')"
+                "message id must be a URL-safe ^msg_ id (letters, digits, '_', '-'), "
+                f"at most {MAX_ID_LENGTH} characters"
             )
 
     # -- server --------------------------------------------------------------
@@ -1194,7 +1316,8 @@ class OpenCodeV2Client:
         # belongs to another turn and must not complete this one.
         window_end = len(messages)
         for index in range(start + 1, len(messages)):
-            if messages[index].get("type") in TURN_OPENING_TYPES:
+            entry = messages[index]
+            if isinstance(entry, dict) and entry.get("type") in TURN_OPENING_TYPES:
                 window_end = index
                 break
         window_open_to_eof = window_end == len(messages)
@@ -1203,7 +1326,10 @@ class OpenCodeV2Client:
         # Only an ``idle`` message is the authoritative terminal for a turn. A
         # completed ``assistant`` is an intermediate agent-loop step and never
         # completes the target on its own.
-        idle = next((m for m in window if m.get("type") == "idle"), None)
+        idle = next(
+            (m for m in window if isinstance(m, dict) and m.get("type") == "idle"),
+            None,
+        )
 
         if idle is None:
             if truncated and window_open_to_eof:
@@ -1234,22 +1360,23 @@ class OpenCodeV2Client:
             )
 
         outcome = idle.get("outcome")
-        state = {
-            "succeeded": "completed",
-            "failed": "failed",
-            "interrupted": "interrupted",
-        }.get(outcome, "unknown")
+        # A malformed idle -- an unhashable/non-string outcome such as a list -- is
+        # a static ``unknown``, never a raw ``TypeError`` from a dict lookup. The
+        # peer-supplied value is untrusted and is deliberately not echoed; it
+        # remains visible only as evidence in ``completion``.
+        if isinstance(outcome, str):
+            state = _IDLE_OUTCOME_STATES.get(outcome, "unknown")
+        else:
+            state = "unknown"
         completion = {"outcome": outcome, "message": idle}
         if state == "unknown":
-            # Static reason: the peer-supplied outcome value is untrusted and is
-            # deliberately not echoed (it remains visible as evidence in
-            # ``completion``, which callers treat as untrusted data).
+            reason = (
+                "unrecognized idle outcome"
+                if isinstance(outcome, str)
+                else "malformed idle outcome (not a string)"
+            )
             return ReconcileResult(
-                admission_id,
-                "unknown",
-                durable,
-                completion,
-                reason="unrecognized idle outcome",
+                admission_id, "unknown", durable, completion, reason=reason
             )
         return ReconcileResult(admission_id, state, durable, completion)
 
@@ -1265,14 +1392,16 @@ class OpenCodeV2Client:
 
         Uses ``experimental.session.wait`` (204 when idle / 503 when a service is
         unavailable). Retries on 503 and transport timeouts until the deadline,
-        then raises :class:`QuiescenceTimeout`. Never blocks forever: ``timeout``
-        and ``retry_interval`` are each validated as finite and capped, so a
-        zero/negative/``nan``/``inf`` value cannot busy-loop or hang.
+        then raises :class:`QuiescenceTimeout`. Never blocks forever and cannot
+        busy-loop: ``timeout`` is finite and capped, and ``retry_interval`` must be
+        a *meaningful* delay in ``[MIN_RETRY_INTERVAL, MAX_RETRY_INTERVAL]`` (a
+        value below the floor is refused rather than spinning request after
+        request). Each sleep is clamped to the remaining budget.
         """
         self._require_session_id(session_id)
         timeout = _require_finite_positive_number(timeout, "timeout", MAX_TIMEOUT)
-        retry_interval = _require_finite_positive_number(
-            retry_interval, "retry_interval", MAX_RETRY_INTERVAL
+        retry_interval = _number_in_range(
+            retry_interval, "retry_interval", MIN_RETRY_INTERVAL, MAX_RETRY_INTERVAL
         )
         deadline = time.monotonic() + timeout
         last: OpenCodeError | None = None
@@ -1310,7 +1439,7 @@ def _window_has_terminal_assistant_error(window: list[dict[str, Any]]) -> bool:
     ``in_progress``.
     """
     for message in window:
-        if message.get("type") != "assistant":
+        if not isinstance(message, dict) or message.get("type") != "assistant":
             continue
         if message.get("finish") == "error" or message.get("error"):
             return True
