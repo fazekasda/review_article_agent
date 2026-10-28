@@ -1016,6 +1016,37 @@ _WORKER_CATEGORY_EXITS = {
 }
 
 
+def _redirect_broken_stdout(out: TextIO) -> None:
+    """Point a broken stdout stream's file descriptor at the null device.
+
+    After a broken pipe, the interpreter's final flush of ``sys.stdout`` can raise
+    a *second* ``BrokenPipeError`` (printing an "Exception ignored" traceback and
+    exiting 120). Redirecting the real file descriptor to ``os.devnull`` prevents
+    that. Best effort and bounded: it does nothing for an in-memory stream with no
+    real fileno, never closes or replaces the caller's stream object, and never
+    touches a stream it did not write to.
+    """
+    try:
+        fileno = out.fileno()
+    except (OSError, ValueError, AttributeError):
+        return
+    if isinstance(fileno, bool) or not isinstance(fileno, int) or fileno < 0:
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(devnull, fileno)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(devnull)
+        except OSError:
+            pass
+
+
 def _emit_result(result: object, stdout: TextIO | None = None) -> None:
     out = stdout if stdout is not None else sys.stdout
     if isinstance(result, StreamNDJSON):
@@ -1030,6 +1061,12 @@ def _emit_result(result: object, stdout: TextIO | None = None) -> None:
                 )
                 out.flush()
         except BrokenPipeError:
+            # The consumer closed the pipe. Redirect the *real* stdout file
+            # descriptor to the null device so the interpreter's final flush
+            # cannot raise a second BrokenPipeError (which would print an ignored
+            # traceback and exit 120). Only a stream with a real fileno is
+            # redirected; an in-memory test stream is left untouched.
+            _redirect_broken_stdout(out)
             return
         return
     if isinstance(result, RawBytes):

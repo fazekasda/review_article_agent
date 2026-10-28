@@ -84,10 +84,10 @@ _STATUS_MESSAGE = (
     "retry."
 )
 _STOP_FOREIGN_MESSAGE = (
-    "another process occupies the worker control endpoint and did not identify "
-    "as this application's worker; no stop request was sent and nothing was "
-    "signalled. Investigate the runtime endpoint in the application data "
-    "directory."
+    "a verified worker acknowledgement was not received from the control "
+    "endpoint (it did not identify as this application's worker, or its reply was "
+    "malformed), so the shutdown is unconfirmed; nothing was signalled. "
+    "Investigate the runtime endpoint in the application data directory."
 )
 _STOP_UNAVAILABLE_MESSAGE = (
     "the worker control endpoint is unavailable, so the stop request could not "

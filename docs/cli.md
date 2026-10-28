@@ -405,7 +405,7 @@ owner-authenticated control socket and is credited only when the socket is then
 | Worker already confirmed **not running** | exit `0`; idempotent `stopped=true`, **`already_stopped=true`**. |
 | Stop **unconfirmed** (delivered but the worker never confirmed shutdown) | exit `4` (`storage`), not success. |
 | Control endpoint **unavailable** | exit `4` (`storage`), not success. |
-| A **foreign** endpoint occupies the control path (not our worker) | exit `3` (`conflict`), not success. |
+| A **foreign** endpoint occupies the control path, or its acknowledgement is missing/malformed (not our verified worker) | exit `3` (`conflict`), not success; the shutdown is unconfirmed and nothing was signalled. |
 
 An unconfirmed, unavailable, or foreign stop is a **stable non-success** with a
 curated, actionable message; it is never reported as a successful stop, and no
@@ -482,11 +482,38 @@ non-success (exit `4`); a foreign endpoint is a `conflict` (exit `3`).
 `job attach` reads fresh job status snapshots and **never** cancels a job on CLI
 exit — a normal exit, a Ctrl-C, or a closed downstream pipe detaches cleanly with
 no traceback and sends no cancel. It is bounded by a poll interval
-(`--poll-interval`, default `0.5`) and an optional overall `--timeout` (default
-`60`), and stops at a terminal scheduling state. By default it prints one JSON
-snapshot (`--once`); `--watch` streams **one JSON object per line**
-(newline-delimited JSON) — the one documented exception to the single-JSON-document
-rule (§3).
+(`--poll-interval`, accepted range `0.05..60`, default `0.5`) and an overall
+`--timeout` (default `60`), and stops at a terminal scheduling state. The overall
+deadline is fixed **before** the first probe, every query's timeout is capped by
+the remaining budget, and no query is issued after the deadline. By default it
+prints one JSON snapshot (`--once`); `--watch` streams **one JSON object per
+line** (newline-delimited JSON) — the one documented exception to the
+single-JSON-document rule (§3).
+
+To keep a read-only exit unambiguous, **each** `--watch` line carries
+`"snapshot": true` and `"terminal": <bool>`, and the stream ends with an explicit
+`{"watch_end": {"reason": "terminal"|"timeout", "terminal_reached": <bool>}}`
+marker. A `timeout` marker reports `terminal_reached=false` and never claims a
+terminal result; `job attach` never dispatches new work.
+
+### Truthful outcomes (no blanket atomicity claim)
+
+Because the control request may reach the worker and change durable state *before*
+the CLI observes a reply, only a **pure local pre-RPC validation** (or a pre-send
+peer refusal) states that nothing was sent. Every other failure is honest about
+uncertainty:
+
+* A **transport failure at or after the send boundary** (a timeout, a lost or
+  truncated response, a closed connection, a socket error) is reported with an
+  **unconfirmed outcome**: the request may already have been applied. Inspect the
+  durable job with `job status`/`job list`, or retry with the **exact same
+  `--request-id`** (never a new identity) so an idempotent replay cannot create a
+  second job.
+* A **conflict** (including a blocked `job switch`) is reported as not-success
+  with a direction to inspect the state first — it makes **no** "nothing changed"
+  claim, because a blocked switch persists a durable pause on the old project
+  before it can find that arbitration is still blocked.
+* A worker-reported **internal** failure is likewise reported as unconfirmed.
 
 ### `job reconcile` — explicit owner disposition only
 

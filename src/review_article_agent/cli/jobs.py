@@ -34,6 +34,13 @@ detached CLI"; ``docs/cli.md`` output/exit/secret conventions):
   status snapshots and never cancels a job on CLI exit (Ctrl-C, a broken pipe, or
   a normal exit). It is bounded by a poll interval and an optional timeout, and
   never busy-loops.
+* **Truthful outcomes, no blanket atomicity claims.** A conflict, an engine
+  internal error, or *any* transport failure at or after the send boundary (a
+  timeout, a lost/truncated response, a socket error) is reported as an
+  **unconfirmed** outcome, never as "nothing changed": the request may already
+  have been applied. Only a pure local pre-RPC validation, or a pre-send peer
+  refusal, states that no request was sent. A retry must reuse the **exact same
+  ``--request-id``** (never a new identity).
 * **Typed, curated errors.** A failure is raised as :class:`JobControlError`
   carrying a stable ``category`` (``validation`` / ``conflict`` / ``storage``)
   and a static, actionable message authored here. No raw engine text, no
@@ -55,8 +62,10 @@ import re
 import time
 from typing import Any, Iterator
 
+from ..domain.records import RecordValidationError, validate_identifier
 from ..runtime import ipc
 from ..runtime.jobs import JobValidationError, TERMINAL_JOB_STATES, validate_reserve_usd
+from ..storage import paths
 from ..worker import process
 from ..worker.engine import PROTOCOL_VERSION, SYNTHETIC_NUMERIC_TASK, SYNTHETIC_WAITING_HUMAN_TASK
 from ..worker.synthetic import MAX_DELAY_MS, MAX_STEPS, MIN_DELAY_MS, MIN_STEPS
@@ -108,9 +117,19 @@ _TERMINAL_RESOLUTIONS = frozenset({"accepted_local_result", "definitive_failure"
 _RESULT_VALUE_MIN = 0
 _RESULT_VALUE_MAX = 999_999
 
-#: Default and maximum attach poll interval (seconds).
+#: Default and operational-bounds attach poll interval (seconds). A sub-50 ms
+#: interval is refused so a watch cannot become a busy loop.
 _DEFAULT_POLL_INTERVAL = 0.5
+_MIN_POLL_INTERVAL = 0.05
 _MAX_POLL_INTERVAL = 60.0
+
+#: Per-query control timeout used while watching; also capped by the remaining
+#: watch budget so no query is issued past the deadline.
+_DEFAULT_QUERY_TIMEOUT = float(ipc.DEFAULT_IO_TIMEOUT)
+
+#: Hard cap on the digit length of an integer argument, checked before ``int()``
+#: so a pathological value cannot trip the interpreter's int-conversion limit.
+_MAX_INT_DIGITS = 20
 
 #: Bounded default overall watch budget when ``--timeout`` is omitted.
 _DEFAULT_WATCH_TIMEOUT = 60.0
@@ -130,8 +149,8 @@ _TIMEOUT_MESSAGE = (
 )
 _POLL_MESSAGE = (
     "invalid value for --poll-interval; it must be a finite number of seconds "
-    "greater than 0 and at most 60. The supplied value is not shown. Run --help "
-    "for usage."
+    "greater than or equal to 0.05 and at most 60. The supplied value is not "
+    "shown. Run --help for usage."
 )
 _STEPS_MESSAGE = (
     "invalid value for --steps; it must be an integer from 1 to 1000. The supplied "
@@ -152,27 +171,35 @@ _RESULT_VALUE_MESSAGE = (
 )
 _CONFIRM_MESSAGE = (
     "this disposition asserts a terminal local outcome; pass --confirm-quiesced to "
-    "acknowledge that the remote work is known to be quiesced. Nothing was changed."
+    "acknowledge that the remote work is known to be quiesced. No request was sent."
 )
+#: A conflict is never reported as a pure no-op: a blocked switch may already have
+#: persisted a durable pause on the old project, so no blanket "nothing changed"
+#: claim is made for any engine response.
 _CONFLICT_MESSAGE = (
     "the request conflicts with current execution state (the project is not the "
-    "execution-active project, the job is in a state that does not permit the "
-    "operation, or unresolved remote work blocks it); nothing was changed."
+    "execution-active project, the job is not in a state that permits the "
+    "operation, or unresolved remote work blocks it). This is not success; inspect "
+    "the project/job state with `job status`/`job list` before retrying."
 )
-_NO_SUCH_JOB_MESSAGE = (
-    "no job with that id exists in the project; nothing was changed."
-)
+_NO_SUCH_JOB_MESSAGE = "no job with that id exists in the project."
 _BAD_INPUT_MESSAGE = (
     "the worker rejected the request as invalid (an identifier, a bounded number, "
-    "or a task parameter did not match the expected form); nothing was changed."
+    "or a task parameter did not match the expected form)."
 )
+#: A worker-reported internal failure may occur after a durable change; the
+#: outcome is unconfirmed and never claimed to be a no-op.
 _ENGINE_MESSAGE = (
-    "the worker could not complete the request; nothing was changed."
+    "the worker reported that it could not complete the request, so its durable "
+    "outcome is unconfirmed. Inspect the job with `job status`/`job list` before "
+    "retrying."
 )
 _ATTACH_MODE_MESSAGE = (
     "choose at most one of --once and --watch; the supplied values are not shown. "
     "Run --help for usage."
 )
+#: Used ONLY where the request provably was not sent (a pre-send probe failure or
+#: a connection refused before any control byte).
 _WORKER_UNAVAILABLE_MESSAGE = (
     "the worker control endpoint is unavailable; no request was sent. Check the "
     "application data directory, or start the worker first, then retry."
@@ -181,19 +208,36 @@ _WORKER_NOT_RUNNING_MESSAGE = (
     "no worker is running for the data directory; job control requires a running "
     "worker. Run `worker start` or `job run` first, then retry."
 )
+#: A pre-send peer check (owner UID / expected PID) refuses before any control
+#: byte: no control is sent, so no change can have been applied.
 _FOREIGN_MESSAGE = (
     "another process occupies the worker control endpoint and did not identify as "
-    "this application's worker; no control was sent and nothing was changed."
+    "this application's worker; no control was sent."
 )
+#: Used for any transport failure at or after the send boundary (timeout, lost or
+#: truncated response, a closed connection, an OSError from the socket): the
+#: request may already have been applied, so the outcome is unconfirmed and never
+#: claimed to be a no-op.
 _TRANSPORT_MESSAGE = (
-    "the worker control request failed at the transport level; no control was "
-    "applied and no job state was changed. Check the application data directory, "
-    "then retry."
+    "the worker control request did not complete at the transport level (it may "
+    "have timed out, or the response was lost), so its outcome is unconfirmed and a "
+    "change may already have been applied. Inspect the durable job with `job "
+    "status`/`job list`, or retry with the exact same --request-id (never a new "
+    "identity)."
 )
 _START_MESSAGE = (
     "the worker did not become ready within the timeout; no job was submitted. "
     "Check the application data directory and its permissions, then retry, or "
     "increase --timeout."
+)
+_PROJECT_ID_MESSAGE = (
+    "invalid project id; it must be an existing registered project id, or omitted "
+    "to use the active project. The supplied value is not shown. Run --help for usage."
+)
+_IDENTIFIER_MESSAGE = (
+    "invalid value for a job or request identifier; it must be a non-empty id with "
+    "no whitespace and no path separators. The supplied value is not shown. Run "
+    "--help for usage."
 )
 
 #: Engine error code -> ``(category, static message)``. The engine's own message
@@ -251,20 +295,31 @@ class StreamNDJSON:
 # argument validation
 # --------------------------------------------------------------------------- #
 def _parse_bounded_int(raw: object, *, lo: int, hi: int, message: str) -> int:
-    """Parse a bounded non-negative integer from a raw string (never echoed)."""
+    """Parse a bounded non-negative integer from a raw string (never echoed).
+
+    The digit length is bounded **before** ``int()`` so a pathological value (for
+    example ten thousand digits, which trips the interpreter's int-conversion
+    limit) is a clean validation error rather than an internal error, and any
+    ``ValueError`` is mapped to the same static message.
+    """
     if not isinstance(raw, str):
         raise JobControlError(_CATEGORY_VALIDATION, message)
     text = raw.strip()
     if not text or _POSITIVE_INT_RE.fullmatch(text) is None:
         raise JobControlError(_CATEGORY_VALIDATION, message)
-    value = int(text)
+    if len(text) > _MAX_INT_DIGITS:
+        raise JobControlError(_CATEGORY_VALIDATION, message)
+    try:
+        value = int(text)
+    except ValueError:
+        raise JobControlError(_CATEGORY_VALIDATION, message) from None
     if not (lo <= value <= hi):
         raise JobControlError(_CATEGORY_VALIDATION, message)
     return value
 
 
-def _parse_seconds(raw: object, *, hi: float, message: str) -> float:
-    """Parse a bounded positive number of seconds from a raw string."""
+def _parse_seconds(raw: object, *, lo: float, hi: float, message: str) -> float:
+    """Parse a bounded number of seconds from a raw string."""
     if not isinstance(raw, str):
         raise JobControlError(_CATEGORY_VALIDATION, message)
     text = raw.strip()
@@ -274,9 +329,19 @@ def _parse_seconds(raw: object, *, hi: float, message: str) -> float:
         number = float(text)
     except ValueError:
         raise JobControlError(_CATEGORY_VALIDATION, message) from None
-    if not math.isfinite(number) or number <= 0 or number > hi:
+    if not math.isfinite(number) or number < lo or number > hi:
         raise JobControlError(_CATEGORY_VALIDATION, message)
     return number
+
+
+def _parse_identifier(raw: object) -> str:
+    """Validate a job/request identifier locally (never echoes the value)."""
+    if not isinstance(raw, str) or not raw:
+        raise JobControlError(_CATEGORY_VALIDATION, _IDENTIFIER_MESSAGE)
+    try:
+        return validate_identifier(raw, "identifier")
+    except RecordValidationError:
+        raise JobControlError(_CATEGORY_VALIDATION, _IDENTIFIER_MESSAGE) from None
 
 
 def _parse_reserve(raw: object) -> str:
@@ -295,7 +360,9 @@ def _resolve_poll_interval(args: argparse.Namespace) -> float:
     raw = getattr(args, "poll_interval", None)
     if raw is None:
         return _DEFAULT_POLL_INTERVAL
-    return _parse_seconds(raw, hi=_MAX_POLL_INTERVAL, message=_POLL_MESSAGE)
+    return _parse_seconds(
+        raw, lo=_MIN_POLL_INTERVAL, hi=_MAX_POLL_INTERVAL, message=_POLL_MESSAGE
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -409,7 +476,7 @@ def build_jobs_parser(sub: "argparse._SubParsersAction") -> None:
     p_attach.add_argument("job_id", metavar="JOB_ID")
     p_attach.add_argument("--once", action="store_true", help="read one snapshot and exit (default).")
     p_attach.add_argument("--watch", action="store_true", help="stream snapshots until terminal/timeout.")
-    p_attach.add_argument("--poll-interval", metavar="SECONDS", help="bounded poll interval (default: 0.5).")
+    p_attach.add_argument("--poll-interval", metavar="SECONDS", help="bounded poll interval (0.05..60, default: 0.5).")
     p_attach.add_argument("--timeout", metavar="SECONDS", help="bounded overall watch budget (default: 60).")
     p_attach.add_argument("--project", metavar="ID")
 
@@ -418,10 +485,18 @@ def build_jobs_parser(sub: "argparse._SubParsersAction") -> None:
 # shared helpers
 # --------------------------------------------------------------------------- #
 def _resolve_project_id(ctx: Any, explicit: str | None) -> str:
-    """Return the explicit project ID or the active project's ID."""
-    if explicit is not None:
-        return explicit
-    return ctx.registry.active_project().project_id
+    """Return the explicit project ID or the active project's ID.
+
+    An explicit id is validated against the generated-shape guard (which also
+    rejects path-like/traversal values) **before** any worker start or RPC, so a
+    bad id is a typed ``validation`` error and no daemon is started.
+    """
+    if explicit is None:
+        return ctx.registry.active_project().project_id
+    try:
+        return paths.validate_project_id(explicit)
+    except Exception:  # noqa: BLE001 - never echo the supplied id
+        raise JobControlError(_CATEGORY_VALIDATION, _PROJECT_ID_MESSAGE) from None
 
 
 def _verified_worker_pid(ctx: Any, timeout: float | None) -> int:
@@ -468,9 +543,12 @@ def _start_worker(ctx: Any, timeout: float | None) -> int:
 def _rpc(ctx: Any, pid: int, request: dict[str, Any], timeout: float | None) -> Any:
     """Send one control request bound to the verified peer PID.
 
-    Transport failures are mapped to curated ``conflict`` (a foreign/replaced
-    endpoint) or ``storage`` (unavailable) errors; no engine or peer text is ever
-    surfaced.
+    A pre-send refusal (a foreign/non-owner endpoint, or a connection refused
+    before any byte) is ``conflict``/``storage`` with a "no request was sent"
+    message. **Any** failure at or after the send boundary (timeout, lost or
+    truncated response, closed connection, socket ``OSError``) is ``storage`` with
+    an *unconfirmed outcome* message — the request may already have been applied.
+    No engine or peer text is ever surfaced.
     """
     client = ipc.WorkerIPCClient(ctx.data_dir)
     try:
@@ -478,13 +556,15 @@ def _rpc(ctx: Any, pid: int, request: dict[str, Any], timeout: float | None) -> 
     except (ipc.PeerNotAuthorized, ipc.PeerIdentityMismatch) as exc:
         raise JobControlError(_CATEGORY_CONFLICT, _FOREIGN_MESSAGE) from exc
     except ipc.WorkerNotRunning as exc:
+        # Raised at connect time: no control byte was sent.
         raise JobControlError(_CATEGORY_STORAGE, _WORKER_UNAVAILABLE_MESSAGE) from exc
     except ipc.IPCRequestError as exc:
         raise JobControlError(_CATEGORY_STORAGE, _TRANSPORT_MESSAGE) from exc
     except ipc.IPCError as exc:
         raise JobControlError(_CATEGORY_STORAGE, _TRANSPORT_MESSAGE) from exc
     except OSError as exc:
-        raise JobControlError(_CATEGORY_STORAGE, _WORKER_UNAVAILABLE_MESSAGE) from exc
+        # Could be raised before or after the send; treat the outcome as unknown.
+        raise JobControlError(_CATEGORY_STORAGE, _TRANSPORT_MESSAGE) from exc
 
 
 def _expect_ok(result: Any) -> dict[str, Any]:
@@ -575,8 +655,7 @@ def _numeric_parameters(args: argparse.Namespace) -> dict[str, Any]:
         message=_DELAY_MESSAGE,
     )
     stage = args.stage if args.stage is not None else _DEFAULT_STAGE
-    if not isinstance(stage, str) or not stage:
-        raise JobControlError(_CATEGORY_VALIDATION, _BAD_INPUT_MESSAGE)
+    stage = _parse_identifier(stage)
     return {
         "steps": steps,
         "delay_ms": delay_ms,
@@ -587,9 +666,15 @@ def _numeric_parameters(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def job_run(args: argparse.Namespace, ctx: Any) -> dict[str, object]:
-    """``job run`` — ensure a worker and submit one synthetic job (admission only)."""
+    """``job run`` — ensure a worker and submit one synthetic job (admission only).
+
+    The request id and every bounded parameter are validated **locally, before**
+    the worker is started or any RPC is sent, so a bad value is a typed
+    ``validation`` error and no daemon is launched.
+    """
     timeout = _resolve_timeout(args)
     project_id = _resolve_project_id(ctx, args.project)
+    request_id = _parse_identifier(args.request_id)
 
     task_kind = getattr(args, "task_kind", SYNTHETIC_NUMERIC_TASK)
     if task_kind not in _TASK_KINDS:
@@ -599,7 +684,7 @@ def job_run(args: argparse.Namespace, ctx: Any) -> dict[str, object]:
         "version": PROTOCOL_VERSION,
         "op": "submit",
         "project_id": project_id,
-        "request_id": args.request_id,
+        "request_id": request_id,
         "task_kind": task_kind,
     }
     if task_kind == SYNTHETIC_NUMERIC_TASK:
@@ -622,9 +707,10 @@ def job_run(args: argparse.Namespace, ctx: Any) -> dict[str, object]:
 def job_status(args: argparse.Namespace, ctx: Any) -> dict[str, object]:
     """``job status`` — one job's durable status, read-only."""
     timeout = _resolve_timeout(args)
+    job_id = _parse_identifier(args.job_id)
     project_id = _resolve_project_id(ctx, args.project)
     pid = _verified_worker_pid(ctx, timeout)
-    result = _control_request(ctx, pid, "job_status", project_id, args.job_id, timeout)
+    result = _control_request(ctx, pid, "job_status", project_id, job_id, timeout)
     return {"job": _job_projection(result.get("job"))}
 
 
@@ -639,8 +725,9 @@ def job_list(args: argparse.Namespace, ctx: Any) -> dict[str, object]:
 
 def _control_command(args: argparse.Namespace, ctx: Any, op: str) -> dict[str, object]:
     timeout = _resolve_timeout(args)
+    raw_job_id = getattr(args, "job_id", None)
+    job_id = None if raw_job_id is None else _parse_identifier(raw_job_id)
     project_id = _resolve_project_id(ctx, args.project)
-    job_id = getattr(args, "job_id", None)
     pid = _verified_worker_pid(ctx, timeout)
     result = _control_request(ctx, pid, op, project_id, job_id, timeout)
     if "job" in result:
@@ -675,7 +762,7 @@ def job_cancel(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
 def job_switch(args: argparse.Namespace, ctx: Any) -> dict[str, object]:
     """``job switch`` — safely make another project execution-active."""
     timeout = _resolve_timeout(args)
-    project_id = args.project
+    project_id = _resolve_project_id(ctx, args.project)
     pid = _verified_worker_pid(ctx, timeout)
     result = _control_request(ctx, pid, "switch", project_id, None, timeout)
     return {
@@ -730,13 +817,14 @@ def job_reconcile(args: argparse.Namespace, ctx: Any) -> dict[str, object]:
     if resolution in _TERMINAL_RESOLUTIONS and not args.confirm_quiesced:
         raise JobControlError(_CATEGORY_VALIDATION, _CONFIRM_MESSAGE)
 
+    job_id = _parse_identifier(args.job_id)
     project_id = _resolve_project_id(ctx, args.project)
     pid = _verified_worker_pid(ctx, timeout)
     engine_request = {
         "version": PROTOCOL_VERSION,
         "op": "reconcile",
         "project_id": project_id,
-        "job_id": args.job_id,
+        "job_id": job_id,
         **request,
     }
     result = _expect_ok(_rpc(ctx, pid, engine_request, timeout))
@@ -751,35 +839,62 @@ def job_attach(args: argparse.Namespace, ctx: Any) -> dict[str, object] | Stream
     """``job attach`` — read-only status snapshots; ``--watch`` streams NDJSON.
 
     The default reads one snapshot and exits. ``--watch`` polls fresh
-    ``job_status`` queries with a bounded interval and an optional overall
-    timeout, emitting one newline-delimited JSON document per poll and stopping
-    at a terminal scheduling state (or the timeout). It never cancels a job on
-    CLI exit (a normal exit, Ctrl-C, or a broken pipe).
+    ``job_status`` queries with a bounded interval and an overall budget, emitting
+    one newline-delimited JSON snapshot per poll and stopping at a terminal
+    scheduling state or the deadline. The deadline is fixed **before** the first
+    probe, every query's timeout is capped by the remaining budget, and no query
+    is issued after the deadline.
+
+    A watch never cancels a job on CLI exit (a normal exit, Ctrl-C, or a broken
+    pipe) and never schedules new work. To make a read-only exit unambiguous, each
+    snapshot line carries ``Snapshot: true``/``Terminal`` and a final
+    ``Watch_end`` line reports ``reason`` (``terminal`` or ``timeout``) with
+    ``terminal_reached``; a timeout never claims a terminal result.
     """
     if args.watch and args.once:
         raise JobControlError(_CATEGORY_VALIDATION, _ATTACH_MODE_MESSAGE)
 
     timeout = _resolve_timeout(args)
     poll = _resolve_poll_interval(args)
+    job_id = _parse_identifier(args.job_id)
     project_id = _resolve_project_id(ctx, args.project)
-    pid = _verified_worker_pid(ctx, timeout)
 
     if not args.watch:
-        result = _control_request(ctx, pid, "job_status", project_id, args.job_id, timeout)
-        return {"job": _job_projection(result.get("job")), "streaming": False}
+        pid = _verified_worker_pid(ctx, timeout)
+        result = _control_request(ctx, pid, "job_status", project_id, job_id, timeout)
+        job = _job_projection(result.get("job"))
+        return {
+            "job": job,
+            "streaming": False,
+            "terminal": job.get("state") in TERMINAL_JOB_STATES,
+        }
 
+    # Fix the overall budget/deadline BEFORE the first probe, so the watch is
+    # bounded end to end and every query shares the remaining budget.
     budget = timeout if timeout is not None else _DEFAULT_WATCH_TIMEOUT
     deadline = time.monotonic() + budget
+    probe_timeout = min(_DEFAULT_QUERY_TIMEOUT, budget)
+    pid = _verified_worker_pid(ctx, probe_timeout)
 
     def _documents() -> Iterator[object]:
         while True:
-            result = _control_request(ctx, pid, "job_status", project_id, args.job_id, timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                yield {"watch_end": {"reason": "timeout", "terminal_reached": False}}
+                return
+            query_timeout = min(_DEFAULT_QUERY_TIMEOUT, remaining)
+            result = _control_request(
+                ctx, pid, "job_status", project_id, job_id, query_timeout
+            )
             job = _job_projection(result.get("job"))
-            yield {"job": job}
-            if job.get("state") in TERMINAL_JOB_STATES:
+            terminal = job.get("state") in TERMINAL_JOB_STATES
+            yield {"snapshot": True, "terminal": terminal, "job": job}
+            if terminal:
+                yield {"watch_end": {"reason": "terminal", "terminal_reached": True}}
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                yield {"watch_end": {"reason": "timeout", "terminal_reached": False}}
                 return
             time.sleep(min(poll, remaining))
 

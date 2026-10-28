@@ -35,6 +35,7 @@ import io
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -50,7 +51,9 @@ if str(SRC) not in sys.path:
 
 import review_article_agent.cli.main as cli_main  # noqa: E402
 from review_article_agent.runtime import ipc  # noqa: E402
+from review_article_agent.storage import Registry  # noqa: E402
 from review_article_agent.worker import process  # noqa: E402
+from review_article_agent.worker.engine import WorkerEngine  # noqa: E402
 
 SECRET = "SYNTHETIC-SECRET-DO-NOT-ECHO"
 
@@ -243,6 +246,7 @@ class AttachTest(JobCliTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         doc = json.loads(proc.stdout)
         self.assertFalse(doc["streaming"])
+        self.assertTrue(doc["terminal"])
         self.assertEqual(doc["job"]["state"], "completed")
 
     def test_attach_watch_reaches_terminal_and_does_not_cancel(self) -> None:
@@ -253,16 +257,19 @@ class AttachTest(JobCliTestCase):
             job_id, "--watch", "--poll-interval", "0.1", "--timeout", "8", "--project", pid
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        lines = [line for line in proc.stdout.splitlines() if line.strip()]
-        self.assertGreaterEqual(len(lines), 1)
-        docs = [json.loads(line) for line in lines]
-        self.assertTrue(all("job" in d for d in docs))
+        docs = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        snapshots = [d for d in docs if d.get("snapshot")]
+        self.assertGreaterEqual(len(snapshots), 1)
         # The watch observed the terminal completion...
-        self.assertEqual(docs[-1]["job"]["state"], "completed")
+        self.assertTrue(snapshots[-1]["terminal"])
+        self.assertEqual(snapshots[-1]["job"]["state"], "completed")
+        # ...and its final marker says it ended because the job is terminal.
+        self.assertEqual(docs[-1]["watch_end"]["reason"], "terminal")
+        self.assertTrue(docs[-1]["watch_end"]["terminal_reached"])
         # ...and attaching did not cancel or mutate the job on exit.
         self.assertEqual(self.status(job_id, pid)["state"], "completed")
 
-    def test_attach_watch_timeout_does_not_cancel_waiting_gate(self) -> None:
+    def test_attach_watch_timeout_marks_timeout_not_terminal(self) -> None:
         pid = self.create_project("A")
         self.select(pid)
         job_id = self.run_job("a-3", "--task-kind", "synthetic_waiting_human")["job"]["job_id"]
@@ -271,6 +278,11 @@ class AttachTest(JobCliTestCase):
             job_id, "--watch", "--poll-interval", "0.1", "--timeout", "0.6", "--project", pid
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        docs = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        # The final marker is an explicit timeout that never claims a terminal.
+        self.assertEqual(docs[-1]["watch_end"]["reason"], "timeout")
+        self.assertFalse(docs[-1]["watch_end"]["terminal_reached"])
+        self.assertNotIn("accepted_result", docs[-1])
         # A bounded watch on a non-terminal gate exits cleanly and never cancels.
         self.assertEqual(self.status(job_id, pid)["state"], "waiting_human")
 
@@ -305,8 +317,73 @@ class AttachTest(JobCliTestCase):
         self.assertNotEqual(child.returncode, 0)
         self.assertNotIn("Traceback", err)
         self.assertNotIn("Traceback", out)
-        # Ctrl-C is a clean detach: the job was never cancelled.
+        # Ctrl-C is a clean read-only detach: it emits no watch_end marker and
+        # the job was never cancelled.
+        self.assertNotIn("watch_end", out)
         self.assertEqual(self.status(job_id, pid)["state"], "waiting_human")
+
+    def test_broken_pipe_is_clean_and_does_not_cancel(self) -> None:
+        pid = self.create_project("A")
+        self.select(pid)
+        job_id = self.run_job("a-5", "--task-kind", "synthetic_waiting_human")["job"]["job_id"]
+        self.await_state(job_id, pid, lambda j: j["state"] == "waiting_human")
+
+        child = subprocess.Popen(
+            [
+                sys.executable, "-m", "review_article_agent",
+                "--data-dir", self.state, "job", "attach", job_id,
+                "--watch", "--poll-interval", "0.1", "--timeout", "30", "--project", pid,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._env(),
+            cwd=str(REPO),
+        )
+        try:
+            first = child.stdout.readline()
+            self.assertTrue(first.strip(), "attach produced no first snapshot")
+            time.sleep(0.3)
+            # Close the read end: the worker-facing CLI's next write gets EPIPE.
+            child.stdout.close()
+            rc = child.wait(timeout=10)
+            err = child.stderr.read()
+        finally:
+            child.stderr.close()
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+        # A closed downstream consumer is a clean detach: exit 0, no ignored
+        # traceback, no spurious error, and the job continues (never cancelled).
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("BrokenPipeError", err)
+        self.assertNotIn("Exception ignored", err)
+        self.assertEqual(self.status(job_id, pid)["state"], "waiting_human")
+
+
+class SwitchBlockedTruthfulnessTest(JobCliTestCase):
+    def test_switch_blocked_does_not_claim_no_change_and_old_pause_visible(self) -> None:
+        pa = self.create_project("A")
+        pb = self.create_project("B")
+        self.select(pa)
+        job_id = self.run_job("s-1", "--outcome", "ambiguous", "--steps", "1", "--delay-ms", "0")[
+            "job"
+        ]["job_id"]
+        self.await_state(
+            job_id, pa, lambda j: j["outcome_unresolved"] and j["state"] == "waiting_human"
+        )
+        proc = self.raw("--data-dir", self.state, "job", "switch", "--project", pb)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        message = json.loads(proc.stderr)["error"]["message"]
+        # A blocked switch already persisted a durable pause on the old project,
+        # so the message must NOT claim that nothing changed.
+        self.assertNotIn("nothing was changed", message)
+        self.assertIn("inspect", message.lower())
+        # The old project's durable pause is actually visible afterwards.
+        after = self.status(job_id, pa)
+        self.assertEqual(after["state"], "paused")
+        self.assertTrue(after["outcome_unresolved"])
 
 
 class ConcurrentProjectTest(JobCliTestCase):
@@ -466,6 +543,12 @@ class InProcessMappingTest(JobCliTestCase):
         self.assertNotIn(SECRET, out + err)
         self.assertNotIn("Traceback", err)
         self.assertEqual(json.loads(err)["error"]["category"], "storage")
+        # A transport failure at/after the send boundary is unconfirmed, never a
+        # blanket "nothing changed" claim.
+        message = json.loads(err)["error"]["message"]
+        self.assertIn("unconfirmed", message)
+        self.assertNotIn("no control was applied", message)
+        self.assertNotIn("nothing was changed", message)
 
     def test_start_worker_failure_is_curated_storage(self) -> None:
         pid = self._activate()
@@ -479,6 +562,198 @@ class InProcessMappingTest(JobCliTestCase):
         self.assertNotIn(SECRET, out + err)
         self.assertNotIn("Traceback", err)
         self.assertEqual(json.loads(err)["error"]["category"], "storage")
+
+
+class LocalValidationTest(JobCliTestCase):
+    """Bad input is a typed validation error (exit 2) before any daemon start."""
+
+    def _no_worker_running(self) -> None:
+        self.assertFalse(process.worker_status(self.state)["running"])
+
+    def test_giant_integer_arguments_are_validation_not_internal(self) -> None:
+        pid = self.create_project("A")
+        self.select(pid)
+        huge = "9" * 10000
+        cases = (
+            ["job", "run", "--request-id", "x", "--steps", huge],
+            ["job", "run", "--request-id", "x", "--delay-ms", huge],
+            ["job", "reconcile", "job_x", "--resolution", "accepted_local_result",
+             "--result-value", huge, "--confirm-quiesced"],
+        )
+        for args in cases:
+            with self.subTest(args=args[:4]):
+                proc = self.raw("--data-dir", self.state, *args)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+                self.assertNotIn(huge, proc.stdout + proc.stderr)
+                self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation")
+        self._no_worker_running()
+
+    def test_invalid_ids_and_stage_are_validation_before_daemon(self) -> None:
+        pid = self.create_project("A")
+        self.select(pid)
+        cases = (
+            ["job", "run", "--request-id", "a/b", "--project", pid],
+            ["job", "run", "--request-id", "x", "--stage", "bad stage", "--project", pid],
+            ["job", "run", "--request-id", "x", "--project", "not-a-project"],
+            ["job", "status", "j/b", "--project", pid],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                proc = self.raw("--data-dir", self.state, *args)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+                self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation")
+        self._no_worker_running()
+
+
+class WatchBoundTest(JobCliTestCase):
+    """The watch deadline is fixed before the first probe and bounds every query."""
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        code = cli_main.main(list(argv), env={}, stdout=out, stderr=err)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_poll_interval_minimum_is_enforced(self) -> None:
+        pid = self.create_project("A")
+        self.cli("--data-dir", self.state, "select", pid)
+        for bad in ("1e-300", "0.04", "0"):
+            with self.subTest(poll_interval=bad):
+                proc = self.raw(
+                    "--data-dir", self.state, "job", "attach", "j1",
+                    "--watch", "--poll-interval", bad,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation")
+        # A refused interval never probes or starts the worker.
+        self.assertFalse(process.worker_status(self.state)["running"])
+
+    def _running(self) -> dict:
+        return {
+            "running": True, "verified": True, "app": process.APP_MARKER,
+            "protocol_version": process.PROTOCOL_VERSION, "pid": 4321, "state": "running",
+        }
+
+    def test_no_query_after_deadline(self) -> None:
+        pid = self.create_project("A")
+        self.cli("--data-dir", self.state, "select", pid)
+        times: list[float] = []
+
+        def fake(self, request, *, timeout=None, expected_peer_pid=None):
+            times.append(time.monotonic())
+            return {"ok": True, "job": {"state": "waiting_human", "outcome_unresolved": True}}
+
+        start = time.monotonic()
+        with mock.patch.object(process, "worker_status", return_value=self._running()), \
+                mock.patch.object(ipc.WorkerIPCClient, "request", fake):
+            rc, out, err = self._run(
+                ["--data-dir", self.state, "job", "attach", "j1",
+                 "--watch", "--poll-interval", "0.05", "--timeout", "0.3", "--project", pid]
+            )
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(times)
+        deadline = start + 0.3
+        for t in times:
+            self.assertLessEqual(t, deadline + 0.2)
+        docs = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertTrue(any(d.get("snapshot") for d in docs))
+        self.assertEqual(docs[-1]["watch_end"]["reason"], "timeout")
+        self.assertFalse(docs[-1]["watch_end"]["terminal_reached"])
+
+    def test_slow_reply_issues_no_second_query(self) -> None:
+        pid = self.create_project("A")
+        self.cli("--data-dir", self.state, "select", pid)
+        calls: list[float] = []
+
+        def fake(self, request, *, timeout=None, expected_peer_pid=None):
+            calls.append(time.monotonic())
+            time.sleep(0.5)  # a slow reply, longer than the whole watch budget
+            return {"ok": True, "job": {"state": "waiting_human"}}
+
+        with mock.patch.object(process, "worker_status", return_value=self._running()), \
+                mock.patch.object(ipc.WorkerIPCClient, "request", fake):
+            rc, out, err = self._run(
+                ["--data-dir", self.state, "job", "attach", "j1",
+                 "--watch", "--poll-interval", "0.05", "--timeout", "0.3", "--project", pid]
+            )
+        self.assertEqual(rc, 0, err)
+        # The slow first reply consumed the budget: no further query is issued.
+        self.assertEqual(len(calls), 1)
+        docs = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertEqual(docs[-1]["watch_end"]["reason"], "timeout")
+
+
+class LostReplyReplayTest(JobCliTestCase):
+    """A lost reply is unconfirmed; replaying the exact request id is idempotent."""
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        code = cli_main.main(list(argv), env={}, stdout=out, stderr=err)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_lost_reply_then_exact_request_id_replay_is_one_job(self) -> None:
+        pid = self.create_project("A")
+        self.cli("--data-dir", self.state, "select", pid)
+        registry = Registry(self.state)
+        engine = WorkerEngine(self.state, registry=registry)
+        self.addCleanup(engine.close)
+
+        running = {
+            "running": True, "verified": True, "app": process.APP_MARKER,
+            "protocol_version": process.PROTOCOL_VERSION, "pid": 4321, "state": "running",
+        }
+
+        def fake(self, request, *, timeout=None, expected_peer_pid=None):
+            # The real engine handles the request (durable submit happens), then
+            # the reply is "lost".
+            result = engine.handle(request)
+            if request.get("op") == "submit":
+                raise ipc.IPCError("simulated lost reply after durable submit")
+            return result
+
+        def run_once():
+            with mock.patch.object(process, "worker_status", return_value=running), \
+                    mock.patch.object(
+                        process, "start_worker",
+                        return_value={**running, "started": True},
+                    ), mock.patch.object(ipc.WorkerIPCClient, "request", fake):
+                return self._run(
+                    ["--data-dir", self.state, "job", "run",
+                     "--request-id", "k1", "--project", pid]
+                )
+
+        rc, out, err = run_once()
+        self.assertEqual(rc, 4)
+        message = json.loads(err)["error"]["message"]
+        self.assertIn("unconfirmed", message)
+        self.assertIn("request-id", message)
+        self.assertNotIn("nothing was changed", message)
+
+        # Replaying the EXACT same request id must not create a second job.
+        rc2, _out2, _err2 = run_once()
+        self.assertEqual(rc2, 4)
+
+        with engine.open_repository(pid) as repo:
+            jobs = [job for job in repo.list() if job.request_id == "k1"]
+        self.assertEqual(len(jobs), 1)
+
+        # Drive the engine to completion; exactly one backend dispatch row exists.
+        for _ in range(500):
+            hint = engine.tick()
+            if hint is None:
+                break
+            if hint > 0:
+                time.sleep(min(hint, 0.02))
+
+        journal = os.path.join(self.state, "runtime", "synthetic.sqlite3")
+        conn = sqlite3.connect(journal)
+        try:
+            rows = conn.execute("SELECT COUNT(*) FROM dispatch").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(rows, 1)
 
 
 if __name__ == "__main__":  # pragma: no cover
