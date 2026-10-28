@@ -33,7 +33,14 @@ What this module deliberately does **not** do
   The returned :class:`SessionTurnSpec` is **inert planning metadata**: it does not
   *prove* it was persisted, and it does not authorize paid model generation or a
   hosted/source upload. Authorization, budgets, and rights remain separate
-  concerns; this module reads no credential and makes no network call.
+  concerns.
+* It makes **no** network call, retrieves **no** provider API key, receives **no**
+  credential value, calls **no** credential-read API (never
+  ``manager.read_password``), and serializes **no** secret. The owned service
+  manager may *internally* read its own service auth file while proving the live
+  process identity behind ``descriptor()``/``connection()``; the planner neither
+  triggers nor inspects that internal proof, and its read-only location lookup
+  performs no credential read at all.
 * It does **not** modify the schema, dispatch ledger, CLI, worker, or any storage
   module; it only reads through the existing repositories.
 
@@ -58,16 +65,21 @@ rows plus the application-supplied ``text``:
   byte-level content, pinned digest, currentness, and current storage-allowed
   rights (reusing the :class:`RuntimeRepository` helper and rebuild conventions,
   with **no** write);
-* the manager's owned, current descriptor/connection and its clean per-project
-  location are locally cross-checked (the ownership/currentness proof is the
-  manager's own ``descriptor()``/``connection()``; this module only checks local
-  consistency and performs no network probe), the mapping's ``clean_location`` must
+* the manager's owned, current descriptor/connection are read via
+  ``descriptor()``/``connection()`` and the location is looked up **read-only**
+  via ``existing_location()`` (never the mutating ``location_for``): the planner
+  creates no directory, applies no ``chmod``, takes no lock, and writes no
+  marker/config. Missing locations are refused, not created. The ownership/
+  currentness proof is the manager's own; this module only checks local
+  consistency and performs no network probe. The mapping's ``clean_location`` must
   equal the owned location's directory and its ``service_instance_id`` must equal
   that owned location's instance id, and the manager's configuration for the role
   must equal the task's role configuration;
-* the **effective** generated role ``steps`` for the role must equal the task's
-  ``step_limit`` exactly (a smaller requested limit is refused, because the task's
-  step field is not assumed to affect the server);
+* the **declared generated** role ``steps`` for the role — computed from the
+  manager's owned configuration, **not** read back from a running server or a
+  cached effective config — must equal the task's ``step_limit`` exactly (a smaller
+  requested limit is refused, because the task's step field is not assumed to
+  affect the server);
 * the ``versions`` set is a validated ``VersionSet`` whose ``route`` is
   ``opencode_session``, whose ``input_digest`` equals the dispatch's
   ``input_digest``, whose canonical hash equals the dispatch's ``version_digest``,
@@ -107,24 +119,31 @@ from ..storage.agent_runtime import (
     PureJsonVersionSet,
     RuntimeCorruptionError,
     RuntimeRepository,
+    RuntimeRepositoryError,
     RuntimeSessionMapping,
     RuntimeTaskRecord,
-    RuntimeValidationError,
     validate_version_set,
 )
-from .dispatch import DispatchRecord, RuntimeDispatchRepository
+from .dispatch import DispatchError, DispatchRecord, RuntimeDispatchRepository
 from .opencode import MESSAGE_ID_RE, MAX_ID_LENGTH, assert_explicit_loopback_url
 from .roles import (
+    MAX_TASK_SIZE_BYTES,
     AgentRoleError,
     BoundedTask,
     RoleConfiguration,
     build_opencode_config,
 )
-from .service import ProjectLocation, ServiceConnection, ServiceDescriptor
+from .service import (
+    ProjectLocation,
+    ServiceConnection,
+    ServiceDescriptor,
+    ServiceLocationError,
+)
 
 __all__ = [
+    "MAX_SESSION_TURN_SPEC_BYTES",
+    "SESSION_TURN_PLAN_DIRECTLY_RETRIEVES_CREDENTIAL",
     "SESSION_TURN_PLAN_PERFORMS_NETWORK_IO",
-    "SESSION_TURN_PLAN_READS_CREDENTIAL",
     "SESSION_TURN_SPEC_GRANTS_ADMISSION",
     "SESSION_TURN_SPEC_GRANTS_APPROVAL",
     "SESSION_TURN_SPEC_IS_PERSISTED",
@@ -141,14 +160,27 @@ SESSION_TURN_SPEC_KIND = "session_turn_spec"
 SESSION_TURN_SPEC_VERSION = 1
 
 #: The plan is inert metadata: it is not persisted by this call (a later runner
-#: persists the correlation), it grants no admission or approval, it performs no
-#: network I/O, and it never reads a credential. These are stated as data so a
-#: later consumer cannot mistake planning for permission.
+#: persists the correlation), it grants no admission or approval, and it performs
+#: no network I/O. These are stated as data so a later consumer cannot mistake
+#: planning for permission.
 SESSION_TURN_SPEC_IS_PERSISTED = False
 SESSION_TURN_SPEC_GRANTS_ADMISSION = False
 SESSION_TURN_SPEC_GRANTS_APPROVAL = False
 SESSION_TURN_PLAN_PERFORMS_NETWORK_IO = False
-SESSION_TURN_PLAN_READS_CREDENTIAL = False
+
+#: The planner **itself** neither retrieves provider API keys, receives credential
+#: values, calls a credential-read API, nor serializes a secret. This is *not* a
+#: claim that the owned service manager performs no internal credential read while
+#: proving its own process identity: ``descriptor()``/``connection()`` ownership
+#: proof may read the service auth file internally. The planner only asks the
+#: manager for its already-proven owned surface.
+SESSION_TURN_PLAN_DIRECTLY_RETRIEVES_CREDENTIAL = False
+
+#: A strict, portable, bounded upper bound for either canonical blob. The message
+#: is additionally bounded by the task ``size_limit`` (itself <=
+#: :data:`MAX_TASK_SIZE_BYTES`); the plan embeds only task pins/versions/digests,
+#: never the message text, so this generous multiple is only a hard sanity bound.
+MAX_SESSION_TURN_SPEC_BYTES = 4 * MAX_TASK_SIZE_BYTES
 
 #: The version slots a session turn consumes (C02 §6.1): the role model and the
 #: prompt. Both MUST be ``known``; an unknown applied version is refused.
@@ -199,7 +231,10 @@ _MSG_VARIANT = (
     "model: an explicit variant is required; an omitted variant is refused rather "
     "than silently defaulted."
 )
-_MSG_MANAGER = "manager: must expose the owned descriptor, connection, and per-project location."
+_MSG_MANAGER = (
+    "manager: must expose the owned descriptor, connection, and read-only "
+    "existing per-project location."
+)
 _MSG_LOCATION = "manager: the per-project location does not match the recorded session location."
 _MSG_SERVICE_INSTANCE = (
     "manager: the owned service instance does not match the recorded session mapping."
@@ -234,6 +269,86 @@ _MSG_CRITIC_SESSION = "section_critic: the critic session must be fresh and must
 _MSG_REPO_HELPER = "task: the runtime repository cannot revalidate the live references."
 _MSG_ADMISSION = "admission: the derived admission id is not an OpenCode-compatible message id."
 _MSG_CORRUPT = "store: a persisted runtime record failed integrity revalidation."
+_MSG_SPEC = (
+    "spec: the value object is not an exact, strict, canonical session-turn plan."
+)
+_MSG_MANAGER_LOCATION = (
+    "manager: no owned per-project location exists; a plan never creates one."
+)
+
+#: The exact top-level plan keys (an unknown/extra key is a forged plan).
+_PLAN_KEYS = frozenset(
+    {
+        "kind",
+        "spec_version",
+        "project_id",
+        "role",
+        "task",
+        "dispatch",
+        "session",
+        "versions",
+        "admission_id",
+        "message_digest",
+        "fresh_context_required",
+        "context_history",
+        "execution_boundary",
+    }
+)
+_TASK_KEYS = frozenset(
+    {
+        "task_id",
+        "request_id",
+        "fingerprint",
+        "target",
+        "input_refs",
+        "scope",
+        "prompt_version",
+        "size_limit",
+        "step_limit",
+    }
+)
+_DISPATCH_KEYS = frozenset(
+    {
+        "dispatch_id",
+        "request_id",
+        "route",
+        "stage",
+        "input_digest",
+        "version_digest",
+    }
+)
+_SESSION_KEYS = frozenset(
+    {
+        "mapping_id",
+        "session_id",
+        "service_instance_id",
+        "clean_location",
+        "opencode_project_id",
+        "config_snapshot_id",
+        "config_digest",
+        "model",
+    }
+)
+_MESSAGE_KEYS = frozenset(
+    {
+        "kind",
+        "project_id",
+        "role",
+        "task_id",
+        "task_fingerprint",
+        "dispatch_id",
+        "mapping_id",
+        "session_id",
+        "scope",
+        "target",
+        "input_refs",
+        "prompt_version",
+        "size_limit",
+        "step_limit",
+        "versions",
+        "text",
+    }
+)
 
 
 class SessionTurnError(ReviewAgentError):
@@ -260,11 +375,19 @@ class SessionTurnValidationError(SessionTurnError, ValueError):
 class SessionTurnSpec:
     """An exact, immutable, deterministic plan for one ``opencode_session`` turn.
 
-    The value is self-checking: ``__post_init__`` re-parses the canonical bytes and
-    requires the recorded admission id, message digest, session/mapping ids, and
-    project id to agree, so a hand-constructed or tampered instance is refused.
-    Every field is an immutable scalar or ``bytes``, so the instance is deeply
-    immutable; both ``canonical`` and ``message`` are immutable ``bytes`` and
+    The value is self-checking: ``__post_init__`` strictly re-parses both byte blobs
+    (bounded size, portable canonical JSON, bounded depth, no duplicate keys, no
+    non-finite numbers) and then requires **every** public field to match its
+    canonical and message projection: identity, role, model, session/mapping ids,
+    location, configuration, dispatch, digests, prompt version, limits, versions,
+    the re-derived deterministic admission id, the fixed non-authorizing execution
+    boundary, and the section-critic freshness mark. A hand-constructed,
+    ``dataclasses.replace``-d or tampered instance is refused with one static typed
+    error, so a partially-consistent plan cannot pass.
+
+    This proves cross-field consistency of the value object, **not** that it was
+    persisted and **not** that any admission/approval/execution was granted. Every
+    field is an immutable scalar or ``bytes``, so the instance is deeply immutable;
     :meth:`to_mapping` returns a fresh plain copy (never an alias), so no caller can
     mutate a plan after it has been digested.
     """
@@ -294,29 +417,7 @@ class SessionTurnSpec:
     message: bytes
 
     def __post_init__(self) -> None:
-        if not isinstance(self.canonical, bytes) or not isinstance(self.message, bytes):
-            raise SessionTurnValidationError("spec", _MSG_CORRUPT)
-        if hashlib.sha256(self.message).hexdigest() != self.message_digest:
-            raise SessionTurnValidationError("spec", _MSG_CORRUPT)
-        if MESSAGE_ID_RE.fullmatch(self.admission_id) is None:
-            raise SessionTurnValidationError("spec", _MSG_ADMISSION)
-        try:
-            plan = json.loads(self.canonical.decode("utf-8"))
-        except (ValueError, UnicodeError) as exc:
-            raise SessionTurnValidationError("spec", _MSG_CORRUPT) from exc
-        if not isinstance(plan, dict) or plan.get("kind") != SESSION_TURN_SPEC_KIND:
-            raise SessionTurnValidationError("spec", _MSG_CORRUPT)
-        session = plan.get("session")
-        if not isinstance(session, dict):
-            raise SessionTurnValidationError("spec", _MSG_CORRUPT)
-        if (
-            plan.get("project_id") != self.project_id
-            or plan.get("admission_id") != self.admission_id
-            or plan.get("message_digest") != self.message_digest
-            or session.get("session_id") != self.session_id
-            or session.get("mapping_id") != self.mapping_id
-        ):
-            raise SessionTurnValidationError("spec", _MSG_CORRUPT)
+        _validate_spec(self)
 
     @property
     def digest(self) -> str:
@@ -353,6 +454,250 @@ def _canonical(value: object, message: str) -> bytes:
         raise SessionTurnValidationError("canonical", message) from exc
 
 
+#: The strict container-depth bound applied before a spec blob is walked. It
+#: mirrors the canonical-JSON bound (``records`` rejects > 64) so both layers agree.
+_MAX_SPEC_DEPTH = 64
+
+#: The ``str``-typed public fields of :class:`SessionTurnSpec`.
+_STR_SPEC_FIELDS: tuple[str, ...] = (
+    "project_id",
+    "role",
+    "task_id",
+    "task_fingerprint",
+    "dispatch_id",
+    "dispatch_request_id",
+    "mapping_id",
+    "session_id",
+    "service_instance_id",
+    "clean_location",
+    "config_snapshot_id",
+    "config_digest",
+    "model",
+    "admission_id",
+    "input_digest",
+    "version_digest",
+    "prompt_version",
+    "message_digest",
+)
+
+
+def _plain_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that refuses a duplicate object key (last-wins gap)."""
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError("duplicate object key is not permitted")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _reject_constant(value: str) -> Any:
+    """``parse_constant`` that refuses ``NaN``/``Infinity``/``-Infinity``."""
+    raise ValueError("non-finite JSON number is not permitted")
+
+
+def _check_depth(text: str) -> None:
+    """Refuse over-deep container nesting **before** the JSON is parsed/walked."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > _MAX_SPEC_DEPTH:
+                raise ValueError("JSON nests too deeply")
+        elif ch in "]}":
+            depth -= 1
+    if depth != 0 or in_string:
+        raise ValueError("JSON is not balanced")
+
+
+def _strict_object(raw: object) -> dict[str, Any]:
+    """Return the strict, portable, canonical top-level object of ``raw`` bytes.
+
+    Order: type + byte-size bound, then decode/depth bound, then a strict parse
+    (no duplicate keys, no non-finite numbers, no recursion blow-up), then a
+    canonical re-serialization that must reproduce the exact bytes — so a
+    non-canonical, over-deep, or non-portable blob is refused before it is walked.
+    """
+    if not isinstance(raw, bytes) or len(raw) == 0 or len(raw) > MAX_SESSION_TURN_SPEC_BYTES:
+        raise SessionTurnValidationError("spec", _MSG_SPEC)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise SessionTurnValidationError("spec", _MSG_SPEC) from exc
+    try:
+        _check_depth(text)
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_no_duplicate_keys,
+            parse_constant=_reject_constant,
+        )
+    except (ValueError, RecursionError) as exc:
+        raise SessionTurnValidationError("spec", _MSG_SPEC) from exc
+    try:
+        rebuilt = canonical_json(parsed)
+    except (RecordValidationError, ValueError, TypeError, RecursionError, UnicodeError) as exc:
+        raise SessionTurnValidationError("spec", _MSG_SPEC) from exc
+    if rebuilt != raw or not isinstance(parsed, dict):
+        raise SessionTurnValidationError("spec", _MSG_SPEC)
+    return parsed
+
+
+def _validate_spec(spec: "SessionTurnSpec") -> None:
+    """Require **every** public field to agree with its canonical/message projection."""
+    for name in _STR_SPEC_FIELDS:
+        _require(isinstance(getattr(spec, name), str), "spec", _MSG_SPEC)
+    _require(_plain_int(spec.step_limit) and _plain_int(spec.size_limit), "spec", _MSG_SPEC)
+    _require(isinstance(spec.fresh_context_required, bool), "spec", _MSG_SPEC)
+
+    plan = _strict_object(spec.canonical)
+    message = _strict_object(spec.message)
+
+    _require(set(plan) == _PLAN_KEYS, "spec", _MSG_SPEC)
+    _require(plan["kind"] == SESSION_TURN_SPEC_KIND, "spec", _MSG_SPEC)
+    _require(
+        _plain_int(plan["spec_version"]) and plan["spec_version"] == SESSION_TURN_SPEC_VERSION,
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(plan["context_history"] == "unverified", "spec", _MSG_SPEC)
+    _require(plan["execution_boundary"] == _EXECUTION_BOUNDARY, "spec", _MSG_SPEC)
+    _require(plan["fresh_context_required"] == spec.fresh_context_required, "spec", _MSG_SPEC)
+    _require(spec.fresh_context_required == (spec.role == "section_critic"), "spec", _MSG_SPEC)
+    _require(plan["project_id"] == spec.project_id, "spec", _MSG_SPEC)
+    _require(plan["role"] == spec.role, "spec", _MSG_SPEC)
+    _require(plan["admission_id"] == spec.admission_id, "spec", _MSG_SPEC)
+    _require(plan["message_digest"] == spec.message_digest, "spec", _MSG_SPEC)
+    _require(MESSAGE_ID_RE.fullmatch(spec.admission_id) is not None, "spec", _MSG_ADMISSION)
+    _require(
+        _admission_id(spec.project_id, spec.dispatch_id) == spec.admission_id,
+        "spec",
+        _MSG_ADMISSION,
+    )
+    _require(
+        hashlib.sha256(spec.message).hexdigest() == spec.message_digest,
+        "spec",
+        _MSG_SPEC,
+    )
+
+    task = plan["task"]
+    dispatch = plan["dispatch"]
+    session = plan["session"]
+    versions = plan["versions"]
+    _require(isinstance(task, dict) and set(task) == _TASK_KEYS, "spec", _MSG_SPEC)
+    _require(isinstance(dispatch, dict) and set(dispatch) == _DISPATCH_KEYS, "spec", _MSG_SPEC)
+    _require(isinstance(session, dict) and set(session) == _SESSION_KEYS, "spec", _MSG_SPEC)
+    _require(isinstance(versions, dict), "spec", _MSG_SPEC)
+
+    _require(
+        task["task_id"] == spec.task_id and task["fingerprint"] == spec.task_fingerprint,
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(task["prompt_version"] == spec.prompt_version, "spec", _MSG_SPEC)
+    _require(
+        _plain_int(task["size_limit"]) and task["size_limit"] == spec.size_limit,
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(
+        _plain_int(task["step_limit"]) and task["step_limit"] == spec.step_limit,
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(
+        isinstance(task["target"], dict)
+        and isinstance(task["input_refs"], list)
+        and isinstance(task["scope"], list),
+        "spec",
+        _MSG_SPEC,
+    )
+
+    _require(
+        dispatch["dispatch_id"] == spec.dispatch_id
+        and dispatch["request_id"] == spec.dispatch_request_id,
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(dispatch["route"] == _SESSION_ROUTE, "spec", _MSG_SPEC)
+    _require(
+        dispatch["input_digest"] == spec.input_digest
+        and dispatch["version_digest"] == spec.version_digest,
+        "spec",
+        _MSG_SPEC,
+    )
+
+    _require(
+        session["mapping_id"] == spec.mapping_id and session["session_id"] == spec.session_id,
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(session["service_instance_id"] == spec.service_instance_id, "spec", _MSG_SPEC)
+    _require(session["clean_location"] == spec.clean_location, "spec", _MSG_SPEC)
+    _require(
+        session["config_snapshot_id"] == spec.config_snapshot_id
+        and session["config_digest"] == spec.config_digest,
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(session["model"] == spec.model, "spec", _MSG_SPEC)
+
+    try:
+        normalized_versions = validate_version_set(versions, consumed=_DEFAULT_CONSUMED)
+    except (
+        RecordValidationError,
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        RecursionError,
+    ) as exc:
+        raise SessionTurnValidationError("spec", _MSG_SPEC) from exc
+    _require(normalized_versions == versions, "spec", _MSG_SPEC)
+    _require(versions.get("route") == _SESSION_ROUTE, "spec", _MSG_SPEC)
+    _require(versions.get("input_digest") == spec.input_digest, "spec", _MSG_SPEC)
+    _require(
+        hashlib.sha256(canonical_json(versions)).hexdigest() == spec.version_digest,
+        "spec",
+        _MSG_SPEC,
+    )
+
+    _require(set(message) == _MESSAGE_KEYS, "spec", _MSG_SPEC)
+    _require(message["kind"] == "session_turn_input", "spec", _MSG_SPEC)
+    for key, expected in (
+        ("project_id", spec.project_id),
+        ("role", spec.role),
+        ("task_id", spec.task_id),
+        ("task_fingerprint", spec.task_fingerprint),
+        ("dispatch_id", spec.dispatch_id),
+        ("mapping_id", spec.mapping_id),
+        ("session_id", spec.session_id),
+        ("prompt_version", spec.prompt_version),
+        ("step_limit", spec.step_limit),
+        ("size_limit", spec.size_limit),
+    ):
+        _require(message.get(key) == expected, "spec", _MSG_SPEC)
+    _require(message["scope"] == task["scope"], "spec", _MSG_SPEC)
+    _require(message["target"] == task["target"], "spec", _MSG_SPEC)
+    _require(message["input_refs"] == task["input_refs"], "spec", _MSG_SPEC)
+    _require(message["versions"] == versions, "spec", _MSG_SPEC)
+
+
 def _store_project_id(store: object) -> str:
     project_id = getattr(store, "project_id", None)
     if not isinstance(project_id, str):
@@ -387,7 +732,7 @@ def _require_persisted_task(
         raise _fail("task", _MSG_TASK_TYPE)
     try:
         persisted = runtime.get_task(task.task_id)
-    except (RuntimeCorruptionError, RuntimeValidationError, ValueError) as exc:
+    except (RuntimeRepositoryError, ValueError) as exc:
         raise SessionTurnValidationError("task", _MSG_CORRUPT) from exc
     if persisted is None or persisted.project_id != project_id:
         raise _fail("task", _MSG_TASK_MISSING)
@@ -403,7 +748,7 @@ def _require_persisted_mapping(
         raise _fail("mapping", _MSG_MAPPING_TYPE)
     try:
         persisted = runtime.get_session_mapping(mapping.mapping_id)
-    except (RuntimeCorruptionError, RuntimeValidationError, ValueError) as exc:
+    except (RuntimeRepositoryError, ValueError) as exc:
         raise SessionTurnValidationError("mapping", _MSG_CORRUPT) from exc
     if persisted is None or persisted.project_id != project_id:
         raise _fail("mapping", _MSG_MAPPING_MISSING)
@@ -419,7 +764,7 @@ def _require_persisted_dispatch(
         raise _fail("dispatch", _MSG_DISPATCH_TYPE)
     try:
         persisted = dispatch_repo.get_dispatch(dispatch.dispatch_id)
-    except (RuntimeCorruptionError, ValueError) as exc:
+    except (DispatchError, RuntimeCorruptionError, ValueError) as exc:
         raise SessionTurnValidationError("dispatch", _MSG_CORRUPT) from exc
     if persisted is None or persisted.project_id != project_id:
         raise _fail("dispatch", _MSG_DISPATCH_MISSING)
@@ -431,7 +776,7 @@ def _require_persisted_dispatch(
 def _get_configuration(runtime: RuntimeRepository, snapshot_id: str):
     try:
         snapshot = runtime.get_configuration(snapshot_id)
-    except (RuntimeCorruptionError, RuntimeValidationError, ValueError) as exc:
+    except (RuntimeRepositoryError, ValueError) as exc:
         raise SessionTurnValidationError("configuration", _MSG_CORRUPT) from exc
     if snapshot is None:
         raise _fail("configuration", _MSG_CONFIG_MISSING)
@@ -443,7 +788,15 @@ def _rebuild_bounded_task(task: RuntimeTaskRecord, configuration: RoleConfigurat
     try:
         stored = json.loads(task.canonical.decode("utf-8"))
         bounded = BoundedTask.from_mapping(stored, configuration=configuration)
-    except (ValueError, UnicodeError, RecordValidationError, AgentRoleError) as exc:
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+        RecursionError,
+        UnicodeError,
+        RecordValidationError,
+        AgentRoleError,
+    ) as exc:
         raise SessionTurnValidationError("task", _MSG_CORRUPT) from exc
     if bounded.canonical_bytes() != task.canonical or bounded.fingerprint() != task.fingerprint:
         raise _fail("task", _MSG_TASK_MISMATCH)
@@ -465,7 +818,7 @@ def _revalidate_live_refs(runtime: RuntimeRepository, bounded: BoundedTask) -> N
         verify(bounded)
     except RuntimeCorruptionError as exc:
         raise SessionTurnValidationError("task", _MSG_CORRUPT) from exc
-    except (ValueError, AgentRoleError) as exc:
+    except (ValueError, TypeError, KeyError, AgentRoleError) as exc:
         # A missing/stale/content-mismatched/superseded-rights reference is a
         # ValueError (or a typed role error); surface it as a static redacted refusal.
         raise SessionTurnValidationError("task", _MSG_LIVE_REFS) from exc
@@ -477,17 +830,23 @@ def _revalidate_live_refs(runtime: RuntimeRepository, bounded: BoundedTask) -> N
 def _manager_surface(
     manager: object, project_id: str
 ) -> tuple[ServiceDescriptor, ServiceConnection, ProjectLocation, RoleConfiguration]:
-    for name in ("descriptor", "connection", "location_for"):
+    for name in ("descriptor", "connection", "existing_location"):
         if not callable(getattr(manager, name, None)):
             raise _fail("manager", _MSG_MANAGER)
     configuration = getattr(manager, "configuration", None)
     if not isinstance(configuration, RoleConfiguration):
         raise _fail("manager", _MSG_MANAGER)
     try:
+        # The owned manager derives these from its own proof. That proof may read
+        # the service auth file *internally* to bind the live process identity; the
+        # planner neither retrieves that credential value nor serializes it.
         descriptor = manager.descriptor()  # type: ignore[attr-defined]
         connection = manager.connection()  # type: ignore[attr-defined]
-        location = manager.location_for(project_id)  # type: ignore[attr-defined]
-    except ReviewAgentError as exc:
+        # A **read-only** lookup: a missing location is refused, never created.
+        location = manager.existing_location(project_id)  # type: ignore[attr-defined]
+    except ServiceLocationError as exc:
+        raise _fail("manager", _MSG_MANAGER_LOCATION) from exc
+    except ReviewAgentError:
         # The manager's own ownership/currentness refusal is already typed and
         # static; surface it unchanged rather than masking it.
         raise
@@ -543,7 +902,7 @@ def _critic_guard(
         raise _fail("section_critic", _MSG_CRITIC) from exc
     try:
         mappings = runtime.list_session_mappings()
-    except (RuntimeCorruptionError, RuntimeValidationError) as exc:
+    except (RuntimeRepositoryError, ValueError) as exc:
         raise SessionTurnValidationError("section_critic", _MSG_CORRUPT) from exc
     for other in mappings:
         if other.role == "writer" and other.session_id == mapping.session_id:
@@ -557,7 +916,14 @@ def _canonical_versions(versions: object, consumed: tuple[str, ...]) -> dict[str
     raw = versions.as_mapping() if isinstance(versions, PureJsonVersionSet) else versions
     try:
         return validate_version_set(raw, consumed=consumed)
-    except (RecordValidationError, ValueError, TypeError) as exc:
+    except (
+        RecordValidationError,
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        RecursionError,
+    ) as exc:
         raise SessionTurnValidationError("versions", _MSG_VERSIONS) from exc
 
 
@@ -744,7 +1110,9 @@ def prepare_session_turn(
             raise _fail("section_critic", _MSG_CRITIC) from exc
         _critic_guard(runtime, persisted_mapping, mapping_configuration)
 
-    # The effective generated steps/model must be exactly what the task pins.
+    # The *declared generated* steps/model from the manager's owned configuration
+    # must be exactly what the task pins. This does not claim the running server is
+    # currently configured that way, nor that any effective-config cache is current.
     generated = build_opencode_config(manager_configuration)
     agent = generated.get("agents", {}).get(role)
     _require(isinstance(agent, dict), "configuration", _MSG_CONFIG_ROLE)

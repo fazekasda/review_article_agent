@@ -30,6 +30,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -56,6 +57,8 @@ from review_article_agent.runtime.service import (  # noqa: E402
     ServiceDescriptor,
 )
 from review_article_agent.runtime.session_turns import (  # noqa: E402
+    MAX_SESSION_TURN_SPEC_BYTES,
+    SESSION_TURN_PLAN_DIRECTLY_RETRIEVES_CREDENTIAL,
     SESSION_TURN_PLAN_PERFORMS_NETWORK_IO,
     SESSION_TURN_SPEC_GRANTS_ADMISSION,
     SESSION_TURN_SPEC_GRANTS_APPROVAL,
@@ -140,10 +143,12 @@ def _sha256_bytes(data: bytes) -> str:
 class _LayoutManager:
     """A disposable owned-layout seam: genuine service dataclasses, no server.
 
-    ``location_for`` delegates to a real :class:`OpenCodeServiceManager`, so the
-    per-project location is the manager's real clean, owned layout. The
-    descriptor/connection are genuine frozen dataclasses derived from that layout;
-    they are never used to connect, and the credential is never read.
+    ``existing_location`` delegates to the real :class:`OpenCodeServiceManager`'s
+    **read-only** lookup, so the per-project location is the manager's real clean,
+    owned layout while the planner never mutates it. ``location_for`` remains only
+    for the test setup that *creates* the disposable layout. The descriptor/
+    connection are genuine frozen dataclasses derived from that layout; they are
+    never used to connect, and the planner never calls ``read_password``.
     """
 
     def __init__(self, real: OpenCodeServiceManager, *, port: int = 4096) -> None:
@@ -151,12 +156,17 @@ class _LayoutManager:
         self.configuration = real.configuration
         self._port = port
         self.read_password_calls = 0
+        self.location_for_calls = 0
 
     @property
     def real(self) -> OpenCodeServiceManager:
         return self._real
 
-    def location_for(self, project_id: str) -> ProjectLocation:
+    def existing_location(self, project_id: str) -> ProjectLocation:
+        return self._real.existing_location(project_id)
+
+    def location_for(self, project_id: str) -> ProjectLocation:  # setup only
+        self.location_for_calls += 1
         return self._real.location_for(project_id)
 
     def descriptor(self) -> ServiceDescriptor:
@@ -480,6 +490,11 @@ class PrepareSessionTurnTest(SessionTurnPlanTestBase):
         self.assertFalse(SESSION_TURN_SPEC_GRANTS_ADMISSION)
         self.assertFalse(SESSION_TURN_SPEC_GRANTS_APPROVAL)
         self.assertFalse(SESSION_TURN_PLAN_PERFORMS_NETWORK_IO)
+        self.assertFalse(SESSION_TURN_PLAN_DIRECTLY_RETRIEVES_CREDENTIAL)
+        # The planner never asks the manager for a credential value and never
+        # calls the mutating location_for (the owned read lookup is used instead).
+        self.assertEqual(scenario.manager.read_password_calls, 0)
+        self.assertEqual(scenario.manager.location_for_calls, 1)
 
         # A second, independent preparation is byte-identical and reconstructible.
         again = self._prepare(scenario)
@@ -849,6 +864,192 @@ class CriticPlanTest(SessionTurnPlanTestBase):
         with self.assertRaises(SessionTurnValidationError) as ctx:
             self._prepare(scenario)
         self.assertEqual(ctx.exception.code, "section_critic")
+
+
+_BAD_FIELD_VALUES = {
+    "project_id": "prj_other",
+    "role": "lead",
+    "task_id": "task_other",
+    "task_fingerprint": "f" * 64,
+    "dispatch_id": "dsp_other",
+    "dispatch_request_id": "req_other",
+    "mapping_id": "map_other",
+    "session_id": "ses_other",
+    "service_instance_id": "svc_other",
+    "clean_location": "/tmp/other-location",
+    "config_snapshot_id": "cfg_other",
+    "config_digest": "0" * 64,
+    "model": "openrouter/other#high",
+    "admission_id": "msg_" + "0" * 32,
+    "input_digest": "0" * 64,
+    "version_digest": "0" * 64,
+    "prompt_version": "other.v1",
+    "step_limit": 1,
+    "size_limit": 1,
+    "fresh_context_required": True,
+    "message_digest": "0" * 64,
+}
+
+
+class SpecSelfCheckTest(SessionTurnPlanTestBase):
+    """``SessionTurnSpec`` is an exact, strict, all-fields self-checking value object."""
+
+    def _spec(self):
+        return self._prepare(self._scenario())
+
+    def test_every_field_family_must_match_its_projections(self) -> None:
+        spec = self._spec()
+        covered = {field.name for field in dataclasses.fields(spec)}
+        # ``canonical``/``message`` are covered by the forged-blob tests below.
+        self.assertEqual(covered - {"canonical", "message"}, set(_BAD_FIELD_VALUES))
+        for name, bad in _BAD_FIELD_VALUES.items():
+            with self.subTest(field=name):
+                with self.assertRaises(SessionTurnValidationError):
+                    dataclasses.replace(spec, **{name: bad})
+        # A legitimate identical replacement still validates.
+        self.assertEqual(
+            dataclasses.replace(spec, canonical=spec.canonical).canonical, spec.canonical
+        )
+
+    def test_forged_canonical_blobs_are_refused(self) -> None:
+        spec = self._spec()
+        plan = spec.to_mapping()
+        deep = b"[" * 70 + b"0" + b"]" * 70
+        variants = {
+            "empty": b"{}",
+            "noncanonical": json.dumps(plan, indent=2).encode("utf-8"),
+            "trailing-newline": spec.canonical + b"\n",
+            "null": b"null",
+            "list": b"[]",
+            "duplicate-keys": (
+                b'{"kind":"session_turn_spec","kind":"session_turn_spec"}'
+            ),
+            "nonfinite": b'{"kind":"session_turn_spec","x":NaN}',
+            "deep": deep,
+            "wrong-kind": canonical_json({**plan, "kind": "other"}),
+            "extra-key": canonical_json({**plan, "extra": 1}),
+            "grant-admission": canonical_json(
+                {
+                    **plan,
+                    "execution_boundary": {
+                        **plan["execution_boundary"],
+                        "grants_admission": True,
+                    },
+                }
+            ),
+            "changed-role": canonical_json({**plan, "role": "lead"}),
+            "bool-version": canonical_json({**plan, "spec_version": True}),
+            "wrong-version": canonical_json({**plan, "spec_version": 2}),
+            "versions-route": canonical_json(
+                {
+                    **plan,
+                    "versions": {**plan["versions"], "route": "direct_call"},
+                }
+            ),
+            "versions-input": canonical_json(
+                {
+                    **plan,
+                    "versions": {**plan["versions"], "input_digest": _DIG_B},
+                }
+            ),
+            "message-digest": canonical_json({**plan, "message_digest": "0" * 64}),
+            "task-step": canonical_json(
+                {**plan, "task": {**plan["task"], "step_limit": 1}}
+            ),
+            "session-id": canonical_json(
+                {**plan, "session": {**plan["session"], "session_id": "ses_other"}}
+            ),
+        }
+        for name, blob in variants.items():
+            with self.subTest(variant=name):
+                with self.assertRaises(SessionTurnValidationError):
+                    dataclasses.replace(spec, canonical=blob)
+
+    def test_forged_message_blobs_are_refused(self) -> None:
+        spec = self._spec()
+        message = json.loads(spec.message)
+        deep = b"[" * 70 + b"0" + b"]" * 70
+
+        def _with_digest(blob: bytes):
+            return dataclasses.replace(
+                spec, message=blob, message_digest=hashlib.sha256(blob).hexdigest()
+            )
+
+        # Structural failures are caught even when the digest is recomputed, so the
+        # digest is not the only checker (no partial-checker gap).
+        structural = {
+            "wrongkeys": canonical_json({"kind": "session_turn_input"}),
+            "changed-session": canonical_json({**message, "session_id": "ses_other"}),
+            "changed-scope": canonical_json({**message, "scope": ["section:other"]}),
+            "changed-step": canonical_json({**message, "step_limit": 1}),
+            "changed-versions": canonical_json(
+                {
+                    **message,
+                    "versions": {**message["versions"], "route": "direct_call"},
+                }
+            ),
+            "changed-target": canonical_json(
+                {**message, "target": {**message["target"], "revision_id": "rev_2"}}
+            ),
+            "extra-key": canonical_json({**message, "extra": 1}),
+        }
+        for name, blob in structural.items():
+            with self.subTest(variant=name):
+                with self.assertRaises(SessionTurnValidationError):
+                    _with_digest(blob)
+
+        raw_variants = {
+            "null": b"null",
+            "list": b"[]",
+            "broken": b"{",
+            "noncanonical": json.dumps(message, indent=2).encode("utf-8"),
+            "trailing-newline": spec.message + b"\n",
+            "duplicate-keys": (
+                b'{"kind":"session_turn_input","kind":"session_turn_input"}'
+            ),
+            "nonfinite": b'{"kind":"session_turn_input","x":NaN}',
+            "deep": deep,
+        }
+        for name, blob in raw_variants.items():
+            with self.subTest(variant=name):
+                with self.assertRaises(SessionTurnValidationError):
+                    _with_digest(blob)
+
+    def test_wrong_public_field_types_are_refused(self) -> None:
+        spec = self._spec()
+        wrong = {
+            "canonical": "not-bytes",
+            "message": 123,
+            "step_limit": "8",
+            "size_limit": 8.0,
+            "fresh_context_required": "yes",
+        }
+        for name, bad in wrong.items():
+            with self.subTest(field=name):
+                with self.assertRaises(SessionTurnValidationError):
+                    dataclasses.replace(spec, **{name: bad})
+
+
+class LocationReadOnlyPlanTest(SessionTurnPlanTestBase):
+    """The planner uses the manager's read-only location lookup and creates nothing."""
+
+    def test_missing_location_is_refused_without_being_recreated(self) -> None:
+        scenario = self._scenario()
+        location_dir = Path(scenario.location.directory)
+        shutil.rmtree(location_dir)
+        real = scenario.manager.real
+        root_mode = os.stat(real.root).st_mode & 0o777
+        projects_mode = os.stat(real.projects_dir).st_mode & 0o777
+        calls_before = scenario.manager.location_for_calls
+
+        with self.assertRaises(SessionTurnValidationError) as ctx:
+            self._prepare(scenario)
+        self.assertEqual(ctx.exception.code, "manager")
+        self.assertFalse(location_dir.exists())
+        self.assertEqual(os.stat(real.root).st_mode & 0o777, root_mode)
+        self.assertEqual(os.stat(real.projects_dir).st_mode & 0o777, projects_mode)
+        self.assertEqual(scenario.manager.location_for_calls, calls_before)
+        self.assertEqual(scenario.manager.read_password_calls, 0)
 
 
 class CriticConfigurationSanityTest(unittest.TestCase):

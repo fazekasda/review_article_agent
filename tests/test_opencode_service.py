@@ -65,6 +65,7 @@ from review_article_agent.runtime.service import (  # noqa: E402
     LoopbackFixtureProvider,
     OpenCodeServiceManager,
     ServiceConfigError,
+    ServiceLocationError,
     ServiceLockError,
     ServiceOwnershipError,
     ServiceProcessError,
@@ -450,6 +451,41 @@ class FilesystemBoundaryTests(_ServiceCase):
         (Path(location.directory) / "opencode.json").write_text("{}", encoding="utf-8")
         with self.assertRaises(ServiceOwnershipError):
             manager.location_for("prj_dirty")
+
+    def test_existing_location_is_read_only_and_never_creates(self) -> None:
+        # A fresh manager whose explicit data dir does not exist yet: a read-only
+        # lookup refuses and creates no directory at all.
+        missing_dir = self.data_dir / "not-created"
+        absent = self.manager(data_dir=missing_dir)
+        with self.assertRaises(ServiceOwnershipError):
+            absent.existing_location("prj_absent")
+        self.assertFalse(missing_dir.exists())
+
+        # After one owned location exists, a different project stays absent and an
+        # existing one is returned without any mkdir/chmod/marker/lock write.
+        manager = self.manager()
+        created = manager.location_for("prj_present")
+        root_mode = os.stat(manager.root).st_mode & 0o777
+        projects_mode = os.stat(manager.projects_dir).st_mode & 0o777
+        marker = Path(created.directory) / service.LOCATION_MARKER_NAME
+        marker_bytes = marker.read_bytes()
+        marker_mode = os.stat(marker).st_mode & 0o777
+
+        with self.assertRaises(ServiceLocationError):
+            manager.existing_location("prj_absent")
+        self.assertFalse((manager.projects_dir / "prj_absent").exists())
+
+        # A stale permissive directory mode must NOT be "repaired" by a read.
+        os.chmod(created.directory, 0o755)
+        proved = manager.existing_location("prj_present")
+        self.assertEqual(proved.directory, created.directory)
+        self.assertEqual(proved.location_id, created.location_id)
+        self.assertEqual(proved.root, created.root)
+        self.assertEqual(os.stat(created.directory).st_mode & 0o777, 0o755)
+        self.assertEqual(os.stat(manager.root).st_mode & 0o777, root_mode)
+        self.assertEqual(os.stat(manager.projects_dir).st_mode & 0o777, projects_mode)
+        self.assertEqual(marker.read_bytes(), marker_bytes)
+        self.assertEqual(os.stat(marker).st_mode & 0o777, marker_mode)
 
     def test_lock_symlink_refused(self) -> None:
         manager = self.manager()

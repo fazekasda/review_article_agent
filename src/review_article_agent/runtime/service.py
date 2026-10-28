@@ -367,6 +367,9 @@ _MSG_LOCATION_UNOWNED = (
     "refusing to use it."
 )
 _MSG_LOCATION_NOT_DIR = "A project location exists and is not a directory."
+_MSG_LOCATION_ABSENT = (
+    "No owned project location exists; a read-only lookup never creates one."
+)
 _MSG_NOT_OWNED_STOP = "The service root is not owned by this application; refusing to stop."
 _MSG_PROBE = "The service did not answer a bounded readiness request."
 _MSG_PROBE_ORIGIN = "A readiness request was refused (origin, path, or redirect)."
@@ -2331,6 +2334,49 @@ class OpenCodeServiceManager:
             result = self._write_location_marker(location, project_id)
             self._scan_dir_for_risks(location)
             return result
+
+    def existing_location(self, project_id: str) -> ProjectLocation:
+        """Return the **already existing** owned location for ``project_id``.
+
+        Read-only counterpart to :meth:`location_for`: it proves the owned root,
+        the safe directory chain, the clean owned tree, and the location's owned
+        marker, and it **creates nothing** — no ``data_dir``/root/location
+        ``mkdir``, no ``chmod``, no lock file, no marker or config write. A
+        missing location (or an unsafe/unowned one) is refused; unlike
+        :meth:`location_for` it is **never** created.
+        """
+        validate_identifier(project_id, "project_id")
+        self._assert_root_safe()
+        if not self.is_owned_root():
+            raise ServiceOwnershipError("root_unowned", _MSG_ROOT_UNOWNED)
+        if not self._dir_chain_ok(self.projects_dir):
+            raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
+        location = self.projects_dir / project_id
+        st = _lstat(str(location))
+        if st is None:
+            raise ServiceLocationError("location_absent", _MSG_LOCATION_ABSENT)
+        if stat.S_ISLNK(st.st_mode):
+            raise ServiceLocationError("location_symlink", _MSG_LOCATION_SYMLINK)
+        if not stat.S_ISDIR(st.st_mode):
+            raise ServiceLocationError("location_not_dir", _MSG_LOCATION_NOT_DIR)
+        if st.st_uid != os.getuid():
+            raise ServiceOwnershipError("location_unowned", _MSG_LOCATION_UNOWNED)
+        if not self._dir_chain_ok(location):
+            raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
+        self._assert_tree_clean()
+        if not self._location_marker_valid(location, project_id):
+            raise ServiceOwnershipError("location_unowned", _MSG_LOCATION_UNOWNED)
+        self._scan_dir_for_risks(location)
+        doc = self._read_location_marker(location)
+        instance_id = str((doc or {}).get("instanceId", ""))
+        if not instance_id:
+            raise ServiceOwnershipError("location_unowned", _MSG_LOCATION_UNOWNED)
+        return ProjectLocation(
+            app_project_id=project_id,
+            directory=str(location),
+            location_id=instance_id,
+            root=str(self.root),
+        )
 
     def _read_location_marker(self, location: Path) -> dict[str, Any] | None:
         """Read a location marker only from a fully owned, symlink-free chain."""
