@@ -46,10 +46,18 @@ Safety properties:
   fields are refused.
 * Redirects are refused (the credential is never forwarded) and proxies are
   bypassed (``ProxyHandler({})``), so the credential cannot leave the origin.
-* Response bodies are bounded (``max_response_bytes``), every request is
-  time-bounded, and message paging is bounded (``max_message_pages``).
-* Errors are **static and redacted**: no peer-supplied message text, raw body,
-  or credential is ever included in an exception.
+* Response **and** request bodies are bounded (``max_response_bytes`` /
+  ``max_request_bytes``), every request is time-bounded, message paging is
+  bounded, and every accepted limit (constructor or per-call override) is finite
+  and capped, so boundedness cannot be disabled or busy-looped.
+* Response JSON is parsed strictly: duplicate object keys, non-finite numbers
+  (``NaN``/``Infinity``), and over-deep nesting are rejected as malformed.
+* Session/message IDs must be URL-safe opaques after their published prefix, so a
+  pathlike ID cannot be interpolated into a request path.
+* Errors are **curated, static, and redacted**: only a published allowlist of
+  ``_tag`` values is surfaced, and no peer-supplied tag/message text, raw body,
+  credential, or idle outcome value reaches an exception, ``repr``, or a
+  reconciliation ``reason``.
 * Request/response identities are strictly validated (envelope, session and
   message IDs, and the pinned agent/model round-trip), so a malformed or foreign
   response fails closed instead of being trusted.
@@ -79,20 +87,38 @@ from __future__ import annotations
 import base64
 import ipaddress
 import json
+import math
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-# --- exact patterns from the published OpenAPI schemas -----------------------
-SESSION_ID_RE = re.compile(r"^ses")
-MESSAGE_ID_RE = re.compile(r"^msg_")
+# --- identities and URL-path safety ------------------------------------------
+# The published patterns are only prefixes (``^ses``, ``^msg``); that is NOT URL
+# path safety. IDs are interpolated into request paths, so the client accepts only
+# an opaque, URL-safe charset after the documented prefix -- no ``/``, ``?``, ``#``,
+# ``%``, ``.``, whitespace, or control characters, which could otherwise steer the
+# request to a different resource (e.g. ``ses/../../api/anything?x=1``).
+SESSION_ID_RE = re.compile(r"^ses[A-Za-z0-9_-]+$")
+MESSAGE_ID_RE = re.compile(r"^msg_[A-Za-z0-9_-]+$")
 
-# Response tags from the published error schemas (*ErrorEncoded).
+# Response tags from the published error schemas (*ErrorEncoded) that the client
+# is willing to surface. An unknown tag is untrusted and is dropped (``None``), so
+# no peer-supplied tag text can reach an exception message or ``repr``.
 CONFLICT_TAG = "ConflictError"
+KNOWN_ERROR_TAGS = frozenset(
+    {
+        "InvalidRequestError",
+        "UnauthorizedError",
+        "SessionNotFoundError",
+        "MessageNotFoundError",
+        "ConflictError",
+        "ServiceUnavailableError",
+    }
+)
 
 # Supported Authorization schemes. The published OpenAPI declares no
 # securitySchemes, but the disposable 2.2.0 harness was observed to answer HTTP
@@ -110,15 +136,24 @@ BASIC_DEFAULT_USERNAME = "opencode"
 TURN_OPENING_TYPES = ("user", "synthetic")
 LOOPBACK_HOSTS = ("localhost",)
 
-# Bounds. A response body over the limit is refused before it is trusted; paging
-# stops honestly at the page bound.
+# Bounds. Every accepted limit (including a per-call override) is finite and
+# capped, so a caller can neither disable boundedness nor busy-loop. A body over
+# its bound is refused before it is trusted; paging stops honestly at the bound.
+MAX_TIMEOUT = 3600.0
+MAX_RETRY_INTERVAL = 60.0
+MAX_MESSAGE_PAGES_CAP = 10_000
+MAX_MESSAGE_LIMIT = 1_000
+MAX_RESPONSE_BYTES_CAP = 64 * 1024 * 1024
+MAX_REQUEST_BYTES_CAP = 64 * 1024 * 1024
 DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_REQUEST_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_MESSAGE_PAGES = 100
 
 # Static, redacted error details. These are the client's own strings and are the
 # only detail ever attached to an error; peer-supplied text is never propagated.
 _DETAIL_REDIRECT = "redirect refused; credential not forwarded"
 _DETAIL_TOO_LARGE = "response body exceeds the configured size limit"
+_DETAIL_REQUEST_TOO_LARGE = "request body exceeds the configured size limit"
 _DETAIL_NOT_JSON = "response body is not valid JSON"
 
 
@@ -139,18 +174,19 @@ class OpenCodeError(Exception):
 
 
 class OpenCodeApiError(OpenCodeError):
-    """A decoded non-2xx API response, with a **static redacted** message.
+    """A decoded non-2xx API response, with a **curated static** message.
 
-    ``tag`` is the ``_tag`` of the published error schema (for example
-    ``ConflictError``) when the body carried a string tag; otherwise ``None``.
-    The exception never carries the peer's ``message`` text, raw body, or any
-    credential: the only free part is ``detail``, an internal constant supplied
-    by this module.
+    ``tag`` is kept only when it is one of the published ``*ErrorEncoded`` tags in
+    :data:`KNOWN_ERROR_TAGS`; any other value -- an unknown, spoofed, or
+    peer-supplied tag -- is discarded, so untrusted text can never reach the
+    exception message or ``repr``. The exception never carries the peer's
+    ``message`` text, raw body, or any credential: the only free part is
+    ``detail``, an internal constant supplied by this module.
     """
 
     def __init__(self, status: int, tag: str | None = None, detail: str | None = None):
         self.status = int(status)
-        self.tag = tag or None
+        self.tag = tag if isinstance(tag, str) and tag in KNOWN_ERROR_TAGS else None
         self.detail = detail
         text = f"HTTP {self.status} {self.tag or 'error'}"
         if detail:
@@ -171,11 +207,24 @@ class OpenCodeProtocolError(OpenCodeError, ValueError):
     """
 
 
+class OpenCodeRequestTooLargeError(OpenCodeProtocolError):
+    """A request body exceeded the configured ``max_request_bytes`` bound."""
+
+
 class AdmissionConflictError(OpenCodeProtocolError):
     """A same-ID replay would admit *different* input than the durable record.
 
     The idempotency key already holds other content; accepting it would silently
     drop or overwrite the admitted input, so it fails closed instead.
+    """
+
+
+class AdmissionUnverifiedError(OpenCodeProtocolError):
+    """The persisted input for an admission could not be verified.
+
+    The server returned an admission record that does not expose the exact
+    persisted payload text, so the client cannot confirm that a same-ID replay
+    would admit the same input. It fails closed instead of assuming equivalence.
     """
 
 
@@ -202,7 +251,7 @@ class Admission:
     """
 
     admission_id: str
-    receipt: dict[str, Any] | None
+    receipt: dict[str, Any] | None = field(repr=False)
     duplicate: bool = False
     reconciled: bool = False
 
@@ -237,8 +286,8 @@ class ReconcileResult:
 
     admission_id: str
     state: str
-    durable_receipt: dict[str, Any] | None
-    completion: dict[str, Any] | None
+    durable_receipt: dict[str, Any] | None = field(repr=False)
+    completion: dict[str, Any] | None = field(repr=False)
     reason: str | None = None
 
     _TERMINAL_OK = ("completed", "failed", "interrupted")
@@ -262,19 +311,34 @@ class ReconcileResult:
 
 
 def assert_explicit_loopback_url(base_url: str) -> str:
-    """Return ``base_url`` only if it is an explicit loopback HTTP(S) endpoint.
+    """Return ``base_url`` only if it is an explicit loopback **origin**.
 
-    Fails closed for a non-loopback host, a non-HTTP scheme, an embedded
-    credential, or a missing host. The client must never talk to a remote or
-    shared service, and must never carry a token off-host.
+    Fails closed for a non-loopback host, a non-HTTP(S) scheme, an embedded
+    credential (userinfo), a path, a query, a fragment, a control character, a
+    malformed port, or a missing host. The endpoint is used as the request origin,
+    so anything beyond scheme+host+port could redirect the request or smuggle an
+    instruction; only an origin is accepted. The client must never talk to a
+    remote or shared service, and must never carry a token off-host.
     """
     if not isinstance(base_url, str) or not base_url.strip():
         raise ValueError("base_url must be an explicit, non-empty URL")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in base_url):
+        raise ValueError("base_url must not contain control characters")
     parsed = urllib.parse.urlsplit(base_url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"base_url scheme must be http or https, got {parsed.scheme!r}")
     if parsed.username or parsed.password:
         raise ValueError("credentials must not be embedded in the endpoint URL")
+    if parsed.path not in ("", "/"):
+        raise ValueError("base_url must be an origin only (no path)")
+    if parsed.query:
+        raise ValueError("base_url must not include a query")
+    if parsed.fragment:
+        raise ValueError("base_url must not include a fragment")
+    try:
+        parsed.port  # a malformed port raises here rather than later
+    except ValueError:
+        raise ValueError("base_url has an invalid port") from None
     host = parsed.hostname
     if not host:
         raise ValueError("base_url must include a host")
@@ -291,6 +355,67 @@ def assert_explicit_loopback_url(base_url: str) -> str:
             f"base_url host must be loopback (127.0.0.0/8 or ::1), got {host}"
         )
     return base_url
+
+
+def _require_finite_positive_number(value: Any, name: str, maximum: float) -> float:
+    """Validate a finite, positive, capped duration or interval."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0 or number > maximum:
+        raise ValueError(f"{name} must be a finite number in (0, {maximum}]")
+    return number
+
+
+def _require_positive_int(value: Any, name: str, maximum: int) -> int:
+    """Validate a positive integer with a finite upper bound (no coercion)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if value < 1 or value > maximum:
+        raise ValueError(f"{name} must be an integer in [1, {maximum}]")
+    return value
+
+
+class _DuplicateJsonKey(ValueError):
+    """Raised internally when a JSON object repeats a key."""
+
+
+class _NonFiniteJsonNumber(ValueError):
+    """Raised internally when JSON carries ``NaN``/``Infinity``/``-Infinity``."""
+
+
+def _json_object_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    obj: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateJsonKey(key)
+        obj[key] = value
+    return obj
+
+
+def _json_reject_non_finite(token: str) -> Any:
+    raise _NonFiniteJsonNumber(token)
+
+
+def _strict_json_loads(text: str) -> Any:
+    """Parse JSON strictly, rejecting duplicate keys and non-finite numbers.
+
+    ``json.loads`` defaults are lenient (last-key-wins, ``NaN``/``Infinity``
+    accepted), which would let a peer smuggle an ambiguous or non-finite value
+    past validation. Duplicate keys, non-finite constants, malformed text, and
+    over-deep nesting (a ``RecursionError`` from the decoder) all become a static
+    :class:`OpenCodeProtocolError`; no peer text is surfaced.
+    """
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_json_object_no_duplicates,
+            parse_constant=_json_reject_non_finite,
+        )
+    except OpenCodeProtocolError:
+        raise
+    except (ValueError, RecursionError):
+        raise OpenCodeProtocolError(_DETAIL_NOT_JSON) from None
 
 
 def resolve_auth(
@@ -386,13 +511,19 @@ class OpenCodeV2Client:
     :param username: Basic username (default ``opencode``); ``basic`` only.
     :param password: Basic password (already resolved by the caller); ``basic``
         only.
-    :param timeout: per-request socket timeout in seconds.
+    :param timeout: per-request socket timeout in seconds; finite, in
+        ``(0, MAX_TIMEOUT]``.
     :param directory: absolute location directory pinned on session create.
-    :param max_message_pages: hard bound on pages read while reconciling.
-    :param max_response_bytes: hard bound on a response body's size.
+    :param max_message_pages: hard bound on pages read while reconciling; a
+        positive integer no larger than ``MAX_MESSAGE_PAGES_CAP``.
+    :param max_response_bytes: hard bound on a response body's size; a positive
+        integer no larger than ``MAX_RESPONSE_BYTES_CAP``.
+    :param max_request_bytes: hard bound on a request body's size; a positive
+        integer no larger than ``MAX_REQUEST_BYTES_CAP``.
 
     Redirects are refused and proxies are bypassed, so the credential cannot leave
-    the origin. Every error message is static and redacted.
+    the origin. Every accepted limit is finite and capped. Every error message is
+    curated, static, and redacted.
     """
 
     def __init__(
@@ -407,25 +538,22 @@ class OpenCodeV2Client:
         directory: str | None = None,
         max_message_pages: int = DEFAULT_MAX_MESSAGE_PAGES,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
     ):
         assert_explicit_loopback_url(base_url)
         scheme, auth_username, secret = resolve_auth(
             auth=auth, token=token, username=username, password=password
         )
-        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
-            raise ValueError("timeout must be a positive number")
-        if (
-            not isinstance(max_message_pages, int)
-            or isinstance(max_message_pages, bool)
-            or max_message_pages < 1
-        ):
-            raise ValueError("max_message_pages must be a positive integer")
-        if (
-            not isinstance(max_response_bytes, int)
-            or isinstance(max_response_bytes, bool)
-            or max_response_bytes < 1
-        ):
-            raise ValueError("max_response_bytes must be a positive integer")
+        self.timeout = _require_finite_positive_number(timeout, "timeout", MAX_TIMEOUT)
+        self.max_message_pages = _require_positive_int(
+            max_message_pages, "max_message_pages", MAX_MESSAGE_PAGES_CAP
+        )
+        self.max_response_bytes = _require_positive_int(
+            max_response_bytes, "max_response_bytes", MAX_RESPONSE_BYTES_CAP
+        )
+        self.max_request_bytes = _require_positive_int(
+            max_request_bytes, "max_request_bytes", MAX_REQUEST_BYTES_CAP
+        )
         if directory is not None and (
             not isinstance(directory, str) or not directory
         ):
@@ -435,10 +563,7 @@ class OpenCodeV2Client:
         self.token = token if scheme == AUTH_BEARER else None
         self.username = auth_username
         self.password = secret if scheme == AUTH_BASIC else None
-        self.timeout = float(timeout)
         self.directory = directory
-        self.max_message_pages = max_message_pages
-        self.max_response_bytes = max_response_bytes
         # A private opener that bypasses proxies and refuses redirects. The empty
         # ProxyHandler means the request never routes through ``http_proxy`` from
         # the environment, so the credential cannot be forwarded to a proxy.
@@ -500,6 +625,8 @@ class OpenCodeV2Client:
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
+            if len(data) > self.max_request_bytes:
+                raise OpenCodeRequestTooLargeError(_DETAIL_REQUEST_TOO_LARGE)
         request = urllib.request.Request(
             self.base_url + path,
             data=data,
@@ -528,24 +655,31 @@ class OpenCodeV2Client:
 
     @staticmethod
     def _decode(raw: bytes) -> Any:
+        """Decode a response body strictly (duplicate keys / non-finite refused)."""
         if not raw:
             return None
         try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
             raise OpenCodeProtocolError(_DETAIL_NOT_JSON) from None
+        return _strict_json_loads(text)
 
     @staticmethod
     def _error_tag(raw: bytes) -> str | None:
-        """The ``_tag`` of a decoded error envelope, or ``None``. Never raises."""
+        """The allowlisted ``_tag`` of an error envelope, or ``None``. Never raises.
+
+        The value is also restricted to the published tag allowlist before it can
+        reach an exception, so an unknown or spoofed tag becomes ``None``.
+        """
         if not raw:
             return None
         try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            text = raw.decode("utf-8")
+            payload = _strict_json_loads(text)
+        except (UnicodeDecodeError, OpenCodeProtocolError):
             return None
         tag = payload.get("_tag") if isinstance(payload, dict) else None
-        return tag if isinstance(tag, str) and tag else None
+        return tag if isinstance(tag, str) and tag in KNOWN_ERROR_TAGS else None
 
     # -- envelope / identity validation --------------------------------------
     @staticmethod
@@ -606,13 +740,19 @@ class OpenCodeV2Client:
 
     @staticmethod
     def _require_session_id(session_id: str) -> None:
+        # The published pattern is only the ``^ses`` prefix; a URL-safe opaque id
+        # is also required so a pathlike value cannot be interpolated into a path.
         if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
-            raise ValueError(f"session_id must match ^ses, got {session_id!r}")
+            raise ValueError(
+                "session_id must be a URL-safe ^ses id (letters, digits, '_', '-')"
+            )
 
     @staticmethod
     def _require_message_id(message_id: str) -> None:
         if not isinstance(message_id, str) or not MESSAGE_ID_RE.match(message_id):
-            raise ValueError(f"message id must match ^msg_, got {message_id!r}")
+            raise ValueError(
+                "message id must be a URL-safe ^msg_ id (letters, digits, '_', '-')"
+            )
 
     # -- server --------------------------------------------------------------
     def info(self) -> dict[str, Any]:
@@ -677,6 +817,42 @@ class OpenCodeV2Client:
         returned = self._check_session_id(data.get("id"), "session.get")
         if returned != session_id:
             raise OpenCodeProtocolError("session.get: response identifies a different session")
+        return data
+
+    def verify_session_pins(
+        self,
+        session_id: str,
+        *,
+        agent: str,
+        model: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Prove a session's recorded role/model match the requested pins.
+
+        ``session.create`` may legitimately omit ``agent``/``model`` from its
+        response, so :meth:`create_session` only fails when a *present* value
+        differs. When the application requires positive proof of pinning before
+        admitting work, call this instead: it re-reads the session with
+        ``session.get`` and **requires** the recorded ``agent`` and ``model`` to be
+        present and equal to the pins, raising :class:`OpenCodeProtocolError` when
+        either is absent or different. (A server that never records the pins makes
+        this fail closed; that is the documented limitation.)
+
+        Returns the retrieved ``Session.Info``.
+        """
+        self._require_session_id(session_id)
+        if not isinstance(agent, str) or not agent.strip():
+            raise ValueError("agent (role) is required and must be a non-empty string")
+        validate_model_ref(model)
+        data = self.get_session(session_id)
+        for key, expected in (("agent", agent), ("model", model)):
+            if key not in data:
+                raise OpenCodeProtocolError(
+                    f"session.get: recorded {key} is absent, so the pin cannot be proven"
+                )
+            if data[key] != expected:
+                raise OpenCodeProtocolError(
+                    f"session.get: recorded {key} does not match the requested pin"
+                )
         return data
 
     def interrupt(self, session_id: str, *, resume: bool | None = None) -> bool:
@@ -772,11 +948,7 @@ class OpenCodeV2Client:
                 session_id, text, admission_id, duplicate=False
             )
         self._validate_receipt(receipt, session_id, admission_id)
-        persisted = _durable_text(receipt)
-        if persisted is not None and persisted != text:
-            raise AdmissionConflictError(
-                f"admission {admission_id} already holds different input"
-            )
+        self._verify_admitted_text(receipt, text, admission_id)
         return Admission(admission_id, receipt, duplicate=False)
 
     def _reconcile_admission(
@@ -785,11 +957,7 @@ class OpenCodeV2Client:
         found = self.reconcile(session_id, admission_id)
         receipt = found.durable_receipt
         if receipt is not None:
-            persisted = _durable_text(receipt)
-            if persisted is not None and persisted != text:
-                raise AdmissionConflictError(
-                    f"admission {admission_id} already holds different input"
-                )
+            self._verify_admitted_text(receipt, text, admission_id)
         return Admission(admission_id, receipt, duplicate=duplicate, reconciled=True)
 
     def _validate_receipt(
@@ -803,6 +971,27 @@ class OpenCodeV2Client:
         if receipt.get("type") != "user":
             raise OpenCodeProtocolError("session.prompt: receipt is not a user admission")
         self._check_owner(receipt, session_id, "session.prompt")
+
+    @staticmethod
+    def _verify_admitted_text(
+        receipt: dict[str, Any], text: str, admission_id: str
+    ) -> None:
+        """Confirm a durable admission holds exactly the submitted input.
+
+        Fails closed when the persisted text cannot be read at all
+        (:class:`AdmissionUnverifiedError`) or holds *different* content
+        (:class:`AdmissionConflictError`), so a same-ID replay can never be
+        mistaken for the same input when verification is impossible.
+        """
+        persisted = _durable_text(receipt)
+        if persisted is None:
+            raise AdmissionUnverifiedError(
+                f"admission {admission_id} payload text could not be verified"
+            )
+        if persisted != text:
+            raise AdmissionConflictError(
+                f"admission {admission_id} already holds different input"
+            )
 
     # -- durable reads / reconciliation --------------------------------------
     def list_inbox(self, session_id: str) -> list[dict[str, Any]]:
@@ -835,14 +1024,15 @@ class OpenCodeV2Client:
         if type is not None:
             params.append(f"type={urllib.parse.quote(type)}")
         if limit is not None:
-            if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
-                raise ValueError("limit must be a positive integer")
-            params.append(f"limit={int(limit)}")
+            evaluated = _require_positive_int(limit, "limit", MAX_MESSAGE_LIMIT)
+            params.append(f"limit={evaluated}")
         if order is not None:
             if order not in ("asc", "desc"):
                 raise ValueError("order must be 'asc' or 'desc'")
             params.append(f"order={order}")
         if cursor is not None:
+            if not isinstance(cursor, str) or not cursor:
+                raise ValueError("cursor must be a non-empty string")
             params.append(f"cursor={urllib.parse.quote(cursor)}")
         path = f"/api/session/{session_id}/message"
         if params:
@@ -899,9 +1089,12 @@ class OpenCodeV2Client:
         plus the opaque ``cursor`` and nothing else that could conflict.
         """
         self._require_session_id(session_id)
-        bound = self.max_message_pages if max_pages is None else int(max_pages)
-        if bound < 1:
-            raise ValueError("max_pages must be a positive integer")
+        if max_pages is None:
+            bound = self.max_message_pages
+        else:
+            # No int() coercion: a float, string, bool, or non-finite value is a
+            # caller error, and the override is capped like the constructor bound.
+            bound = _require_positive_int(max_pages, "max_pages", MAX_MESSAGE_PAGES_CAP)
         messages: list[dict[str, Any]] = []
         cursor: str | None = None
         pages = 0
@@ -913,9 +1106,16 @@ class OpenCodeV2Client:
                 page = self.list_messages(session_id, type=type, cursor=cursor)
             messages.extend(page.get("data", []))
             pages += 1
-            next_cursor = (page.get("cursor") or {}).get("next")
-            if not next_cursor:
+            cursor_obj = page.get("cursor")
+            next_cursor = cursor_obj.get("next") if isinstance(cursor_obj, dict) else None
+            if next_cursor is None:
                 return messages, False
+            # A malformed cursor (non-string, empty, or repeated) is a protocol
+            # failure, never a silent stop or an unhashable-value TypeError.
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise OpenCodeProtocolError(
+                    "session.message.list: cursor.next is not a valid cursor"
+                )
             if next_cursor in seen_cursors:
                 # a repeating cursor cannot make progress; stop honestly
                 return messages, True
@@ -1041,12 +1241,15 @@ class OpenCodeV2Client:
         }.get(outcome, "unknown")
         completion = {"outcome": outcome, "message": idle}
         if state == "unknown":
+            # Static reason: the peer-supplied outcome value is untrusted and is
+            # deliberately not echoed (it remains visible as evidence in
+            # ``completion``, which callers treat as untrusted data).
             return ReconcileResult(
                 admission_id,
                 "unknown",
                 durable,
                 completion,
-                reason=f"unrecognized idle outcome {outcome!r}",
+                reason="unrecognized idle outcome",
             )
         return ReconcileResult(admission_id, state, durable, completion)
 
@@ -1062,10 +1265,16 @@ class OpenCodeV2Client:
 
         Uses ``experimental.session.wait`` (204 when idle / 503 when a service is
         unavailable). Retries on 503 and transport timeouts until the deadline,
-        then raises :class:`QuiescenceTimeout`. Never blocks forever.
+        then raises :class:`QuiescenceTimeout`. Never blocks forever: ``timeout``
+        and ``retry_interval`` are each validated as finite and capped, so a
+        zero/negative/``nan``/``inf`` value cannot busy-loop or hang.
         """
         self._require_session_id(session_id)
-        deadline = time.monotonic() + float(timeout)
+        timeout = _require_finite_positive_number(timeout, "timeout", MAX_TIMEOUT)
+        retry_interval = _require_finite_positive_number(
+            retry_interval, "retry_interval", MAX_RETRY_INTERVAL
+        )
+        deadline = time.monotonic() + timeout
         last: OpenCodeError | None = None
         while True:
             remaining = deadline - time.monotonic()

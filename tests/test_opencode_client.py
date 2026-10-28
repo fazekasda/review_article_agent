@@ -38,10 +38,18 @@ for _path in (str(SRC), str(HERE)):
 
 from _opencode_mock import MockServer  # noqa: E402
 from review_article_agent.runtime.opencode import (  # noqa: E402
+    MAX_MESSAGE_LIMIT,
+    MAX_MESSAGE_PAGES_CAP,
+    MAX_REQUEST_BYTES_CAP,
+    MAX_RESPONSE_BYTES_CAP,
+    MAX_RETRY_INTERVAL,
+    MAX_TIMEOUT,
     Admission,
     AdmissionConflictError,
+    AdmissionUnverifiedError,
     OpenCodeApiError,
     OpenCodeProtocolError,
+    OpenCodeRequestTooLargeError,
     OpenCodeResponseTooLargeError,
     OpenCodeTransportError,
     OpenCodeV2Client,
@@ -719,6 +727,369 @@ class TestFreshCritic(ClientTestCase):
             self.client.start_critic(
                 agent="critic", model=CRITIC_MODEL, writer_model=WRITER_MODEL
             )
+
+
+# ---------------------------------------------------------------------------
+# Repair R1: boundedness, redaction, URL-path safety, strict JSON, pin proof
+# ---------------------------------------------------------------------------
+class TestFiniteBounds(unittest.TestCase):
+    """Every accepted limit is finite and capped, including per-call overrides."""
+
+    def _reject(self, **kwargs: object) -> None:
+        with self.assertRaises(ValueError, msg=repr(kwargs)):
+            OpenCodeV2Client("http://127.0.0.1:1", token="t", **kwargs)
+
+    def test_timeout_must_be_finite_positive_and_capped(self) -> None:
+        for bad in (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            False,
+            0,
+            -1.0,
+            MAX_TIMEOUT + 1,
+        ):
+            self._reject(timeout=bad)
+
+    def test_page_and_byte_bounds_must_be_positive_capped_ints(self) -> None:
+        for bad in (
+            float("inf"),
+            float("nan"),
+            True,
+            3.0,
+            "3",
+            0,
+            -1,
+            MAX_MESSAGE_PAGES_CAP + 1,
+            10**9,
+        ):
+            self._reject(max_message_pages=bad)
+        for bad in (float("inf"), True, 0, MAX_RESPONSE_BYTES_CAP + 1):
+            self._reject(max_response_bytes=bad)
+        for bad in (float("inf"), True, 0, MAX_REQUEST_BYTES_CAP + 1):
+            self._reject(max_request_bytes=bad)
+
+    def test_valid_bounds_are_accepted(self) -> None:
+        client = OpenCodeV2Client(
+            "http://127.0.0.1:1",
+            token="t",
+            timeout=1,
+            max_message_pages=5,
+            max_response_bytes=1024,
+            max_request_bytes=1024,
+        )
+        self.assertEqual(client.timeout, 1.0)
+        self.assertEqual(client.max_message_pages, 5)
+        self.assertEqual(client.max_request_bytes, 1024)
+
+
+class TestOriginOnlyBaseUrl(unittest.TestCase):
+    def test_path_query_fragment_userinfo_and_control_chars_rejected(self) -> None:
+        for bad in (
+            "http://127.0.0.1:4096/api",
+            "http://127.0.0.1:4096/x?y=1",
+            "http://127.0.0.1:4096#frag",
+            "http://user:pass@127.0.0.1:4096",
+            "http://127.0.0.1:4096@evil.invalid",
+            "http://127.0.0.1:4096\n",
+            "http://127.0.0.1:bad",
+        ):
+            with self.assertRaises(ValueError, msg=bad):
+                OpenCodeV2Client(bad, token="t")
+
+    def test_plain_origins_accepted(self) -> None:
+        for good in ("http://127.0.0.1:4096", "http://localhost:4096/", "http://[::1]:1"):
+            OpenCodeV2Client(good, token="t")
+
+
+class TestUrlSafeIdentifiers(unittest.TestCase):
+    """A published ``^ses``/``^msg`` prefix is not URL path safety."""
+
+    def setUp(self) -> None:
+        self.server = MockServer(token="t")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.client = OpenCodeV2Client(self.server.base_url, token="t")
+        self.sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+
+    def test_pathlike_session_ids_rejected_without_a_request(self) -> None:
+        for bad in (
+            "ses/../../api/anything?x=1",
+            "ses x",
+            "ses%2f",
+            "ses..",
+            "ses\n",
+            "ses#f",
+            "ses?a=b",
+            "ses",
+            "",
+            "ses/",
+            "ses.foo",
+            "sess/../ses_ok",
+        ):
+            before = len(self.server.state.requests)
+            with self.assertRaises(ValueError, msg=bad):
+                self.client.get_session(bad)
+            self.assertEqual(len(self.server.state.requests), before)  # no request sent
+
+    def test_safe_session_ids_accepted(self) -> None:
+        for good in ("ses_abc123", "ses-X_Y", "ses_0"):
+            OpenCodeV2Client._require_session_id(good)
+
+    def test_pathlike_message_ids_rejected(self) -> None:
+        for bad in ("msg_../x", "msg_a/b", "msg_a?b", "msg_%2f", "msg_", "msg_a b", "msg_a.b"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.client.admit(self.sid, "x", bad)
+
+    def test_safe_message_ids_accepted(self) -> None:
+        OpenCodeV2Client._require_message_id("msg_abc-1_2")
+
+
+class TestCuratedErrors(unittest.TestCase):
+    """Only an allowlisted ``_tag`` may reach an exception; never peer text."""
+
+    def test_unknown_tag_is_not_echoed(self) -> None:
+        err = OpenCodeApiError(400, "SYNTHETIC_SECRET_CANARY")
+        self.assertIsNone(err.tag)
+        self.assertNotIn("SYNTHETIC_SECRET_CANARY", str(err))
+
+    def test_known_tag_is_preserved(self) -> None:
+        err = OpenCodeApiError(409, "ConflictError")
+        self.assertEqual(err.tag, "ConflictError")
+        self.assertIn("ConflictError", str(err))
+
+    def test_unknown_server_tag_is_dropped(self) -> None:
+        body = b'{"_tag":"SYNTHETIC_SECRET_CANARY","message":"peer-secret-leak-42"}'
+        with _RecorderServer(status=400, body=body) as origin:
+            client = OpenCodeV2Client(origin.base_url, token="t")
+            with self.assertRaises(OpenCodeApiError) as ctx:
+                client._request("GET", "/api/info")
+        self.assertIsNone(ctx.exception.tag)
+        self.assertNotIn("SYNTHETIC_SECRET_CANARY", str(ctx.exception))
+        self.assertNotIn("peer-secret-leak-42", str(ctx.exception))
+
+    def test_known_server_tag_is_surfaced(self) -> None:
+        with _RecorderServer(status=409, body=b'{"_tag":"ConflictError","message":"x"}') as origin:
+            client = OpenCodeV2Client(origin.base_url, token="t")
+            with self.assertRaises(OpenCodeApiError) as ctx:
+                client._request("GET", "/api/info")
+        self.assertEqual(ctx.exception.tag, "ConflictError")
+
+
+class TestStrictJson(unittest.TestCase):
+    """``json.loads`` leniency (duplicate keys, NaN/Infinity, deep nesting) is off."""
+
+    def test_duplicate_keys_rejected(self) -> None:
+        with self.assertRaises(OpenCodeProtocolError):
+            OpenCodeV2Client._decode(b'{"data":1,"data":2}')
+
+    def test_non_finite_numbers_rejected(self) -> None:
+        for body in (b'{"data":NaN}', b'{"data":Infinity}', b'{"data":-Infinity}'):
+            with self.assertRaises(OpenCodeProtocolError, msg=body):
+                OpenCodeV2Client._decode(body)
+
+    def test_over_deep_json_rejected(self) -> None:
+        deep = b"[" * 100000 + b"]" * 100000
+        with self.assertRaises(OpenCodeProtocolError):
+            OpenCodeV2Client._decode(deep)
+
+    def test_valid_json_round_trips_and_empty_is_none(self) -> None:
+        self.assertIsNone(OpenCodeV2Client._decode(b""))
+        self.assertEqual(OpenCodeV2Client._decode(b'{"data":1}'), {"data": 1})
+
+    def test_non_json_rejected(self) -> None:
+        with self.assertRaises(OpenCodeProtocolError):
+            OpenCodeV2Client._decode(b"not json")
+
+    def test_non_json_response_over_http_is_protocol_error(self) -> None:
+        with _RecorderServer(body=b'{"data":1,"data":2}') as origin:
+            client = OpenCodeV2Client(origin.base_url, token="t")
+            with self.assertRaises(OpenCodeProtocolError):
+                client.info()
+
+
+class TestRequestSizeBound(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = MockServer(token="t")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        # large enough for a pinned create, too small for the oversized requests
+        self.client = OpenCodeV2Client(self.server.base_url, token="t", max_request_bytes=200)
+
+    def test_oversized_admission_request_rejected(self) -> None:
+        sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+        with self.assertRaises(OpenCodeRequestTooLargeError):
+            self.client.admit(sid, "x" * 500, "msg_big00001")
+
+    def test_oversized_create_request_rejected(self) -> None:
+        with self.assertRaises(OpenCodeRequestTooLargeError):
+            self.client.create_session(agent="writer", model=WRITER_MODEL, title="t" * 500)
+
+    def test_request_error_is_a_value_error(self) -> None:
+        self.assertTrue(issubclass(OpenCodeRequestTooLargeError, ValueError))
+
+
+class TestPagingCursorValidation(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = MockServer(token="t")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.client = OpenCodeV2Client(self.server.base_url, token="t")
+        self.sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+
+    def test_malformed_cursor_next_is_protocol_error(self) -> None:
+        message = {"id": "msg_cur000001", "type": "user"}
+        for bad_next in (["x"], 123, "", {}, 0):
+            self.server.state.message_list_payload = {
+                "data": [message],
+                "cursor": {"next": bad_next},
+            }
+            with self.assertRaises(OpenCodeProtocolError, msg=repr(bad_next)):
+                self.client.collect_messages(self.sid)
+
+    def test_null_cursor_next_is_a_clean_end(self) -> None:
+        self.server.state.message_list_payload = {
+            "data": [{"id": "msg_cur000002", "type": "user"}],
+            "cursor": {"next": None},
+        }
+        messages, truncated = self.client.collect_messages(self.sid)
+        self.assertFalse(truncated)
+        self.assertEqual([m["id"] for m in messages], ["msg_cur000002"])
+
+    def test_collect_messages_max_pages_override_validated(self) -> None:
+        for bad in (
+            0,
+            -1,
+            True,
+            3.5,
+            "3",
+            float("nan"),
+            float("inf"),
+            MAX_MESSAGE_PAGES_CAP + 1,
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.client.collect_messages(self.sid, max_pages=bad)
+
+    def test_list_messages_limit_and_cursor_validated(self) -> None:
+        for bad_limit in (0, -1, True, MAX_MESSAGE_LIMIT + 1):
+            with self.assertRaises(ValueError, msg=repr(bad_limit)):
+                self.client.list_messages(self.sid, limit=bad_limit)
+        for bad_cursor in (123, ""):
+            with self.assertRaises(ValueError, msg=repr(bad_cursor)):
+                self.client.list_messages(self.sid, cursor=bad_cursor)
+
+
+class TestWaitBounds(unittest.TestCase):
+    """``wait`` cannot busy-loop or hang on a bad timeout/interval."""
+
+    def setUp(self) -> None:
+        self.server = MockServer(token="t")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.client = OpenCodeV2Client(self.server.base_url, token="t")
+        self.sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+
+    def test_retry_interval_validated(self) -> None:
+        for bad in (0, -1.0, float("nan"), float("inf"), True, MAX_RETRY_INTERVAL + 1):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.client.wait(self.sid, retry_interval=bad)
+
+    def test_timeout_validated(self) -> None:
+        for bad in (0, -1.0, float("nan"), float("inf"), True, MAX_TIMEOUT + 1):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.client.wait(self.sid, timeout=bad)
+
+
+class TestPinVerification(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = MockServer(token="t")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.client = OpenCodeV2Client(self.server.base_url, token="t")
+
+    def test_verify_session_pins_proves_the_pins(self) -> None:
+        sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+        data = self.client.verify_session_pins(sid, agent="writer", model=WRITER_MODEL)
+        self.assertEqual(data["agent"], "writer")
+        self.assertEqual(data["model"], WRITER_MODEL)
+
+    def test_create_tolerates_omitted_pins_but_verify_fails_closed(self) -> None:
+        self.server.state.omit_pinned = True
+        sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+        # create does not invent a required wire field: omission is tolerated...
+        self.assertNotIn("model", self.client.get_session(sid))
+        # ...but the explicit proof requirement fails closed when the pin is absent
+        with self.assertRaises(OpenCodeProtocolError):
+            self.client.verify_session_pins(sid, agent="writer", model=WRITER_MODEL)
+
+    def test_verify_session_pins_fails_when_recorded_field_differs(self) -> None:
+        sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+        self.server.state.sessions[sid]["model"] = CRITIC_MODEL
+        with self.assertRaises(OpenCodeProtocolError):
+            self.client.verify_session_pins(sid, agent="writer", model=WRITER_MODEL)
+
+    def test_verify_session_pins_validates_its_arguments(self) -> None:
+        sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+        with self.assertRaises(ValueError):
+            self.client.verify_session_pins(sid, agent="  ", model=WRITER_MODEL)
+        with self.assertRaises(ValueError):
+            self.client.verify_session_pins(sid, agent="writer", model={"id": "x"})
+
+
+class TestUnverifiableAdmissionPayload(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = MockServer(token="t")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.client = OpenCodeV2Client(self.server.base_url, token="t")
+
+    def test_admit_fails_closed_when_receipt_text_absent(self) -> None:
+        self.server.state.receipt_omit_text = True
+        sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+        with self.assertRaises(AdmissionUnverifiedError):
+            self.client.admit(sid, "first", "msg_notext01")
+
+    def test_reconcile_path_fails_closed_when_text_unverifiable(self) -> None:
+        self.server.state.receipt_omit_text = True
+        self.server.state.prompt_drops = 1
+        sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+        with self.assertRaises(AdmissionUnverifiedError):
+            self.client.admit(sid, "first", "msg_notext02")
+
+    def test_unverified_error_is_a_value_error(self) -> None:
+        self.assertTrue(issubclass(AdmissionUnverifiedError, ValueError))
+
+
+class TestStaticReasonsAndRepr(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = MockServer(token="t")
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.client = OpenCodeV2Client(self.server.base_url, token="t")
+        self.sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
+
+    def test_unknown_idle_outcome_reason_is_static(self) -> None:
+        self.server.state.append_user(self.sid, "msg_canary001", "x")
+        self.server.state.append_idle(self.sid, "SECRET_OUTCOME_CANARY")
+        found = self.client.reconcile(self.sid, "msg_canary001")
+        self.assertEqual(found.state, "unknown")
+        self.assertEqual(found.reason, "unrecognized idle outcome")
+        self.assertNotIn("SECRET_OUTCOME_CANARY", found.reason)
+        self.assertNotIn("SECRET_OUTCOME_CANARY", repr(found))
+
+    def test_admission_receipt_is_hidden_from_repr(self) -> None:
+        admission = Admission("msg_x0000001", {"payload": {"text": "PEER_SECRET"}})
+        self.assertNotIn("PEER_SECRET", repr(admission))
+
+    def test_reconcile_result_hides_peer_evidence_from_repr(self) -> None:
+        result = ReconcileResult(
+            "msg_x0000001",
+            "completed",
+            {"secret": "PEER_SECRET"},
+            {"outcome": "PEER_SECRET"},
+        )
+        self.assertNotIn("PEER_SECRET", repr(result))
 
 
 if __name__ == "__main__":

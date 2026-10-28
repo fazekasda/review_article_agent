@@ -78,6 +78,8 @@ class MockState:
         self.message_get_id_override: str | None = None
         self.create_model_override: Any = None
         self.create_agent_override: Any = None
+        self.omit_pinned = False  # omit agent/model from Session.Info entirely
+        self.receipt_omit_text = False  # admit receipt carries no payload text
         self.wait_status = 204  # 204 = idle; 503 = service unavailable
         self.wait_503_times = 0
         self.interrupt_result = True
@@ -112,9 +114,9 @@ class MockState:
         model = body.get("model")
         if self.create_model_override is not None:
             model = self.create_model_override
-        if agent is not None:
+        if agent is not None and not self.omit_pinned:
             info["agent"] = agent
-        if model is not None:
+        if model is not None and not self.omit_pinned:
             info["model"] = model
         if body.get("title") is not None:
             info["title"] = body["title"]
@@ -437,20 +439,23 @@ class MockHandler(BaseHTTPRequestHandler):
         message_id = admission_id or self.state.new_message_id()
         if self.state.receipt_id_override is not None:
             message_id = self.state.receipt_id_override
-        item = {
+        text = body.get("text", "")
+        payload: dict[str, Any] = {} if self.state.receipt_omit_text else {"text": text}
+        item: dict[str, Any] = {
             "id": message_id,
             "sessionID": sid,
             "time": {"created": created},
             "type": "user",
-            "payload": {"text": body.get("text", "")},
+            "payload": payload,
             "delivery": body.get("delivery") or "queue",
         }
-        message = {
+        message: dict[str, Any] = {
             "id": message_id,
             "time": {"created": created},
-            "text": body.get("text", ""),
             "type": "user",
         }
+        if not self.state.receipt_omit_text:
+            message["text"] = text
         # Admit durably first so a dropped connection is recoverable.
         if isinstance(admission_id, str):
             self.state.seen_admission[admission_id] = sid
