@@ -838,6 +838,19 @@ def cmd_fixture_status(args: argparse.Namespace, ctx: Context) -> dict[str, obje
         verification = approvals.verify_snapshot(args.approval_id)
         current = repo.current_revision(approval.target_artifact_id)
         current_id = None if current is None else current.revision_id
+        # Truthful, fixture-only indicator: true ONLY when this is an *approved*
+        # fixture whose computed status is still `active`, whose snapshot verifies,
+        # and whose exact approved revision is still the artifact's current head.
+        # A rejected decision, a stale/superseded/invalidated status (e.g. an
+        # amended upstream dependency or rights record), a corrupt snapshot, or a
+        # moved head all report False.
+        fixture_approved = (
+            approval.decision == "approved"
+            and status.status == "active"
+            and verification.ok
+            and current_id is not None
+            and current_id == approval.target_revision_id
+        )
         data = _fixture_approval_dict(approval)
         data.update(
             {
@@ -845,9 +858,7 @@ def cmd_fixture_status(args: argparse.Namespace, ctx: Context) -> dict[str, obje
                 "superseded_by": status.superseded_by,
                 "reasons": list(status.reasons),
                 "current_revision_id": current_id,
-                "current_revision_approved": (
-                    current_id is not None and current_id == approval.target_revision_id
-                ),
+                "current_revision_fixture_approved": fixture_approved,
                 "snapshot_verified": verification.ok,
                 "snapshot_problems": list(verification.problems),
             }

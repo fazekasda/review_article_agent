@@ -294,13 +294,21 @@ one.
 | --- | --- |
 | `fixture record-approval --artifact-id A --revision-id R --gate-id G --decision approved\|rejected --rationale TEXT [--project ID]` | Record a local fixture approval bound to the exact `{project_id, artifact_id, revision_id}`, with `gate_kind` fixed to `fixture_artifact_revision`. |
 | `fixture list [--project ID]` | List local fixture approvals with their computed status. |
-| `fixture status APPROVAL_ID [--project ID]` | Show one approval's computed status, snapshot verification, and whether the approved revision is still current. |
+| `fixture status APPROVAL_ID [--project ID]` | Show one approval's computed status, snapshot verification, and the truthful `current_revision_fixture_approved` indicator. |
 
 Every `fixture` output carries the non-authorizing constants
 `scope="storage_fixture"`, `actor_authenticated=false`,
 `authorizes_execution=false`, `authorizes_export=false`, and
 `scientific_validation=false`. The `rationale` is stored but is **not** echoed in
 `status`/`list` output.
+
+`fixture status` reports `current_revision_fixture_approved`, a **fixture-only**
+indicator that is `true` **only** when the decision is `approved`, the computed
+status is still `active`, the snapshot verifies, and the exact approved revision
+is still the artifact's current head. It is `false` for a rejected decision, a
+stale/superseded/invalidated approval (for example an amended upstream dependency
+or rights record), or a corrupt snapshot. The generic name deliberately stresses
+that this is a local fixture, **not** a scientific approval.
 
 **Status is recomputed, never carried forward.** A new revision of the approved
 artifact, of any pinned live dependency, or of a pinned rights record makes the
