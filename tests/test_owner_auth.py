@@ -95,20 +95,16 @@ class _FakeTty:
     simulates EOF/timeout and an ``Exception`` element is raised.
     """
 
-    def __init__(self, *, replies=(), is_tty=True, device_owner=None):
+    def __init__(self, *, replies=(), is_tty=True):
         self._replies = list(replies)
         self._is_tty = is_tty
-        self._device_owner = device_owner
         self.written: list[str] = []
         self.closed = False
 
     def is_tty(self) -> bool:
         return self._is_tty
 
-    def device_owner_uid(self) -> int:
-        return self._device_owner
-
-    def write(self, text: str) -> None:
+    def write(self, text: str, *, deadline=None) -> None:
         self.written.append(text)
 
     def read_line(self, *, max_chars: int, deadline: float):
@@ -125,9 +121,10 @@ class _FakeTty:
 
 class OwnerAuthTestBase(unittest.TestCase):
     def setUp(self) -> None:
-        # A mutable clock the module's patched ``_utcnow`` reads, so a test can
-        # advance time (an expiration test) without sleeping.
+        # Mutable clocks the module's patched seams read, so a test can advance
+        # wall or monotonic time without sleeping.
         self.clock = [_BASE_TIME]
+        self.mono = [1000.0]
 
     def install(
         self,
@@ -144,6 +141,7 @@ class OwnerAuthTestBase(unittest.TestCase):
             mock.patch.object(owner_auth, "_current_owner_uid", lambda: owner_uid),
             mock.patch.object(owner_auth, "_real_uid", lambda: real_uid),
             mock.patch.object(owner_auth, "_utcnow", lambda: self.clock[0]),
+            mock.patch.object(owner_auth, "_monotonic", lambda: self.mono[0]),
         ]
         if patch_open:
             patches.append(
@@ -166,9 +164,7 @@ class OwnerAuthTestBase(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestMinting(OwnerAuthTestBase):
     def test_successful_confirmation_mints_opaque_capability(self):
-        tty = _FakeTty(
-            replies=[_FIXED_CHALLENGE], device_owner=_FIXED_OWNER_UID
-        )
+        tty = _FakeTty(replies=[_FIXED_CHALLENGE])
         self.install(tty=tty)
         action = _action()
         cap = request_owner_confirmation(action)
@@ -187,13 +183,13 @@ class TestMinting(OwnerAuthTestBase):
         self.assertIn("Challenge: " + _FIXED_CHALLENGE, prompt)
 
     def test_capability_is_not_json_serializable(self):
-        self.install(tty=_FakeTty(replies=[_FIXED_CHALLENGE], device_owner=_FIXED_OWNER_UID))
+        self.install(tty=_FakeTty(replies=[_FIXED_CHALLENGE]))
         cap = request_owner_confirmation(_action())
         with self.assertRaises(TypeError):
             json.dumps(cap)
 
     def test_capability_is_not_pickleable_or_copyable(self):
-        self.install(tty=_FakeTty(replies=[_FIXED_CHALLENGE], device_owner=_FIXED_OWNER_UID))
+        self.install(tty=_FakeTty(replies=[_FIXED_CHALLENGE]))
         cap = request_owner_confirmation(_action())
         with self.assertRaises((TypeError, pickle.PicklingError)):
             pickle.dumps(cap)
@@ -211,6 +207,8 @@ class TestMinting(OwnerAuthTestBase):
                 owner_uid=_FIXED_OWNER_UID,
                 created_at=now,
                 expires_at=now + timedelta(seconds=60),
+                created_monotonic=0.0,
+                expires_monotonic=60.0,
             )
         # Missing the private sentinel entirely is a TypeError.
         with self.assertRaises(TypeError):
@@ -219,13 +217,12 @@ class TestMinting(OwnerAuthTestBase):
                 owner_uid=_FIXED_OWNER_UID,
                 created_at=now,
                 expires_at=now + timedelta(seconds=60),
+                created_monotonic=0.0,
+                expires_monotonic=60.0,
             )
 
     def test_wrong_challenge_fails_closed_and_mints_nothing(self):
-        tty = _FakeTty(
-            replies=["WRONG-0000", "WRONG-0000", "WRONG-0000"],
-            device_owner=_FIXED_OWNER_UID,
-        )
+        tty = _FakeTty(replies=["WRONG-0000", "WRONG-0000", "WRONG-0000"])
         self.install(tty=tty)
         with self.assertRaises(OwnerChallengeError):
             request_owner_confirmation(_action())
@@ -233,13 +230,13 @@ class TestMinting(OwnerAuthTestBase):
 
     def test_over_length_reply_fails_closed(self):
         too_long = "X" * (owner_auth.MAX_CHALLENGE_LINE_CHARS + 5)
-        tty = _FakeTty(replies=[too_long], device_owner=_FIXED_OWNER_UID)
+        tty = _FakeTty(replies=[too_long])
         self.install(tty=tty)
         with self.assertRaises(OwnerChallengeError):
             request_owner_confirmation(_action())
 
     def test_exhausted_deadline_fails_closed(self):
-        tty = _FakeTty(replies=[None], device_owner=_FIXED_OWNER_UID)
+        tty = _FakeTty(replies=[None])
         self.install(tty=tty)
         with self.assertRaises(OwnerChallengeError):
             request_owner_confirmation(_action())
@@ -263,23 +260,28 @@ class TestMinting(OwnerAuthTestBase):
     def test_elevated_identity_mismatch_fails_closed(self):
         # euid != ruid => an elevated/setuid identity; refuse before any I/O.
         self.install(
-            tty=_FakeTty(replies=[_FIXED_CHALLENGE], device_owner=_FIXED_OWNER_UID),
+            tty=_FakeTty(replies=[_FIXED_CHALLENGE]),
             owner_uid=0,
             real_uid=_FIXED_OWNER_UID,
         )
         with self.assertRaises(OwnerIdentityError):
             request_owner_confirmation(_action())
 
-    def test_foreign_terminal_owner_fails_closed(self):
-        tty = _FakeTty(replies=[_FIXED_CHALLENGE], device_owner=999)
+    def test_terminal_device_ownership_is_not_asserted(self):
+        # /dev/tty resolves to a typically root-owned multiplexor, so no device
+        # (PTY) owner is asserted: the check is euid + controlling-tty only.
+        # The fake exposes no owner method and confirmation still succeeds.
+        tty = _FakeTty(replies=[_FIXED_CHALLENGE])
         self.install(tty=tty)
-        with self.assertRaises(OwnerIdentityError):
-            request_owner_confirmation(_action())
+        cap = request_owner_confirmation(_action())
+        self.assertIsInstance(cap, OwnerApproval)
+        # The boundary never queries a terminal device owner.
+        self.assertFalse(hasattr(tty, "device_owner_uid"))
 
     def test_never_reads_standard_input(self):
         # stdin holds a *correct-looking* value; the boundary must ignore it.
         fake_stdin = io.StringIO(_FIXED_CHALLENGE + "\n")
-        tty = _FakeTty(replies=[_FIXED_CHALLENGE], device_owner=_FIXED_OWNER_UID)
+        tty = _FakeTty(replies=[_FIXED_CHALLENGE])
         self.install(tty=tty)
         with mock.patch.object(sys, "stdin", fake_stdin):
             cap = request_owner_confirmation(_action())
@@ -289,7 +291,7 @@ class TestMinting(OwnerAuthTestBase):
     def test_render_is_safe_against_terminal_control_injection(self):
         inject = "\x1b[2K\rOWNER APPROVAL GRANTED\nChallenge: HACK-0000\x07"
         action = _action(rationale=inject)
-        tty = _FakeTty(replies=[_FIXED_CHALLENGE], device_owner=_FIXED_OWNER_UID)
+        tty = _FakeTty(replies=[_FIXED_CHALLENGE])
         self.install(tty=tty)
         request_owner_confirmation(action)
         prompt = tty.written[0]
@@ -308,7 +310,7 @@ class TestMinting(OwnerAuthTestBase):
         )
 
     def test_digest_binds_all_action_fields(self):
-        self.install(tty=_FakeTty(replies=[_FIXED_CHALLENGE], device_owner=_FIXED_OWNER_UID))
+        self.install(tty=_FakeTty(replies=[_FIXED_CHALLENGE]))
         digests = set()
         for action in (
             _action(),
@@ -320,6 +322,54 @@ class TestMinting(OwnerAuthTestBase):
         ):
             digests.add(action_digest(action))
         self.assertEqual(len(digests), 6)
+
+    def test_target_is_frozen_and_mutation_raises(self):
+        # The coordinator's exact repro: a frozen action must not be mutable
+        # through its target mapping.
+        action = _action()
+        with self.assertRaises(TypeError):
+            action.target["project_id"] = "FOREIGN"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            action.target["artifact_id"] = "FOREIGN"  # type: ignore[index]
+        # The digest is unchanged and still binds the original target.
+        self.assertEqual(action.target["project_id"], "prj_syn")
+
+    def test_display_digest_equals_bound_digest(self):
+        # The digest shown on the terminal is the same one the capability binds
+        # (single capture; no time-of-check/time-of-use gap).
+        action = _action(rationale="display-vs-bound check")
+        tty = _FakeTty(replies=[_FIXED_CHALLENGE])
+        self.install(tty=tty)
+        cap = request_owner_confirmation(action)
+        prompt = tty.written[0]
+        shown = prompt.split("Action digest: ", 1)[1].splitlines()[0]
+        self.assertEqual(shown, action_digest(action))
+        evidence = consume_owner_approval(cap, action)
+        self.assertEqual(evidence.action_digest, shown)
+
+    def test_tampered_action_fails_closed_before_io(self):
+        # A hand-tampered action (target swapped via object.__setattr__) is
+        # re-validated on capture and fails closed before any terminal I/O.
+        action = _action()
+        object.__setattr__(
+            action,
+            "target",
+            {"project_id": "prj_foreign", "artifact_id": "a", "revision_id": "r"},
+        )
+        tty = _FakeTty(replies=[_FIXED_CHALLENGE])
+        self.install(tty=tty)
+        with self.assertRaises(OwnerActionError):
+            request_owner_confirmation(action)
+        self.assertEqual(tty.written, [])  # nothing was written
+
+    def test_write_failure_is_curated_typed_error(self):
+        class _RaisingTty(_FakeTty):
+            def write(self, text, *, deadline=None):
+                raise OwnerAuthTtyUnavailable("curated write failure")
+
+        self.install(tty=_RaisingTty(replies=[_FIXED_CHALLENGE]))
+        with self.assertRaises(OwnerAuthTtyUnavailable):
+            request_owner_confirmation(_action())
 
 
 # --------------------------------------------------------------------------- #
@@ -368,6 +418,94 @@ class TestActionValidation(unittest.TestCase):
         with self.assertRaises(OwnerActionError):
             request_owner_confirmation(raw)
 
+    def test_action_errors_do_not_echo_input(self):
+        # Every failing field must produce a static message: no canary/secret
+        # reflection of the offending identifier, gate kind, decision, reference,
+        # digest, or rationale.
+        canary = "SYNTHETIC_SECRET_CANARY"
+        cases = [
+            (_action, {"gate_kind": canary}),
+            (_action, {"decision": canary}),
+            (_action, {"gate_id": canary + " with space"}),
+            (_action, {"snapshot_digest": canary}),
+            (
+                _action,
+                {
+                    "project_id": "prj_a",
+                    "target": {
+                        "project_id": "prj_b",
+                        "artifact_id": canary,
+                        "revision_id": canary,
+                    },
+                },
+            ),
+        ]
+        for factory, overrides in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(OwnerActionError) as ctx:
+                    factory(**overrides)
+                self.assertNotIn(canary, str(ctx.exception))
+                self.assertNotIn("prj_b", str(ctx.exception))
+
+    def test_long_identifier_rejected(self):
+        too_long = "i" * (owner_auth.MAX_ACTION_IDENTIFIER_CHARS + 1)
+        with self.assertRaises(OwnerActionError):
+            _action(gate_id=too_long)
+
+    def test_long_rationale_rejected(self):
+        too_long = "r" * (owner_auth.MAX_RATIONALE_CHARS + 1)
+        with self.assertRaises(OwnerActionError):
+            _action(rationale=too_long)
+
+
+# --------------------------------------------------------------------------- #
+# Bounded confirmation knobs (no raw OverflowError; no unbounded caller text)
+# --------------------------------------------------------------------------- #
+class TestBoundedKnobs(OwnerAuthTestBase):
+    def _installed(self):
+        tty = _FakeTty(replies=[_FIXED_CHALLENGE])
+        self.install(tty=tty)
+        return tty
+
+    def test_huge_int_knob_is_a_typed_error_not_overflow(self):
+        self._installed()
+        for kwargs in (
+            {"timeout_seconds": 10**1000},
+            {"expires_after_seconds": 10**1000},
+            {"max_attempts": 10**1000},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(owner_auth.OwnerAuthConfigError):
+                    request_owner_confirmation(_action(), **kwargs)
+
+    def test_out_of_range_and_bad_type_knobs_fail_closed(self):
+        self._installed()
+        cases = [
+            {"timeout_seconds": 0},
+            {"timeout_seconds": -1},
+            {"timeout_seconds": float("inf")},
+            {"timeout_seconds": float("nan")},
+            {"timeout_seconds": True},
+            {"timeout_seconds": "10"},
+            {"timeout_seconds": owner_auth.MAX_OWNER_CONFIRM_TIMEOUT_SECONDS + 1},
+            {"expires_after_seconds": 0},
+            {"expires_after_seconds": owner_auth.MAX_OWNER_APPROVAL_TTL_SECONDS + 1},
+            {"max_attempts": 0},
+            {"max_attempts": -3},
+            {"max_attempts": owner_auth.MAX_OWNER_CONFIRM_ATTEMPTS + 1},
+            {"max_attempts": "3"},
+        ]
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(owner_auth.OwnerAuthConfigError):
+                    request_owner_confirmation(_action(), **kwargs)
+
+    def test_knob_error_raised_before_any_terminal_io(self):
+        tty = self._installed()
+        with self.assertRaises(owner_auth.OwnerAuthConfigError):
+            request_owner_confirmation(_action(), timeout_seconds=10**1000)
+        self.assertEqual(tty.written, [])
+
 
 # --------------------------------------------------------------------------- #
 # Consumption: binding, expiry, replay, forgery
@@ -375,7 +513,7 @@ class TestActionValidation(unittest.TestCase):
 class TestConsumption(OwnerAuthTestBase):
     def _minted(self, action=None):
         action = action or _action()
-        self.install(tty=_FakeTty(replies=[_FIXED_CHALLENGE], device_owner=_FIXED_OWNER_UID))
+        self.install(tty=_FakeTty(replies=[_FIXED_CHALLENGE]))
         cap = request_owner_confirmation(action)
         return action, cap
 
@@ -409,15 +547,37 @@ class TestConsumption(OwnerAuthTestBase):
 
     def test_mutable_payload_fails_closed(self):
         action, cap = self._minted()
-        action.target["artifact_id"] = "art_swapped"
+        # The captured target is frozen: in-place mutation raises.
+        with self.assertRaises(TypeError):
+            action.target["artifact_id"] = "art_swapped"  # type: ignore[index]
+        # A different-but-valid action still fails the digest binding.
+        swapped = _action(
+            target={
+                "project_id": "prj_syn",
+                "artifact_id": "art_swapped",
+                "revision_id": "rev_syn",
+            }
+        )
         with self.assertRaises(ActionDigestMismatch):
-            consume_owner_approval(cap, action)
+            consume_owner_approval(cap, swapped)
 
     def test_expired_capability_fails_closed(self):
         action, cap = self._minted()
         self.clock[0] = _BASE_TIME + timedelta(
             seconds=owner_auth.OWNER_APPROVAL_TTL_SECONDS + 1
         )
+        with self.assertRaises(ApprovalExpired):
+            consume_owner_approval(cap, action)
+
+    def test_monotonic_bound_expires_and_wall_rollback_cannot_prolong(self):
+        # A short TTL, then advance monotonic time past it while rolling the wall
+        # clock *backwards*. A wall-clock-only check would wrongly still honor the
+        # capability; the monotonic bound expires it.
+        action = _action()
+        self.install(tty=_FakeTty(replies=[_FIXED_CHALLENGE]))
+        cap = request_owner_confirmation(action, expires_after_seconds=10)
+        self.mono[0] += 11  # elapsed real time
+        self.clock[0] = _BASE_TIME - timedelta(seconds=3600)  # rolled back wall
         with self.assertRaises(ApprovalExpired):
             consume_owner_approval(cap, action)
 
@@ -436,7 +596,7 @@ class TestConsumption(OwnerAuthTestBase):
 
     def test_error_messages_do_not_leak_the_challenge(self):
         self.install(
-            tty=_FakeTty(replies=["WRONG-0000"], device_owner=_FIXED_OWNER_UID)
+            tty=_FakeTty(replies=["WRONG-0000"])
         )
         with self.assertRaises(OwnerChallengeError) as ctx:
             request_owner_confirmation(_action())
@@ -476,6 +636,14 @@ class TestRealTtyReader(unittest.TestCase):
         self.assertIsNone(
             tty.read_line(max_chars=64, deadline=time.monotonic() - 1)
         )
+
+    def test_write_deadline_fails_closed(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        tty = owner_auth._RealTty(write_fd)
+        with self.assertRaises(OwnerAuthTtyUnavailable):
+            tty.write("prompt", deadline=time.monotonic() - 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -623,6 +791,57 @@ class TestRealControllingTerminal(unittest.TestCase):
         )
         self.assertIn("ERROR OwnerAuthTtyUnavailable", proc.stdout, proc.stdout + proc.stderr)
         self.assertNotIn("RESULT ", proc.stdout)
+
+    @unittest.skipUnless(hasattr(os, "forkpty"), "requires os.forkpty")
+    def test_real_pty_device_owner_is_a_multiplexor_not_asserted(self):
+        # Document real Linux behavior: a fd opened on /dev/tty resolves to
+        # /dev/tty (a root-owned multiplexor), not the user's PTY node. The
+        # boundary therefore does NOT assert a terminal device owner; it relies
+        # on euid + controlling-tty, which is why the real confirmation above
+        # still succeeds.
+        probe = (
+            "import os, json\n"
+            "fd = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)\n"
+            "name = os.ttyname(fd)\n"
+            "print('PROBE ' + json.dumps({'name': name, "
+            "'isatty': os.isatty(fd), "
+            "'node_owner': os.stat(name).st_uid, "
+            "'euid': os.geteuid()}))\n"
+        )
+        pid, master_fd = os.forkpty()
+        if pid == 0:  # pragma: no cover - child process
+            with contextlib.suppress(Exception):
+                os.execv(sys.executable, [sys.executable, "-c", probe])
+            os._exit(127)
+        buffer = ""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and "PROBE " not in buffer:
+            try:
+                ready, _, _ = select.select([master_fd], [], [], 0.5)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buffer += chunk.decode("utf-8", "replace")
+        with contextlib.suppress(OSError):
+            os.close(master_fd)
+        with contextlib.suppress(ChildProcessError, OSError):
+            os.waitpid(pid, 0)
+
+        self.assertIn("PROBE ", buffer, buffer)
+        info = json.loads(buffer.split("PROBE ", 1)[1].splitlines()[0])
+        self.assertTrue(info["isatty"])
+        # We deliberately make no ownership equality assertion: on Linux the
+        # /dev/tty node is root-owned. We only assert the boundary does not
+        # depend on it (the confirmation test above succeeds).
+        self.assertIsInstance(info["node_owner"], int)
+        self.assertIsInstance(info["euid"], int)
 
 
 if __name__ == "__main__":  # pragma: no cover

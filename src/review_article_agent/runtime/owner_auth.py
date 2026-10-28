@@ -38,10 +38,15 @@ What this module **is not**
   within the app, the restricted scientific roles have **all tools denied**, so
   a model/tool/document/request payload cannot reach this boundary or mint a
   capability; it cannot forge authority in-band.
-* It is **not** proof of a **biological human**. It proves that *a controlling
-  terminal owned by the owner's effective UID produced the per-operation
-  challenge*; a same-UID script could type it. It is a much stronger, explicit
-  boundary than an in-band boolean, but it is not a biometrics claim.
+* It is **not** proof of a **biological human**, and it is **not** a native
+  sandbox. What it proves is narrow: *the process runs with the owner's effective
+  UID (equal to its real UID), has a controlling terminal, and that terminal
+  produced the per-operation challenge*. It does **not** assert the terminal
+  device's ownership: ``/dev/tty`` resolves to the controlling terminal whose
+  node is typically root-owned (a multiplexor), so a device-owner check would be
+  neither reliable nor a proof of the typing user. A same-UID script could type
+  the challenge. It is a much stronger, explicit boundary than an in-band
+  boolean, but it is not a biometrics claim.
 * It does **not** accept, and cannot be granted authority by, a plain boolean
   "authenticated" flag, an actor label, a string, or any imported data record.
   No public constructor or data import can mint an :class:`OwnerApproval`.
@@ -73,10 +78,13 @@ import re
 import select
 import secrets
 import threading
+import types
 import unicodedata
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 from ..domain.errors import ReviewAgentError
 from ..domain.records import (
@@ -88,6 +96,7 @@ from ..domain.records import (
 
 __all__ = [
     "OwnerAuthError",
+    "OwnerAuthConfigError",
     "OwnerActionError",
     "OwnerAuthTtyUnavailable",
     "OwnerIdentityError",
@@ -109,6 +118,11 @@ __all__ = [
     "OWNER_APPROVAL_TTL_SECONDS",
     "OWNER_CONFIRM_TIMEOUT_SECONDS",
     "OWNER_CONFIRM_MAX_ATTEMPTS",
+    "MAX_OWNER_APPROVAL_TTL_SECONDS",
+    "MAX_OWNER_CONFIRM_TIMEOUT_SECONDS",
+    "MAX_OWNER_CONFIRM_ATTEMPTS",
+    "MAX_ACTION_IDENTIFIER_CHARS",
+    "MAX_RATIONALE_CHARS",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -142,16 +156,36 @@ OWNER_CONFIRM_TIMEOUT_SECONDS = 120.0
 #: Default number of challenge attempts before the confirmation fails closed.
 OWNER_CONFIRM_MAX_ATTEMPTS = 3
 
+#: Hard upper bounds on the confirmation knobs. A caller-supplied value above a
+#: bound (or a non-finite / non-positive one) is refused **before** any float
+#: conversion, with a clean typed :class:`OwnerAuthConfigError`; a value such as
+#: ``10**1000`` never reaches ``math.isfinite`` (which would raise
+#: ``OverflowError``).
+MAX_OWNER_APPROVAL_TTL_SECONDS = 3600.0
+MAX_OWNER_CONFIRM_TIMEOUT_SECONDS = 1800.0
+MAX_OWNER_CONFIRM_ATTEMPTS = 10
+
 #: Hard bound on the number of bytes accepted for one typed challenge line.
 MAX_CHALLENGE_LINE_CHARS = 64
+
+#: Hard bounds on caller-supplied action text, so the rendered prompt and the
+#: digest are bounded and cannot be used to hang the terminal write.
+MAX_ACTION_IDENTIFIER_CHARS = 512
+MAX_RATIONALE_CHARS = 8192
+
+#: Hard bound on the rendered prompt bytes (defensive; the field bounds above
+#: keep it far below this).
+MAX_PROMPT_BYTES = 65536
 
 #: The controlling terminal path. This is opened directly and is **not** a
 #: parameter: the boundary must never fall back to standard input.
 _CONTROLLING_TTY_PATH = "/dev/tty"
 
+#: Challenge alphabet (32 symbols, 5 bits each) and shape. Four groups of four
+#: characters give 16 characters over 32 symbols = **80 bits** of entropy.
 _CHALLENGE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 _CHALLENGE_GROUP_LENGTH = 4
-_CHALLENGE_GROUPS = 3
+_CHALLENGE_GROUPS = 4
 
 _DIGEST_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 
@@ -167,8 +201,21 @@ class OwnerAuthError(ReviewAgentError):
     """
 
 
+class OwnerAuthConfigError(OwnerAuthError, ValueError):
+    """A caller-supplied confirmation knob is out of range or not a number.
+
+    Raised *before* any float conversion, so an absurd integer such as
+    ``10**1000`` produces this clean typed error rather than an ``OverflowError``
+    from ``math.isfinite``. The message states only the bound, never caller text.
+    """
+
+
 class OwnerActionError(OwnerAuthError, ValueError):
-    """An :class:`OwnerAction` is malformed or not the expected typed value."""
+    """An :class:`OwnerAction` is malformed or not the expected typed value.
+
+    Messages are **static**: they never echo the offending identifier, gate kind,
+    decision, reference, digest, or rationale (no canary/secret reflection).
+    """
 
 
 class OwnerAuthTtyUnavailable(OwnerAuthError):
@@ -226,65 +273,6 @@ class OwnerUidMismatch(OwnerAuthError):
 # --------------------------------------------------------------------------- #
 # The immutable action description bound by the caller
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class OwnerAction:
-    """The immutable action an owner is asked to confirm.
-
-    The caller (a future CLI/approval repository) supplies this *description*;
-    it is **not** a claim of authority. The canonical digest of these exact
-    fields is what a capability binds to, so any later change to any field — or
-    to the mutable ``target`` mapping — is detected as a mismatch and fails
-    closed.
-
-    Fields mirror the C02 §2.1 ``Approval`` gate identity: ``project_id`` +
-    ``target`` + ``snapshot_digest`` (the dependency-snapshot digest the caller
-    already computed) + ``gate_kind`` + ``gate_id`` + ``decision`` +
-    ``rationale``.
-    """
-
-    project_id: str
-    target: dict
-    snapshot_digest: str
-    gate_kind: str
-    gate_id: str
-    decision: str
-    rationale: str
-
-    def __post_init__(self) -> None:
-        try:
-            project_id = validate_identifier(self.project_id, "project_id")
-            # ``validate_ref`` both normalizes and enforces that the target's
-            # ``project_id`` equals ``project_id`` (a cross-project target denies
-            # the approval, C02 §2.1).
-            target = validate_ref(self.target, project_id)
-            gate_id = validate_identifier(self.gate_id, "gate_id")
-        except RecordValidationError as exc:
-            raise OwnerActionError(
-                f"the action description is invalid ({exc}); it cannot be "
-                "confirmed."
-            ) from exc
-        gate_kind = self.gate_kind
-        if gate_kind not in APPROVAL_GATE_KINDS:
-            raise OwnerActionError(
-                f"gate_kind {gate_kind!r} is not one of the approved gate kinds; "
-                "an unrecognized gate kind is refused, never coerced."
-            )
-        decision = self.decision
-        if decision not in APPROVAL_DECISIONS:
-            raise OwnerActionError(
-                f"decision {decision!r} is not one of {APPROVAL_DECISIONS}."
-            )
-        rationale = self.rationale
-        if not isinstance(rationale, str) or rationale == "":
-            raise OwnerActionError("rationale must be a non-empty string.")
-        snapshot_digest = _normalize_digest(self.snapshot_digest, "snapshot_digest")
-
-        object.__setattr__(self, "project_id", project_id)
-        object.__setattr__(self, "target", target)
-        object.__setattr__(self, "snapshot_digest", snapshot_digest)
-        object.__setattr__(self, "gate_id", gate_id)
-
-
 def _normalize_digest(value: object, field: str) -> str:
     if not isinstance(value, str):
         raise OwnerActionError(f"{field} must be a string.")
@@ -297,27 +285,177 @@ def _normalize_digest(value: object, field: str) -> str:
     return match.group(1)
 
 
-def action_digest(action: OwnerAction) -> str:
-    """Return the canonical SHA-256 digest of an exact :class:`OwnerAction`.
+def _require_bounded_identifier(value: object, field: str) -> str:
+    """Validate one action identifier and its length, with a **static** error.
 
-    Only a typed :class:`OwnerAction` is accepted; a mapping, string, or boolean
-    offered as an "action" cannot produce a digest (and so cannot match a
-    capability). The digest is recomputed from the current field values on each
-    call, so a mutated ``target`` mapping yields a different digest.
+    Never echoes the offending value.
+    """
+    try:
+        identifier = validate_identifier(value, field)
+    except RecordValidationError as exc:
+        raise OwnerActionError(
+            f"the action's {field} is not a valid identifier; it cannot be "
+            "confirmed."
+        ) from exc
+    if len(identifier) > MAX_ACTION_IDENTIFIER_CHARS:
+        raise OwnerActionError(
+            f"the action's {field} exceeds the {MAX_ACTION_IDENTIFIER_CHARS}"
+            "-character bound; it cannot be confirmed."
+        )
+    return identifier
+
+
+class _FrozenAction(NamedTuple):
+    """An immutable, fully-validated capture of an :class:`OwnerAction`.
+
+    ``target`` is a :class:`types.MappingProxyType` over a private copy, so the
+    captured action cannot be mutated after capture: the same bytes feed both the
+    canonical digest and the on-terminal display (no time-of-check /
+    time-of-use gap).
+    """
+
+    project_id: str
+    target: Mapping
+    snapshot_digest: str
+    gate_kind: str
+    gate_id: str
+    decision: str
+    rationale: str
+
+
+def _validate_and_normalize(
+    project_id: object,
+    target: object,
+    snapshot_digest: object,
+    gate_kind: object,
+    gate_id: object,
+    decision: object,
+    rationale: object,
+) -> _FrozenAction:
+    """Validate every action field and return an immutable, deep-frozen capture.
+
+    Every failure raises a static :class:`OwnerActionError` that never echoes the
+    offending input text (identifier, reference, gate kind, decision, digest, or
+    rationale).
+    """
+    pid = _require_bounded_identifier(project_id, "project_id")
+    if not isinstance(target, Mapping):
+        raise OwnerActionError(
+            "the action's target reference is not a reference object; it cannot "
+            "be confirmed."
+        )
+    try:
+        # ``validate_ref`` normalizes and enforces that the target's project id
+        # equals the action's (a cross-project target denies the approval,
+        # C02 §2.1). Its message echoes ids, so it is never propagated.
+        normalized_target = validate_ref(dict(target), pid)
+    except (RecordValidationError, TypeError, ValueError) as exc:
+        raise OwnerActionError(
+            "the action's target reference is invalid or cross-project; it "
+            "cannot be confirmed."
+        ) from exc
+    frozen_target = types.MappingProxyType(dict(normalized_target))
+    if gate_kind not in APPROVAL_GATE_KINDS:
+        raise OwnerActionError(
+            "the action's gate kind is not one of the approved gate kinds; an "
+            "unrecognized gate kind is refused, never coerced or echoed."
+        )
+    gid = _require_bounded_identifier(gate_id, "gate_id")
+    if decision not in APPROVAL_DECISIONS:
+        raise OwnerActionError(
+            "the action's decision is not one of the approved decisions."
+        )
+    if not isinstance(rationale, str) or rationale == "":
+        raise OwnerActionError("the action's rationale must be a non-empty string.")
+    if len(rationale) > MAX_RATIONALE_CHARS:
+        raise OwnerActionError(
+            f"the action's rationale exceeds the {MAX_RATIONALE_CHARS}-character "
+            "bound; it cannot be confirmed."
+        )
+    return _FrozenAction(
+        project_id=pid,
+        target=frozen_target,
+        snapshot_digest=_normalize_digest(snapshot_digest, "snapshot_digest"),
+        gate_kind=gate_kind,
+        gate_id=gid,
+        decision=decision,
+        rationale=rationale,
+    )
+
+
+@dataclass(frozen=True)
+class OwnerAction:
+    """The immutable action an owner is asked to confirm.
+
+    The caller (a future CLI/approval repository) supplies this *description*;
+    it is **not** a claim of authority. Fields are validated once at construction
+    and the ``target`` is stored as a read-only :class:`types.MappingProxyType`,
+    so the action cannot be mutated after construction (assignment through
+    ``action.target[...]`` raises). The canonical digest of these exact fields is
+    what a capability binds to.
+
+    Fields mirror the C02 §2.1 ``Approval`` gate identity: ``project_id`` +
+    ``target`` + ``snapshot_digest`` (the dependency-snapshot digest the caller
+    already computed) + ``gate_kind`` + ``gate_id`` + ``decision`` +
+    ``rationale``.
+    """
+
+    project_id: str
+    target: Mapping
+    snapshot_digest: str
+    gate_kind: str
+    gate_id: str
+    decision: str
+    rationale: str
+
+    def __post_init__(self) -> None:
+        frozen = _validate_and_normalize(
+            self.project_id,
+            self.target,
+            self.snapshot_digest,
+            self.gate_kind,
+            self.gate_id,
+            self.decision,
+            self.rationale,
+        )
+        object.__setattr__(self, "project_id", frozen.project_id)
+        object.__setattr__(self, "target", frozen.target)
+        object.__setattr__(self, "snapshot_digest", frozen.snapshot_digest)
+        object.__setattr__(self, "gate_id", frozen.gate_id)
+
+
+def _capture_action(action: object) -> _FrozenAction:
+    """Re-validate and deep-freeze an action for one digest+display use.
+
+    Re-validating on capture means a hand-tampered ``OwnerAction`` (e.g. one whose
+    ``target`` was replaced via ``object.__setattr__``) fails closed here, before
+    any terminal I/O or digest comparison.
     """
     if not isinstance(action, OwnerAction):
         raise OwnerActionError(
             "an owner confirmation requires a typed OwnerAction; a mapping, "
             "string, or boolean cannot describe an approvable action."
         )
+    return _validate_and_normalize(
+        action.project_id,
+        action.target,
+        action.snapshot_digest,
+        action.gate_kind,
+        action.gate_id,
+        action.decision,
+        action.rationale,
+    )
+
+
+def _digest_of(frozen: _FrozenAction) -> str:
     payload = {
-        "project_id": action.project_id,
-        "target": dict(action.target),
-        "snapshot_digest": action.snapshot_digest,
-        "gate_kind": action.gate_kind,
-        "gate_id": action.gate_id,
-        "decision": action.decision,
-        "rationale": action.rationale,
+        "project_id": frozen.project_id,
+        "target": dict(frozen.target),
+        "snapshot_digest": frozen.snapshot_digest,
+        "gate_kind": frozen.gate_kind,
+        "gate_id": frozen.gate_id,
+        "decision": frozen.decision,
+        "rationale": frozen.rationale,
     }
     try:
         encoded = canonical_json(payload)
@@ -326,6 +464,17 @@ def action_digest(action: OwnerAction) -> str:
             "the action is not canonically encodable, so it cannot be confirmed."
         ) from exc
     return hashlib.sha256(encoded).hexdigest()
+
+
+def action_digest(action: object) -> str:
+    """Return the canonical SHA-256 digest of an exact :class:`OwnerAction`.
+
+    Only a typed :class:`OwnerAction` is accepted; a mapping, string, or boolean
+    offered as an "action" cannot produce a digest (and so cannot match a
+    capability). The action is re-validated and deep-frozen on each call, so a
+    tampered or mutated value fails closed with a static :class:`OwnerActionError`.
+    """
+    return _digest_of(_capture_action(action))
 
 
 # --------------------------------------------------------------------------- #
@@ -367,6 +516,8 @@ class OwnerApproval:
         "_owner_uid",
         "_created_at",
         "_expires_at",
+        "_created_monotonic",
+        "_expires_monotonic",
         "_consumed",
         "_lock",
     )
@@ -379,6 +530,8 @@ class OwnerApproval:
         owner_uid: int,
         created_at: datetime,
         expires_at: datetime,
+        created_monotonic: float,
+        expires_monotonic: float,
     ) -> None:
         if _guard is not _MINT:
             raise OwnerAuthError(
@@ -390,6 +543,8 @@ class OwnerApproval:
         self._owner_uid = owner_uid
         self._created_at = created_at
         self._expires_at = expires_at
+        self._created_monotonic = created_monotonic
+        self._expires_monotonic = expires_monotonic
         self._consumed = False
         self._lock = threading.Lock()
 
@@ -405,6 +560,8 @@ class OwnerApproval:
         owner_uid: int,
         created_at: datetime,
         expires_at: datetime,
+        created_monotonic: float,
+        expires_monotonic: float,
     ) -> "OwnerApproval":
         return cls(
             _MINT,
@@ -412,6 +569,8 @@ class OwnerApproval:
             owner_uid=owner_uid,
             created_at=created_at,
             expires_at=expires_at,
+            created_monotonic=created_monotonic,
+            expires_monotonic=expires_monotonic,
         )
 
     # -- non-serializable / non-copyable ----------------------------------- #
@@ -515,12 +674,34 @@ class _RealTty:
     def is_tty(self) -> bool:
         return os.isatty(self._fd)
 
-    def device_owner_uid(self) -> int:
-        return os.stat(os.ttyname(self._fd)).st_uid
+    def write(self, text: str, *, deadline: float | None = None) -> None:
+        """Write ``text``, abandoning the write past ``deadline`` (monotonic).
 
-    def write(self, text: str) -> None:
+        The write is bounded by the caller's text bounds **and** by a
+        select-writable deadline budget, so an unread terminal cannot hang the
+        prompt indefinitely. A write that cannot complete in time raises a
+        curated :class:`OwnerAuthTtyUnavailable`.
+        """
         data = text.encode("utf-8", "strict")
         while data:
+            if deadline is not None:
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    raise OwnerAuthTtyUnavailable(
+                        "the controlling terminal write exceeded its deadline."
+                    )
+                try:
+                    _, writable, _ = select.select([], [self._fd], [], remaining)
+                except InterruptedError:
+                    continue
+                except (OSError, ValueError) as exc:
+                    raise OwnerAuthTtyUnavailable(
+                        "the controlling terminal could not be written to."
+                    ) from exc
+                if not writable:
+                    raise OwnerAuthTtyUnavailable(
+                        "the controlling terminal write exceeded its deadline."
+                    )
             try:
                 written = os.write(self._fd, data)
             except OSError as exc:
@@ -625,7 +806,7 @@ def _escape_for_terminal(text: str) -> str:
     return "".join(out)
 
 
-def _format_target(target: dict) -> str:
+def _format_target(target: Mapping) -> str:
     return (
         f"{_escape_for_terminal(target['project_id'])} / "
         f"{_escape_for_terminal(target['artifact_id'])} @ "
@@ -633,18 +814,23 @@ def _format_target(target: dict) -> str:
     )
 
 
-def _render_prompt(action: OwnerAction, digest: str, challenge: str) -> str:
+def _render_prompt(frozen: _FrozenAction, digest: str, challenge: str) -> str:
+    """Render the prompt from the **captured** action (same bytes as the digest).
+
+    No field is re-read from a live caller object, so there is no
+    time-of-check/time-of-use gap between what is hashed and what is shown.
+    """
     lines = [
         "OWNER APPROVAL REQUIRED (out-of-band controlling-terminal confirmation)",
         "This authenticates an owner decision for the application only; it is not",
         "proof of a biological human and not protection against a same-UID process.",
         "Action digest: " + digest,
-        "Project: " + _escape_for_terminal(action.project_id),
-        "Gate: " + _escape_for_terminal(action.gate_kind) + " / " + _escape_for_terminal(action.gate_id),
-        "Decision: " + _escape_for_terminal(action.decision),
-        "Target: " + _format_target(action.target),
-        "Snapshot: " + _escape_for_terminal(action.snapshot_digest),
-        "Rationale: " + _escape_for_terminal(action.rationale),
+        "Project: " + _escape_for_terminal(frozen.project_id),
+        "Gate: " + _escape_for_terminal(frozen.gate_kind) + " / " + _escape_for_terminal(frozen.gate_id),
+        "Decision: " + _escape_for_terminal(frozen.decision),
+        "Target: " + _format_target(frozen.target),
+        "Snapshot: " + _escape_for_terminal(frozen.snapshot_digest),
+        "Rationale: " + _escape_for_terminal(frozen.rationale),
         "---",
         "Type the challenge below exactly (case-sensitive), then press Enter.",
         "Challenge: " + challenge,
@@ -661,6 +847,45 @@ def _render_retry(challenge: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Bounded confirmation knobs (checked before any float conversion)
+# --------------------------------------------------------------------------- #
+def _bounded_seconds(value: object, *, name: str, maximum: float) -> float:
+    """Return a positive finite number of seconds ``<= maximum``.
+
+    Rejects a bool, a non-number, a non-finite float, a non-positive value, and an
+    over-maximum value **before** converting to float, so an absurd integer such
+    as ``10**1000`` raises a clean typed error instead of ``OverflowError`` from
+    ``math.isfinite``/``float``. Never echoes caller text.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise OwnerAuthConfigError(
+            f"{name} must be a positive finite number no greater than {maximum:g}."
+        )
+    if isinstance(value, float) and not math.isfinite(value):
+        raise OwnerAuthConfigError(
+            f"{name} must be a positive finite number no greater than {maximum:g}."
+        )
+    if value <= 0 or value > maximum:
+        raise OwnerAuthConfigError(
+            f"{name} must be a positive finite number no greater than {maximum:g}."
+        )
+    return float(value)
+
+
+def _bounded_attempts(value: object, *, maximum: int) -> int:
+    """Return a positive integer attempt count ``<= maximum`` (never echoes text)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise OwnerAuthConfigError(
+            f"max_attempts must be a positive integer no greater than {maximum}."
+        )
+    if value < 1 or value > maximum:
+        raise OwnerAuthConfigError(
+            f"max_attempts must be a positive integer no greater than {maximum}."
+        )
+    return value
+
+
+# --------------------------------------------------------------------------- #
 # Minting: the only path to authority
 # --------------------------------------------------------------------------- #
 def request_owner_confirmation(
@@ -674,37 +899,33 @@ def request_owner_confirmation(
 
     Opens ``/dev/tty`` directly (never stdin; no ``--yes``/env/JSON token),
     verifies the controlling terminal and the owner's effective UID (refusing an
-    elevated/mismatched identity and a foreign terminal), presents the immutable
-    action summary plus a fresh random challenge (safely escaped against
+    elevated/mismatched identity), presents the **captured** immutable action
+    summary plus a fresh random challenge (safely escaped against
     terminal-control injection), and returns an :class:`OwnerApproval` capability
     **only** if the owner types the exact challenge within the bounded
     length/deadline/attempts.
 
-    Every failure raises a static typed :class:`OwnerAuthError` and mints
-    nothing. This function performs no DB write and dispatches no action.
+    The action is captured (re-validated and deep-frozen) once, and that single
+    capture feeds **both** the canonical digest and the on-terminal display, so a
+    concurrent mutation cannot change what is shown after the digest is fixed.
+    TTL, timeout, and attempts have hard upper bounds checked before any float
+    conversion. Every failure raises a static typed :class:`OwnerAuthError` and
+    mints nothing. This function performs no DB write and dispatches no action.
     """
-    digest = action_digest(action)  # rejects a non-OwnerAction before any I/O
+    frozen = _capture_action(action)  # rejects bad/tampered actions before any I/O
+    digest = _digest_of(frozen)
 
-    if (
-        isinstance(expires_after_seconds, bool)
-        or not isinstance(expires_after_seconds, (int, float))
-        or not math.isfinite(expires_after_seconds)
-        or expires_after_seconds <= 0
-    ):
-        raise ValueError("expires_after_seconds must be a positive finite number.")
-    if (
-        isinstance(timeout_seconds, bool)
-        or not isinstance(timeout_seconds, (int, float))
-        or not math.isfinite(timeout_seconds)
-        or timeout_seconds <= 0
-    ):
-        raise ValueError("timeout_seconds must be a positive finite number.")
-    if (
-        isinstance(max_attempts, bool)
-        or not isinstance(max_attempts, int)
-        or max_attempts < 1
-    ):
-        raise ValueError("max_attempts must be a positive integer.")
+    ttl = _bounded_seconds(
+        expires_after_seconds,
+        name="expires_after_seconds",
+        maximum=MAX_OWNER_APPROVAL_TTL_SECONDS,
+    )
+    timeout = _bounded_seconds(
+        timeout_seconds,
+        name="timeout_seconds",
+        maximum=MAX_OWNER_CONFIRM_TIMEOUT_SECONDS,
+    )
+    attempts = _bounded_attempts(max_attempts, maximum=MAX_OWNER_CONFIRM_ATTEMPTS)
 
     owner_uid = _current_owner_uid()
     if owner_uid != _real_uid():
@@ -714,7 +935,7 @@ def request_owner_confirmation(
         )
 
     challenge = _new_challenge()
-    deadline = _monotonic() + float(timeout_seconds)
+    deadline = _monotonic() + timeout
 
     terminal = _open_controlling_tty()
     try:
@@ -723,16 +944,10 @@ def request_owner_confirmation(
                 "the opened controlling terminal is not a terminal; owner "
                 "confirmation fails closed rather than reading standard input."
             )
-        device_owner = terminal.device_owner_uid()
-        if device_owner not in (owner_uid, 0):
-            raise OwnerIdentityError(
-                "the controlling terminal is owned by neither the owner's "
-                "effective UID nor root; refusing an unverified terminal."
-            )
 
-        terminal.write(_render_prompt(action, digest, challenge))
+        terminal.write(_render_prompt(frozen, digest, challenge), deadline=deadline)
         confirmed = False
-        for _ in range(max_attempts):
+        for _ in range(attempts):
             typed = terminal.read_line(
                 max_chars=MAX_CHALLENGE_LINE_CHARS, deadline=deadline
             )
@@ -747,7 +962,7 @@ def request_owner_confirmation(
             ):
                 confirmed = True
                 break
-            terminal.write(_render_retry(challenge))
+            terminal.write(_render_retry(challenge), deadline=deadline)
         if not confirmed:
             raise OwnerChallengeError(
                 "the exact owner challenge was not entered within the allowed "
@@ -760,12 +975,15 @@ def request_owner_confirmation(
             pass
 
     created_at = _utcnow()
-    expires_at = created_at + timedelta(seconds=float(expires_after_seconds))
+    created_monotonic = _monotonic()
+    expires_at = created_at + timedelta(seconds=ttl)
     return OwnerApproval._mint(
         action_digest=digest,
         owner_uid=owner_uid,
         created_at=created_at,
         expires_at=expires_at,
+        created_monotonic=created_monotonic,
+        expires_monotonic=created_monotonic + ttl,
     )
 
 
@@ -810,7 +1028,12 @@ def consume_owner_approval(
         )
 
     now = _utcnow()
-    if now >= capability._expires_at:
+    # Two independent bounds: the wall-clock window and a monotonic window. A
+    # backward wall-clock adjustment cannot prolong the capability, because the
+    # monotonic window is unaffected by clock rollback. (A capability is
+    # process-local and non-serializable, so it cannot outlive the process to be
+    # resurrected after a restart.)
+    if now >= capability._expires_at or _monotonic() >= capability._expires_monotonic:
         raise ApprovalExpired(
             "this owner confirmation has expired; request a fresh one."
         )
