@@ -21,9 +21,22 @@ Design (``docs/implementation/02-project-foundation.md`` AC1/AC2/AC3/AC7 and
 
 The command handlers are intentionally small and uniform (``cmd_*`` functions
 taking ``(args, context)`` and returning a JSON-ready object) so later steps can
-add subcommands without reworking dispatch. No ``approve``/``run``/``worker``/
-``model`` command exists here: those belong to later steps once their storage
-and approval layers are integrated.
+add subcommands without reworking dispatch. This module also exposes:
+
+* ``backup``/``export`` — a **private local storage snapshot** (SQLite online
+  backup), ``verify``, and ``restore`` over
+  :mod:`review_article_agent.storage.backup`. This is **not** a manuscript or
+  redistribution export (no Markdown/BibTeX/RIS) and must never be published.
+* ``fixture`` — **non-authorizing** local storage-fixture review state over
+  :mod:`review_article_agent.storage.approvals`. Every fixture output carries
+  ``scope=storage_fixture``, ``actor_authenticated=false``,
+  ``authorizes_execution=false``, ``authorizes_export=false`` and
+  ``scientific_validation=false``; no real protocol/pilot/outline/release gate
+  and no in-band actor/authority flag is accepted.
+
+No ``run``/``worker``/``model`` or **scientific** ``approve`` command exists
+here: those belong to later steps once their execution and scientific-approval
+layers are integrated.
 """
 
 from __future__ import annotations
@@ -55,7 +68,18 @@ from ..storage import (
     Registry,
     paths,
 )
+from ..storage.approvals import (
+    FIXTURE_DECISIONS,
+    ApprovalRepository,
+)
 from ..storage.artifacts import Revision
+from ..storage.backup import (
+    BackupConflictError,
+    BackupError,
+    create_backup,
+    restore_backup,
+    verify_backup,
+)
 from .config import (
     CONFIG_SCHEMA_VERSION,
     STRICT_JSON_REASONS,
@@ -201,6 +225,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_register.add_argument("--name")
 
     _build_artifact_parser(sub)
+    _build_backup_parser(sub)
+    _build_fixture_parser(sub)
 
     return parser
 
@@ -265,6 +291,73 @@ def _build_artifact_parser(sub: "argparse._SubParsersAction") -> None:
     p_content.add_argument("--project", metavar="ID")
 
 
+def _build_backup_parser(sub: "argparse._SubParsersAction") -> None:
+    bk = sub.add_parser(
+        "backup",
+        help="private local storage snapshot (create/verify/restore); never publish",
+    )
+    bk_sub = bk.add_subparsers(
+        dest="backup_command", required=True, metavar="BACKUP_COMMAND"
+    )
+
+    p_create = bk_sub.add_parser(
+        "create", help="create a private storage snapshot directory at DEST"
+    )
+    p_create.add_argument("dest", metavar="DEST")
+    p_create.add_argument("--project", metavar="ID")
+
+    p_verify = bk_sub.add_parser(
+        "verify", help="verify a private storage snapshot directory DIR"
+    )
+    p_verify.add_argument("dir", metavar="DIR")
+
+    p_restore = bk_sub.add_parser(
+        "restore", help="verify and restore snapshot DIR into a new project ROOT"
+    )
+    p_restore.add_argument("dir", metavar="DIR")
+    p_restore.add_argument("root", metavar="ROOT")
+
+    # ``export`` is an explicit alias of ``backup create``: the same private
+    # local storage snapshot. It is deliberately NOT a manuscript/BibTeX/RIS or
+    # redistribution export.
+    p_export = sub.add_parser(
+        "export",
+        help="alias of `backup create` (private local storage snapshot; not a manuscript export)",
+    )
+    p_export.add_argument("dest", metavar="DEST")
+    p_export.add_argument("--project", metavar="ID")
+
+
+def _build_fixture_parser(sub: "argparse._SubParsersAction") -> None:
+    fx = sub.add_parser(
+        "fixture",
+        help="non-authorizing local storage-fixture review state (never a real approval)",
+    )
+    fx_sub = fx.add_subparsers(
+        dest="fixture_command", required=True, metavar="FIXTURE_COMMAND"
+    )
+
+    p_rec = fx_sub.add_parser(
+        "record-approval",
+        help="record a local, non-authorizing fixture approval for one exact revision",
+    )
+    p_rec.add_argument("--artifact-id", required=True, metavar="ID")
+    p_rec.add_argument("--revision-id", required=True, metavar="ID")
+    p_rec.add_argument("--gate-id", required=True, metavar="ID")
+    p_rec.add_argument("--decision", required=True, choices=list(FIXTURE_DECISIONS))
+    p_rec.add_argument("--rationale", required=True, metavar="TEXT")
+    p_rec.add_argument("--project", metavar="ID")
+
+    p_list = fx_sub.add_parser("list", help="list local fixture approvals")
+    p_list.add_argument("--project", metavar="ID")
+
+    p_status = fx_sub.add_parser(
+        "status", help="show one local fixture approval's computed status"
+    )
+    p_status.add_argument("approval_id", metavar="APPROVAL_ID")
+    p_status.add_argument("--project", metavar="ID")
+
+
 # --------------------------------------------------------------------------- #
 # Shared projections / helpers
 # --------------------------------------------------------------------------- #
@@ -288,7 +381,12 @@ def _artifact_dict(artifact: Any) -> dict[str, object]:
 
 
 def _revision_dict(revision: Revision) -> dict[str, object]:
-    """A safe revision projection: no content bytes, no rights strings, no actor."""
+    """A safe revision projection: no content bytes, no rights strings, no actor.
+
+    Every Step 02 revision is an unvalidated local **proposal**
+    (``scientific_state="proposal"``): no revision here is a validated scientific
+    artifact and a fixture approval never changes that.
+    """
     return {
         "project_id": revision.project_id,
         "artifact_id": revision.artifact_id,
@@ -303,6 +401,7 @@ def _revision_dict(revision: Revision) -> dict[str, object]:
         "provenance_method": revision.provenance_method,
         "rights_ref": revision.rights_ref.as_dict(),
         "dependencies": [dep.as_dict() for dep in revision.dependencies],
+        "scientific_state": "proposal",
     }
 
 
@@ -611,6 +710,154 @@ def cmd_artifact_content(
 
 
 # --------------------------------------------------------------------------- #
+# Backup / export commands (private local storage snapshot)
+# --------------------------------------------------------------------------- #
+def cmd_backup_create(args: argparse.Namespace, ctx: Context) -> dict[str, object]:
+    """``backup create DEST`` / ``export DEST`` — private storage snapshot.
+
+    Uses the storage-layer online-backup API (never a copy of the live database
+    file), so committed WAL content is captured consistently. The destination is
+    refused if it already exists, and it may not live inside the application data
+    directory or any registered project's app-owned directory.
+    """
+    project_id = _resolve_project_id(ctx.registry, args.project)
+    dest = os.path.abspath(args.dest)
+    _reject_forbidden_output_path(ctx, dest)
+    _info, store, _repo = _open_project(ctx.registry, project_id)
+    try:
+        summary = create_backup(store, dest)
+    finally:
+        store.close()
+    return {
+        "backup": summary,
+        "scientific_validation": False,
+        "publishable": False,
+    }
+
+
+def cmd_backup_verify(args: argparse.Namespace, ctx: Context) -> dict[str, object]:
+    summary = verify_backup(args.dir)
+    summary = dict(summary)
+    summary["scientific_validation"] = False
+    summary["publishable"] = False
+    return {"backup": summary}
+
+
+def cmd_backup_restore(args: argparse.Namespace, ctx: Context) -> dict[str, object]:
+    info = restore_backup(args.dir, args.root, ctx.registry)
+    return {"project": _project_info_dict(info)}
+
+
+# --------------------------------------------------------------------------- #
+# Fixture commands (non-authorizing local storage-fixture review state)
+# --------------------------------------------------------------------------- #
+#: The only gate kind the CLI records. Deliberately a fixture-local gate, never a
+#: real C02 ``protocol``/``pilot``/``outline``/``final_release`` gate.
+_FIXTURE_GATE_KIND = "fixture_artifact_revision"
+
+#: Non-authorizing constants carried on every fixture output.
+_FIXTURE_FALSE_FLAGS = {
+    "scope": "storage_fixture",
+    "actor_authenticated": False,
+    "authorizes_execution": False,
+    "authorizes_export": False,
+    "scientific_validation": False,
+}
+
+
+def _fixture_approval_dict(approval: Any) -> dict[str, object]:
+    """A safe projection of one fixture approval (never echoes ``rationale``)."""
+    data = {
+        "project_id": approval.project_id,
+        "approval_id": approval.approval_id,
+        "target": approval.target,
+        "gate_kind": approval.gate_kind,
+        "gate_id": approval.gate_id,
+        "decision": approval.decision,
+        "actor_label": approval.actor_label,
+        "snapshot_id": approval.snapshot_id,
+        "snapshot_digest": approval.snapshot_digest,
+        "granted_at_utc": approval.granted_at_utc,
+        "created_at_utc": approval.created_at_utc,
+    }
+    data.update(_FIXTURE_FALSE_FLAGS)
+    return data
+
+
+def cmd_fixture_record_approval(
+    args: argparse.Namespace, ctx: Context
+) -> dict[str, object]:
+    project_id = _resolve_project_id(ctx.registry, args.project)
+    _info, store, _repo = _open_project(ctx.registry, project_id)
+    try:
+        approvals = ApprovalRepository(store)
+        approval = approvals.record_fixture_approval(
+            target={
+                "project_id": project_id,
+                "artifact_id": args.artifact_id,
+                "revision_id": args.revision_id,
+            },
+            gate_kind=_FIXTURE_GATE_KIND,
+            gate_id=args.gate_id,
+            decision=args.decision,
+            rationale=args.rationale,
+        )
+        return {"fixture_approval": _fixture_approval_dict(approval)}
+    finally:
+        store.close()
+
+
+def cmd_fixture_list(args: argparse.Namespace, ctx: Context) -> dict[str, object]:
+    project_id = _resolve_project_id(ctx.registry, args.project)
+    _info, store, _repo = _open_project(ctx.registry, project_id)
+    try:
+        approvals = ApprovalRepository(store)
+        entries: list[dict[str, object]] = []
+        for approval in approvals.list_approvals():
+            item = _fixture_approval_dict(approval)
+            status = approvals.evaluate(approval.approval_id)
+            item["status"] = status.status
+            item["superseded_by"] = status.superseded_by
+            entries.append(item)
+        return {"fixture_approvals": entries}
+    finally:
+        store.close()
+
+
+def cmd_fixture_status(args: argparse.Namespace, ctx: Context) -> dict[str, object]:
+    project_id = _resolve_project_id(ctx.registry, args.project)
+    _info, store, repo = _open_project(ctx.registry, project_id)
+    try:
+        approvals = ApprovalRepository(store)
+        approval = approvals.get_approval(args.approval_id)
+        if approval is None:
+            raise RecordValidationError(
+                f"approval_id: no fixture approval {args.approval_id!r} in this project."
+            )
+        status = approvals.evaluate(args.approval_id)
+        verification = approvals.verify_snapshot(args.approval_id)
+        current = repo.current_revision(approval.target_artifact_id)
+        current_id = None if current is None else current.revision_id
+        data = _fixture_approval_dict(approval)
+        data.update(
+            {
+                "status": status.status,
+                "superseded_by": status.superseded_by,
+                "reasons": list(status.reasons),
+                "current_revision_id": current_id,
+                "current_revision_approved": (
+                    current_id is not None and current_id == approval.target_revision_id
+                ),
+                "snapshot_verified": verification.ok,
+                "snapshot_problems": list(verification.problems),
+            }
+        )
+        return {"fixture_approval": data}
+    finally:
+        store.close()
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch
 # --------------------------------------------------------------------------- #
 _COMMANDS = {
@@ -620,6 +867,7 @@ _COMMANDS = {
     "status": cmd_status,
     "relocate": cmd_relocate,
     "register": cmd_register,
+    "export": cmd_backup_create,
 }
 
 _ARTIFACT_COMMANDS = {
@@ -633,6 +881,18 @@ _ARTIFACT_COMMANDS = {
     "content": cmd_artifact_content,
 }
 
+_BACKUP_COMMANDS = {
+    "create": cmd_backup_create,
+    "verify": cmd_backup_verify,
+    "restore": cmd_backup_restore,
+}
+
+_FIXTURE_COMMANDS = {
+    "record-approval": cmd_fixture_record_approval,
+    "list": cmd_fixture_list,
+    "status": cmd_fixture_status,
+}
+
 
 def dispatch(args: argparse.Namespace, ctx: Context) -> object:
     """Route a parsed invocation to its handler (extension hook for new commands)."""
@@ -641,6 +901,18 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
             handler = _ARTIFACT_COMMANDS[args.artifact_command]
         except KeyError as exc:  # pragma: no cover - argparse enforces choices
             raise CliUsageError(f"unknown artifact command {args.artifact_command!r}") from exc
+        return handler(args, ctx)
+    if args.command == "backup":
+        try:
+            handler = _BACKUP_COMMANDS[args.backup_command]
+        except KeyError as exc:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(f"unknown backup command {args.backup_command!r}") from exc
+        return handler(args, ctx)
+    if args.command == "fixture":
+        try:
+            handler = _FIXTURE_COMMANDS[args.fixture_command]
+        except KeyError as exc:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(f"unknown fixture command {args.fixture_command!r}") from exc
         return handler(args, ctx)
     try:
         handler = _COMMANDS[args.command]
@@ -675,6 +947,18 @@ _VALIDATION_MESSAGE = (
     "record, or a dependency reference did not match the expected schema); "
     "nothing was written. Check the input against the documented schema."
 )
+_BACKUP_MESSAGE = (
+    "a private storage snapshot operation failed (the archive could not be "
+    "created, verified, read, or restored safely); nothing was modified where it "
+    "could not complete. Check the archive integrity and the destination, then "
+    "retry."
+)
+_BACKUP_CONFLICT_MESSAGE = (
+    "this project identity is already registered elsewhere, or the target "
+    "location already belongs to a different project; restoring a second copy "
+    "would clone the project. Use the existing registration, or restore into a "
+    "target whose data directory does not already hold that identity."
+)
 
 
 def _emit_result(result: object, stdout: TextIO | None = None) -> None:
@@ -699,7 +983,7 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
     """Map an exception to a stable ``(category, exit_code)`` pair."""
     if isinstance(exc, (CliUsageError, ConfigError)):
         return "usage", EXIT_USAGE
-    if isinstance(exc, (ProjectConflict, ArtifactConflictError)):
+    if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
         return "storage", EXIT_STORAGE
@@ -734,10 +1018,16 @@ def _error_message(exc: BaseException, category: str) -> str:
             return str(exc)
         return "invalid command-line usage; run --help."
     if category == "conflict":
+        if isinstance(exc, BackupConflictError):
+            return _BACKUP_CONFLICT_MESSAGE
         return _CONFLICT_MESSAGE
     if category == "not_found":
         return _NOT_FOUND_MESSAGE
     if category == "storage":
+        if isinstance(exc, BackupError):
+            # Never echo a raw manifest / snapshot / path detail from the backup
+            # layer.
+            return _BACKUP_MESSAGE
         if isinstance(exc, UnsupportedSchemaVersion):
             # ``label`` is our own curated string ("project store"/"application
             # registry"), never user input.

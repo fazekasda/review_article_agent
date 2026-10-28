@@ -3,9 +3,15 @@
 > **Scope: Step 02 only.** This document is the **contract** for the command-line
 > surface over the durable local project foundation. It describes exactly what the
 > commands accept, what they print, and how they fail. It is **not** a scientific
-> or approval contract and it claims **no** scientific validation. Approval,
-> execution, worker, model, backup, and restore commands are **out of scope here**
-> and belong to later steps.
+> or approval contract and it claims **no** scientific validation.
+>
+> It covers: projects/registry, immutable artifact revisions, a **private local
+> storage snapshot** (`backup`/`export`) and **non-authorizing local
+> storage-fixture review state** (`fixture`). The `fixture` commands record a
+> local *fixture* only; they are **never** a real protocol/pilot/outline/final
+> release approval and never authorize execution, export, or science. No
+> agent-execution (`run`/`worker`/`model`) or scientific-`approve` command exists
+> here.
 
 The contract was decided in task T6a; the exact spellings below are the T6a
 decision. The behavior boundaries are fixed by
@@ -72,12 +78,14 @@ untrusted/error-path values, and `artifact content` intentionally reads content.
 | `2` | `usage` | Command-line usage or configuration-file problem. |
 | `2` | `validation` | Invalid input data (bad identifier, malformed import, unknown id shape). |
 | `2` | `not_found` | A referenced project id is not registered. |
-| `3` | `conflict` | Divergent duplicate / immutable-state conflict. |
-| `4` | `storage` | Store/registry/schema/path/filesystem/permission error. |
+| `3` | `conflict` | Divergent duplicate / immutable-state conflict, including a private-snapshot **restore** that would clone or overwrite an existing project identity. |
+| `4` | `storage` | Store/registry/schema/path/filesystem/permission error, including a failed private-snapshot create/verify/restore. |
 | `1` | `internal` | Unexpected error; no traceback is shown. |
 
 Both `usage` and `validation` deliberately share exit `2` (matching `argparse`'s
-convention); the JSON `category` distinguishes them.
+convention); the JSON `category` distinguishes them. Snapshot failures use
+curated `storage`/`conflict` messages and **never** echo a raw manifest, snapshot,
+or exception detail.
 
 ## 4. Configuration file (optional)
 
@@ -158,6 +166,10 @@ is given.
 | `--request-id ID` | Optional idempotency key; an identical replay is stable, a divergent replay is a `conflict`. |
 | `--origin LOCATOR` | Optional origin locator (default `import:cli`). |
 | `--project ID` | Target project (default: active). |
+
+**Revision projections** include `"scientific_state": "proposal"` on every
+artifact revision: all Step 02 revisions are unvalidated local proposals, and no
+CLI command or `fixture` approval changes that.
 
 ### Content and untrusted imports
 
@@ -241,34 +253,118 @@ $ review-article-agent --data-dir ~/.local/share/review_article_agent artifact g
 $ review-article-agent --data-dir ~/.local/share/review_article_agent artifact content art-syn --revision rev-syn-1 --output ./out.bin
 ```
 
-## 7. Explicit exclusions (Step 02)
+## 7. Private storage snapshot — `backup` and `export`
 
-* No `approve`/`reject`, `run`/`pause`/`resume`, `worker`, or `model`/provider
-  command exists here. Those depend on later steps' storage and approval layers
-  and are **not** reimplemented in the CLI.
+`backup`/`export` operate over the private local storage snapshot API
+([`storage.md`](storage.md)). **This is not a manuscript or redistribution
+export** (no Markdown/BibTeX/RIS) and the archive **must never be published**.
+The CLI never copies the live database file; it uses the storage layer's SQLite
+online-backup API, so committed WAL content is captured consistently.
+
+| Command | Synopsis |
+| --- | --- |
+| `backup create DEST [--project ID]` | Create a **new** private snapshot directory at `DEST`. Refused if `DEST` already exists, and refused inside the application data directory or any project's app-owned directory. |
+| `backup verify DIR` | Read-only, fail-closed verification of a snapshot directory. Prints `{"backup": {ok, project_id, counts, …}}`. |
+| `backup restore DIR ROOT` | Verify, then atomically restore `DIR` into a **new** project `ROOT`, preserving the snapshot's exact `project_id`. |
+| `export DEST [--project ID]` | **Alias** of `backup create`: the same private local storage snapshot format. |
+
+Snapshot output is owner-private: the directory `0700`, and `manifest.json` /
+`snapshot.sqlite3` `0600`; the directory contains **only** those two members.
+A snapshot command's JSON result is marked `"publishable": false` and
+`"scientific_validation": false`.
+
+Restore conflicts (exit `3`, `conflict`): restoring a snapshot whose project
+identity is already registered at **another** root is refused (never a clone),
+and restoring into a root registered to a different project is refused. To
+restore a project a second time, use a **separate data directory** whose registry
+does not already hold that identity. A failed snapshot create/verify/restore is
+exit `4` (`storage`) with a curated message that never echoes a raw manifest,
+snapshot, path, or exception detail.
+
+## 8. Local fixture review state — `fixture`
+
+`fixture` records **non-authorizing** local storage-fixture review state over
+[`review_article_agent.storage.approvals`](../src/review_article_agent/storage/approvals.py).
+It is a local *fixture*: it is **never** a real protocol/pilot/outline/final
+release approval and **never** authorizes execution, export, or science. The CLI
+accepts **no** in-band actor/authority flag, and no imported document can grant
+one.
+
+| Command | Synopsis |
+| --- | --- |
+| `fixture record-approval --artifact-id A --revision-id R --gate-id G --decision approved\|rejected --rationale TEXT [--project ID]` | Record a local fixture approval bound to the exact `{project_id, artifact_id, revision_id}`, with `gate_kind` fixed to `fixture_artifact_revision`. |
+| `fixture list [--project ID]` | List local fixture approvals with their computed status. |
+| `fixture status APPROVAL_ID [--project ID]` | Show one approval's computed status, snapshot verification, and whether the approved revision is still current. |
+
+Every `fixture` output carries the non-authorizing constants
+`scope="storage_fixture"`, `actor_authenticated=false`,
+`authorizes_execution=false`, `authorizes_export=false`, and
+`scientific_validation=false`. The `rationale` is stored but is **not** echoed in
+`status`/`list` output.
+
+**Status is recomputed, never carried forward.** A new revision of the approved
+artifact, of any pinned live dependency, or of a pinned rights record makes the
+approval `stale`; an independent approval for an unrelated artifact stays
+`active`; a newer approval for the same gate instance `superseded` the older one.
+An edited artifact's new revision is a `proposal`
+(`scientific_state="proposal"`) and its prior content stays byte-immutable.
+
+### Copyable synthetic example (fixture caveats)
+
+A complete, synthetic, copyable sequence. It demonstrates the private snapshot
+and the fixture lifecycle; **nothing here is a scientific result or a real
+approval**, and the ``export`` archive must not be published. Replace
+`<PROJECT_ID>` with the id printed by `create`.
+
+```console
+# ... create/select a project and import artifacts (see §6) ...
+$ review-article-agent --data-dir "$DD" fixture record-approval \
+    --artifact-id art-syn --revision-id rev-syn-1 --gate-id gate-local-1 \
+    --decision approved --rationale "synthetic local fixture; not a scientific approval"
+$ review-article-agent --data-dir "$DD" fixture list --project <PROJECT_ID>
+$ review-article-agent --data-dir "$DD" fixture status apv_… --project <PROJECT_ID>
+# Edit the artifact (new immutable revision, parent = current head); the fixture
+# approval then reports "stale" and the new revision reports scientific_state=proposal.
+
+# Private local storage snapshot (NOT a manuscript export; never publish):
+$ review-article-agent --data-dir "$DD" backup create ./snap-1 --project <PROJECT_ID>
+$ review-article-agent --data-dir "$DD" backup verify ./snap-1
+$ review-article-agent --data-dir ./other-state backup restore ./snap-1 ./restored
+$ review-article-agent --data-dir "$DD" export ./snap-1b --project <PROJECT_ID>   # same private format
+```
+
+## 9. Explicit exclusions (Step 02)
+
+* No scientific `approve`/`reject` and no `run`/`pause`/`resume`, `worker`, or
+  `model`/provider command exists here. Those depend on later steps' execution
+  and scientific-approval layers and are **not** reimplemented in the CLI.
+* `fixture` records a local, non-authorizing fixture only. No real
+  protocol/pilot/outline/final-release gate and no in-band actor/authority is
+  accepted; an imported document still cannot self-grant any approval.
 * No scientific acquisition, evidence validation, or approval is performed or
-  implied. Fixtures are synthetic and fixture-only.
-* Backup/restore/export commands are a **separate** task once their storage layer
-  is integrated; the data-directory and store layout here is designed for it.
+  implied. All fixtures and archives are synthetic/private and non-authorizing.
+* `backup`/`export` is a **private local storage snapshot**, not a manuscript
+  (Markdown/BibTeX/RIS) or redistribution export; never publish an archive.
 
-## 8. Extension hooks
+## 10. Extension hooks
 
 Adding a subcommand is intentionally small:
 
 1. Add a parser in `build_parser()` (`review_article_agent/cli/main.py`).
 2. Add a handler `cmd_<name>(args, ctx) -> dict | RawBytes` that returns a
    JSON-ready object.
-3. Register it in `_COMMANDS` (or `_ARTIFACT_COMMANDS`).
+3. Register it in `_COMMANDS`, `_ARTIFACT_COMMANDS`, `_BACKUP_COMMANDS`, or
+   `_FIXTURE_COMMANDS`.
 
 Handlers receive a `Context` holding the resolved `Registry`, the data directory,
 the parsed config, and the environment, and never touch global state. New exit
 categories are added to `classify_error()` and this table.
 
-## 9. Verification
+## 11. Verification
 
 * `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` — includes
-  the real-subprocess CLI acceptance tests (`tests/test_cli.py`) and the config
-  tests (`tests/test_config.py`).
+  the real-subprocess CLI acceptance tests (`tests/test_cli.py`,
+  `tests/test_cli_snapshot.py`) and the config tests (`tests/test_config.py`).
 * `python3 scripts/check_contract_docs.py --self-test` — the Step 01 contract
   checks remain green (this document adds no fixtures or schema field semantics).
 * The packaged console script and the absence of an invented license are checked
