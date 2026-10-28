@@ -20,6 +20,10 @@ injected transports (no network, no credential, no paid call):
 * idempotent replay (no fence change, no duplicate cost, an already-unknown replay
   stays unknown), divergent-replay and stale-fence refusal with zero mutation, and
   contradiction refusal before any write;
+* an existing **inert** observation (`record_result` then `commit_result`) never
+  implies the dispatch transition/cost were already committed: a pending
+  submitted/unknown dispatch is transitioned by the commit without re-inserting
+  rows, while a genuinely already-applied commit is a byte-exact no-op;
 * injected fault seams after the set insert / after the cost / before the accept
   roll back the rows, the state, and the cost together;
 * the commit path never nests a transaction (``ProjectStore.transaction`` cannot
@@ -425,6 +429,41 @@ class CommitTestBase(unittest.TestCase):
     def reload_dispatch(self):
         return self.dispatch.get_dispatch(self.dispatch_record.dispatch_id)
 
+    def snapshot_rows(self):
+        """Raw byte-for-byte snapshots of the observation + dispatch rows."""
+        conn = self.store.connection
+        dispatch_id = self.dispatch_record.dispatch_id
+
+        def one(sql, params):
+            row = conn.execute(sql, params).fetchone()
+            return None if row is None else tuple(row)
+
+        def many(sql, params):
+            return tuple(tuple(row) for row in conn.execute(sql, params).fetchall())
+
+        return {
+            "set": one(
+                "SELECT * FROM decision_result_set WHERE project_id = ? AND "
+                "dispatch_id = ?",
+                (self.pid, dispatch_id),
+            ),
+            "questions": many(
+                "SELECT * FROM decision_result_question WHERE project_id = ? AND "
+                "dispatch_id = ? ORDER BY ordinal",
+                (self.pid, dispatch_id),
+            ),
+            "dispatch": one(
+                "SELECT * FROM runtime_dispatch WHERE project_id = ? AND "
+                "dispatch_id = ?",
+                (self.pid, dispatch_id),
+            ),
+            "state": one(
+                "SELECT * FROM runtime_dispatch_state WHERE project_id = ? AND "
+                "dispatch_id = ?",
+                (self.pid, dispatch_id),
+            ),
+        }
+
     def assert_pristine(self, *, state="submitted", cost_state="unknown"):
         self.assertEqual(self.counts(), (0, 0))
         record = self.reload_dispatch()
@@ -736,6 +775,235 @@ class IdempotenceAndRefusalTest(CommitTestBase):
         self.assert_pristine()
 
 
+class PendingInertObservationTest(CommitTestBase):
+    """An inert ``record_result`` observation must never masquerade as committed."""
+
+    def inert(self, result):
+        return self.results.record_result(
+            self.dispatch_record.dispatch_id, result, fence=1
+        )
+
+    def test_submitted_success_inert_observation_is_applied_atomically(self) -> None:
+        self.submit()
+        result = self.valid_result()
+        observation = self.inert(result)
+        self.assertEqual(self.reload_dispatch().state, "submitted")
+
+        committed = self.commit(result)
+        self.assertEqual(committed.outcome, "completed")
+        self.assertTrue(committed.observation_reused)
+        self.assertFalse(committed.replayed)
+        self.assertEqual(committed.dispatch.state, "completed")
+        self.assertEqual(committed.dispatch.result_kind, RESULT_KIND)
+        self.assertEqual(committed.dispatch.result_ref, observation.result_id)
+        self.assertEqual(committed.dispatch.result_digest, observation.digest)
+        self.assertEqual(committed.dispatch.cost_state, "known")
+        self.assertEqual(committed.dispatch.cost_amount_usd, "0.00002037")
+        # No duplicate observation rows and no new identity.
+        self.assertEqual(self.counts(), (1, len(_SPECS)))
+        self.assertEqual(len(self.dispatch.list_dispatches()), 1)
+
+    def test_submitted_definitive_error_inert_observation_is_applied(self) -> None:
+        self.submit()
+        result = self.definitive_result(400)
+        self.inert(result)
+
+        committed = self.commit(result)
+        self.assertEqual(committed.outcome, "failed")
+        self.assertTrue(committed.observation_reused)
+        self.assertFalse(committed.replayed)
+        self.assertEqual(committed.dispatch.state, "failed")
+        self.assertIsNone(committed.dispatch.result_digest)
+        self.assertEqual(committed.dispatch.cost_state, "not_incurred")
+        self.assertIsNone(committed.dispatch.cost_amount_usd)
+        self.assertEqual(self.counts(), (1, len(_SPECS)))
+
+    def test_submitted_ambiguous_known_cost_inert_observation_is_applied(self) -> None:
+        self.submit()
+        result = self.ambiguous_known_cost_result(status=429, cost=0.001)
+        self.inert(result)
+
+        committed = self.commit(result)
+        self.assertEqual(committed.outcome, "unknown")
+        self.assertTrue(committed.observation_reused)
+        self.assertFalse(committed.replayed)
+        self.assertEqual(committed.dispatch.state, "unknown")
+        # The known reported cost is settled, but the operation stays unresolved.
+        self.assertEqual(committed.dispatch.cost_state, "known")
+        self.assertEqual(committed.dispatch.cost_amount_usd, "0.001")
+        self.assertIsNone(committed.dispatch.result_digest)
+        self.assertEqual(
+            runtime_reserve_exposure(self.store.connection, self.pid), Decimal("0.25")
+        )
+
+    def test_submitted_timeout_inert_observation_is_applied(self) -> None:
+        self.submit()
+        result = self.transport_error_result()
+        self.inert(result)
+
+        committed = self.commit(result)
+        self.assertEqual(committed.outcome, "unknown")
+        self.assertTrue(committed.observation_reused)
+        self.assertFalse(committed.replayed)
+        self.assertEqual(committed.dispatch.state, "unknown")
+        self.assertEqual(committed.dispatch.cost_state, "unknown")
+        self.assertIsNone(committed.dispatch.result_digest)
+
+    def test_recovered_unknown_success_inert_observation_completes(self) -> None:
+        self.submit()
+        self.dispatch.recover(self.dispatch_record.dispatch_id)
+        result = self.valid_result()
+        observation = self.inert(result)
+        self.assertEqual(self.reload_dispatch().state, "unknown")
+
+        committed = self.commit(result)
+        self.assertEqual(committed.outcome, "completed")
+        self.assertTrue(committed.observation_reused)
+        self.assertFalse(committed.replayed)
+        self.assertEqual(committed.dispatch.state, "completed")
+        self.assertEqual(committed.dispatch.result_ref, observation.result_id)
+        self.assertEqual(committed.dispatch.result_digest, observation.digest)
+
+    def test_recovered_unknown_definitive_inert_observation_fails(self) -> None:
+        self.submit()
+        self.dispatch.recover(self.dispatch_record.dispatch_id)
+        result = self.definitive_result(404)
+        self.inert(result)
+
+        committed = self.commit(result)
+        self.assertEqual(committed.outcome, "failed")
+        self.assertTrue(committed.observation_reused)
+        self.assertFalse(committed.replayed)
+        self.assertEqual(committed.dispatch.state, "failed")
+        self.assertEqual(committed.dispatch.cost_state, "not_incurred")
+        self.assertIsNone(committed.dispatch.result_digest)
+
+    def test_recovered_unknown_ambiguous_inert_observation_stays_unknown(self) -> None:
+        self.submit()
+        self.dispatch.recover(self.dispatch_record.dispatch_id)
+        result = self.transport_error_result()
+        self.inert(result)
+
+        committed = self.commit(result)
+        self.assertEqual(committed.outcome, "unknown")
+        self.assertTrue(committed.observation_reused)
+        # Already-unknown state and already-unknown cost: the entire commit is a
+        # no-op (nothing was written), so this one legitimately reports a replay.
+        self.assertTrue(committed.replayed)
+        self.assertEqual(committed.dispatch.state, "unknown")
+        self.assertIsNone(committed.dispatch.result_digest)
+        self.assertEqual(self.counts(), (1, len(_SPECS)))
+
+    def test_restart_then_inert_observation_commit_completes_once(self) -> None:
+        self.submit()
+        result = self.valid_result()
+        self.inert(result)
+        # A fresh process opens the same store: fresh repositories over one store.
+        fresh_dispatch = RuntimeDispatchRepository(self.store)
+        fresh_results = DecisionResultRepository(self.store)
+        self.assertEqual(
+            fresh_dispatch.get_dispatch(self.dispatch_record.dispatch_id).state,
+            "submitted",
+        )
+        committed = fresh_results.commit_result(
+            self.dispatch_record.dispatch_id, result, fence=1
+        )
+        self.assertEqual(committed.outcome, "completed")
+        self.assertTrue(committed.observation_reused)
+        self.assertFalse(committed.replayed)
+        self.assertEqual(committed.dispatch.state, "completed")
+        self.assertEqual(len(fresh_dispatch.list_dispatches()), 1)
+        with self.assertRaises(DispatchStateError):
+            fresh_dispatch.mark_submitted(self.dispatch_record.dispatch_id)
+
+    def test_conflicting_accepted_triple_rejected_with_zero_mutation(self) -> None:
+        self.submit()
+        result = self.valid_result()
+        self.results.record_result(self.dispatch_record.dispatch_id, result, fence=1)
+        # A different accepted result already claimed the dispatch.
+        self.dispatch.accept_result(
+            self.dispatch_record.dispatch_id,
+            fence=1,
+            result_kind="other_kind",
+            result_ref="res_other",
+            result_digest=_DIG_A,
+        )
+        before = self.snapshot_rows()
+        with self.assertRaises(DecisionResultConflictError):
+            self.commit(result)
+        self.assertEqual(self.snapshot_rows(), before)
+        self.assertEqual(self.reload_dispatch().result_kind, "other_kind")
+        self.assertFalse(self.store.connection.in_transaction)
+
+    def test_completed_dispatch_with_ambiguous_inert_observation_refused(self) -> None:
+        self.submit()
+        result = self.transport_error_result()
+        observation = self.results.record_result(
+            self.dispatch_record.dispatch_id, result, fence=1
+        )
+        self.dispatch.accept_result(
+            self.dispatch_record.dispatch_id,
+            fence=1,
+            result_kind=RESULT_KIND,
+            result_ref=observation.result_id,
+            result_digest=observation.digest,
+        )
+        before = self.snapshot_rows()
+        with self.assertRaises(DecisionResultConflictError):
+            self.commit(result)
+        self.assertEqual(self.snapshot_rows(), before)
+
+    def test_fully_applied_replay_is_a_byte_exact_noop(self) -> None:
+        self.submit()
+        result = self.valid_result()
+        self.commit(result)
+        before = self.snapshot_rows()
+
+        replay = self.commit(result)
+        self.assertTrue(replay.replayed)
+        self.assertTrue(replay.observation_reused)
+        self.assertEqual(replay.dispatch.state, "completed")
+        # Bytes, timestamps, fence and cost are all untouched.
+        self.assertEqual(self.snapshot_rows(), before)
+        self.assertFalse(self.store.connection.in_transaction)
+
+
+    def test_fully_applied_replay_preserves_a_stronger_external_settlement(self) -> None:
+        self.submit()
+        result = self.valid_result()
+        first = self.commit(result)
+        # An external caller settles a stronger actual cost on the same dispatch.
+        stronger = self.dispatch.settle_cost(
+            self.dispatch_record.dispatch_id, cost_state="known", amount_usd="2.00"
+        )
+        self.assertEqual(stronger.cost_amount_usd, "2.00")
+
+        replay = self.commit(result)
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.dispatch.cost_state, "known")
+        # The stronger settlement is preserved: never lowered back to the observed
+        # amount, and never reported as absent.
+        self.assertEqual(replay.dispatch.cost_amount_usd, "2.00")
+        self.assertEqual(
+            runtime_reserve_exposure(self.store.connection, self.pid), Decimal("2.00")
+        )
+        self.assertEqual(replay.observation.cost["amount_usd"], "0.00002037")
+
+    def test_ambiguous_observation_does_not_downgrade_a_stronger_known_cost(self) -> None:
+        self.submit()
+        result = self.ambiguous_known_cost_result(status=429, cost=0.001)
+        self.results.record_result(self.dispatch_record.dispatch_id, result, fence=1)
+        # A stronger actual cost is already established before the commit.
+        self.dispatch.settle_cost(
+            self.dispatch_record.dispatch_id, cost_state="known", amount_usd="2.00"
+        )
+        committed = self.commit(result)
+        self.assertEqual(committed.outcome, "unknown")
+        self.assertEqual(committed.dispatch.state, "unknown")
+        self.assertEqual(committed.dispatch.cost_state, "known")
+        self.assertEqual(committed.dispatch.cost_amount_usd, "2.00")
+
+
 class FaultSeamTest(CommitTestBase):
     def _install_raising_hook(self, seam):
         def hook(**_info):
@@ -768,6 +1036,36 @@ class FaultSeamTest(CommitTestBase):
     def test_unknown_seam_name_refused(self) -> None:
         with self.assertRaises(DecisionResultValidationError):
             self.results.add_commit_fault_hook("not_a_seam", lambda **_: None)
+
+    def test_after_cost_fault_preserves_preexisting_rows_and_rolls_back_apply(self) -> None:
+        self.submit()
+        result = self.valid_result()
+        self.results.record_result(self.dispatch_record.dispatch_id, result, fence=1)
+        before = self.snapshot_rows()
+
+        self._install_raising_hook("after_cost")
+        with self.assertRaises(RuntimeError):
+            self.commit(result)
+        # The prior inert 1+N rows are preserved byte-exact; only the newly applied
+        # dispatch state and cost rolled back.
+        after = self.snapshot_rows()
+        self.assertIsNotNone(before["set"])
+        self.assertEqual(after["set"], before["set"])
+        self.assertEqual(after["questions"], before["questions"])
+        self.assertEqual(after["dispatch"], before["dispatch"])
+        self.assertEqual(after["state"], before["state"])
+        self.assertEqual(self.reload_dispatch().state, "submitted")
+        self.assertEqual(self.reload_dispatch().cost_state, "unknown")
+        self.assertFalse(self.store.connection.in_transaction)
+
+        # A clean commit then applies the pending transition exactly once.
+        self.results._commit_hooks["after_cost"].clear()
+        committed = self.commit(result)
+        self.assertEqual(committed.outcome, "completed")
+        self.assertTrue(committed.observation_reused)
+        self.assertFalse(committed.replayed)
+        self.assertEqual(committed.dispatch.state, "completed")
+        self.assertEqual(self.counts(), (1, len(_SPECS)))
 
 
 class SingleTransactionTest(CommitTestBase):

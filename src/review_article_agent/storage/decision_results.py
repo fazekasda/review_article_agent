@@ -111,6 +111,7 @@ from ..runtime.decision_records import (
 from ..runtime.dispatch import (
     _ACCEPTABLE_STATES,
     DISPATCH_STATES,
+    DispatchConflictError,
     DispatchCorruptionError,
     DispatchRecord,
     RuntimeDispatchRepository,
@@ -364,6 +365,10 @@ _M_CONTRADICTION = (
     "relation; nothing was written"
 )
 _M_BAD_SEAM = "a commit fault seam is not a documented commit seam"
+_M_ACCEPTED_CONFLICT = (
+    "the dispatch's recorded state or accepted result contradicts the recorded "
+    "observation; refusing to report a completed commit"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -713,16 +718,41 @@ class DecisionResultQuestion:
 
 @dataclass(frozen=True)
 class DecisionCommitOutcome:
-    """The result of one atomic observe + cost-settle + dispatch transition."""
+    """The result of one atomic observe + cost-settle + dispatch transition.
+
+    ``outcome`` is the local outcome derived from the validated observation.
+    ``observation_reused`` is ``True`` when this call found the identical 1+N
+    observation already stored and therefore did **not** insert rows again; it may
+    still have applied a pending dispatch/cost transition. ``replayed`` is ``True``
+    only when the *entire* commit was already applied, i.e. nothing was written at
+    all (an exact no-op). ``replayed`` therefore implies ``observation_reused``,
+    never the reverse, and it can never describe a ``completed`` outcome whose
+    dispatch is still ``submitted``.
+    """
 
     observation: DecisionResultObservation
     dispatch: DispatchRecord
     outcome: str
     replayed: bool
+    observation_reused: bool = False
 
     def __post_init__(self) -> None:
         if self.outcome not in COMMIT_OUTCOMES:
             raise DecisionResultValidationError(_M_STATUS)
+        if self.replayed and not self.observation_reused:
+            raise DecisionResultValidationError(_M_STATE)
+        if self.outcome == "completed":
+            # A returned completed commit must actually be completed: an inert
+            # observation that never reached acceptance must not look like success.
+            if (
+                self.dispatch.state != "completed"
+                or self.dispatch.result_kind != RESULT_KIND
+                or self.dispatch.result_ref != self.observation.result_id
+                or self.dispatch.result_digest != self.observation.digest
+            ):
+                raise DecisionResultValidationError(_M_COMPLETED)
+        if self.replayed and self.dispatch.state == "submitted":
+            raise DecisionResultValidationError(_M_STATE)
 
 
 def _derive_commit_outcome(observation: DecisionResultObservation) -> str:
@@ -1301,14 +1331,26 @@ class DecisionResultRepository:
              cost does **not** resolve the operation) with no accepted result, no
              new identity and no retry.
 
-        An observation already recorded for this dispatch is an **idempotent
-        replay**: the stored observation is returned and the dispatch is left
-        exactly as it is — so a replay against an already-``unknown`` fence stays
-        ``unknown``, a replay against a ``completed`` one stays ``completed`` with
-        no fence change and no duplicate cost, and a second accepted result can
-        never be created. A **divergent** replay raises
-        :class:`DecisionResultConflictError` and a **stale fence** raises
-        :class:`DecisionResultStaleFenceError`; either writes nothing.
+        An observation already stored for this dispatch is **reused, not
+        re-inserted**, and its required transition is still enforced against the
+        current dispatch. That distinction matters: an inert
+        :meth:`record_result` observation only proves *observation*, never that the
+        dispatch was accepted/completed or its cost settled. So when the dispatch is
+        still pending (``submitted``/``unknown``) this call applies the **same**
+        atomic state + cost commit without touching the stored rows. A genuinely
+        already-applied commit (state, accepted-result triple and cost all match the
+        observation) is an exact no-op — bytes, timestamps, fence and cost are left
+        untouched. A conflicting accepted result raises
+        :class:`DecisionResultConflictError` instead of reporting false success, and
+        a **divergent** observation replay raises the same error; a **stale fence**
+        raises :class:`DecisionResultStaleFenceError`. Every refusal writes nothing.
+
+        A cost already settled *more strongly* elsewhere is never downgraded or
+        discarded: the observed cost is applied only as a monotonic upgrade, and the
+        terminal/``unknown`` state is written first so the row is always
+        read-consistent (an in-flight state can never carry ``not_incurred``). The
+        single ``not_incurred`` remains the validated definitive pre-billing
+        rejection.
 
         Every failure (a contradiction in the result envelope, a cost/incurred
         contradiction, a stale/divergent replay, or an injected fault-seam hook)
@@ -1327,47 +1369,24 @@ class DecisionResultRepository:
                 dispatch_id, result, fence=fence
             )
             outcome = _derive_commit_outcome(observation)
-            if not inserted:
-                # Idempotent replay: never a second accepted result, never a
-                # re-settlement, never a fence change, never a state change.
-                dispatch = self._require_dispatch(dispatch_id)
-                return DecisionCommitOutcome(
-                    observation=observation,
-                    dispatch=dispatch,
-                    outcome=outcome,
-                    replayed=True,
+            applied = inserted
+            if inserted:
+                self._fire_commit_seam(
+                    "after_set_insert", dispatch_id=dispatch_id, observation=observation
                 )
-
-            self._fire_commit_seam(
-                "after_set_insert", dispatch_id=dispatch_id, observation=observation
-            )
+            # A reused observation still requires its transition to be applied: an
+            # inert observation alone never proves completion or cost settlement.
             self._fire_commit_seam(
                 "before_accept", dispatch_id=dispatch_id, outcome=outcome
             )
-            if outcome == "completed":
-                self._dispatch._accept_result_in_transaction(
-                    dispatch_id,
-                    fence=fence,
-                    result_kind=RESULT_KIND,
-                    result_ref=observation.result_id,
-                    result_digest=observation.digest,
+            applied = (
+                self._apply_required_transition(
+                    dispatch_id, observation, outcome, fence=fence
                 )
-            elif outcome == "failed":
-                self._dispatch._mark_failed_in_transaction(
-                    dispatch_id, definitive_rejection=True
-                )
-            else:  # unknown: reconcile the ambiguous remote outcome
-                self._dispatch._recover_in_transaction(dispatch_id)
-
-            # Settle the exact observed cost monotonically. The terminal/unknown
-            # state is written first so the row is always read-consistent (an
-            # in-flight state can never carry not_incurred); the one not_incurred
-            # is the definitive pre-billing rejection.
-            self._dispatch._settle_cost_in_transaction(
-                dispatch_id,
-                cost_state=observation.cost["state"],
-                amount_usd=observation.cost.get("amount_usd"),
-                allow_definitive_not_incurred=(outcome == "failed"),
+                or applied
+            )
+            applied = (
+                self._settle_observed_cost(dispatch_id, observation, outcome) or applied
             )
             self._fire_commit_seam(
                 "after_cost", dispatch_id=dispatch_id, outcome=outcome
@@ -1377,8 +1396,108 @@ class DecisionResultRepository:
                 observation=observation,
                 dispatch=dispatch,
                 outcome=outcome,
-                replayed=False,
+                replayed=not applied,
+                observation_reused=not inserted,
             )
+
+    def _apply_required_transition(
+        self,
+        dispatch_id: str,
+        observation: DecisionResultObservation,
+        outcome: str,
+        *,
+        fence: int,
+    ) -> bool:
+        """Apply (or verify) the dispatch transition the observation requires.
+
+        Returns ``True`` iff a state write was performed. A dispatch that already
+        reached the required terminal/``unknown`` state is validated against the
+        observation and left untouched; a pending ``submitted``/``unknown`` dispatch
+        with an inert observation is transitioned here (same atomic commit, no row
+        re-insertion). Any state/accepted-result contradiction raises
+        :class:`DecisionResultConflictError` — never a silent success.
+        """
+        record = self._require_dispatch(dispatch_id)
+        expected_triple = (
+            RESULT_KIND,
+            observation.result_id,
+            observation.digest,
+        )
+        accepted_triple = (
+            record.result_kind,
+            record.result_ref,
+            record.result_digest,
+        )
+        state = record.state
+        if state == "completed":
+            # The dispatch already carries an accepted local result: it must be
+            # *this* observation's triple. Anything else is a conflicting accepted
+            # result and must never be reported as a completed commit.
+            if outcome != "completed" or accepted_triple != expected_triple:
+                raise DecisionResultConflictError(_M_ACCEPTED_CONFLICT)
+            return False
+        if state == "failed":
+            # A definitive failure has no accepted result by construction; an
+            # ambiguous or completed observation on a failed dispatch is a
+            # contradiction (only a validated definitive rejection may fail it).
+            if outcome != "failed":
+                raise DecisionResultConflictError(_M_ACCEPTED_CONFLICT)
+            return False
+        if outcome == "completed":
+            self._dispatch._accept_result_in_transaction(
+                dispatch_id,
+                fence=fence,
+                result_kind=RESULT_KIND,
+                result_ref=observation.result_id,
+                result_digest=observation.digest,
+            )
+            return True
+        if outcome == "failed":
+            self._dispatch._mark_failed_in_transaction(
+                dispatch_id, definitive_rejection=True
+            )
+            return True
+        # An ambiguous outcome on a submitted dispatch reconciles to unknown; one
+        # that is already unknown is already recorded (no write, no new identity).
+        if state == "submitted":
+            self._dispatch._recover_in_transaction(dispatch_id)
+            return True
+        return False
+
+    def _settle_observed_cost(
+        self,
+        dispatch_id: str,
+        observation: DecisionResultObservation,
+        outcome: str,
+    ) -> bool:
+        """Apply the observed cost monotonically; never downgrade a stronger one.
+
+        Returns ``True`` iff a cost write was performed. The observed settlement is
+        applied only when it is an upgrade over what the row already records; when
+        the row already carries the same cost it is left byte-exact, and when an
+        externally stronger settlement is already recorded it is preserved rather
+        than lowered or discarded.
+        """
+        desired_state = observation.cost["state"]
+        desired_amount = observation.cost.get("amount_usd")
+        current = self._require_dispatch(dispatch_id)
+        if (
+            current.cost_state == desired_state
+            and current.cost_amount_usd == desired_amount
+        ):
+            return False
+        try:
+            self._dispatch._settle_cost_in_transaction(
+                dispatch_id,
+                cost_state=desired_state,
+                amount_usd=desired_amount,
+                allow_definitive_not_incurred=(outcome == "failed"),
+            )
+        except DispatchConflictError:
+            # The row already holds a stronger/established settlement; keep it
+            # (monotonic evidence is preserved, never discarded or re-claimed).
+            return False
+        return True
 
     # -- reads --------------------------------------------------------------- #
     def get_result(self, dispatch_id: str) -> DecisionResultObservation | None:
