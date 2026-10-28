@@ -26,7 +26,8 @@ the live database file or its ``-wal``/``-shm`` sidecars directly, so committed
 WAL content is captured transactionally and a concurrent writer cannot produce a
 torn backup. Immutable content is a SQLite BLOB, so the snapshot captures **all**
 project data (identity, artifacts, revisions, rights records, dependencies,
-import requests, and local fixture approvals) in one consistent database.
+import requests, local fixture approvals, and — under store schema 4 — the durable
+synthetic job/attempt/accepted-result/budget rows) in one consistent database.
 
 The manifest is derived **from the closed snapshot**, never from live state, so
 the recorded digests describe exactly the bytes that were captured.
@@ -55,7 +56,10 @@ cross-project key, an invalid rights record, a dangling dependency/request
 reference, and any approval snapshot whose stored digest/structure does not
 verify. It recomputes **every** revision/rights BLOB digest and byte size, so
 rewriting the outer database hash in the manifest does **not** bypass inner
-validation.
+validation. Under store schema 4 it additionally re-validates every durable
+job/attempt/accepted-result/budget row (identity and parameter/result
+fingerprints, fences, counters, state/outcome flags, checkpoint JSON,
+bounded-exact-decimal budgets/reserves, and cross-project/dangling references).
 
 Restore validates first and is atomic
 -------------------------------------
@@ -68,9 +72,19 @@ and no stale approvals remain, and unrelated files in the target root are
 preserved. It never creates a new scientific identity: the restored project keeps
 the snapshot's exact ``project_id``.
 
-Only the current store schema (version 3) is supported. A newer store schema is
-refused clearly; migrations from older schemas remain a separate, independently
-tested path.
+Supported store schemas are **3 and 4**. Schema 3 is the pre-Step-03 schema
+(identity, artifacts, revisions, rights, dependencies, import requests, and local
+fixture approvals); schema 4 adds the durable worker's synthetic job/attempt/
+accepted-result/budget tables (``runtime/jobs.py``). Both are validated against
+the exact schema the canonical migrations generate for **that** version, and a
+schema-4 snapshot additionally re-validates every job row read-only (identity and
+parameter/result fingerprints, fences, counters, state/outcome flags, checkpoint
+JSON, bounded exact-decimal budgets/reserves, and cross-project/dangling
+references). A newer store schema is refused clearly. A schema-3 snapshot is
+restored as-is and is upgraded to schema 4 by the ordinary ``ProjectStore``
+migration on first open; no format churn is needed because the manifest
+``format_version`` stays 1 and the version-specific validation is driven by the
+recorded ``store_schema_version``.
 """
 
 from __future__ import annotations
@@ -83,6 +97,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from urllib.parse import quote
 
 from ..domain.errors import (
@@ -96,6 +111,7 @@ from ..domain.records import (
     RecordValidationError,
     canonical_json,
     require_storage_allowed,
+    validate_identifier,
     validate_rights_record,
 )
 from . import paths, schema
@@ -111,6 +127,22 @@ BACKUP_FORMAT_VERSION = 1
 
 #: The only supported store schema version for a snapshot.
 SUPPORTED_STORE_SCHEMA_VERSION = schema.STORE_SCHEMA_VERSION
+
+#: The oldest store schema version a snapshot may record. Schema 3 is the
+#: pre-Step-03 schema; schema 4 adds the durable job/attempt/budget tables. A
+#: schema-3 snapshot is verified against the canonical schema-3 definition and is
+#: upgraded to the current schema by the ordinary ``ProjectStore`` migration on
+#: first open.
+MIN_SUPPORTED_STORE_SCHEMA_VERSION = 3
+
+#: The closed set of store schema versions a snapshot may record (``3..current``).
+SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset(
+    range(MIN_SUPPORTED_STORE_SCHEMA_VERSION, SUPPORTED_STORE_SCHEMA_VERSION + 1)
+)
+
+#: The store schema version at (or above) which the durable job/attempt/budget
+#: tables exist and must be inner-validated.
+_JOB_SCHEMA_VERSION = 4
 
 #: Store schema versions whose *recorded* approval ``storage_schema_version`` is
 #: accepted (the historical version survives a restore where supported; an
@@ -280,32 +312,35 @@ def _schema_objects(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
     }
 
 
-_CANONICAL_SCHEMA_OBJECTS: dict[tuple[str, str], str] | None = None
+_CANONICAL_SCHEMA_OBJECTS: dict[int, dict[tuple[str, str], str]] = {}
 
 
-def _canonical_schema_objects() -> dict[tuple[str, str], str]:
-    """Build schema 3 from the canonical migrations **in memory** and cache it.
+def _canonical_schema_objects(version: int) -> dict[tuple[str, str], str]:
+    """Build schema ``version`` from the canonical migrations **in memory**.
 
     Comparing a snapshot against the schema the migrations actually generate
     (not merely against a set of table names) detects a forged database that
     reuses the right names but drops a foreign key or an immutability trigger, or
-    adds a hidden column — none of which ``PRAGMA foreign_key_check`` can see.
+    adds a hidden column — none of which ``PRAGMA foreign_key_check`` can see. The
+    result is cached per version, so schema-3 and schema-4 snapshots each compare
+    against their own exact canonical definition.
     """
-    global _CANONICAL_SCHEMA_OBJECTS
-    if _CANONICAL_SCHEMA_OBJECTS is None:
+    cached = _CANONICAL_SCHEMA_OBJECTS.get(version)
+    if cached is None:
         conn = sqlite3.connect(":memory:", isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
             schema.migrate(
                 conn,
-                target_version=schema.STORE_SCHEMA_VERSION,
+                target_version=version,
                 migrations=schema.STORE_MIGRATIONS,
                 label="project store",
             )
-            _CANONICAL_SCHEMA_OBJECTS = _schema_objects(conn)
+            cached = _schema_objects(conn)
         finally:
             conn.close()
-    return _CANONICAL_SCHEMA_OBJECTS
+        _CANONICAL_SCHEMA_OBJECTS[version] = cached
+    return cached
 
 
 def _assert_known_schema(conn: sqlite3.Connection, version: int) -> None:
@@ -316,13 +351,13 @@ def _assert_known_schema(conn: sqlite3.Connection, version: int) -> None:
             found=version,
             supported=SUPPORTED_STORE_SCHEMA_VERSION,
         )
-    if version != SUPPORTED_STORE_SCHEMA_VERSION:
+    if version not in SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS:
         raise BackupError(
             f"the snapshot records store schema version {version}; only schema "
-            f"version {SUPPORTED_STORE_SCHEMA_VERSION} backups are supported."
+            f"versions {sorted(SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS)} are supported."
         )
     actual = _schema_objects(conn)
-    expected = _canonical_schema_objects()
+    expected = _canonical_schema_objects(version)
     if actual != expected:
         missing = sorted(f"{kind} {name!r}" for kind, name in expected if (kind, name) not in actual)
         extra = sorted(f"{kind} {name!r}" for kind, name in actual if (kind, name) not in expected)
@@ -339,10 +374,11 @@ def _assert_known_schema(conn: sqlite3.Connection, version: int) -> None:
         if altered:
             details.append("altered: " + ", ".join(altered))
         raise BackupError(
-            "the snapshot schema does not match the canonical schema-3 "
+            f"the snapshot schema does not match the canonical schema-{version} "
             "definition (" + "; ".join(details) + "); refusing a snapshot with "
             "missing, extra, or altered schema objects."
         )
+
 
 
 @dataclass
@@ -682,10 +718,10 @@ def _read_manifest(manifest_path: str) -> dict[str, object]:
             found=store_schema_version,
             supported=SUPPORTED_STORE_SCHEMA_VERSION,
         )
-    if store_schema_version != SUPPORTED_STORE_SCHEMA_VERSION:
+    if store_schema_version not in SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS:
         raise BackupError(
             f"store_schema_version: {store_schema_version} is not a supported "
-            f"snapshot schema ({SUPPORTED_STORE_SCHEMA_VERSION})."
+            f"snapshot schema {sorted(SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS)}."
         )
 
     database = manifest.get("database")
@@ -999,6 +1035,460 @@ def _verify_relations(conn: sqlite3.Connection, project_id: str, version: int) -
             )
 
 
+# --------------------------------------------------------------------------- #
+# Durable job/attempt/budget inner validation (schema 4)
+# --------------------------------------------------------------------------- #
+#: Attempt ``prior_outcome`` vocabulary (mirrors the schema-4 CHECK constraint and
+#: ``runtime.jobs``); kept here so a snapshot is validated without importing the
+#: runtime repository.
+_PRIOR_OUTCOMES = frozenset(
+    {"none", "definitive_failure", "ambiguous", "succeeded", "interrupted"}
+)
+
+#: Reserve lifecycle states (schema-4 CHECK constraint).
+_RESERVE_STATES = frozenset({"held", "retained", "settled"})
+
+
+def _parse_canonical_json_text(value: object, field: str) -> object:
+    """Parse a stored JSON text column and require it to be canonical JSON.
+
+    Every JSON text column is written through ``canonical_json`` (sorted keys,
+    compact separators, no non-finite constants). Re-encoding the parsed value and
+    comparing the bytes rejects a forged/duplicated-key/non-canonical body, while
+    reusing :func:`canonical_json` also enforces the portability/depth bounds.
+    """
+    if not isinstance(value, str):
+        raise BackupError(f"{field}: must be a JSON text string")
+    try:
+        parsed = json.loads(value)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BackupError(f"{field}: is not valid JSON") from exc
+    try:
+        canonical = canonical_json(parsed)
+    except RecordValidationError as exc:
+        raise BackupError(f"{field}: is not portable canonical JSON") from exc
+    if canonical.decode("utf-8") != value:
+        raise BackupError(f"{field}: is not stored as canonical JSON; refusing.")
+    return parsed
+
+
+def _require_exact_decimal(value: object, field: str, *, positive: bool = True) -> Decimal:
+    """Validate a stored exact-decimal amount (bounded, finite, non-negative)."""
+    from ..runtime.jobs import _bounded_decimal_amount  # local: avoid layering cost
+
+    try:
+        amount = _bounded_decimal_amount(value, field)
+    except Exception as exc:  # JobValidationError -> fail closed as a BackupError
+        raise BackupError(f"{field}: is not a bounded exact decimal amount") from exc
+    if positive and amount == 0:
+        raise BackupError(f"{field}: must be greater than zero")
+    return amount
+
+
+def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
+    """Read-only re-validation of the schema-4 durable job/attempt/budget rows.
+
+    Recomputes every identity and parameter/result fingerprint from the stored
+    bytes, re-derives each ``job_id`` from its ``(project_id, request_id)`` key,
+    and checks the fences, counters, state/outcome flags, checkpoint JSON, and
+    bounded exact-decimal budgets/reserves — so a corrupt archive whose outer
+    database hash was rewritten still fails inner verification. Cross-project keys
+    and dangling job/attempt references are refused. Schema-3 snapshots have no
+    such tables and skip this entirely.
+    """
+    from ..runtime.jobs import (  # local imports keep the storage layer decoupled
+        ATTEMPT_STATES,
+        COST_STATES,
+        DISPATCH_KINDS,
+        JOB_STATES,
+        _fingerprint,
+        _job_id_for,
+    )
+
+    job_rows = conn.execute("SELECT * FROM job ORDER BY job_id").fetchall()
+    jobs_by_id: dict[str, sqlite3.Row] = {}
+    for row in job_rows:
+        if row["project_id"] != project_id:
+            raise BackupError("a job carries a cross-project key; refusing.")
+        job_id = row["job_id"]
+        request_id = row["request_id"]
+        if not isinstance(job_id, str) or not job_id:
+            raise BackupError("a job row has a malformed job id; refusing.")
+        if not isinstance(request_id, str) or not request_id or request_id != request_id.strip():
+            raise BackupError(f"job {job_id!r} has a malformed request key; refusing.")
+        if _job_id_for(project_id, request_id) != job_id:
+            raise BackupError(
+                f"job {job_id!r} identity does not derive from its project/request "
+                f"key; refusing."
+            )
+        if job_id in jobs_by_id:
+            raise BackupError("the snapshot contains a duplicate job id; refusing.")
+        if row["state"] not in JOB_STATES:
+            raise BackupError(f"job {job_id!r} has an illegal state; refusing.")
+        if row["outcome_unresolved"] not in (0, 1):
+            raise BackupError(
+                f"job {job_id!r} has a malformed unresolved-outcome flag; refusing."
+            )
+        task_kind = row["task_kind"]
+        if not isinstance(task_kind, str) or not task_kind:
+            raise BackupError(f"job {job_id!r} has a malformed task kind; refusing.")
+        parameters = _parse_canonical_json_text(
+            row["parameters_json"], f"job {job_id!r} parameters"
+        )
+        expected_fp = _fingerprint({"task_kind": task_kind, "parameters": parameters})
+        if expected_fp != row["fingerprint"]:
+            raise BackupError(
+                f"job {job_id!r} parameter fingerprint does not match its stored "
+                f"parameters; refusing."
+            )
+        resume_state = row["resume_state"]
+        if resume_state is not None and resume_state not in JOB_STATES:
+            raise BackupError(
+                f"job {job_id!r} has an illegal resume state; refusing."
+            )
+        # ``resume_state`` is recorded exactly while a job is paused.
+        if (row["state"] == "paused") != (resume_state is not None):
+            raise BackupError(
+                f"job {job_id!r} has an inconsistent paused/resume state; refusing."
+            )
+        for field in ("created_at_utc", "updated_at_utc"):
+            if not isinstance(row[field], str) or not row[field]:
+                raise BackupError(
+                    f"job {job_id!r} has a malformed {field}; refusing."
+                )
+        jobs_by_id[job_id] = row
+
+    attempt_rows = conn.execute(
+        "SELECT * FROM job_attempt ORDER BY job_id, attempt_no"
+    ).fetchall()
+    attempts_by_id: dict[str, sqlite3.Row] = {}
+    attempts_by_job: dict[str, list[sqlite3.Row]] = {}
+    for row in attempt_rows:
+        if row["project_id"] != project_id:
+            raise BackupError("a job attempt carries a cross-project key; refusing.")
+        attempt_id = row["attempt_id"]
+        job_id = row["job_id"]
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise BackupError("a job attempt has a malformed attempt id; refusing.")
+        if attempt_id in attempts_by_id:
+            raise BackupError("the snapshot contains a duplicate attempt id; refusing.")
+        if job_id not in jobs_by_id:
+            raise BackupError(
+                f"attempt {attempt_id!r} references a job that does not exist in "
+                f"this project; refusing."
+            )
+        if row["dispatch_kind"] not in DISPATCH_KINDS:
+            raise BackupError(
+                f"attempt {attempt_id!r} has an illegal dispatch kind; refusing."
+            )
+        if row["state"] not in ATTEMPT_STATES:
+            raise BackupError(
+                f"attempt {attempt_id!r} has an illegal state; refusing."
+            )
+        if row["prior_outcome"] not in _PRIOR_OUTCOMES:
+            raise BackupError(
+                f"attempt {attempt_id!r} has an illegal prior outcome; refusing."
+            )
+        if row["outcome_unresolved"] not in (0, 1):
+            raise BackupError(
+                f"attempt {attempt_id!r} has a malformed unresolved flag; refusing."
+            )
+        if row["outcome_unresolved"] == 1 and row["state"] not in (
+            "ambiguous",
+            "interrupted",
+        ):
+            raise BackupError(
+                f"attempt {attempt_id!r} claims an unresolved outcome in a state "
+                f"that cannot carry one; refusing."
+            )
+        if row["state"] == "ambiguous" and row["outcome_unresolved"] != 1:
+            raise BackupError(
+                f"attempt {attempt_id!r} is ambiguous but not marked unresolved; "
+                f"refusing."
+            )
+        if not isinstance(row["fence"], int) or row["fence"] < 1:
+            raise BackupError(f"attempt {attempt_id!r} has an illegal fence; refusing.")
+        if not isinstance(row["attempt_no"], int) or row["attempt_no"] < 1:
+            raise BackupError(
+                f"attempt {attempt_id!r} has an illegal attempt number; refusing."
+            )
+        # Dispatch-kind / reserve consistency (reserve-before-dispatch, C02 §5.6).
+        if row["dispatch_kind"] == "local":
+            if row["reserve_usd"] is not None:
+                raise BackupError(
+                    f"a local attempt {attempt_id!r} records a budget reserve; "
+                    f"refusing."
+                )
+        else:
+            if row["reserve_usd"] is None:
+                raise BackupError(
+                    f"external attempt {attempt_id!r} has no budget reserve recorded "
+                    f"before dispatch; refusing."
+                )
+            _require_exact_decimal(
+                row["reserve_usd"], f"attempt {attempt_id!r} reserve"
+            )
+        if row["cost_state"] not in COST_STATES:
+            raise BackupError(
+                f"attempt {attempt_id!r} has an illegal cost state; refusing."
+            )
+        if row["cost_state"] in ("known", "estimated"):
+            if row["cost_amount_usd"] is None:
+                raise BackupError(
+                    f"attempt {attempt_id!r} records a {row['cost_state']} cost with "
+                    f"no amount; refusing."
+                )
+            _require_exact_decimal(
+                row["cost_amount_usd"], f"attempt {attempt_id!r} cost amount"
+            )
+        elif row["cost_amount_usd"] is not None:
+            raise BackupError(
+                f"attempt {attempt_id!r} records a cost amount for a "
+                f"{row['cost_state']} cost; refusing."
+            )
+        if row["checkpoint_json"] is not None:
+            _parse_canonical_json_text(
+                row["checkpoint_json"], f"attempt {attempt_id!r} checkpoint"
+            )
+        for field in ("retry_authorized_by", "external_ref"):
+            value = row[field]
+            if value is not None and (
+                not isinstance(value, str) or not value or value != value.strip()
+            ):
+                raise BackupError(
+                    f"attempt {attempt_id!r} has a malformed {field}; refusing."
+                )
+        admission_id = row["admission_id"]
+        if admission_id is not None:
+            if not isinstance(admission_id, str) or not admission_id:
+                raise BackupError(
+                    f"attempt {attempt_id!r} has a malformed admission id; refusing."
+                )
+            try:
+                validate_identifier(admission_id, "admission_id")
+            except RecordValidationError as exc:
+                raise BackupError(
+                    f"attempt {attempt_id!r} has an invalid admission id; refusing."
+                ) from exc
+        if not isinstance(row["started_at_utc"], str) or not row["started_at_utc"]:
+            raise BackupError(
+                f"attempt {attempt_id!r} has a malformed start timestamp; refusing."
+            )
+        if row["ended_at_utc"] is not None and (
+            not isinstance(row["ended_at_utc"], str) or not row["ended_at_utc"]
+        ):
+            raise BackupError(
+                f"attempt {attempt_id!r} has a malformed end timestamp; refusing."
+            )
+        attempts_by_id[attempt_id] = row
+        attempts_by_job.setdefault(job_id, []).append(row)
+
+    # ---- per-job fences/counters must reconstruct exactly ------------------ #
+    for job in job_rows:
+        job_id = job["job_id"]
+        attempts = attempts_by_job.get(job_id, [])
+        if not isinstance(job["current_fence"], int) or job["current_fence"] < 0:
+            raise BackupError(f"job {job_id!r} has an illegal current fence; refusing.")
+        if not isinstance(job["attempts_total"], int) or job["attempts_total"] < 0:
+            raise BackupError(f"job {job_id!r} has an illegal attempt count; refusing.")
+        if not isinstance(job["retries_used"], int) or job["retries_used"] < 0:
+            raise BackupError(f"job {job_id!r} has an illegal retry count; refusing.")
+        if not attempts:
+            if (
+                job["attempts_total"] != 0
+                or job["retries_used"] != 0
+                or job["current_fence"] != 0
+                or job["current_attempt_id"] is not None
+            ):
+                raise BackupError(
+                    f"job {job_id!r} has no attempts but non-zero counters/fence; "
+                    f"refusing."
+                )
+            continue
+        ordered = sorted(attempts, key=lambda a: a["attempt_no"])
+        if job["attempts_total"] != len(ordered):
+            raise BackupError(
+                f"job {job_id!r} attempt count does not match its rows; refusing."
+            )
+        if job["retries_used"] != len(ordered) - 1:
+            raise BackupError(
+                f"job {job_id!r} retry count does not match its attempts; refusing."
+            )
+        for index, attempt in enumerate(ordered, start=1):
+            if attempt["attempt_no"] != index or attempt["fence"] != index:
+                raise BackupError(
+                    f"job {job_id!r} attempt fences/numbers are not the contiguous "
+                    f"sequence; refusing."
+                )
+        if job["current_fence"] != ordered[-1]["fence"]:
+            raise BackupError(
+                f"job {job_id!r} current fence does not match its latest attempt; "
+                f"refusing."
+            )
+        if job["current_attempt_id"] != ordered[-1]["attempt_id"]:
+            raise BackupError(
+                f"job {job_id!r} current attempt is not its latest attempt; refusing."
+            )
+        if ordered[0]["prior_outcome"] != "none":
+            raise BackupError(
+                f"job {job_id!r} first attempt has a non-'none' prior outcome; "
+                f"refusing."
+            )
+        if ordered[0]["retry_authorized_by"] is not None:
+            raise BackupError(
+                f"job {job_id!r} first attempt records a retry authorization; "
+                f"refusing."
+            )
+        for previous, attempt in zip(ordered, ordered[1:]):
+            if attempt["prior_outcome"] != previous["state"]:
+                raise BackupError(
+                    f"job {job_id!r} attempt {attempt['attempt_no']} prior outcome "
+                    f"does not match the previous attempt's state; refusing."
+                )
+            if not attempt["retry_authorized_by"]:
+                raise BackupError(
+                    f"job {job_id!r} retry attempt {attempt['attempt_no']} has no "
+                    f"retry authorization; refusing."
+                )
+
+    # ---- accepted results: fenced, current, digest-verified ---------------- #
+    accepted_rows = conn.execute(
+        "SELECT * FROM job_accepted_result ORDER BY job_id"
+    ).fetchall()
+    accepted_by_job: dict[str, sqlite3.Row] = {}
+    for row in accepted_rows:
+        if row["project_id"] != project_id:
+            raise BackupError(
+                "an accepted job result carries a cross-project key; refusing."
+            )
+        job_id = row["job_id"]
+        if job_id not in jobs_by_id:
+            raise BackupError(
+                "an accepted job result references a job that does not exist; "
+                "refusing."
+            )
+        if job_id in accepted_by_job:
+            raise BackupError(
+                "a job has more than one accepted result; refusing."
+            )
+        attempt = attempts_by_id.get(row["attempt_id"])
+        if attempt is None or attempt["job_id"] != job_id:
+            raise BackupError(
+                f"an accepted result for job {job_id!r} references a missing or "
+                f"foreign attempt; refusing."
+            )
+        job = jobs_by_id[job_id]
+        result_kind = row["result_kind"]
+        if not isinstance(result_kind, str) or not result_kind:
+            raise BackupError("an accepted result has a malformed result kind; refusing.")
+        if row["fence"] != attempt["fence"]:
+            raise BackupError(
+                f"an accepted result for job {job_id!r} does not match its attempt "
+                f"fence; refusing."
+            )
+        if (
+            job["current_attempt_id"] != attempt["attempt_id"]
+            or job["current_fence"] != attempt["fence"]
+        ):
+            raise BackupError(
+                f"an accepted result for job {job_id!r} is not the job's current "
+                f"attempt/fence; refusing."
+            )
+        if job["accepted_fence"] != row["fence"]:
+            raise BackupError(
+                f"job {job_id!r} accepted fence does not match its accepted result; "
+                f"refusing."
+            )
+        if attempt["state"] != "succeeded" or attempt["outcome_unresolved"] != 0:
+            raise BackupError(
+                f"an accepted result for job {job_id!r} is not backed by a succeeded, "
+                f"resolved attempt; refusing."
+            )
+        result = _parse_canonical_json_text(
+            row["result_json"], f"job {job_id!r} accepted result"
+        )
+        expected_digest = _fingerprint({"result_kind": result_kind, "result": result})
+        if expected_digest != row["result_digest"]:
+            raise BackupError(
+                f"job {job_id!r} accepted result digest does not match its stored "
+                f"result; refusing."
+            )
+        accepted_by_job[job_id] = row
+
+    for job in job_rows:
+        accepted_fence = job["accepted_fence"]
+        if accepted_fence is not None:
+            if not isinstance(accepted_fence, int) or accepted_fence < 1:
+                raise BackupError(
+                    f"job {job['job_id']!r} has an illegal accepted fence; refusing."
+                )
+            record = accepted_by_job.get(job["job_id"])
+            if record is None or record["fence"] != accepted_fence:
+                raise BackupError(
+                    f"job {job['job_id']!r} records an accepted fence with no matching "
+                    f"accepted result; refusing."
+                )
+
+    # ---- budget policy + reserves ------------------------------------------ #
+    for row in conn.execute("SELECT * FROM job_budget_policy").fetchall():
+        if row["project_id"] != project_id:
+            raise BackupError("a budget policy carries a cross-project key; refusing.")
+        _require_exact_decimal(row["project_cap_usd"], "budget project cap")
+        _require_exact_decimal(row["stage_cap_usd"], "budget stage cap")
+
+    reserved_attempts: set[str] = set()
+    for row in conn.execute("SELECT * FROM job_budget_reserve").fetchall():
+        if row["project_id"] != project_id:
+            raise BackupError("a budget reserve carries a cross-project key; refusing.")
+        job_id = row["job_id"]
+        if job_id not in jobs_by_id:
+            raise BackupError(
+                "a budget reserve references a job that does not exist; refusing."
+            )
+        if row["state"] not in _RESERVE_STATES:
+            raise BackupError("a budget reserve has an illegal state; refusing.")
+        stage = row["stage"]
+        if not isinstance(stage, str) or not stage or stage != stage.strip():
+            raise BackupError("a budget reserve has a malformed stage; refusing.")
+        amount = _require_exact_decimal(row["amount_usd"], "budget reserve amount")
+        attempt_id = row["attempt_id"]
+        if attempt_id is None:
+            # A job-scoped reserve is permitted by the schema but is not produced
+            # by the dispatcher; keep it valid and counted without an attempt.
+            continue
+        attempt = attempts_by_id.get(attempt_id)
+        if attempt is None:
+            raise BackupError(
+                "a budget reserve references an attempt that does not exist; "
+                "refusing."
+            )
+        if attempt["job_id"] != job_id:
+            raise BackupError(
+                "a budget reserve's attempt belongs to a different job; refusing."
+            )
+        if attempt["dispatch_kind"] != "external_synthetic":
+            raise BackupError(
+                "a budget reserve is attached to a non-external attempt; refusing."
+            )
+        if attempt_id in reserved_attempts:
+            raise BackupError(
+                "an attempt has more than one budget reserve; refusing."
+            )
+        reserved_attempts.add(attempt_id)
+        if attempt["reserve_usd"] is None or Decimal(attempt["reserve_usd"]) != amount:
+            raise BackupError(
+                "a budget reserve amount does not match its attempt's recorded "
+                "reserve; refusing."
+            )
+
+    for attempt in attempt_rows:
+        if attempt["reserve_usd"] is not None and attempt["attempt_id"] not in reserved_attempts:
+            raise BackupError(
+                f"attempt {attempt['attempt_id']!r} records a reserve with no matching "
+                f"reserve row; refusing."
+            )
+
+
 def verify_backup(backup_dir) -> dict[str, object]:
     """Read-only, fail-closed verification of a private backup directory.
 
@@ -1087,6 +1577,8 @@ def verify_backup(backup_dir) -> dict[str, object]:
         paths.validate_project_id(project_id)
 
         _verify_relations(conn, project_id, version)
+        if version >= _JOB_SCHEMA_VERSION:
+            _verify_job_relations(conn, project_id)
 
         # Recompute aggregate digests and counts from the snapshot itself.
         artifacts = conn.execute(
@@ -1275,7 +1767,9 @@ __all__ = [
     "BackupConflictError",
     "BackupError",
     "MANIFEST_FILENAME",
+    "MIN_SUPPORTED_STORE_SCHEMA_VERSION",
     "SNAPSHOT_FILENAME",
+    "SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS",
     "SUPPORTED_STORE_SCHEMA_VERSION",
     "create_backup",
     "restore_backup",
