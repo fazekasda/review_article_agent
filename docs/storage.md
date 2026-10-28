@@ -47,9 +47,16 @@ store plus a manifest.
   artifact content is captured as BLOBs, a snapshot may contain source bytes even
   though its manifest and inner validation carry only digests and pinned
   references. It is never a manuscript export and must never be published. A
-  schema-8 intent's canonical bytes carry only bounded request/question metadata,
-  opaque ids, exact decimal amounts, and digests — never raw source bytes, a
-  credential, a capability, or an authority claim.
+  schema-8 intent's canonical bytes carry bounded private request/question metadata
+  — opaque ids, exact decimal amounts, digests, and the **submitted request state**
+  (`plan_request.state`), which is caller-provided text that may itself be source
+  text or any other submitted content. The intent therefore reproduces the exact
+  request and may contain source/state text inside the private snapshot. No
+  credential, capability, or authority is *automatically* serialized by the
+  application, but this module cannot prove the absence of a secret a caller placed
+  into the request state or artifact content: never put credentials in artifact
+  content or a request state. The public manifest and static verification errors do
+  not carry the state text (see §3 and §5).
 
 Mechanism: a backup is produced with SQLite's **online backup API**
 (`sqlite3.Connection.backup`) into a fresh, staged snapshot database. The live
@@ -127,7 +134,9 @@ The `counts.approvals`/`counts.approval_entries` and `approvals` manifest fields
 describe the **local fixture approvals only** (the pre-existing storage-fixture
 rows). Durable schema-7 named-gate human approvals and durable schema-8 decision
 request intents are not duplicated into the manifest; they are inner-validated
-read-only from the snapshot database, exactly like the schema-4/5/6 rows.
+read-only from the snapshot database, exactly like the schema-4/5/6 rows. The
+manifest therefore never carries a schema-8 intent's request state text (or any
+artifact/request BLOB content) — only ids, counts, and aggregate digests.
 
 ## 4. Public API
 
@@ -230,9 +239,12 @@ newer manifest/store schema) on any of:
   digest/bytes/bound/pricing/reserve. A foreign-project row, a dangling/orphan
   intent (missing parent dispatch or task), and a corrupt row all fail closed. A
   legitimate intent whose target head has since advanced remains structurally valid
-  (history is preserved). No credential, capability, or authority is read or
-  serialized; only the bounded request/question metadata, opaque ids, exact decimal
-  amounts, and digests are revalidated.
+  (history is preserved). The bounded request/question metadata it revalidates
+  includes the recorded request state text. The sweep does not read or serialize a
+  credential/capability/authority *field* (none exists), and it never echoes the
+  state text: its problems are static and value-free. It does not scan the
+  caller-provided state for secrets, so a secret the caller put into the state
+  remains in the private snapshot.
 
 The schema-specific inner hooks are selected by **minimum version**: a snapshot
 records exactly one schema version and is always compared against the canonical
@@ -340,13 +352,19 @@ module. A restore never fabricates a scientific or model approval.
   operational row changes, as an explicit state transition.
 - A **schema-8** decision request intent is an append-only, immutable record of the
   exact pre-dispatch Jev question and the exact request binding (target/question
-  refs, consumed version set, request digest/bytes/bound/pricing/reserve). Its
-  canonical bytes carry only bounded request/question metadata, opaque ids, exact
-  decimal amounts, and SHA-256 digests — never raw source bytes, a credential, a
-  capability, or an opaque authority. It makes no scientific decision and grants no
-  approval or execution right: it records intent only, and an `unknown` dispatch
-  that carries an intent keeps its reserve and is never re-declared resolved,
-  executed, or automatically retried.
+  refs, consumed version set, request digest/bytes/bound/pricing/reserve,
+  and the submitted request state). Its canonical bytes are **private** and carry
+  bounded request/question metadata, opaque ids, exact decimal amounts, SHA-256
+  digests, and the caller-provided `plan_request.state` text — so the intent may
+  contain source text (or any other content the caller submitted as the state). No
+  credential, capability, or opaque authority is *automatically* serialized, but the
+  module cannot prove the absence of a secret a caller placed into the state or
+  artifact content: never put credentials there. The intent canonical is never
+  published or redistributed, and the public manifest and static verification errors
+  never carry the state text. It makes no scientific decision and grants no approval
+  or execution right: it records intent only, and an `unknown` dispatch that carries
+  an intent keeps its reserve and is never re-declared resolved, executed, or
+  automatically retried.
 - `verify_backup` re-validates stored rights records and recomputes content
   digests; from schema 4 upward it additionally re-validates the durable
   job/attempt/result/budget rows, from schema 5 upward the runtime mappings, from

@@ -23,11 +23,16 @@ pre-dispatch Jev decision request intent (``storage/decision_intents.py``):
   below its threshold), and an upgraded schema-7 store preserves its prior rows;
 * the hook table is threshold-driven and ordered, so a later schema can append its
   own validator without editing the schema-8 code (not hardcoded to "current 8");
-* the intent canonical carries only bounded request metadata — never raw source
-  bytes, a credential, a capability, or an authority claim.
+* the private intent canonical includes the bounded submitted request state (which
+  may be source text), the actual backup/restore preserves it, and the **public**
+  manifest and static verification errors do not carry that state; no credential,
+  capability, or authority is automatically serialized. The archive is owner-private
+  (0o700/0o600) and is never published or redistributed.
 
 Synthetic data only (no secrets, no licensed source text, no credentials, no
-network, no model calls, no paid calls).
+network, no model calls, no paid calls). The synthetic "source state" canary below
+is a deliberate test fixture that models caller-submitted request state; it is not
+a real secret and no real licensed source text is uploaded.
 
 Run with::
 
@@ -41,6 +46,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 import tempfile
 import unittest
@@ -89,9 +95,15 @@ from review_article_agent.storage.decision_intents import (  # noqa: E402
 
 _OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
 
-#: A canary in the target artifact's private content. It must never leak into the
-#: intent canonical bytes or the manifest.
+#: A canary in the target artifact's private BLOB content. The private intent
+#: canonical records only the submitted *state*, not arbitrary artifact bytes, so
+#: this artifact canary must not appear in the intent canonical or the manifest.
 _SOURCE_CANARY = b"PRIVATE-SOURCE-CANARY-8842-target-bytes"
+
+#: A distinct synthetic canary used as the Jev request *state*. Unlike arbitrary
+#: artifact bytes, the bounded request state IS recorded verbatim in the private
+#: intent canonical; the public manifest and static errors must not carry it.
+_STATE_CANARY = b"SUBMITTED-STATE-CANARY-7731-candidate-abstract"
 
 PROMPT_VERSION = "screen/1"
 
@@ -487,13 +499,6 @@ class IntentBackupBase(unittest.TestCase):
     def new_registry(self) -> Registry:
         return Registry(self.tmp / "state")
 
-    def _assert_rewritten_hash_rejected(self, dest: Path) -> None:
-        self.rewrite_outer_db_hash(dest)
-        with self.assertRaises(BackupError):
-            verify_backup(dest)
-
-
-class RoundTripTest(IntentBackupBase):
     def _restore(self, dest: Path, name: str):
         registry = self.new_registry()
         target = self.tmp / name
@@ -505,6 +510,13 @@ class RoundTripTest(IntentBackupBase):
         self.addCleanup(restored.close)
         return restored, info
 
+    def _assert_rewritten_hash_rejected(self, dest: Path) -> None:
+        self.rewrite_outer_db_hash(dest)
+        with self.assertRaises(BackupError):
+            verify_backup(dest)
+
+
+class RoundTripTest(IntentBackupBase):
     def test_roundtrip_reserved_intent_preserves_exact_request(self) -> None:
         record = self.record_intent()
         self.assertEqual(self.dispatches.get_dispatch(record.dispatch_id).state, "reserved")
@@ -665,46 +677,50 @@ class RoundTripTest(IntentBackupBase):
         after = (snapshot.read_bytes(), manifest.read_bytes())
         self.assertEqual(before, after)
 
-    def test_intent_canonical_is_bounded_and_never_publishes_source_or_credentials(
+    def test_intent_canonical_includes_bounded_request_state_and_is_owner_private(
         self,
     ) -> None:
+        # Model real behavior: the Jev request ``state`` IS the submitted source/
+        # state text. Record the intent with a distinct state canary so the evidence
+        # is not vacuous.
+        state_text = _STATE_CANARY.decode("utf-8")
+        self.plan = jev.plan_dispatch(self.questions, state_text, reserve_usd="0.25")
         record = self.record_intent()
+
+        # The PRIVATE intent canonical records the bounded request state verbatim;
+        # it may therefore contain source text. It does NOT copy arbitrary target
+        # artifact BLOBs (only the bounded state the caller submitted).
+        self.assertIn(_STATE_CANARY, record.canonical)
+        self.assertNotIn(_SOURCE_CANARY, record.canonical)
+        # Boundedness is retained: the request bytes stay within the Jev safe bound,
+        # and an over-bound state is refused by the planner rather than truncated.
+        self.assertEqual(record.request_bytes, len(self.plan.request_body))
+        self.assertLessEqual(record.request_bytes, jev.SAFE_MAX_REQUEST_BYTES)
+        with self.assertRaises(jev.JevValidationError):
+            jev.plan_dispatch(
+                self.questions,
+                "x" * (jev.SAFE_MAX_REQUEST_BYTES + 1),
+                reserve_usd="0.25",
+            )
+
         dest = self.backup()
 
-        # The intent canonical carries the bounded request state text, not the raw
-        # target artifact bytes, and no credential/capability/authority claim.
-        self.assertNotIn(_SOURCE_CANARY, record.canonical)
-        self.assertIn(b"Synthetic candidate abstract text.", record.canonical)
-        lowered = record.canonical.lower()
-        for forbidden in (
-            b"credential",
-            b"capability",
-            b"challenge",
-            b"authority",
-            b"password",
-            b"api_key",
-            b"secret",
-            b"bearer",
-        ):
-            self.assertNotIn(forbidden, lowered)
-
-        # The manifest never carries the private source bytes either.
-        self.assertNotIn(_SOURCE_CANARY, (dest / MANIFEST_FILENAME).read_bytes())
-
-        # The intent table has no credential/authority projection column at all.
+        # The actual backup stores the state-bearing intent, and restore preserves it.
+        self.assertTrue(verify_backup(dest)["ok"])
         conn = self._snapshot_conn(dest)
         try:
+            stored = conn.execute(
+                "SELECT canonical FROM decision_request_intent"
+            ).fetchone()
+            self.assertIn(_STATE_CANARY, bytes(stored["canonical"]))
+            # The intent table has no credential/authority projection column at all;
+            # no credential or capability is automatically serialized.
             columns = {
                 row["name"]
                 for row in conn.execute(
                     "PRAGMA table_info(decision_request_intent)"
                 ).fetchall()
             }
-            row = conn.execute("SELECT * FROM decision_request_intent").fetchone()
-            values = b"\x00".join(
-                value if isinstance(value, bytes) else str(value).encode("utf-8")
-                for value in tuple(row)
-            )
         finally:
             conn.close()
         for forbidden in (
@@ -719,7 +735,43 @@ class RoundTripTest(IntentBackupBase):
             self.assertFalse(
                 any(forbidden in column.lower() for column in columns), forbidden
             )
-        self.assertNotIn(_SOURCE_CANARY, values)
+
+        restored, _ = self._restore(dest, "restored-state")
+        got = DecisionIntentRepository(restored).get_intent(record.dispatch_id)
+        self.assertEqual(got.canonical, record.canonical)
+        self.assertIn(_STATE_CANARY, got.canonical)
+
+        # The PUBLIC manifest carries only ids/digests/aggregates: neither the state
+        # text nor arbitrary artifact bytes appear in it.
+        manifest = (dest / MANIFEST_FILENAME).read_bytes()
+        self.assertNotIn(_STATE_CANARY, manifest)
+        self.assertNotIn(_SOURCE_CANARY, manifest)
+
+        # A static verification error is value-free: corrupt the intent digest, then
+        # rehash the outer database so verification reaches the inner checker. The
+        # raised message must not echo the submitted state or the artifact bytes.
+        self.tamper_db(
+            dest,
+            "DROP TRIGGER decision_request_intent_no_update",
+            "UPDATE decision_request_intent SET content_digest = '" + "0" * 64 + "'",
+        )
+        self.rewrite_outer_db_hash(dest)
+        with self.assertRaises(BackupError) as caught:
+            verify_backup(dest)
+        message = str(caught.exception)
+        self.assertNotIn(_STATE_CANARY.decode("utf-8"), message)
+        self.assertNotIn("SUBMITTED-STATE-CANARY", message)
+        self.assertNotIn(_SOURCE_CANARY.decode("utf-8"), message)
+        # The error stays a curated static description.
+        self.assertIn("do not revalidate", message)
+
+        # The backup directory and its members are owner-private (0o700/0o600) and
+        # the archive is never published/redistributed by this module.
+        self.assertEqual(stat.S_IMODE(os.stat(dest).st_mode), 0o700)
+        for name in (MANIFEST_FILENAME, SNAPSHOT_FILENAME):
+            self.assertEqual(
+                stat.S_IMODE(os.stat(dest / name).st_mode), 0o600, name
+            )
 
 
 class InnerValidationTest(IntentBackupBase):
