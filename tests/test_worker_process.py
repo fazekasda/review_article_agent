@@ -240,6 +240,58 @@ finally:
     server.close()
 '''
 
+# A worker that announces itself, then waits for an external gate file before it
+# ever attempts to claim the singleton lock. It lets a test deterministically
+# hold a *spawned* child in the pre-bind window so it can prove the launcher does
+# not leave a losing child alive to become a second singleton later.
+GATED_WORKER = r'''
+import os
+import sys
+import threading
+import time
+
+from review_article_agent.runtime import ipc
+
+data_dir = sys.argv[1]
+pidfile = sys.argv[2]
+gate = sys.argv[3]
+
+# Announce this child exists *before* it ever tries to bind the socket.
+with open(pidfile, "w", encoding="utf-8") as fh:
+    fh.write(str(os.getpid()))
+
+# Hold off claiming the singleton until the test opens the gate (bounded so a
+# bug cannot leak this process past the test's lifetime).
+deadline = time.monotonic() + 30.0
+while not os.path.exists(gate) and time.monotonic() < deadline:
+    time.sleep(0.01)
+
+_stop = threading.Event()
+
+
+def _handler(request, peer):
+    if request.get("version") != 1:
+        raise ValueError("unsupported protocol version")
+    op = request.get("op")
+    if op == "status":
+        return {"app": "review_article_agent.worker", "protocol_version": 1,
+                "pid": os.getpid(), "state": "running"}
+    if op == "stop":
+        _stop.set()
+        return {"app": "review_article_agent.worker", "protocol_version": 1,
+                "stopping": True}
+    raise ValueError("unknown operation")
+
+
+server = ipc.WorkerIPCServer(data_dir, _handler, io_timeout=2.0)
+server.start()
+try:
+    while not _stop.is_set():
+        server.serve_once(0.1)
+finally:
+    server.close()
+'''
+
 # A launcher that runs this checkout's launcher in a separate process and exits;
 # used to prove the daemon outlives the process that started it.
 LAUNCHER = r'''
@@ -267,6 +319,7 @@ class WorkerProcessTest(unittest.TestCase):
         self.foreign_script = self._write("foreign_server.py", FOREIGN_SERVER)
         self.slow_script = self._write("slow_worker.py", SLOW_WORKER)
         self.subtle_script = self._write("subtle_worker.py", SUBTLE_WORKER)
+        self.gated_script = self._write("gated_worker.py", GATED_WORKER)
         self.launcher_script = self._write(
             "launcher.py", LAUNCHER.format(src=str(SRC), fixture=self.worker_script)
         )
@@ -374,6 +427,87 @@ class WorkerProcessTest(unittest.TestCase):
         self.assertTrue(all(r["running"] for r in results))
         # The single surviving worker is still ours and stoppable.
         self.assertTrue(process.worker_status(self.data_dir)["running"])
+        self.assertTrue(process.stop_worker(self.data_dir, timeout=10.0)["stopped"])
+
+    def test_losing_concurrent_child_is_not_left_to_become_worker(self) -> None:
+        """A losing starter must not leave its own spawned child alive.
+
+        Regression for the flake in ``test_concurrent_starts_race_to_single_worker``:
+        ``start_worker`` returned as soon as *any* verified worker answered,
+        leaving its own spawned-but-not-yet-bound child alive. That child later
+        acquired the freed singleton lock and bound a second worker as soon as
+        the winner was stopped, so the subsequent ``stop_worker`` never observed
+        the socket gone (``stop_unconfirmed``).
+
+        This holds one child deterministically in its pre-bind window (gated on
+        a file the test never creates) while a second, well-behaved starter wins
+        the singleton race. The losing child must be gone by the time its
+        ``start_worker`` call returns.
+        """
+        pidfile = self.tmp / "gated.pid"
+        gate = self.tmp / "gate"
+
+        def gated_command(data_dir: str) -> list[str]:
+            return [
+                sys.executable, self.gated_script, data_dir,
+                str(pidfile), str(gate),
+            ]
+
+        normal = self._worker_command()
+        current = {"command": gated_command}
+
+        def dispatch(data_dir: str) -> list[str]:
+            return current["command"](data_dir)
+
+        gated_pid: int | None = None
+
+        def cleanup() -> None:
+            # Release any lingering gated child, then make sure nothing runs.
+            try:
+                gate.write_text("go", encoding="utf-8")
+            except OSError:  # pragma: no cover - defensive
+                pass
+            if gated_pid is not None:
+                try:
+                    os.kill(gated_pid, 15)
+                except ProcessLookupError:
+                    pass
+            process.stop_worker(self.data_dir, timeout=5.0)
+
+        self.addCleanup(cleanup)
+
+        with mock.patch.object(process, "_build_command", dispatch):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                losing = pool.submit(
+                    process.start_worker, self.data_dir, timeout=15.0
+                )
+                # Wait until the gated child exists but has not bound the socket.
+                deadline = time.monotonic() + 10.0
+                while not pidfile.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(pidfile.exists(), "gated child never started")
+                gated_pid = int(pidfile.read_text(encoding="utf-8"))
+                # A different, well-behaved worker now wins the singleton race.
+                current["command"] = normal
+                winning = pool.submit(
+                    process.start_worker, self.data_dir, timeout=15.0
+                )
+                loser_result = losing.result(timeout=30.0)
+                winner_result = winning.result(timeout=30.0)
+
+        self.assertTrue(winner_result["running"])
+        self.assertEqual(loser_result["pid"], winner_result["pid"])
+        # The losing child must be gone, so it can never become a second worker.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(gated_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("losing child was left alive by start_worker")
+        # The single surviving worker is still ours and stoppable.
         self.assertTrue(process.stop_worker(self.data_dir, timeout=10.0)["stopped"])
 
     # -- absent / malformed / foreign ---------------------------------------- #

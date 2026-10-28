@@ -26,8 +26,10 @@ the live database file or its ``-wal``/``-shm`` sidecars directly, so committed
 WAL content is captured transactionally and a concurrent writer cannot produce a
 torn backup. Immutable content is a SQLite BLOB, so the snapshot captures **all**
 project data (identity, artifacts, revisions, rights records, dependencies,
-import requests, local fixture approvals, and — under store schema 4 — the durable
-synthetic job/attempt/accepted-result/budget rows) in one consistent database.
+import requests, local fixture approvals, the durable synthetic
+job/attempt/accepted-result/budget rows under store schema 4, and the durable
+runtime configuration/session/task/proposal mappings under store schema 5) in one
+consistent database.
 
 The manifest is derived **from the closed snapshot**, never from live state, so
 the recorded digests describe exactly the bytes that were captured.
@@ -59,7 +61,49 @@ rewriting the outer database hash in the manifest does **not** bypass inner
 validation. Under store schema 4 it additionally re-validates every durable
 job/attempt/accepted-result/budget row (identity and parameter/result
 fingerprints, fences, counters, state/outcome flags, checkpoint JSON,
-bounded-exact-decimal budgets/reserves, and cross-project/dangling references).
+bounded-exact-decimal budgets/reserves, and cross-project/dangling references),
+and under store schema 5 it additionally re-validates every durable runtime
+configuration/session/task/proposal mapping (recomputed canonical digests and
+fingerprints, projected columns, config/task/input/proposal links, and
+cross-project keys) via the shared
+:func:`~review_article_agent.storage.agent_runtime.store_integrity_problems`
+sweep — without ever requiring a historical task to still name the *current*
+revision, and without treating a proposal as an approval. Under store schema 6 it
+additionally re-validates every durable runtime dispatch and its operational row
+(the route/bucket identity, digests, exact-decimal reserve/settled cost, state/
+result/cost consistency, and the linked task) via the shared
+:func:`~review_article_agent.runtime.dispatch.runtime_dispatch_integrity_problems`
+sweep, and under store schema 7 it additionally re-validates every durable
+human-approval row (the recomputed snapshot digest/structure, projected columns,
+entry pins, and the out-of-band owner-auth binding) via the shared
+:func:`~review_article_agent.storage.human_approvals.integrity_problems` sweep —
+preserving historical ``stale``/``superseded`` approvals and never reading a
+capability/challenge. Under store schema 8 it additionally re-validates every
+durable pre-dispatch Jev decision-request intent (recomputed canonical bytes and
+content digest, projected columns, the exact question refs/versions, the parent
+dispatch/task links, and the recomputed request binding) via the shared
+:func:`~review_article_agent.storage.decision_intents.decision_intent_integrity_problems`
+sweep — never requiring the intent to still name the *current* head revision and
+never reading a credential, capability, or authority. Under store schema 9 it
+additionally re-validates every durable full per-question Jev decision-result
+observation (the whole-call set row and each per-question record independently,
+re-deriving the canonical bytes/digest, the projected columns, the parent
+dispatch/task/intent pins, the exact complete ordered question set against the
+recorded intent, and the per-record refs/versions/cost/provider envelope) via the
+shared
+:func:`~review_article_agent.storage.decision_results.decision_result_integrity_problems`
+sweep — never requiring the target to still name the *current* head revision,
+never reading a credential, capability, or authority, and never re-performing an
+accept or reinterpreting a stored row as an execution, a retry, or a new
+acceptance (a committed row's accepted triple is preserved verbatim; an ``unknown``
+cost stays ``unknown``, never ``0``). Under store schema 10 it additionally
+re-validates every durable pre-transport session-turn intent (the exact canonical
+plan/message bytes and their digests, the projected session/message/admission
+columns, and the independent binding to the persisted dispatch/task/mapping/
+configuration parents) via the shared
+:func:`~review_article_agent.storage.session_intents.session_intent_integrity_problems`
+sweep — read-only and without requiring a live service, a live filesystem path, or
+the target's *current* head revision.
 
 Restore validates first and is atomic
 -------------------------------------
@@ -72,19 +116,33 @@ and no stale approvals remain, and unrelated files in the target root are
 preserved. It never creates a new scientific identity: the restored project keeps
 the snapshot's exact ``project_id``.
 
-Supported store schemas are **3 and 4**. Schema 3 is the pre-Step-03 schema
+Supported store schemas are **3 through 10**. Schema 3 is the pre-Step-03 schema
 (identity, artifacts, revisions, rights, dependencies, import requests, and local
 fixture approvals); schema 4 adds the durable worker's synthetic job/attempt/
-accepted-result/budget tables (``runtime/jobs.py``). Both are validated against
-the exact schema the canonical migrations generate for **that** version, and a
-schema-4 snapshot additionally re-validates every job row read-only (identity and
-parameter/result fingerprints, fences, counters, state/outcome flags, checkpoint
-JSON, bounded exact-decimal budgets/reserves, and cross-project/dangling
-references). A newer store schema is refused clearly. A schema-3 snapshot is
-restored as-is and is upgraded to schema 4 by the ordinary ``ProjectStore``
-migration on first open; no format churn is needed because the manifest
-``format_version`` stays 1 and the version-specific validation is driven by the
-recorded ``store_schema_version``.
+accepted-result/budget tables (``runtime/jobs.py``); schema 5 adds the durable
+runtime configuration/session/task/proposal mapping tables
+(``storage/agent_runtime.py``); schema 6 adds the runtime dispatch/cost ledger
+(``runtime/dispatch.py``); schema 7 adds the out-of-band human approvals
+(``storage/human_approvals.py``); schema 8 adds the immutable durable
+pre-dispatch Jev decision-request intent (``storage/decision_intents.py``);
+schema 9 adds the immutable durable full per-question Jev decision-result
+observation (``storage/decision_results.py``); and schema 10 adds the immutable
+durable pre-transport session-turn intent correlation
+(``storage/session_intents.py``). Each is
+validated against the exact schema the
+canonical migrations generate for **that** version. A schema-4 snapshot
+additionally re-validates every job row read-only (identity and parameter/result
+fingerprints, fences, counters, state/outcome flags, checkpoint JSON, bounded
+exact-decimal budgets/reserves, and cross-project/dangling references); a
+schema-5 snapshot additionally re-validates every runtime mapping row read-only
+(recomputed canonical digests/fingerprints, projected columns, config/task/input/
+proposal links, and cross-project keys). A newer store schema is refused clearly.
+A schema-3/4 snapshot is restored as-is and is upgraded to the current schema by
+the ordinary ``ProjectStore`` migration on first open; no format churn is needed
+because the manifest ``format_version`` stays 1 and the version-specific
+validation is driven by the recorded ``store_schema_version`` through the
+extensible ``_SCHEMA_VALIDATORS`` hook (so a later schema-6 checkpoint can append
+its own validator without disturbing schema-3/4/5 compatibility).
 """
 
 from __future__ import annotations
@@ -143,6 +201,34 @@ SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset(
 #: The store schema version at (or above) which the durable job/attempt/budget
 #: tables exist and must be inner-validated.
 _JOB_SCHEMA_VERSION = 4
+
+#: The store schema version at (or above) which the durable runtime
+#: configuration/session/task/proposal mapping tables exist and must be
+#: inner-validated.
+_RUNTIME_SCHEMA_VERSION = 5
+
+#: The store schema version at (or above) which the durable runtime dispatch +
+#: route-separated cost ledger tables exist and must be inner-validated.
+_DISPATCH_SCHEMA_VERSION = 6
+
+#: The store schema version at (or above) which the durable exact named-gate
+#: human-approval tables exist and must be inner-validated.
+_HUMAN_APPROVAL_SCHEMA_VERSION = 7
+
+#: The store schema version at (or above) which the immutable durable
+#: pre-dispatch Jev decision-request intent table exists and must be
+#: inner-validated.
+_INTENT_SCHEMA_VERSION = 8
+
+#: The store schema version at (or above) which the immutable durable
+#: full per-question Jev decision-result observation tables (the set row and its
+#: per-question rows) exist and must be inner-validated.
+_DECISION_RESULT_SCHEMA_VERSION = 9
+
+#: The store schema version at (or above) which the immutable durable
+#: pre-transport session-turn intent correlation table exists and must be
+#: inner-validated.
+_SESSION_INTENT_SCHEMA_VERSION = 10
 
 #: Store schema versions whose *recorded* approval ``storage_schema_version`` is
 #: accepted (the historical version survives a restore where supported; an
@@ -1599,6 +1685,350 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
             )
 
 
+# --------------------------------------------------------------------------- #
+# Durable runtime mapping inner validation (schema 5)
+# --------------------------------------------------------------------------- #
+#: The five schema-5 tables that hold a project's durable runtime mappings. A
+#: backup must contain only rows for its own project in **every** one of them.
+_RUNTIME_TABLES = (
+    "runtime_config_snapshot",
+    "runtime_session_mapping",
+    "runtime_bounded_task",
+    "runtime_task_input",
+    "runtime_proposal",
+)
+
+
+def _verify_runtime_relations(conn: sqlite3.Connection, project_id: str) -> None:
+    """Read-only re-validation of the schema-5 durable runtime mapping rows.
+
+    The shared :func:`~review_article_agent.storage.agent_runtime.store_integrity_problems`
+    sweep re-derives every stored configuration/session/task/proposal from its
+    exact canonical bytes and linked rows (recomputed config/result digests, the
+    task fingerprint, projected columns, task inputs, proposal provenance), so a
+    corrupt archive whose outer database hash was rewritten still fails closed.
+
+    That helper filters its sweep by ``project_id``; this function therefore also
+    scans **every** row of all five runtime tables and refuses any foreign-project
+    key, so another project's mapping cannot be smuggled into a snapshot. It never
+    requires a historical task's target/inputs to remain the artifact's *current*
+    revision (a legitimate later head is valid history), and it never treats a
+    proposal as an approval.
+    """
+    for table in _RUNTIME_TABLES:
+        for row in conn.execute(f"SELECT project_id FROM {table}").fetchall():
+            if row["project_id"] != project_id:
+                raise BackupError(
+                    f"the snapshot contains a {table} row for a foreign project; "
+                    f"refusing."
+                )
+
+    # Local import keeps the storage layer decoupled at module-import time, just
+    # as the schema-4 job validator imports ``runtime.jobs`` lazily.
+    from .agent_runtime import store_integrity_problems
+
+    problems = store_integrity_problems(conn, project_id)
+    if problems:
+        # ``store_integrity_problems`` returns only static, value-free strings.
+        raise BackupError(
+            "the snapshot's durable runtime mappings do not revalidate ("
+            + "; ".join(problems)
+            + "); refusing."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Durable runtime dispatch inner validation (schema 6)
+# --------------------------------------------------------------------------- #
+#: The two schema-6 tables that hold a project's durable runtime dispatch ledger.
+#: A backup must contain only rows for its own project in **both** of them.
+_DISPATCH_TABLES = ("runtime_dispatch", "runtime_dispatch_state")
+
+
+def _verify_dispatch_relations(conn: sqlite3.Connection, project_id: str) -> None:
+    """Read-only re-validation of the schema-6 durable runtime dispatch ledger.
+
+    The shared :func:`~review_article_agent.runtime.dispatch.runtime_dispatch_integrity_problems`
+    sweep re-derives every dispatch from its stored bytes and its paired
+    operational row (recomputed identity/fingerprint/digest bindings, projected
+    columns, the exact-decimal reserve/settled cost, the state/result/cost
+    consistency, and the linked runtime task), so a corrupt archive whose outer
+    database hash was rewritten still fails inner verification.
+
+    That helper filters its sweep by ``project_id``; this function therefore also
+    scans **every** row of both dispatch tables and refuses any foreign-project
+    key, so another project's dispatch cannot be smuggled into a snapshot. An
+    ``unknown``-cost dispatch is validated as ``unknown`` (its amount is absent,
+    never ``0``); the sweep imposes **no** retry/currentness requirement, so a
+    legitimate historical ledger row stays valid. Any boundary failure of the
+    runtime helper is converted into a curated :class:`BackupError`, so a raw
+    dispatch exception is never surfaced.
+    """
+    for table in _DISPATCH_TABLES:
+        for row in conn.execute(f"SELECT project_id FROM {table}").fetchall():
+            if row["project_id"] != project_id:
+                raise BackupError(
+                    f"the snapshot contains a {table} row for a foreign project; "
+                    f"refusing."
+                )
+
+    # Local imports keep the storage layer decoupled at module-import time, just
+    # as the schema-4/5 validators import their repositories lazily.
+    try:
+        from ..runtime.dispatch import runtime_dispatch_integrity_problems
+
+        problems = runtime_dispatch_integrity_problems(conn, project_id)
+    except BackupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a boundary failure is a refusal
+        raise BackupError(
+            "the snapshot's durable runtime dispatch ledger could not be "
+            "revalidated; refusing."
+        ) from exc
+    if problems:
+        # ``runtime_dispatch_integrity_problems`` returns static, value-free strings.
+        raise BackupError(
+            "the snapshot's durable runtime dispatch ledger does not revalidate ("
+            + "; ".join(problems)
+            + "); refusing."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Durable human-approval inner validation (schema 7)
+# --------------------------------------------------------------------------- #
+#: The three schema-7 tables that hold a project's durable exact named-gate human
+#: approvals (the out-of-band owner-auth evidence, the immutable approval, and its
+#: exact snapshot entries). A backup must contain only rows for its own project in
+#: **every** one of them.
+_HUMAN_APPROVAL_TABLES = (
+    "owner_auth_evidence",
+    "human_approval",
+    "human_approval_entry",
+)
+
+
+def _verify_human_approval_relations(
+    conn: sqlite3.Connection, project_id: str
+) -> None:
+    """Read-only re-validation of the schema-7 durable human-approval rows.
+
+    The shared :func:`~review_article_agent.storage.human_approvals.integrity_problems`
+    sweep re-derives every approval from its exact canonical bytes and linked rows
+    (recomputed snapshot digest/structure, every projected column, the entry pins,
+    and the out-of-band owner-auth binding), so a corrupt archive whose outer
+    database hash was rewritten still fails inner verification. It detects a
+    foreign-project row, a corrupt approval/evidence row, an orphan (parentless)
+    entry row, and an owner-auth evidence row without exactly one valid
+    corresponding approval.
+
+    The sweep imposes **no** current-head requirement, so a legitimate historical
+    ``stale``/``superseded`` approval is structurally valid and is preserved. No
+    capability/challenge is ever read or required: only the safe evidence
+    projection is revalidated. Any boundary failure of the helper is converted
+    into a curated :class:`BackupError`, so a raw approval/credential exception is
+    never surfaced.
+    """
+    for table in _HUMAN_APPROVAL_TABLES:
+        for row in conn.execute(f"SELECT project_id FROM {table}").fetchall():
+            if row["project_id"] != project_id:
+                raise BackupError(
+                    f"the snapshot contains a {table} row for a foreign project; "
+                    f"refusing."
+                )
+
+    # Local import keeps the storage layer decoupled at module-import time.
+    try:
+        from .human_approvals import integrity_problems
+
+        problems = integrity_problems(conn, project_id)
+    except BackupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a boundary failure is a refusal
+        raise BackupError(
+            "the snapshot's durable human approvals could not be revalidated; "
+            "refusing."
+        ) from exc
+    if problems:
+        # ``integrity_problems`` returns static, value-free strings.
+        raise BackupError(
+            "the snapshot's durable human approvals do not revalidate ("
+            + "; ".join(problems)
+            + "); refusing."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Durable pre-dispatch decision-intent inner validation (schema 8)
+# --------------------------------------------------------------------------- #
+def _verify_intent_relations(conn: sqlite3.Connection, project_id: str) -> None:
+    """Read-only re-validation of the schema-8 durable decision-intent rows.
+
+    The shared
+    :func:`~review_article_agent.storage.decision_intents.decision_intent_integrity_problems`
+    sweep re-derives every intent from its exact canonical bytes and linked rows
+    (recomputed canonical JSON/content digest, every projected column, the exact
+    per-question refs and versions, the parent dispatch/task links, and the
+    recomputed request binding), so a corrupt archive whose outer database hash was
+    rewritten still fails inner verification. It detects a foreign-project row, a
+    dangling/orphan intent (missing parent dispatch or task), and a corrupt row.
+
+    The sweep imposes **no** current-head requirement, so a legitimate intent whose
+    target head has since advanced remains structurally valid and is preserved. It
+    also never reads a credential, capability, or authority: only the recorded
+    request/question metadata and opaque ids/digests are revalidated. Any boundary
+    failure of the helper is converted into a curated :class:`BackupError`, so a raw
+    intent/credential exception is never surfaced.
+    """
+    # The helper already scans every row in the table and reports a foreign-project
+    # row itself, so no separate table foreign-row scan is duplicated here.
+    try:
+        from .decision_intents import decision_intent_integrity_problems
+
+        problems = decision_intent_integrity_problems(conn, project_id)
+    except BackupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a boundary failure is a refusal
+        raise BackupError(
+            "the snapshot's durable decision request intents could not be "
+            "revalidated; refusing."
+        ) from exc
+    if problems:
+        # ``decision_intent_integrity_problems`` returns static, value-free strings.
+        raise BackupError(
+            "the snapshot's durable decision request intents do not revalidate ("
+            + "; ".join(problems)
+            + "); refusing."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Durable full per-question decision-result observation inner validation (schema 9)
+# --------------------------------------------------------------------------- #
+def _verify_decision_result_relations(
+    conn: sqlite3.Connection, project_id: str
+) -> None:
+    """Read-only re-validation of the schema-9 durable decision-result rows.
+
+    The shared
+    :func:`~review_article_agent.storage.decision_results.decision_result_integrity_problems`
+    sweep independently re-validates every recorded observation: the whole-call
+    set row (its exact canonical bytes/content digest, projected columns, parent
+    dispatch/task/intent pins, the single dispatch cost, and the provider
+    envelope) **and** each per-question row on its own (the question rebuilt from
+    the recorded refs, the descriptor digest, options/levels/kind, the version set
+    and consumed slots, the request pin, the per-record cost and provider
+    envelope, and the exact complete ordered question set measured against the
+    recorded intent's own questions — never the set's own array alone). A foreign
+    row, a dangling/orphan or partial set, and a corrupt set/record row are all
+    reported, so a corrupt archive whose outer database hash was rewritten still
+    fails inner verification.
+
+    The sweep imposes **no** current-head requirement (a legitimate observation
+    whose target head has since advanced is preserved), performs **no** accept,
+    execution, or retry, and never reads a credential, capability, or authority:
+    only the recorded provider/cost/ref/version metadata and opaque ids/digests
+    are revalidated. These rows are an inert **observation**, not an accepted
+    local result; an ``unknown`` cost stays ``unknown`` with no amount (never a
+    silent ``0``). Any boundary failure of the helper is converted into a curated
+    :class:`BackupError`, so a raw result/credential exception is never surfaced.
+    """
+    # The helper already scans every row in both result tables and reports a
+    # foreign-project row (and an orphan/partial set) itself, so no separate
+    # table foreign-row scan is duplicated here.
+    try:
+        from .decision_results import decision_result_integrity_problems
+
+        problems = decision_result_integrity_problems(conn, project_id)
+    except BackupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a boundary failure is a refusal
+        raise BackupError(
+            "the snapshot's durable decision result observations could not be "
+            "revalidated; refusing."
+        ) from exc
+    if problems:
+        # ``decision_result_integrity_problems`` returns static, value-free strings.
+        raise BackupError(
+            "the snapshot's durable decision result observations do not revalidate ("
+            + "; ".join(problems)
+            + "); refusing."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Durable pre-transport session-turn intent inner validation (schema 10)
+# --------------------------------------------------------------------------- #
+def _verify_session_intent_relations(
+    conn: sqlite3.Connection, project_id: str
+) -> None:
+    """Read-only re-validation of the schema-10 durable session-turn intents.
+
+    The shared
+    :func:`~review_article_agent.storage.session_intents.session_intent_integrity_problems`
+    sweep re-derives every intent from its exact canonical plan/message bytes and
+    their digests, checks every projected column against those bytes, and re-binds
+    the whole specification to the persisted dispatch/task/session-mapping/
+    configuration parents. It reports a foreign-project row, a dangling/orphan
+    intent (missing dispatch, task, or session mapping), and a corrupt row, so a
+    corrupt archive whose outer database hash was rewritten still fails inner
+    verification.
+
+    The sweep is read-only and imposes **no** live-service or live-filesystem
+    requirement and **no** current-head requirement: a legitimate intent whose
+    target head has since advanced remains structurally valid and is preserved. It
+    records correlation only — no credential, capability, admission, approval, or
+    execution authority is read or granted. Any boundary failure of the helper is
+    converted into a curated :class:`BackupError`, so a raw intent/credential
+    exception is never surfaced.
+    """
+    # The helper already scans every row in the table and reports a foreign-project
+    # row itself, so no separate table foreign-row scan is duplicated here.
+    try:
+        from .session_intents import session_intent_integrity_problems
+
+        problems = session_intent_integrity_problems(conn, project_id)
+    except BackupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a boundary failure is a refusal
+        raise BackupError(
+            "the snapshot's durable session-turn intents could not be "
+            "revalidated; refusing."
+        ) from exc
+    if problems:
+        # ``session_intent_integrity_problems`` returns static, value-free strings.
+        raise BackupError(
+            "the snapshot's durable session-turn intents do not revalidate ("
+            + "; ".join(problems)
+            + "); refusing."
+        )
+
+
+#: Ordered ``(minimum_store_schema_version, validator)`` hook. Each validator is
+#: applied for a snapshot whose recorded schema is **at or above** its minimum, so
+#: a later schema checkpoint can append a validator here without touching the
+#: historical schema-3/4/5 compatibility paths. Validators are read-only and take
+#: ``(connection, project_id)``.
+_SCHEMA_VALIDATORS = (
+    (_JOB_SCHEMA_VERSION, _verify_job_relations),
+    (_RUNTIME_SCHEMA_VERSION, _verify_runtime_relations),
+    (_DISPATCH_SCHEMA_VERSION, _verify_dispatch_relations),
+    (_HUMAN_APPROVAL_SCHEMA_VERSION, _verify_human_approval_relations),
+    (_INTENT_SCHEMA_VERSION, _verify_intent_relations),
+    (_DECISION_RESULT_SCHEMA_VERSION, _verify_decision_result_relations),
+    (_SESSION_INTENT_SCHEMA_VERSION, _verify_session_intent_relations),
+)
+
+
+def _verify_schema_specific(
+    conn: sqlite3.Connection, project_id: str, version: int
+) -> None:
+    """Run every inner validator whose minimum schema version ``version`` meets."""
+    for minimum_version, validator in _SCHEMA_VALIDATORS:
+        if version >= minimum_version:
+            validator(conn, project_id)
+
+
 def verify_backup(backup_dir) -> dict[str, object]:
     """Read-only, fail-closed verification of a private backup directory.
 
@@ -1687,8 +2117,7 @@ def verify_backup(backup_dir) -> dict[str, object]:
         paths.validate_project_id(project_id)
 
         _verify_relations(conn, project_id, version)
-        if version >= _JOB_SCHEMA_VERSION:
-            _verify_job_relations(conn, project_id)
+        _verify_schema_specific(conn, project_id, version)
 
         # Recompute aggregate digests and counts from the snapshot itself.
         artifacts = conn.execute(

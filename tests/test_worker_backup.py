@@ -355,7 +355,7 @@ class Schema4RoundTripTest(WorkerBackupBase):
         dest = self.tmp / "backup4"
         create_backup(store, dest)
         report = verify_backup(dest)
-        self.assertEqual(report["store_schema_version"], 4)
+        self.assertEqual(report["store_schema_version"], schema.STORE_SCHEMA_VERSION)
 
         registry = Registry(self.tmp / "state")
         info = restore_backup(dest, self.tmp / "restored4", registry)

@@ -42,7 +42,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 4
+STORE_SCHEMA_VERSION = 10
 
 #: Registry maps project IDs to names and locations, records the single
 #: *selected* project, and records durable **execution activation** (which
@@ -513,11 +513,792 @@ def _store_v4(conn: sqlite3.Connection) -> None:
     )
 
 
+def _store_v5(conn: sqlite3.Connection) -> None:
+    """Add the durable immutable **runtime task/session/proposal mappings**.
+
+    These tables back :mod:`review_article_agent.storage.agent_runtime`: per-project
+    configuration snapshots, app-owned OpenCode service/project/session mappings,
+    bounded-task records, and non-authorizing proposal records (C02 §1/§6.1/§8;
+    step 04 deliverables 1-2 and acceptance 3/4/7).
+
+    Only new tables and triggers are added; migrations 1-4 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture
+    approvals, and the synthetic job/attempt/budget tables) are never rewritten,
+    so their exact bytes/refs are preserved across the upgrade (``ARCH-ASSETS``;
+    step doc line 21). Immutability is enforced at the database: every runtime
+    row is immutable (never ``UPDATE``d/``DELETE``d), so a change is always a
+    **new** row. Composite foreign keys pin every task/proposal reference to an
+    existing same-project revision and every proposal to its persisted task, so a
+    failed transaction can leave no dangling reference.
+
+    The schema deliberately stores **no** endpoint, password, provider key, or
+    challenge value: those never reach a durable row (spec lines 62-63;
+    ``docs/storage.md``). ``config_digest``/``fingerprint``/``stored_digest``
+    values are recomputed from the exact canonical bytes the application wrote.
+
+    ``runtime_proposal`` is keyed by an immutable **task-scoped** ``record_id``
+    (unique per ``(project_id, task_id, proposal_id)``), so the machine
+    ``proposal_id`` alone never collapses two identical task rows into one
+    proposal: the logical task association is preserved.
+    """
+    conn.execute(
+        """
+        CREATE TABLE runtime_config_snapshot (
+            project_id     TEXT NOT NULL,
+            snapshot_id    TEXT NOT NULL,
+            config_version INTEGER NOT NULL,
+            config_digest  TEXT NOT NULL,
+            canonical      BLOB NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            PRIMARY KEY (project_id, snapshot_id),
+            UNIQUE (project_id, config_digest),
+            UNIQUE (project_id, config_version)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_session_mapping (
+            project_id          TEXT NOT NULL,
+            mapping_id          TEXT NOT NULL,
+            service_instance_id TEXT NOT NULL,
+            opencode_project_id TEXT,
+            clean_location      TEXT NOT NULL,
+            session_id          TEXT NOT NULL,
+            role                TEXT NOT NULL,
+            provider_id         TEXT NOT NULL,
+            model_id            TEXT NOT NULL,
+            variant             TEXT,
+            config_digest       TEXT NOT NULL,
+            config_snapshot_id  TEXT NOT NULL,
+            created_at_utc      TEXT NOT NULL,
+            PRIMARY KEY (project_id, mapping_id),
+            UNIQUE (project_id, session_id),
+            FOREIGN KEY (project_id, config_snapshot_id)
+                REFERENCES runtime_config_snapshot (project_id, snapshot_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_bounded_task (
+            project_id         TEXT NOT NULL,
+            task_id            TEXT NOT NULL,
+            request_id         TEXT NOT NULL,
+            fingerprint        TEXT NOT NULL,
+            role               TEXT NOT NULL,
+            config_digest      TEXT NOT NULL,
+            config_snapshot_id TEXT NOT NULL,
+            target_artifact_id TEXT NOT NULL,
+            target_revision_id TEXT NOT NULL,
+            prompt_version     TEXT NOT NULL,
+            size_limit         INTEGER NOT NULL,
+            step_limit         INTEGER NOT NULL,
+            canonical          BLOB NOT NULL,
+            created_at_utc     TEXT NOT NULL,
+            PRIMARY KEY (project_id, task_id),
+            UNIQUE (project_id, request_id),
+            FOREIGN KEY (project_id, config_snapshot_id)
+                REFERENCES runtime_config_snapshot (project_id, snapshot_id),
+            FOREIGN KEY (project_id, target_artifact_id, target_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_task_input (
+            project_id  TEXT NOT NULL,
+            task_id     TEXT NOT NULL,
+            ordinal     INTEGER NOT NULL,
+            artifact_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            digest      TEXT NOT NULL,
+            PRIMARY KEY (project_id, task_id, ordinal),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id),
+            FOREIGN KEY (project_id, artifact_id, revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_proposal (
+            project_id         TEXT NOT NULL,
+            record_id          TEXT NOT NULL,
+            proposal_id        TEXT NOT NULL,
+            task_id            TEXT NOT NULL,
+            role               TEXT NOT NULL,
+            provider_id        TEXT NOT NULL,
+            model_id           TEXT NOT NULL,
+            variant            TEXT,
+            target_artifact_id TEXT NOT NULL,
+            target_revision_id TEXT NOT NULL,
+            task_digest        TEXT NOT NULL,
+            input_digest       TEXT NOT NULL,
+            payload_digest     TEXT NOT NULL,
+            stored_digest      TEXT NOT NULL,
+            canonical          BLOB NOT NULL,
+            created_at_utc     TEXT NOT NULL,
+            PRIMARY KEY (project_id, record_id),
+            UNIQUE (project_id, task_id, proposal_id),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id)
+        )
+        """
+    )
+
+    for table in (
+        "runtime_config_snapshot",
+        "runtime_session_mapping",
+        "runtime_bounded_task",
+        "runtime_task_input",
+        "runtime_proposal",
+    ):
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+
+
+def _store_v6(conn: sqlite3.Connection) -> None:
+    """Add the durable **runtime dispatch + route-separated cost ledger** (C02 §5.6/§6.3/§8).
+
+    These tables back :mod:`review_article_agent.runtime.dispatch`: one immutable
+    *logical-call identity* row per dispatch (pinning the existing runtime task and
+    its fingerprint, the request/logical-call key, the ``opencode_session``/
+    ``direct_call`` route and its implied accounting bucket, the stage, the
+    canonical input/version digests, the exact-decimal pre-dispatch reserve, and
+    the immutable bound-evidence digest) plus a **mutable operational row** holding
+    the dispatch's explicit safe state (``reserved``/``submitted``/``admitted``/
+    ``completed``/``failed``/``unknown``), its fence, the retained admission, the
+    single fenced local result, and the settled cost.
+
+    Only new tables and triggers are added; migrations 1-5 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, and the runtime task/session/proposal
+    mappings) are never rewritten, so their exact bytes/refs are preserved across
+    the upgrade (``ARCH-ASSETS``; step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **Append-only identity + mutable operational row.** ``runtime_dispatch`` is
+      immutable (never ``UPDATE``d/``DELETE``d), so a request's pinned task,
+      fingerprint, route/bucket, stage, digests, reserve, and bound-evidence digest
+      can never be rewritten; only the paired ``runtime_dispatch_state`` row
+      changes, so a change is always a *state transition*, never a re-identity.
+    * **Logical-call identity is explicit and idempotent.** ``dispatch_id`` is
+      derived from ``(project_id, request_id)`` and ``UNIQUE(project_id,
+      request_id)`` makes a repeated reserve with the same key return the same one
+      row, so a reserve can never double-count. ``UNIQUE(project_id, task_id)``
+      additionally makes "at most one logical dispatch per task" (initial scope,
+      no retries) a database invariant rather than only a repository check.
+    * **Route/bucket separation.** ``CHECK ((route = 'direct_call') =
+      (accounting_bucket = 'direct_call'))`` makes a ``direct_call`` cost
+      un-aggregatable into OpenCode session statistics (C02 §6.3).
+    * **No durable admission on the direct route.** A trigger aborts any
+      ``runtime_dispatch_state`` row that carries an ``admission_id`` **or** an
+      ``admission_ref`` while its dispatch's route is ``direct_call`` (C02
+      §8.1/§8.1.1) — the direct Jev route has no proven durable/idempotent
+      admission.
+    * **Submitted means something was spent-or-maybe-spent.** A ``CHECK`` forbids
+      a ``submitted``/``admitted``/``unknown`` row from claiming ``cost_state =
+      'not_incurred'`` (C02 §6.3/§8.3), and the initial scope has exactly one
+      fence (``current_fence = 1``); re-fencing is not part of this step.
+    * **Conservative cost accounting.** The exact-decimal ``reserve_usd`` is
+      recorded before dispatch and counted until settlement; an ``unknown``/
+      ``not_incurred`` cost records **no** amount (never ``0``) and retains its
+      reserve (C02 §5.6/§6.3).
+
+    The schema deliberately stores **no** endpoint, credential, provider key, or
+    response content: only opaque ids, exact-decimal amounts, and canonical
+    SHA-256 digests (spec lines 62-63; ``docs/storage.md``).
+    """
+    conn.execute(
+        """
+        CREATE TABLE runtime_dispatch (
+            project_id            TEXT NOT NULL,
+            dispatch_id           TEXT NOT NULL,
+            request_id            TEXT NOT NULL,
+            task_id               TEXT NOT NULL,
+            task_fingerprint      TEXT NOT NULL,
+            route                 TEXT NOT NULL CHECK (route IN (
+                'opencode_session', 'direct_call')),
+            accounting_bucket     TEXT NOT NULL CHECK (accounting_bucket IN (
+                'session_statistics', 'direct_call')),
+            stage                 TEXT NOT NULL,
+            input_digest          TEXT NOT NULL,
+            version_digest        TEXT NOT NULL,
+            reserve_usd           TEXT NOT NULL,
+            bound_evidence_digest TEXT NOT NULL,
+            created_at_utc        TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            UNIQUE (project_id, request_id),
+            -- Initial scope permits at most one logical dispatch per task (no
+            -- retries); enforced here as well as in the repository so the
+            -- database itself cannot hold a second dispatch for the same task.
+            UNIQUE (project_id, task_id),
+            CHECK ((route = 'direct_call') = (accounting_bucket = 'direct_call')),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_dispatch_state (
+            project_id      TEXT NOT NULL,
+            dispatch_id     TEXT NOT NULL,
+            state           TEXT NOT NULL CHECK (state IN (
+                'reserved', 'submitted', 'admitted', 'completed', 'failed',
+                'unknown')),
+            current_fence   INTEGER NOT NULL DEFAULT 1 CHECK (current_fence = 1),
+            admission_id    TEXT,
+            admission_ref   TEXT,
+            result_kind     TEXT,
+            result_ref      TEXT,
+            result_digest   TEXT,
+            cost_state      TEXT NOT NULL DEFAULT 'not_incurred' CHECK (cost_state IN (
+                'known', 'estimated', 'unknown', 'not_incurred')),
+            cost_amount_usd TEXT,
+            started_at_utc  TEXT,
+            ended_at_utc    TEXT,
+            updated_at_utc  TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            CHECK ((state = 'completed') = (result_digest IS NOT NULL)),
+            CHECK ((result_kind IS NULL) = (result_digest IS NULL)),
+            CHECK ((result_ref IS NULL) = (result_digest IS NULL)),
+            CHECK ((cost_state IN ('known', 'estimated'))
+                   = (cost_amount_usd IS NOT NULL)),
+            CHECK (admission_ref IS NULL OR admission_id IS NOT NULL),
+            -- A dispatch that has been submitted (or is in-flight/ambiguous) can
+            -- never claim that no cost was incurred (C02 §6.3/§8.3).
+            CHECK (state NOT IN ('submitted', 'admitted', 'unknown')
+                   OR cost_state <> 'not_incurred'),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES runtime_dispatch (project_id, dispatch_id)
+        )
+        """
+    )
+
+    # The logical-call identity row is append-only: its pinned task, route/bucket,
+    # stage, digests, reserve, and bound evidence can never be rewritten or removed.
+    conn.execute(
+        """
+        CREATE TRIGGER runtime_dispatch_no_update
+        BEFORE UPDATE ON runtime_dispatch
+        BEGIN
+            SELECT RAISE(ABORT, 'runtime_dispatch identity rows are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER runtime_dispatch_no_delete
+        BEFORE DELETE ON runtime_dispatch
+        BEGIN
+            SELECT RAISE(ABORT, 'runtime_dispatch identity rows are immutable');
+        END
+        """
+    )
+
+    # The direct route has no proven durable/idempotent admission, so no
+    # operational row may ever carry an admission id *or* ref for a direct_call
+    # dispatch (C02 §8.1/§8.1.1).
+    for event in ("INSERT", "UPDATE"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER runtime_dispatch_state_direct_no_admission_{event.lower()}
+            BEFORE {event} ON runtime_dispatch_state
+            WHEN (NEW.admission_id IS NOT NULL OR NEW.admission_ref IS NOT NULL)
+              AND (SELECT route FROM runtime_dispatch
+                   WHERE project_id = NEW.project_id
+                     AND dispatch_id = NEW.dispatch_id) = 'direct_call'
+            BEGIN
+                SELECT RAISE(ABORT,
+                    'a direct_call dispatch cannot carry a durable admission');
+            END
+            """
+        )
+
+
+def _store_v7(conn: sqlite3.Connection) -> None:
+    """Add the durable **exact named-gate human approval** tables (C02 §1.3/§2/§3/§6.1).
+
+    These tables back :mod:`review_article_agent.storage.human_approvals`: an
+    append-only out-of-band owner-auth evidence row, the immutable human approval
+    it authorizes, and the exact dependency-snapshot entries the approval binds.
+
+    Only new tables and triggers are added; migrations 1-6 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, the runtime task/session/proposal
+    mappings, and the runtime dispatch/cost ledger) are never rewritten, so their
+    exact bytes/refs are preserved across the upgrade (``ARCH-ASSETS``; step doc
+    line 21).
+
+    Design notes enforced at the database:
+
+    * **Append-only.** Every row is immutable (never ``UPDATE``d/``DELETE``d), so
+      a change is always a **new** approval row; a re-approval never revises an
+      existing row, and a historical ``stale``/``superseded`` row is preserved.
+    * **Authority is out-of-band, never a column a payload can set.** ``actor_kind``
+      is pinned to ``'human'`` and ``authority`` to ``'owner_authenticated'``, and
+      ``authorizes_execution``/``authorizes_export`` are pinned to ``0`` by
+      ``CHECK`` constraints. The approval only *points at* its out-of-band
+      ``owner_auth_evidence`` row (C02 §1.3/§11.0).
+    * **Exact project/target binding.** Composite foreign keys pin the target and
+      every snapshot entry to an existing same-project revision and pin the
+      approval to the exact owner-auth evidence row, so a failed transaction can
+      leave no dangling reference.
+
+    The schema deliberately stores **no** challenge, credential, or capability: the
+    evidence is a safe projection (auth id, method, owner uid, time, action digest)
+    and the snapshot holds only digests and pinned refs, never source bytes
+    (spec lines 62-63; ``docs/storage.md``).
+    """
+    conn.execute(
+        """
+        CREATE TABLE owner_auth_evidence (
+            project_id      TEXT NOT NULL,
+            auth_id         TEXT NOT NULL,
+            method          TEXT NOT NULL,
+            owner_uid       INTEGER NOT NULL,
+            action_digest   TEXT NOT NULL,
+            verified_at_utc TEXT NOT NULL,
+            canonical       BLOB NOT NULL,
+            content_sha256  TEXT NOT NULL,
+            created_at_utc  TEXT NOT NULL,
+            PRIMARY KEY (project_id, auth_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE human_approval (
+            project_id               TEXT NOT NULL,
+            approval_id              TEXT NOT NULL,
+            target_artifact_id       TEXT NOT NULL,
+            target_revision_id       TEXT NOT NULL,
+            gate_kind                TEXT NOT NULL,
+            gate_id                  TEXT NOT NULL,
+            decision                 TEXT NOT NULL
+                                     CHECK (decision IN ('approved', 'rejected')),
+            rationale                TEXT NOT NULL,
+            granted_at_utc           TEXT NOT NULL,
+            snapshot_id              TEXT NOT NULL,
+            snapshot_digest          TEXT NOT NULL,
+            snapshot_canonical       BLOB NOT NULL,
+            snapshot_schema_version  INTEGER NOT NULL,
+            storage_schema_version   INTEGER NOT NULL,
+            version_set_canonical    BLOB NOT NULL,
+            owner_auth_id            TEXT NOT NULL,
+            owner_auth_method        TEXT NOT NULL,
+            owner_auth_action_digest TEXT NOT NULL,
+            owner_uid                INTEGER NOT NULL,
+            actor_kind               TEXT NOT NULL DEFAULT 'human'
+                                     CHECK (actor_kind = 'human'),
+            authority                TEXT NOT NULL DEFAULT 'owner_authenticated'
+                                     CHECK (authority = 'owner_authenticated'),
+            authorizes_execution     INTEGER NOT NULL DEFAULT 0
+                                     CHECK (authorizes_execution = 0),
+            authorizes_export        INTEGER NOT NULL DEFAULT 0
+                                     CHECK (authorizes_export = 0),
+            created_at_utc           TEXT NOT NULL,
+            PRIMARY KEY (project_id, approval_id),
+            FOREIGN KEY (project_id, target_artifact_id, target_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id),
+            FOREIGN KEY (project_id, owner_auth_id)
+                REFERENCES owner_auth_evidence (project_id, auth_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE human_approval_entry (
+            project_id             TEXT NOT NULL,
+            approval_id            TEXT NOT NULL,
+            entry_index            INTEGER NOT NULL,
+            artifact_id            TEXT NOT NULL,
+            revision_id            TEXT NOT NULL,
+            role                   TEXT NOT NULL,
+            content_sha256         TEXT NOT NULL,
+            byte_size              INTEGER NOT NULL,
+            rights_id              TEXT NOT NULL,
+            rights_record_revision INTEGER NOT NULL,
+            rights_digest          TEXT NOT NULL,
+            PRIMARY KEY (project_id, approval_id, entry_index),
+            FOREIGN KEY (project_id, approval_id)
+                REFERENCES human_approval (project_id, approval_id),
+            FOREIGN KEY (project_id, artifact_id, revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+
+    for table in ("owner_auth_evidence", "human_approval", "human_approval_entry"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+
+
+def _store_v8(conn: sqlite3.Connection) -> None:
+    """Add the durable **pre-dispatch Jev decision request intent** table (C02 §6.1/§6.2/§6.3/§8.1.1).
+
+    This table backs :mod:`review_article_agent.storage.decision_intents`: the
+    immutable, canonical record of the **exact question** a future direct Jev
+    dispatch intends to ask, recorded **before** the dispatch is submitted so a
+    later runner/result can prove the exact question refs/versions and the exact
+    request binding.
+
+    Only new tables and triggers are added; migrations 1-7 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, the runtime task/session/proposal
+    mappings, the runtime dispatch/cost ledger, and the human approvals) are never
+    rewritten, so their exact bytes/refs are preserved across the upgrade
+    (``ARCH-ASSETS``; step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **One immutable intent per logical dispatch.** The row is keyed by the
+      same-project ``(project_id, dispatch_id)`` and foreign-keys the existing
+      ``runtime_dispatch`` identity and its ``runtime_bounded_task``, so an intent
+      can never name a foreign project, a missing dispatch, or a task other than
+      the one the dispatch already pins.
+    * **Append-only.** The row is immutable (never ``UPDATE``d/``DELETE``d), so a
+      request's pinned question refs, versions, request digest/bytes/bound/pricing,
+      and canonical bytes can never be rewritten; a change is always a **new**
+      intent (which cannot happen for the same dispatch — divergence is refused by
+      the repository).
+    * **Canonical bytes are the truth.** ``canonical`` holds the exact canonical
+      JSON of the recorded intent and ``content_digest`` is its recomputed SHA-256;
+      the projected columns (target ref, ``request_sha256``, ``version_digest``, …)
+      must agree with the canonical bytes on every read, so a tampered column is
+      detected rather than trusted.
+    * **No credential, capability, or response content.** Only opaque ids, exact
+      decimal amounts, SHA-256 digests, and the bounded canonical request/question
+      metadata are stored (spec lines 62-63; ``docs/storage.md``).
+
+    ``route`` is pinned to ``direct_call``: only the direct Jev route has a
+    request intent recorded here (§8.1.1).
+    """
+    conn.execute(
+        """
+        CREATE TABLE decision_request_intent (
+            project_id            TEXT NOT NULL,
+            dispatch_id           TEXT NOT NULL,
+            intent_id             TEXT NOT NULL,
+            schema_version        INTEGER NOT NULL,
+            task_id               TEXT NOT NULL,
+            task_fingerprint      TEXT NOT NULL,
+            route                 TEXT NOT NULL CHECK (route = 'direct_call'),
+            stage                 TEXT NOT NULL,
+            input_digest          TEXT NOT NULL,
+            version_digest        TEXT NOT NULL,
+            reserve_usd           TEXT NOT NULL,
+            bound_evidence_digest TEXT NOT NULL,
+            request_sha256        TEXT NOT NULL,
+            request_bytes         INTEGER NOT NULL,
+            cost_upper_bound_usd  TEXT NOT NULL,
+            pricing_version       TEXT NOT NULL,
+            prompt_version        TEXT NOT NULL,
+            target_artifact_id    TEXT NOT NULL,
+            target_revision_id    TEXT NOT NULL,
+            question_count        INTEGER NOT NULL,
+            canonical             BLOB NOT NULL,
+            content_digest        TEXT NOT NULL,
+            created_at_utc        TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            UNIQUE (project_id, intent_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES runtime_dispatch (project_id, dispatch_id),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id),
+            FOREIGN KEY (project_id, target_artifact_id, target_revision_id)
+                REFERENCES revision (project_id, artifact_id, revision_id)
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TRIGGER decision_request_intent_no_update
+        BEFORE UPDATE ON decision_request_intent
+        BEGIN
+            SELECT RAISE(ABORT, 'decision_request_intent rows are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER decision_request_intent_no_delete
+        BEFORE DELETE ON decision_request_intent
+        BEGIN
+            SELECT RAISE(ABORT, 'decision_request_intent rows are immutable');
+        END
+        """
+    )
+
+
+def _store_v9(conn: sqlite3.Connection) -> None:
+    """Add the durable, immutable **full per-question Jev result observation** (C02 §6.2/§6.3/§8.1.1).
+
+    These tables back :mod:`review_article_agent.storage.decision_results`: one
+    immutable observation per direct Jev dispatch holding the **complete** array
+    of per-question ``DecisionRecord`` rows plus each row's canonical bytes, so a
+    later atomic bridge can accept/transition the dispatch alongside rows without
+    ever observing a partial set.
+
+    Only new tables and triggers are added; migrations 1-8 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, the runtime task/session/proposal
+    mappings, the runtime dispatch/cost ledger, the human approvals, and the
+    pre-dispatch decision request intent) are never rewritten, so their exact
+    bytes/refs are preserved across the upgrade (``ARCH-ASSETS``; step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **One observation per dispatch.** ``decision_result_set`` is keyed by the
+      same-project ``(project_id, dispatch_id)`` and foreign-keys the existing
+      ``runtime_dispatch`` identity, its ``runtime_bounded_task``, and the
+      ``decision_request_intent`` recorded before dispatch. A result can never
+      name a foreign project, a missing dispatch/task/intent, or an intent for a
+      different dispatch.
+    * **Complete set + queryable rows.** ``decision_result_question`` holds the
+      canonical C02 §6.2 record for each question, keyed by its content-derived
+      ``record_id`` and unique per ``(project_id, dispatch_id, question_id)``; the
+      set row's canonical bytes carry the complete ordered ``(record_id, digest)``
+      array and its ``question_count``, so a partial set is detectable.
+    * **Append-only.** Every row is immutable (never ``UPDATE``d/``DELETE``d), so a
+      result can never be rewritten; an identical replay returns the stored row and
+      a divergent replay is refused by the repository.
+    * **Canonical bytes are the truth.** ``canonical`` holds the exact canonical
+      JSON and ``content_digest`` its recomputed SHA-256; projected columns must
+      agree with the canonical bytes on every read.
+    * **No unknown cost 0.** A ``known``/``estimated`` cost requires an amount and
+      every other cost state forbids one, so an ambiguous cost is never stored as a
+      silent ``0``.
+    * **No credential or source bytes.** Only opaque ids, exact-decimal amounts,
+      redacted diagnostics, and SHA-256 digests are stored (spec lines 62-63;
+      ``docs/storage.md``).
+    """
+    conn.execute(
+        """
+        CREATE TABLE decision_result_set (
+            project_id            TEXT NOT NULL,
+            dispatch_id           TEXT NOT NULL,
+            result_id             TEXT NOT NULL,
+            schema_version        INTEGER NOT NULL,
+            task_id               TEXT NOT NULL,
+            intent_id             TEXT NOT NULL,
+            intent_digest         TEXT NOT NULL,
+            input_digest          TEXT NOT NULL,
+            version_digest        TEXT NOT NULL,
+            request_sha256        TEXT NOT NULL,
+            request_bytes         INTEGER NOT NULL,
+            cost_upper_bound_usd  TEXT NOT NULL,
+            reserve_usd           TEXT NOT NULL,
+            status                TEXT NOT NULL,
+            attempt_no            INTEGER NOT NULL CHECK (attempt_no = 1),
+            prior_outcome         TEXT NOT NULL CHECK (prior_outcome = 'none'),
+            cost_state            TEXT NOT NULL CHECK (cost_state IN (
+                'known', 'estimated', 'unknown', 'not_incurred')),
+            cost_amount_usd       TEXT,
+            question_count        INTEGER NOT NULL,
+            canonical             BLOB NOT NULL,
+            content_digest        TEXT NOT NULL,
+            created_at_utc        TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            UNIQUE (project_id, result_id),
+            CHECK ((cost_state IN ('known', 'estimated'))
+                   = (cost_amount_usd IS NOT NULL)),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES runtime_dispatch (project_id, dispatch_id),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES decision_request_intent (project_id, dispatch_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE decision_result_question (
+            project_id      TEXT NOT NULL,
+            dispatch_id     TEXT NOT NULL,
+            result_id       TEXT NOT NULL,
+            record_id       TEXT NOT NULL,
+            question_id     TEXT NOT NULL,
+            question_kind   TEXT NOT NULL,
+            outcome         TEXT NOT NULL,
+            ordinal         INTEGER NOT NULL,
+            request_sha256  TEXT NOT NULL,
+            canonical       BLOB NOT NULL,
+            content_digest  TEXT NOT NULL,
+            created_at_utc  TEXT NOT NULL,
+            PRIMARY KEY (project_id, record_id),
+            UNIQUE (project_id, dispatch_id, question_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES decision_result_set (project_id, dispatch_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES decision_request_intent (project_id, dispatch_id)
+        )
+        """
+    )
+
+    for table in ("decision_result_set", "decision_result_question"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} rows are immutable');
+            END
+            """
+        )
+
+
+def _store_v10(conn: sqlite3.Connection) -> None:
+    """Add the durable **pre-transport session-turn intent correlation** (C02 §6.1/§8.1).
+
+    This table backs :mod:`review_article_agent.storage.session_intents`: the
+    immutable record of the **exact** deterministic session-turn specification a
+    future runner will transport, recorded **before** transport so a restart can
+    prove the exact session/dispatch/message/admission pins without a live
+    service or manager.
+
+    Only a new table and triggers are added; migrations 1-9 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, the runtime task/session/proposal
+    mappings, the runtime dispatch/cost ledger, the human approvals, the
+    pre-dispatch decision request intent, and the per-question decision result
+    observation) are never rewritten, so their exact bytes/refs are preserved
+    across the upgrade (``ARCH-ASSETS``; step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **One immutable intent per dispatch.** The row is keyed by the same-project
+      ``(project_id, dispatch_id)`` and foreign-keys the existing
+      ``runtime_dispatch`` identity, its ``runtime_bounded_task``, and its
+      ``runtime_session_mapping``, so an intent can never name a foreign project,
+      a missing parent, or a task/session mapping the dispatch does not pin.
+    * **One correlation per session/admission.** ``UNIQUE (project_id, session_id,
+      admission_id)`` prevents the same client admission id from being reused by a
+      second session in the same project.
+    * **Append-only.** The row is immutable (never ``UPDATE``d/``DELETE``d), so the
+      exact canonical spec bytes, message bytes, digests, IDs, and time can never
+      be rewritten; a change is always refused (divergence), never an update.
+    * **Canonical bytes are the truth.** ``canonical`` holds the exact canonical
+      session-turn plan bytes and ``message`` the exact canonical application
+      message bytes; ``spec_digest``/``message_digest`` are their recomputed
+      SHA-256 values. Projected columns must agree with the canonical bytes on
+      every read, so a tampered column is detected rather than trusted.
+    * **No authority or source guarantee.** The row grants no admission, approval,
+      or execution authority and never changes the dispatch's operational state or
+      cost. ``message`` contains the private application source text by design;
+      this schema makes **no** secret-scanner or no-source guarantee (spec lines
+      62-63; ``docs/storage.md``).
+    """
+    conn.execute(
+        """
+        CREATE TABLE session_turn_intent (
+            project_id          TEXT NOT NULL,
+            dispatch_id         TEXT NOT NULL,
+            intent_id           TEXT NOT NULL,
+            schema_version      INTEGER NOT NULL,
+            fence               INTEGER NOT NULL CHECK (fence >= 1),
+            admission_id        TEXT NOT NULL,
+            session_id          TEXT NOT NULL,
+            mapping_id          TEXT NOT NULL,
+            service_instance_id TEXT NOT NULL,
+            task_id             TEXT NOT NULL,
+            task_fingerprint    TEXT NOT NULL,
+            role                TEXT NOT NULL,
+            model               TEXT NOT NULL,
+            prompt_version      TEXT NOT NULL,
+            input_digest        TEXT NOT NULL,
+            version_digest      TEXT NOT NULL,
+            config_snapshot_id  TEXT NOT NULL,
+            config_digest       TEXT NOT NULL,
+            spec_digest         TEXT NOT NULL,
+            message_digest      TEXT NOT NULL,
+            message_bytes       INTEGER NOT NULL CHECK (message_bytes >= 1),
+            canonical           BLOB NOT NULL,
+            message             BLOB NOT NULL,
+            created_at_utc      TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            UNIQUE (project_id, intent_id),
+            UNIQUE (project_id, session_id, admission_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES runtime_dispatch (project_id, dispatch_id),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id),
+            FOREIGN KEY (project_id, mapping_id)
+                REFERENCES runtime_session_mapping (project_id, mapping_id)
+        )
+        """
+    )
+    for event in ("UPDATE", "DELETE"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER session_turn_intent_no_{event.lower()}
+            BEFORE {event} ON session_turn_intent
+            BEGIN
+                SELECT RAISE(ABORT, 'session_turn_intent rows are immutable');
+            END
+            """
+        )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
     3: _store_v3,
     4: _store_v4,
+    5: _store_v5,
+    6: _store_v6,
+    7: _store_v7,
+    8: _store_v8,
+    9: _store_v9,
+    10: _store_v10,
 }
 
 
