@@ -32,13 +32,26 @@ stage already mints as generic, versioned artifact revisions:
   each supported document type. It performs no I/O and invents no defaults.
 * :func:`read_context_document` — read the exact immutable revision content from
   a verified project store, prove byte-integrity and canonical-envelope form, and
-  re-validate the payload (plus the type's on-read cross-checks: seed run/index
-  existence, rubric artifact kind, plan references and their dependency pins).
+  re-validate the payload. It then runs the type's on-read cross-checks: a seed's
+  real run/index existence, a rubric's ``rubric`` artifact kind, and — for a plan
+  and an interview — that every referenced document exists, is pinned by the
+  revision as an exact dependency, and reads as its **exact** expected document
+  type (a plan's ``brief_ref``→``discovery_brief``, ``interview_ref``→
+  ``discovery_interview``, ``framing_ref``→``discovery_framing``,
+  ``scope_ref``→``discovery_scope``, ``rubric_ref``→``discovery_rubric``, and
+  every seed→``discovery_seed``; an interview's ``brief_ref`` must be a typed
+  ``discovery_brief`` that the interview pins). The expected type is checked
+  before the referenced document's own cross-checks, so a self-referential or
+  cyclic reference is refused, never followed. With ``require_current`` every
+  live reference must also be the referenced artifact's current revision; a
+  historical read (``require_current=False``) preserves each pinned revision.
 * :func:`require_approved_context` — as :func:`read_context_document`, but only
   if the exact named gate instance is currently satisfied by a real human
   approval. For a ``discovery_plan`` this additionally requires the protocol gate
-  ``protocol``/``discovery.plan``, an individually approved ``artifact_revision``
-  gate per seed, and the exact brief/interview association with
+  ``protocol``/``discovery.plan``, every seed to pass
+  :func:`seed_context` (exact current typed ``discovery_seed`` + real run/index +
+  its individual ``artifact_revision`` gate — never a bare gate name over an
+  arbitrary artifact), and the exact brief/interview association with
   ``interview.ready_to_advance`` true.
 * :func:`seed_context` — the seed documents **only** when every exact current
   seed individually passes its ``artifact_revision`` gate
@@ -77,7 +90,7 @@ from ..domain.records import (
 )
 from ..runtime.owner_auth import APPROVAL_GATE_KINDS
 from ..storage.artifacts import ArtifactRepository, sha256_digest
-from ..storage.discovery import DiscoveryRepository
+from ..storage.discovery import DiscoveryRepository, DiscoverySearchError
 from ..storage.human_approvals import HumanApprovalRepository
 
 __all__ = [
@@ -649,26 +662,45 @@ def _revision_exists(repo: ArtifactRepository, ref: dict) -> bool:
     return repo.get_revision(ref["artifact_id"], ref["revision_id"]) is not None
 
 
+def _pinned_refs(revision) -> set[tuple[str, str]]:
+    """The ``(artifact_id, revision_id)`` pairs a revision pins as dependencies."""
+    return {(edge.artifact_id, edge.revision_id) for edge in revision.dependencies}
+
+
 def _check_plan_references(
-    store, revision, document: dict, repo: ArtifactRepository
+    store, revision, document: dict, repo: ArtifactRepository, *, require_current: bool
 ) -> None:
-    """On read: every plan reference resolves and is pinned by the plan revision."""
+    """On read: validate every plan reference as its exact expected document type.
+
+    Each direct reference must exist, be pinned by the plan revision as an exact
+    dependency, and read as its **exact** expected document type
+    (``brief_ref``→``discovery_brief``, ``interview_ref``→``discovery_interview``,
+    ``framing_ref``→``discovery_framing``, ``scope_ref``→``discovery_scope``,
+    ``rubric_ref``→``discovery_rubric``); every seed must read as a
+    ``discovery_seed`` with a real run/index. The expected type is checked before
+    the referenced document's own cross-checks, so a self-referential or cyclic
+    plan reference is **refused, never followed**. With ``require_current`` every
+    live reference must also be the referenced artifact's current revision; a
+    historical read (``require_current=False``) preserves the pinned revision.
+    """
     project_id = repo.project_id
     payload = document["payload"]
-    references = {
-        "brief_ref": payload["brief_ref"],
-        "interview_ref": payload["interview_ref"],
-        "framing_ref": payload["framing_ref"],
-        "scope_ref": payload["scope_ref"],
-        "rubric_ref": payload["rubric_ref"],
-    }
-    for field, ref in references.items():
-        normalized = _normalize_ref(ref, project_id, f"discovery_plan.{field}")
-        if not _revision_exists(repo, normalized):
+    direct = (
+        ("brief_ref", "discovery_brief"),
+        ("interview_ref", "discovery_interview"),
+        ("framing_ref", "discovery_framing"),
+        ("scope_ref", "discovery_scope"),
+        ("rubric_ref", "discovery_rubric"),
+    )
+    resolved: dict[str, dict] = {}
+    for field, _expected_type in direct:
+        ref = _normalize_ref(payload[field], project_id, f"discovery_plan.{field}")
+        if not _revision_exists(repo, ref):
             _fail(
                 f"discovery_plan.{field}: the referenced revision does not exist in "
                 "this project"
             )
+        resolved[field] = ref
     seed_refs = [
         _normalize_ref(ref, project_id, f"discovery_plan.seed_refs[{index}]")
         for index, ref in enumerate(payload["seed_refs"])
@@ -680,10 +712,9 @@ def _check_plan_references(
                 "not exist in this project"
             )
 
-    pinned = {
-        (edge.artifact_id, edge.revision_id) for edge in revision.dependencies
-    }
-    for field, ref in references.items():
+    pinned = _pinned_refs(revision)
+    for field, _expected_type in direct:
+        ref = resolved[field]
         if (ref["artifact_id"], ref["revision_id"]) not in pinned:
             _fail(
                 f"discovery_plan.{field}: the plan revision does not pin this "
@@ -696,11 +727,20 @@ def _check_plan_references(
                 "this seed as an exact dependency"
             )
 
-    rubric_artifact = repo.get_artifact(references["rubric_ref"]["artifact_id"])
-    if rubric_artifact is None or rubric_artifact.kind != "rubric":
-        _fail(
-            "discovery_plan.rubric_ref: the referenced artifact must have kind "
-            "'rubric'"
+    # Typed validation of each referenced document (expected type before traverse).
+    for field, expected_type in direct:
+        read_context_document(
+            store,
+            resolved[field],
+            expected_type=expected_type,
+            require_current=require_current,
+        )
+    for index, ref in enumerate(seed_refs):
+        read_context_document(
+            store,
+            ref,
+            expected_type="discovery_seed",
+            require_current=require_current,
         )
 
     # Substantive-amendment shape is enforced against the real parent revision.
@@ -747,12 +787,15 @@ def _check_seed_reference(store, document: dict, repo: ArtifactRepository) -> No
     the exact run exists and the exact record index is inside its result.
     """
     payload = document["payload"]
-    run_id = payload["run_id"]
-    index = payload["record_index"]
-    search = DiscoveryRepository(store).get_search(run_id)
+    try:
+        search = DiscoveryRepository(store).get_search(payload["run_id"])
+    except DiscoverySearchError as exc:
+        raise DiscoveryContextError(
+            "discovery_seed.run_id: the referenced discovery run is not readable"
+        ) from exc
     if search is None:
         _fail("discovery_seed.run_id: the referenced discovery run does not exist")
-    if index >= len(search.result.records):
+    if payload["record_index"] >= len(search.result.records):
         _fail(
             "discovery_seed.record_index: is outside the referenced run's records"
         )
@@ -772,10 +815,13 @@ def read_context_document(
     **current** revision, so a superseded context document is never read as
     current state. The stored bytes must match the recorded digest and byte size
     **and** be the canonical encoding of the validated envelope. The payload is
-    then validated and the type's on-read cross-checks run (seed run/index, rubric
-    artifact kind, plan references and their dependency pins). A malformed,
-    stale, cross-project, forged, or dangling document is a static
-    :class:`DiscoveryContextError`.
+    then validated and the type's on-read cross-checks run: a seed's real
+    run/index existence, a rubric's ``rubric`` artifact kind, and a plan's or
+    interview's referenced documents validated as their exact expected document
+    type and pinned as exact dependencies. With ``require_current`` every live
+    reference must also be the referenced artifact's current revision. A
+    malformed, stale, cross-project, forged, mistyped, or dangling document is a
+    static :class:`DiscoveryContextError`.
     """
     if expected_type is not None and expected_type not in DOCUMENT_TYPES:
         _fail("expected_type: is not a supported discovery-context type")
@@ -829,7 +875,9 @@ def read_context_document(
 
     document_type = document["document_type"]
     if document_type == "discovery_plan":
-        _check_plan_references(store, revision, document, repo)
+        _check_plan_references(
+            store, revision, document, repo, require_current=require_current
+        )
     elif document_type == "discovery_seed":
         _check_seed_reference(store, document, repo)
     elif document_type == "discovery_rubric":
@@ -845,6 +893,19 @@ def read_context_document(
                 "discovery_interview.brief_ref: the referenced brief revision does "
                 "not exist in this project"
             )
+        if (brief_ref["artifact_id"], brief_ref["revision_id"]) not in _pinned_refs(
+            revision
+        ):
+            _fail(
+                "discovery_interview.brief_ref: the interview revision does not pin "
+                "this reference as an exact dependency"
+            )
+        read_context_document(
+            store,
+            brief_ref,
+            expected_type="discovery_brief",
+            require_current=require_current,
+        )
 
     return document
 
@@ -879,9 +940,11 @@ def require_approved_context(
 
     A ``discovery_plan`` is a **combined** approval: it requires the protocol gate
     ``protocol``/``discovery.plan``; it additionally requires every seed reference
-    to individually satisfy its ``artifact_revision`` gate
-    ``discovery.seed.<artifact_id>``; and it requires the exact brief/interview
-    association (``interview.brief_ref`` equals ``plan.brief_ref``) with
+    to pass :func:`seed_context` — an exact, current, typed ``discovery_seed``
+    with a real run/index that individually satisfies its ``artifact_revision``
+    gate ``discovery.seed.<artifact_id>`` (a bare gate name over a non-seed
+    artifact is not enough); and it requires the exact brief/interview association
+    (``interview.brief_ref`` equals ``plan.brief_ref``) with
     ``interview.ready_to_advance`` true.
     """
     if gate_kind not in APPROVAL_GATE_KINDS:
@@ -913,19 +976,11 @@ def _require_plan_approvals(store, document: dict, approvals) -> None:
     project_id = ArtifactRepository(store).project_id
     payload = document["payload"]
 
-    # Every seed reference must be individually approved (D1 AC1).
-    for index, ref in enumerate(payload["seed_refs"]):
-        seed_artifact_id = ref["artifact_id"]
-        if not _gate_satisfied(
-            approvals,
-            seed_artifact_id,
-            ARTIFACT_REVISION_GATE_KIND,
-            _seed_gate_id(seed_artifact_id),
-        ):
-            _fail(
-                f"discovery_plan.seed_refs[{index}]: the seed is not individually "
-                "approved"
-            )
+    # Every seed must be an exact, current, typed ``discovery_seed`` with a real
+    # run/index that individually satisfies its ``artifact_revision`` gate
+    # ``discovery.seed.<artifact_id>`` -- a bare gate name over an arbitrary
+    # non-seed artifact is not enough (D1 AC1).
+    seed_context(store, payload["seed_refs"])
 
     # The interview must exactly associate this brief and be ready to advance.
     interview_ref = _normalize_ref(

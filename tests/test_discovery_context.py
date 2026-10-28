@@ -26,6 +26,7 @@ Run::
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -69,7 +70,7 @@ _OWNER_UID = 1000
 
 def _rights(project_id, artifact_id, revision_id):
     return {
-        "rights_id": f"RIGHTS-{revision_id}",
+        "rights_id": f"RIGHTS-{artifact_id}-{revision_id}",
         "project_id": project_id,
         "record_revision": 1,
         "subject": {
@@ -119,6 +120,32 @@ def _brief_payload(**overrides):
     return payload
 
 
+def _interview_payload(brief_ref, *, ready_to_advance=True, turns=None):
+    return {
+        "brief_ref": brief_ref,
+        "turns": turns if turns is not None else [{"question": "q", "answer": "a"}],
+        "ready_to_advance": ready_to_advance,
+    }
+
+
+def _framing_payload(**overrides):
+    payload = {"alternatives": ["alt"], "counterevidence_queries": ["q"], "limitations": []}
+    payload.update(overrides)
+    return payload
+
+
+def _scope_payload():
+    return {
+        "scope": "s", "date_boundary": "none", "language_boundary": "english",
+        "source_boundary": ["none"], "intended_synthesis": "syn",
+        "terminology": [], "exclusions": [],
+    }
+
+
+def _rubric_payload():
+    return {"eligibility_rules": ["r"], "uncertain_action": "retain", "limitations": []}
+
+
 def _envelope(document_type, payload):
     return {
         "schema_version": 1,
@@ -163,6 +190,19 @@ class ContextTestBase(unittest.TestCase):
 
     def put_brief(self, aid="a-brief", rid="rev-brief", payload=None, **kw):
         return self._put(aid, "report", rid, _envelope("discovery_brief", payload or _brief_payload()), **kw)
+
+    def _corrupt_revision_bytes(self, artifact_id, revision_id, content=b'{"schema_version":1}'):
+        """Overwrite a stored revision's bytes (dropping the immutability trigger)."""
+        conn = sqlite3.connect(paths.store_path_for(str(self.tmp / "p")))
+        try:
+            conn.execute("DROP TRIGGER IF EXISTS revision_no_update")
+            conn.execute(
+                "UPDATE revision SET content = ? WHERE artifact_id = ? AND revision_id = ?",
+                (content, artifact_id, revision_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     # -- owner-auth seams (copied from the human-approval test pattern) ------ #
     def install(self, *, challenge=_FIXED_CHALLENGE, owner_uid=_OWNER_UID, real_uid=_OWNER_UID):
@@ -461,19 +501,28 @@ class ReadContextTest(ContextTestBase):
         document = read_context_document(self.store, self.ref("a-rubric", "rev-r2"))
         self.assertEqual(document["payload"]["uncertain_action"], "retain")
 
-    def test_read_interview_checks_brief_reference_exists(self) -> None:
-        payload = {
-            "brief_ref": self.ref("a-brief", "rev-brief"),
-            "turns": [{"question": "q", "answer": "a"}],
-            "ready_to_advance": True,
-        }
-        self._put("a-interview", "report", "rev-i", _envelope("discovery_interview", payload))
+    def test_read_interview_requires_typed_pinned_brief(self) -> None:
+        self.put_brief(aid="a-brief", rid="rev-brief")
+        self._put("a-scope", "framework", "rev-scope",
+                  _envelope("discovery_scope", _scope_payload()))
+        brief_ref = self.ref("a-brief", "rev-brief")
+        # The interview must pin its brief as an exact dependency.
+        self._put("a-interview-unpinned", "report", "rev-i0",
+                  _envelope("discovery_interview", _interview_payload(brief_ref)))
         with self.assertRaises(DiscoveryContextError):
-            read_context_document(self.store, self.ref("a-interview", "rev-i"))
-        self.put_brief()
-        self.assertIsNotNone(
-            read_context_document(self.store, self.ref("a-interview", "rev-i"))
-        )
+            read_context_document(self.store, self.ref("a-interview-unpinned", "rev-i0"))
+        # The referenced brief must itself be a typed discovery_brief.
+        self._put("a-interview-wrong", "report", "rev-i1",
+                  _envelope("discovery_interview", _interview_payload(self.ref("a-scope", "rev-scope"))),
+                  dependencies=[self.ref("a-scope", "rev-scope")])
+        with self.assertRaises(DiscoveryContextError):
+            read_context_document(self.store, self.ref("a-interview-wrong", "rev-i1"))
+        # A correctly pinned, typed brief reads.
+        self._put("a-interview", "report", "rev-i2",
+                  _envelope("discovery_interview", _interview_payload(brief_ref)),
+                  dependencies=[brief_ref])
+        document = read_context_document(self.store, self.ref("a-interview", "rev-i2"))
+        self.assertEqual(document["document_type"], "discovery_interview")
 
 
 # --------------------------------------------------------------------------- #
@@ -528,54 +577,56 @@ class SeedContextTest(ContextTestBase):
 # Plan reading + combined protocol approval
 # --------------------------------------------------------------------------- #
 class PlanApprovalTest(ContextTestBase):
-    def build_plan_fixture(self, *, ready_to_advance=True, interview_brief=None, plan_revision="rev-plan", parent=None, previous_plan=None, affected=None, rationale="", include_seed=True):
+    def build_plan_fixture(self, *, ready_to_advance=True, interview_brief=None, plan_artifact="a-plan", plan_revision="rev-plan", parent=None, previous_plan=None, affected=None, rationale="", include_seed=True, override=None, seed_refs_override=None):
+        brief_ref = self.ref("a-brief", "rev-brief")
         self.put_brief(aid="a-brief", rid="rev-brief")
+        # The interview pins its exact brief as a dependency (typed on read).
         self._put(
             "a-interview", "report", "rev-interview",
-            _envelope("discovery_interview", {
-                "brief_ref": interview_brief or self.ref("a-brief", "rev-brief"),
-                "turns": [{"question": "q", "answer": "a"}],
-                "ready_to_advance": ready_to_advance,
-            }),
+            _envelope("discovery_interview", _interview_payload(
+                interview_brief or brief_ref, ready_to_advance=ready_to_advance
+            )),
+            dependencies=[interview_brief or brief_ref],
         )
         run = self.put_run(request_id="req-plan", n_records=1)
         seed = self.put_seed(aid="a-seed0", rid="rev-seed0", run_id=run.run_id)
-        self._put(
-            "a-framing", "framework", "rev-framing",
-            _envelope("discovery_framing", {
-                "alternatives": ["alt"], "counterevidence_queries": ["q"], "limitations": [],
-            }),
-        )
-        self._put(
-            "a-scope", "framework", "rev-scope",
-            _envelope("discovery_scope", {
-                "scope": "s", "date_boundary": "none", "language_boundary": "english",
-                "source_boundary": ["none"], "intended_synthesis": "syn",
-                "terminology": [], "exclusions": [],
-            }),
-        )
-        self._put(
-            "a-rubric", "rubric", "rev-rubric",
-            _envelope("discovery_rubric", {
-                "eligibility_rules": ["r"], "uncertain_action": "retain", "limitations": [],
-            }),
-        )
-        refs = [
-            self.ref("a-brief", "rev-brief"),
-            self.ref("a-interview", "rev-interview"),
-            *([seed] if include_seed else []),
-            self.ref("a-framing", "rev-framing"),
-            self.ref("a-scope", "rev-scope"),
-            self.ref("a-rubric", "rev-rubric"),
-        ]
-        payload = {
-            "protocol": "protocol",
-            "brief_ref": refs[0],
-            "interview_ref": refs[1],
-            "seed_refs": [seed] if include_seed else [],
+        self._put("a-framing", "framework", "rev-framing",
+                  _envelope("discovery_framing", _framing_payload()))
+        self._put("a-scope", "framework", "rev-scope",
+                  _envelope("discovery_scope", _scope_payload()))
+        self._put("a-rubric", "rubric", "rev-rubric",
+                  _envelope("discovery_rubric", _rubric_payload()))
+        good = {
+            "brief_ref": brief_ref,
+            "interview_ref": self.ref("a-interview", "rev-interview"),
             "framing_ref": self.ref("a-framing", "rev-framing"),
             "scope_ref": self.ref("a-scope", "rev-scope"),
             "rubric_ref": self.ref("a-rubric", "rev-rubric"),
+        }
+        if override:
+            good.update(override)
+        if seed_refs_override is not None:
+            seeds = list(seed_refs_override)
+        elif include_seed:
+            seeds = [seed]
+        else:
+            seeds = []
+        refs = [
+            good["brief_ref"],
+            good["interview_ref"],
+            *seeds,
+            good["framing_ref"],
+            good["scope_ref"],
+            good["rubric_ref"],
+        ]
+        payload = {
+            "protocol": "protocol",
+            "brief_ref": good["brief_ref"],
+            "interview_ref": good["interview_ref"],
+            "seed_refs": seeds,
+            "framing_ref": good["framing_ref"],
+            "scope_ref": good["scope_ref"],
+            "rubric_ref": good["rubric_ref"],
             "queries": [{"source": "pubmed", "query": "q", "page_size": 20, "max_pages": 2}],
             "complementary_sources": [],
             "expansion": {"max_hops": 1, "max_sources": 5, "max_requests": 10, "page_size": 20, "max_pages": 3},
@@ -586,10 +637,10 @@ class PlanApprovalTest(ContextTestBase):
             },
         }
         self._put(
-            "a-plan", "report", plan_revision, _envelope("discovery_plan", payload),
+            plan_artifact, "report", plan_revision, _envelope("discovery_plan", payload),
             dependencies=refs, parent=parent,
         )
-        return self.ref("a-plan", plan_revision), seed
+        return self.ref(plan_artifact, plan_revision), seed
 
     def approve_all(self, seed_ref, plan_ref):
         self.seed_gate(seed_ref["artifact_id"], seed_ref["revision_id"])
@@ -688,6 +739,105 @@ class PlanApprovalTest(ContextTestBase):
         self._put("a-plan", "report", "rev-plan", _envelope("discovery_plan", payload))
         with self.assertRaises(DiscoveryContextError):
             read_context_document(self.store, self.ref("a-plan", "rev-plan"))
+
+    def test_plan_read_rejects_wrong_typed_direct_reference(self) -> None:
+        wrong = {
+            "brief_ref": ("a-w-brief", "report", "discovery_scope", _scope_payload()),
+            "interview_ref": ("a-w-interview", "report", "discovery_brief", _brief_payload()),
+            "framing_ref": ("a-w-framing", "framework", "discovery_brief", _brief_payload()),
+            "scope_ref": ("a-w-scope", "framework", "discovery_framing", _framing_payload()),
+            "rubric_ref": ("a-w-rubric", "report", "discovery_brief", _brief_payload()),
+        }
+        for aid, kind, dtype, payload in wrong.values():
+            self._put(aid, kind, "rev-w", _envelope(dtype, payload))
+        for field, (aid, _kind, _dtype, _payload) in wrong.items():
+            plan_ref, _seed = self.build_plan_fixture(
+                plan_artifact=f"a-plan-{field}",
+                plan_revision="rev-wrong",
+                override={field: self.ref(aid, "rev-w")},
+            )
+            with self.assertRaises(DiscoveryContextError):
+                read_context_document(self.store, plan_ref)
+
+    def test_plan_read_rejects_invalid_referenced_payload(self) -> None:
+        invalid = {
+            "brief_ref": ("a-i-brief", "report", "discovery_brief", {"objective": "o"}),
+            "interview_ref": ("a-i-interview", "report", "discovery_interview", {
+                "brief_ref": self.ref("a-brief", "rev-brief"), "turns": [],
+                "ready_to_advance": "yes",
+            }),
+            "framing_ref": ("a-i-framing", "framework", "discovery_framing", {
+                "alternatives": [], "counterevidence_queries": [], "limitations": [],
+            }),
+            "scope_ref": ("a-i-scope", "framework", "discovery_scope", {"scope": "s"}),
+            "rubric_ref": ("a-i-rubric", "rubric", "discovery_rubric", {
+                "eligibility_rules": [], "uncertain_action": "exclude", "limitations": [],
+            }),
+        }
+        for aid, kind, dtype, payload in invalid.values():
+            self._put(aid, kind, "rev-i", _envelope(dtype, payload))
+        for field, (aid, _kind, _dtype, _payload) in invalid.items():
+            plan_ref, _seed = self.build_plan_fixture(
+                plan_artifact=f"a-plan-{field}",
+                plan_revision="rev-invalid",
+                override={field: self.ref(aid, "rev-i")},
+            )
+            with self.assertRaises(DiscoveryContextError):
+                read_context_document(self.store, plan_ref)
+
+    def test_plan_read_rejects_fake_seed_approval_on_non_seed(self) -> None:
+        # A generic artifact_revision gate named discovery.seed.<id> over a
+        # non-seed artifact satisfies the *name* but must NOT satisfy a plan.
+        self.put_brief(aid="a-brief", rid="rev-brief")
+        self._put("a-fake-seed", "report", "rev-fake",
+                  _envelope("discovery_brief", _brief_payload()))
+        self.approve("a-fake-seed", "rev-fake", ARTIFACT_REVISION_GATE_KIND,
+                     ctx.SEED_GATE_PREFIX + "a-fake-seed")
+        approvals = HumanApprovalRepository(self.store)
+        self.assertTrue(
+            approvals.named_gate_satisfied(
+                "a-fake-seed", gate_kind=ARTIFACT_REVISION_GATE_KIND,
+                gate_id=ctx.SEED_GATE_PREFIX + "a-fake-seed",
+            )
+        )
+        fake_seed = self.ref("a-fake-seed", "rev-fake")
+        plan_ref, _seed = self.build_plan_fixture(
+            plan_revision="rev-fake-seed", seed_refs_override=[fake_seed],
+        )
+        with self.assertRaises(DiscoveryContextError):
+            read_context_document(self.store, plan_ref)
+
+    def test_plan_read_requires_current_direct_reference(self) -> None:
+        plan_ref, _seed = self.build_plan_fixture()
+        self.assertIsNotNone(read_context_document(self.store, plan_ref))
+        # A substantive change to a pinned direct reference makes the current read stale.
+        self._put("a-framing", "framework", "rev-framing2",
+                  _envelope("discovery_framing", _framing_payload(alternatives=["alt2"])),
+                  parent="rev-framing")
+        with self.assertRaises(DiscoveryContextError):
+            read_context_document(self.store, plan_ref)
+        historical = read_context_document(self.store, plan_ref, require_current=False)
+        self.assertEqual(historical["document_type"], "discovery_plan")
+
+    def test_plan_historic_read_of_amended_plan(self) -> None:
+        plan_ref, _seed = self.build_plan_fixture()
+        self.build_plan_fixture(
+            plan_revision="rev-plan2", parent="rev-plan", previous_plan=plan_ref,
+            affected=["scope"], rationale="substantive",
+        )
+        # The superseded plan revision is not current ...
+        with self.assertRaises(DiscoveryContextError):
+            read_context_document(self.store, plan_ref)
+        # ... but a historical read of the exact revision resolves.
+        historical = read_context_document(self.store, plan_ref, require_current=False)
+        self.assertEqual(historical["document_type"], "discovery_plan")
+
+    def test_plan_read_rejects_corrupted_referenced_bytes(self) -> None:
+        plan_ref, _seed = self.build_plan_fixture()
+        self.assertIsNotNone(read_context_document(self.store, plan_ref))
+        self._corrupt_revision_bytes("a-scope", "rev-scope", b'{"schema_version":1}')
+        with self.assertRaises(DiscoveryContextError):
+            read_context_document(self.store, plan_ref)
 
     def test_plan_amendment_requires_prior_plan_reference(self) -> None:
         # Initial plan (no parent) must have a null previous_plan.
