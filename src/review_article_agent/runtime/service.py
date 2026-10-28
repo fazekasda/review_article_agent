@@ -51,6 +51,29 @@ product's own XDG default data directory
   (``markerVersion`` + canonical ``root`` + ``ownerUid`` + non-empty
   ``instanceId``) whose file is owned by the current user and is not a symlink.
 
+Trust boundary (repair R2)
+--------------------------
+
+R1 vetted only the *leaf* of a managed path, so swapping an owned intermediate
+directory (``run``/``config``/…) for a symlink could redirect a read, write,
+``chmod``, or record deletion to an external file that still looked like an
+owner file. R2 proves the *whole* chain from the owned root before every managed
+read, write, ``chmod``, or signal, and refuses to trust disk documents over the
+manager's own state:
+
+* the secret is read only from an owner-only (no group/other bits) file, and a
+  swapped ``run`` chain is refused;
+* the server's log files are opened with ``O_NOFOLLOW`` and are refused when
+  pre-existing as a symlink, a non-regular entry, a foreign-owner file, or a
+  multiply-linked file, so a spawn can never truncate someone else's data;
+* ``descriptor()``/``connection()``/an idempotent ``start`` re-prove the live
+  owned process, the owned tree/config, and the port-vs-record agreement, and
+  derive their values from the manager rather than from a disk document;
+* one startup deadline covers the version subprocess, readiness, and the
+  post-ready probes; a failed start retains the identity record when the child
+  cannot be proven gone; and provider credential names/values are bounded and
+  NUL/newline-free before spawn.
+
 What this manager owns and does **not** own
 -------------------------------------------
 
@@ -167,6 +190,11 @@ MAX_RECORD_BYTES = 262_144
 MAX_HTTP_BODY_BYTES = 4_194_304
 MAX_JSON_DEPTH = 64
 
+#: Upper bound (bytes) for one explicitly supplied provider credential value.
+#: A value is refused **before** spawn when it is empty, contains a NUL, or is
+#: longer than this; it is never persisted.
+MAX_PROVIDER_ENV_VALUE_BYTES = 8192
+
 #: The (*only*) HTTP paths this manager will request.
 _ALLOWED_PROBE_PATHS: frozenset[str] = frozenset({"/api/info", "/api/config"})
 
@@ -226,7 +254,9 @@ _SYSTEM_CONFIG_DIRS: tuple[str, ...] = (
     "/Library/Application Support/opencode",
 )
 
-_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+#: Anchored with ``fullmatch`` (not ``$``) so a trailing newline can never be
+#: smuggled into a provider credential name.
+_ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 _PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _FIXTURE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
@@ -423,7 +453,11 @@ def _validate_timeout(name: str, value: object) -> float:
     """Return a finite, bounded timeout or raise a redacted error."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ServiceConfigError(name, _MSG_BAD_TIMEOUT)
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        # e.g. ``float(10 ** 10000)`` overflows; refuse it as a bounded error.
+        raise ServiceConfigError(name, _MSG_BAD_TIMEOUT) from exc
     if not math.isfinite(number) or number < MIN_LIFECYCLE_TIMEOUT_S or number > MAX_LIFECYCLE_TIMEOUT_S:
         raise ServiceConfigError(name, _MSG_BAD_TIMEOUT)
     return number
@@ -590,14 +624,6 @@ def _strict_json(payload: bytes, *, max_depth: int = MAX_JSON_DEPTH) -> Any:
         raise ValueError("JSON nested too deeply") from exc
     _check_json_depth(obj, max_depth)
     return obj
-
-
-def _read_bounded_json(path: Path, *, max_bytes: int = MAX_RECORD_BYTES) -> Any:
-    """Read a regular, owned, non-symlink file as bounded strict JSON."""
-    data = _file_bytes_strict(str(path), max_bytes=max_bytes)
-    if data is None:
-        raise ValueError("record is not a readable regular owned file")
-    return _strict_json(data)
 
 
 def _free_loopback_port() -> int:
@@ -1065,11 +1091,17 @@ class OpenCodeServiceManager:
             raise ServiceConfigError("provider_env", _MSG_PROVIDER_ENV)
         out: dict[str, str] = {}
         for name, value in provider_env.items():
-            if not isinstance(name, str) or not _ENV_NAME_RE.match(name):
+            # ``fullmatch`` (never ``match`` with ``$``) so a trailing newline is
+            # refused rather than accepted as an allowlisted name.
+            if not isinstance(name, str) or _ENV_NAME_RE.fullmatch(name) is None:
                 raise ServiceConfigError("provider_env", _MSG_PROVIDER_ENV)
             if name not in KNOWN_PROVIDER_ENV_NAMES:
                 raise ServiceConfigError("provider_env", _MSG_PROVIDER_ENV)
             if not isinstance(value, str) or value == "":
+                raise ServiceConfigError("provider_env", _MSG_PROVIDER_ENV)
+            # Reject an invalid env value *before* spawn: a NUL byte cannot be
+            # passed to ``execve`` and an unbounded value is not a credential.
+            if "\x00" in value or len(value.encode("utf-8")) > MAX_PROVIDER_ENV_VALUE_BYTES:
                 raise ServiceConfigError("provider_env", _MSG_PROVIDER_ENV)
             out[name] = value
         return out
@@ -1192,14 +1224,136 @@ class OpenCodeServiceManager:
             if os.path.lexists(system_dir):
                 raise ServiceOwnershipError("root_inherited", _MSG_ROOT_INHERITED)
 
-    def _marker_doc(self) -> dict[str, Any] | None:
-        st = _lstat(str(self.marker))
-        if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    # -- managed-path safety (repair R2) ---------------------------------- #
+    #
+    # ``_file_bytes_strict`` only vets the *leaf*. A leaf check is not enough:
+    # replacing an owned intermediate directory (``run``/``config``/…) with a
+    # symlink would let a read/write/chmod/signal reach an external file that
+    # still looks like a regular owner file. Every managed operation therefore
+    # first proves the *whole* chain from the owned root is real, owned, and
+    # symlink-free.
+
+    def _dir_chain_ok(self, directory: Path) -> bool:
+        """True when ``directory`` and every ancestor up to the owned root are
+        real, owner-owned, non-symlink directories."""
+        root = self.root
+        try:
+            rel = directory.relative_to(root)
+        except ValueError:
+            return False
+        components = [root]
+        current = root
+        for part in rel.parts:
+            current = current / part
+            components.append(current)
+        for component in components:
+            st = _lstat(str(component))
+            if (
+                st is None
+                or stat.S_ISLNK(st.st_mode)
+                or not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.getuid()
+            ):
+                return False
+        return True
+
+    def _dir_chain_safe(self, directory: Path) -> bool:
+        """True when every *existing* directory from the owned root down to
+        ``directory`` is real, owned, and symlink-free.
+
+        Unlike :meth:`_dir_chain_ok` this tolerates components that do not exist
+        yet (a missing ``run`` is "nothing recorded", not "unsafe"), but it still
+        refuses a symlinked/foreign ancestor so a swapped directory can never be
+        read as an empty tree.
+        """
+        root = self.root
+        root_st = _lstat(str(root))
+        if (
+            root_st is None
+            or stat.S_ISLNK(root_st.st_mode)
+            or not stat.S_ISDIR(root_st.st_mode)
+            or root_st.st_uid != os.getuid()
+        ):
+            return False
+        try:
+            rel = directory.relative_to(root)
+        except ValueError:
+            return False
+        current = root
+        for part in rel.parts:
+            current = current / part
+            st = _lstat(str(current))
+            if st is None:
+                return True  # nothing deeper can exist; the existing chain is safe
+            if (
+                stat.S_ISLNK(st.st_mode)
+                or not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.getuid()
+            ):
+                return False
+        return True
+
+    def _file_chain_ok(self, path: Path) -> bool:
+        """True when ``path``'s parent chain from the owned root is safe."""
+        return self._dir_chain_ok(path.parent)
+
+    def _assert_managed_dirs(self, path: Path) -> None:
+        if not self._file_chain_ok(path):
+            raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
+
+    def _read_owned_file(
+        self, path: Path, *, max_bytes: int, private: bool = False
+    ) -> bytes | None:
+        """Bounded read of a managed file whose whole directory chain is owned.
+
+        Returns ``None`` (a static denial) when any component of the path is a
+        symlink or foreign directory, when the leaf is not a regular owner file
+        within the bound, or — with ``private`` — when it is not owner-only.
+        """
+        if not self._file_chain_ok(path):
             return None
-        if st.st_uid != os.getuid():
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(str(path), flags)
+        except OSError:
             return None
         try:
-            doc = _read_bounded_json(self.marker)
+            st = os.fstat(fd)
+            if (
+                not stat.S_ISREG(st.st_mode)
+                or st.st_uid != os.getuid()
+                or st.st_size > max_bytes
+                or (private and (st.st_mode & 0o077))
+            ):
+                return None
+            data = b""
+            while len(data) <= max_bytes:
+                chunk = os.read(fd, max_bytes + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+        if len(data) > max_bytes:
+            return None
+        return data
+
+    def _read_owned_json(self, path: Path, *, max_bytes: int = MAX_RECORD_BYTES) -> Any:
+        data = self._read_owned_file(path, max_bytes=max_bytes)
+        if data is None:
+            raise ValueError("record is not a readable managed file")
+        return _strict_json(data)
+
+    def _atomic_write_owned(self, path: Path, data: bytes, mode: int) -> None:
+        """Atomically write a managed file only when its chain is safe."""
+        self._assert_managed_dirs(path)
+        _atomic_write(path, data, mode)
+
+    def _marker_doc(self) -> dict[str, Any] | None:
+        try:
+            doc = self._read_owned_json(self.marker)
         except (OSError, ValueError):
             return None
         return doc if isinstance(doc, dict) else None
@@ -1267,10 +1421,17 @@ class OpenCodeServiceManager:
             "instanceId": secrets.token_hex(16),
             "createdAtMs": int(time.time() * 1000),
         }
-        _atomic_write(self.marker, canonical_json(doc) + b"\n", 0o600)
+        self._atomic_write_owned(self.marker, canonical_json(doc) + b"\n", 0o600)
 
     def _ensure_private_dir(self, directory: Path) -> None:
-        """Create or verify one owned, owner-private, non-symlink directory."""
+        """Create or verify one owned, owner-private, non-symlink directory.
+
+        The *parent* chain from the owned root is proven safe first, so a
+        symlinked intermediate directory can never redirect the ``makedirs`` or
+        the ``chmod`` to an external location.
+        """
+        if not self._dir_chain_ok(directory.parent):
+            raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
         target = str(directory)
         st = _lstat(target)
         if st is None:
@@ -1338,11 +1499,29 @@ class OpenCodeServiceManager:
     # -- process identity ------------------------------------------------- #
 
     def _read_pid_record(self) -> tuple[str, dict[str, Any] | None]:
-        """Return ``("absent"|"invalid"|"ok", doc)`` — never silently "absent"."""
+        """Return ``("absent"|"invalid"|"ok", doc)`` — never silently "absent".
+
+        An unsafe ``run`` chain is reported ``invalid`` (never ``absent``), so a
+        symlinked run directory can never be mistaken for "nothing recorded".
+        """
+        root_st = _lstat(str(self.root))
+        if (
+            root_st is None
+            or stat.S_ISLNK(root_st.st_mode)
+            or not stat.S_ISDIR(root_st.st_mode)
+            or root_st.st_uid != os.getuid()
+        ):
+            # No owned root (or an unsafe one) means "nothing recorded"; an
+            # unsafe *intermediate* is reported invalid below.
+            return ("absent", None) if root_st is None else ("invalid", None)
         if not os.path.lexists(str(self.pid_record)):
-            return ("absent", None)
+            # A genuinely missing record is "absent" only while the existing
+            # ``run`` chain is safe; a swapped run directory is "invalid".
+            return ("absent", None) if self._dir_chain_safe(self.run) else ("invalid", None)
+        if not self._file_chain_ok(self.pid_record):
+            return ("invalid", None)
         try:
-            doc = _read_bounded_json(self.pid_record)
+            doc = self._read_owned_json(self.pid_record)
         except (OSError, ValueError):
             return ("invalid", None)
         if not isinstance(doc, dict):
@@ -1352,7 +1531,7 @@ class OpenCodeServiceManager:
         return ("ok", doc)
 
     def _secret_bytes(self) -> bytes | None:
-        return _file_bytes_strict(str(self.secret_file), max_bytes=1024)
+        return self._read_owned_file(self.secret_file, max_bytes=1024, private=True)
 
     def _expected_exe(self) -> str | None:
         try:
@@ -1482,7 +1661,17 @@ class OpenCodeServiceManager:
             "LANG": "C.UTF-8",
         }
 
-    def _verify_binary_version(self, binary: str) -> str:
+    def _remaining(self, deadline: float) -> float:
+        """Seconds left before ``deadline`` or a bounded start-timeout error."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ServiceStartError("start_timeout", _MSG_START_FAILED)
+        return remaining
+
+    def _verify_binary_version(self, binary: str, deadline: float) -> str:
+        # The version subprocess shares the one startup deadline: it can never
+        # outlive the caller's ``start_timeout`` and eat the readiness window.
+        timeout = min(20.0, max(0.05, self._remaining(deadline)))
         try:
             proc = subprocess.run(  # noqa: S603 - explicit argv, shell=False
                 [binary, "--version"],
@@ -1490,9 +1679,11 @@ class OpenCodeServiceManager:
                 text=True,
                 env=self._binary_env(),
                 cwd=str(self.cwd) if self.cwd.is_dir() else str(self.data_dir),
-                timeout=20,
+                timeout=timeout,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise ServiceStartError("start_timeout", _MSG_START_FAILED) from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise ServiceBinaryError("binary_version", _MSG_BINARY) from exc
         tokens = (proc.stdout or "").split()
@@ -1539,26 +1730,33 @@ class OpenCodeServiceManager:
         data = self._verify_expected_config()
         expected = data + b"\n"
         self._ensure_private_dir(self.config_file.parent)
-        _atomic_write(self.config_file, expected, 0o600)
+        self._atomic_write_owned(self.config_file, expected, 0o600)
         # Verify the bytes actually on disk are exactly ours.
-        on_disk = _file_bytes_strict(str(self.config_file), max_bytes=MAX_RECORD_BYTES)
+        on_disk = self._read_owned_file(self.config_file, max_bytes=MAX_RECORD_BYTES)
         if on_disk != expected:
             raise ServiceOwnershipError("config_disk", _MSG_TREE_DIRTY)
 
     def _write_secret(self, password: str) -> None:
-        _atomic_write(self.secret_file, password.encode("utf-8"), 0o600)
+        self._atomic_write_owned(self.secret_file, password.encode("utf-8"), 0o600)
 
     def read_password(self) -> str:
-        """Return the per-run HTTP Basic secret (callers must not log it)."""
+        """Return the per-run HTTP Basic secret (callers must not log it).
+
+        The secret is read only from a fully owned, symlink-free ``run`` chain
+        and only when the file is owner-only; a swapped ``run`` directory, a
+        foreign file, or a group/other-readable secret is refused.
+        """
         if not self.is_owned_root():
             raise ServiceOwnershipError("root_unowned", _MSG_NOT_OWNED_STOP)
-        data = self._secret_bytes()
+        if not self._file_chain_ok(self.secret_file):
+            raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
+        data = self._read_owned_file(self.secret_file, max_bytes=1024, private=True)
         if data is None:
             raise ServiceOwnershipError("no_secret", _MSG_NO_SECRET)
         return data.decode("utf-8")
 
     def _read_port(self) -> int | None:
-        data = _file_bytes_strict(str(self.port_file), max_bytes=64)
+        data = self._read_owned_file(self.port_file, max_bytes=64)
         if data is None:
             return None
         try:
@@ -1566,6 +1764,17 @@ class OpenCodeServiceManager:
         except (ValueError, UnicodeDecodeError):
             return None
         return port if 1 <= port <= 65535 else None
+
+    def _validated_base_url(self, record: Mapping[str, Any]) -> str | None:
+        """Return the loopback URL only when the live port file still matches the
+        owned record's port (a changed port file is refused, not trusted)."""
+        port = self._read_port()
+        if port is None:
+            return None
+        recorded = record.get("port")
+        if isinstance(recorded, bool) or not isinstance(recorded, int) or port != recorded:
+            return None
+        return f"http://{SERVICE_HOST}:{port}"
 
     def _base_url(self) -> str | None:
         port = self._read_port()
@@ -1581,13 +1790,54 @@ class OpenCodeServiceManager:
 
     # -- spawn / readiness ------------------------------------------------ #
 
+    def _open_log(self, path: Path) -> int:
+        """Open a managed log file for truncation without following a symlink.
+
+        The whole ``run`` chain must be owned and symlink-free; a pre-existing
+        symlink, a non-regular entry, a foreign-owner file, or a multiply-linked
+        file (a hardlink into someone else's data) is refused rather than
+        truncated.
+        """
+        if not self._file_chain_ok(path):
+            raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
+        st = _lstat(str(path))
+        if st is not None and (
+            stat.S_ISLNK(st.st_mode)
+            or not stat.S_ISREG(st.st_mode)
+            or st.st_uid != os.getuid()
+            or st.st_nlink != 1
+        ):
+            raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_TRUNC
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        fd = os.open(str(path), flags, 0o600)
+        try:
+            fst = os.fstat(fd)
+            if (
+                not stat.S_ISREG(fst.st_mode)
+                or fst.st_uid != os.getuid()
+                or fst.st_nlink != 1
+            ):
+                raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
     def _spawn(self, binary: str, port: int, password: str) -> subprocess.Popen[bytes]:
         env = self._child_env(password)
-        for path in (self.stdout_file, self.stderr_file):
-            st = _lstat(str(path))
-            if st is not None and (stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode)):
-                raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
-        with open(str(self.stdout_file), "wb") as out, open(str(self.stderr_file), "wb") as err:
+        out_fd = self._open_log(self.stdout_file)
+        try:
+            err_fd = self._open_log(self.stderr_file)
+        except BaseException:
+            os.close(out_fd)
+            raise
+        with os.fdopen(out_fd, "wb") as out, os.fdopen(err_fd, "wb") as err:
             return subprocess.Popen(  # noqa: S603 - explicit argv, shell=False
                 [binary, "serve", "--hostname", SERVICE_HOST, "--port", str(port)],
                 cwd=str(self.cwd),
@@ -1616,14 +1866,15 @@ class OpenCodeServiceManager:
         }
 
     def _await_ready(
-        self, proc: subprocess.Popen[bytes], port: int, password: str
+        self,
+        proc: subprocess.Popen[bytes],
+        port: int,
+        password: str,
+        deadline: float,
     ) -> dict[str, Any]:
         url = f"http://{SERVICE_HOST}:{port}"
-        deadline = time.monotonic() + self.start_timeout
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ServiceStartError("start_timeout", _MSG_START_FAILED)
+            remaining = self._remaining(deadline)
             if proc.poll() is not None:
                 raise ServiceStartError("server_exited", _MSG_START_EXITED)
             try:
@@ -1638,20 +1889,37 @@ class OpenCodeServiceManager:
                 info = None
             if isinstance(info, dict) and info.get("version"):
                 return info
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ServiceStartError("start_timeout", _MSG_START_FAILED)
+            remaining = self._remaining(deadline)
             self._sleep(min(_PROBE_INTERVAL_S, remaining))
 
-    def _assert_server_owned(self, pid: int, port: int, password: str) -> None:
-        """Prove the ready server is our child and runs only our effective config."""
+    def _assert_server_owned(
+        self, pid: int, port: int, password: str, deadline: float
+    ) -> None:
+        """Prove the ready server is our child and runs only our effective config.
+
+        The two post-ready probes share the *same* startup deadline as readiness
+        and the version check, so fixed 3 s probes can never push startup past
+        ``start_timeout``.
+        """
         url = f"http://{SERVICE_HOST}:{port}"
-        info = self._http_get(url, SERVICE_USERNAME, password, _PROBE_TIMEOUT_S, "/api/info")
+        info = self._http_get(
+            url,
+            SERVICE_USERNAME,
+            password,
+            min(_PROBE_TIMEOUT_S, max(0.05, self._remaining(deadline))),
+            "/api/info",
+        )
         if not isinstance(info, dict) or info.get("pid") != pid:
             raise ServiceProcessError("server_pid", _MSG_SERVER_PID)
         if info.get("version") != OPENCODE_PINNED_VERSION:
             raise ServiceVersionError("server_version", _MSG_SERVER_VERSION)
-        sources = self._http_get(url, SERVICE_USERNAME, password, _PROBE_TIMEOUT_S, "/api/config")
+        sources = self._http_get(
+            url,
+            SERVICE_USERNAME,
+            password,
+            min(_PROBE_TIMEOUT_S, max(0.05, self._remaining(deadline))),
+            "/api/config",
+        )
         if not isinstance(sources, list):
             raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
         merged: dict[str, Any] | None = None
@@ -1697,15 +1965,19 @@ class OpenCodeServiceManager:
         if set(merged.get("providers", {}) or {}) != expected_providers:
             raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
 
-    def _terminate_child(self, proc: subprocess.Popen[bytes]) -> None:
-        """Terminate our own direct child (safe: the Popen object pins it)."""
+    def _terminate_child(self, proc: subprocess.Popen[bytes]) -> bool:
+        """Terminate our own direct child; return True only when it is gone.
+
+        A ``False`` result means the child could not be proven reaped, so the
+        caller must retain (never clear) its identity record.
+        """
         try:
             proc.terminate()
         except OSError:
             pass
         try:
             proc.wait(timeout=max(self.stop_timeout, 1.0))
-            return
+            return True
         except subprocess.TimeoutExpired:
             pass
         try:
@@ -1714,11 +1986,12 @@ class OpenCodeServiceManager:
             pass
         try:
             proc.wait(timeout=5.0)
+            return True
         except subprocess.TimeoutExpired:
-            pass
+            return False
 
     def _write_pid_record(self, record: Mapping[str, Any]) -> None:
-        _atomic_write(self.pid_record, canonical_json(dict(record)) + b"\n", 0o600)
+        self._atomic_write_owned(self.pid_record, canonical_json(dict(record)) + b"\n", 0o600)
 
     def _write_descriptor(self, record: Mapping[str, Any], version: str) -> None:
         doc = {
@@ -1748,9 +2021,13 @@ class OpenCodeServiceManager:
                 "This instance writes no standard service registration."
             ),
         }
-        _atomic_write(self.descriptor_file, canonical_json(doc) + b"\n", 0o600)
+        self._atomic_write_owned(self.descriptor_file, canonical_json(doc) + b"\n", 0o600)
 
     def _clear_run_records(self) -> None:
+        # Never unlink through a swapped ``run`` directory: if the chain is not
+        # the owned one, removing the paths would delete external files.
+        if not self._dir_chain_ok(self.run):
+            return
         for path in (self.pid_record, self.port_file, self.secret_file, self.descriptor_file):
             try:
                 os.unlink(str(path))
@@ -1782,6 +2059,14 @@ class OpenCodeServiceManager:
                 or record.get("instanceFence") != self.instance_fence
             ):
                 raise ServiceConfigError("conflicting_config", _MSG_CONFLICTING_CONFIG)
+            # An already-running instance is re-proved: the tree and the on-disk
+            # config must still be exactly ours, and the live port must still
+            # match the owned record. A drifted tree/port is refused, never
+            # reported as a usable running instance.
+            self._assert_tree_clean()
+            self._verify_expected_config()
+            if self._validated_base_url(record) is None:
+                raise ServiceProcessError("not_running", _MSG_PROBE)
             return self._running_status(inspect=False)
         if state == "foreign":
             raise ServiceProcessError("foreign_process", _MSG_STOP_FOREIGN)
@@ -1793,13 +2078,16 @@ class OpenCodeServiceManager:
         self._assert_tree_clean()
 
         binary = self._resolve_binary()
-        self._verify_binary_version(binary)
+        # One deadline for *every* startup step: the version subprocess, the
+        # readiness poll, and the two post-ready config probes.
+        deadline = time.monotonic() + self.start_timeout
+        self._verify_binary_version(binary, deadline)
         self._write_config()
 
         port = self._port if self._port else _free_loopback_port()
         password = secrets.token_urlsafe(32)
         self._write_secret(password)
-        _atomic_write(self.port_file, str(port).encode("ascii"), 0o600)
+        self._atomic_write_owned(self.port_file, str(port).encode("ascii"), 0o600)
 
         proc = self._spawn(binary, port, password)
         self._proc = proc
@@ -1809,21 +2097,30 @@ class OpenCodeServiceManager:
             initial = self._capture_identity(proc.pid, port, password)
             self._write_pid_record(initial)
 
-            info = self._await_ready(proc, port, password)
+            info = self._await_ready(proc, port, password, deadline)
             version = str(info.get("version", ""))
             if version != OPENCODE_PINNED_VERSION:
                 raise ServiceVersionError("server_version", _MSG_SERVER_VERSION)
-            self._assert_server_owned(proc.pid, port, password)
+            self._assert_server_owned(proc.pid, port, password, deadline)
 
             record = self._capture_identity(proc.pid, port, password)
             record["version"] = version
             self._write_pid_record(record)
             self._write_descriptor(record, version)
         except BaseException:
-            # Any failure after spawn must leave no unmanaged child behind.
-            self._terminate_child(proc)
+            # Any failure after spawn must leave no unmanaged child behind. When
+            # the child cannot be proven gone, retain (never clear) its identity
+            # so it stays discoverable and owned.
+            gone = self._terminate_child(proc)
             self._proc = None
-            self._clear_run_records()
+            if gone:
+                self._clear_run_records()
+            else:
+                try:
+                    if not os.path.lexists(str(self.pid_record)):
+                        self._write_pid_record(self._capture_identity(proc.pid, port, password))
+                except Exception:  # pragma: no cover - best-effort retention
+                    pass
             raise
         return ServiceStatus(
             state="running",
@@ -1927,7 +2224,10 @@ class OpenCodeServiceManager:
         except (TypeError, ValueError):
             pid = None
         version = record.get("version")
-        if inspect:
+        # Report a URL only while the live port file still matches the owned
+        # record; a changed port is never reported as a usable endpoint.
+        url = self._validated_base_url(record)
+        if inspect and url is not None:
             try:
                 info = self._fetch("/api/info")
                 if isinstance(info, dict) and info.get("version"):
@@ -1938,7 +2238,7 @@ class OpenCodeServiceManager:
             state="running",
             running=True,
             pid=pid,
-            url=self._base_url(),
+            url=url,
             version=version,
             root=str(self.root),
         )
@@ -1970,6 +2270,8 @@ class OpenCodeServiceManager:
             if st is not None and st.st_uid != os.getuid():
                 raise ServiceOwnershipError("location_unowned", _MSG_LOCATION_UNOWNED)
             if st is not None:
+                if not self._dir_chain_ok(location):
+                    raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
                 try:
                     entries = os.listdir(str(location))
                 except OSError as exc:
@@ -1978,7 +2280,7 @@ class OpenCodeServiceManager:
                     raise ServiceOwnershipError("location_unowned", _MSG_LOCATION_UNOWNED)
                 os.chmod(str(location), 0o700)
                 self._scan_dir_for_risks(location)
-                doc = _read_json_marker(location / LOCATION_MARKER_NAME)
+                doc = self._read_location_marker(location)
                 return ProjectLocation(
                     app_project_id=project_id,
                     directory=str(location),
@@ -1990,14 +2292,19 @@ class OpenCodeServiceManager:
             self._scan_dir_for_risks(location)
             return result
 
-    def _location_marker_valid(self, location: Path, project_id: str) -> bool:
+    def _read_location_marker(self, location: Path) -> dict[str, Any] | None:
+        """Read a location marker only from a fully owned, symlink-free chain."""
         marker = location / LOCATION_MARKER_NAME
-        st = _lstat(str(marker))
-        if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            return False
-        if st.st_uid != os.getuid():
-            return False
-        doc = _read_json_marker(marker)
+        if not self._file_chain_ok(marker):
+            return None
+        try:
+            doc = self._read_owned_json(marker)
+        except (OSError, ValueError):
+            return None
+        return doc if isinstance(doc, dict) else None
+
+    def _location_marker_valid(self, location: Path, project_id: str) -> bool:
+        doc = self._read_location_marker(location)
         if doc is None:
             return False
         return (
@@ -2021,7 +2328,7 @@ class OpenCodeServiceManager:
             "instanceId": instance_id,
             "createdAtMs": int(time.time() * 1000),
         }
-        _atomic_write(location / LOCATION_MARKER_NAME, canonical_json(doc) + b"\n", 0o600)
+        self._atomic_write_owned(location / LOCATION_MARKER_NAME, canonical_json(doc) + b"\n", 0o600)
         return ProjectLocation(
             app_project_id=project_id,
             directory=str(location),
@@ -2031,64 +2338,64 @@ class OpenCodeServiceManager:
 
     # -- safe discovery for a future client ------------------------------ #
 
-    def connection(self) -> ServiceConnection:
-        """Explicit connection parameters for a future client (no secret).
+    def _current_owned_record(self) -> dict[str, Any]:
+        """The record of the *current* live owned instance, or a refusal.
 
-        Requires a validated owned root, a valid current record, the owned
-        process, and (implicitly) a readable secret; a corrupted or absent
-        instance is refused rather than reported as a usable connection.
+        Proves the owned root, the live owned process, the safe ``run`` chain,
+        the on-disk config, and the port all still agree before any descriptor
+        or connection value is derived from them.
         """
         if not self.is_owned_root():
             raise ServiceOwnershipError("root_unowned", _MSG_NOT_OWNED_STOP)
         if self._process_state() != "ours":
             raise ServiceProcessError("not_running", _MSG_PROBE)
-        url = self._base_url()
-        if url is None:
+        self._assert_tree_clean()
+        self._verify_expected_config()
+        _, record = self._read_pid_record()
+        record = record or {}
+        if self._validated_base_url(record) is None:
+            raise ServiceProcessError("not_running", _MSG_PROBE)
+        return record
+
+    def connection(self) -> ServiceConnection:
+        """Explicit connection parameters for a future client (no secret).
+
+        Requires a validated owned root, the live owned process, an unchanged
+        owned tree/config, and a port file that still matches the owned record;
+        a corrupted, drifted, or absent instance is refused rather than reported
+        as a usable connection.
+        """
+        record = self._current_owned_record()
+        url = self._validated_base_url(record)
+        if url is None:  # pragma: no cover - re-checked after the proof above
             raise ServiceProcessError("not_running", _MSG_PROBE)
         return ServiceConnection(
             base_url=url, username=SERVICE_USERNAME, password_file=str(self.secret_file)
         )
 
-    def descriptor(self) -> ServiceDescriptor:
-        """The safe, secret-free descriptor of the currently recorded instance."""
-        if not self.is_owned_root():
-            raise ServiceOwnershipError("root_unowned", _MSG_NOT_OWNED_STOP)
-        kind, record = self._read_pid_record()
-        if kind == "invalid":
-            raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
-        record = record or {}
+    def _descriptor_binary(self, record: Mapping[str, Any]) -> str:
+        try:
+            return self._resolve_binary()
+        except ServiceError:
+            return str(record.get("exe", ""))
 
-        if os.path.lexists(str(self.descriptor_file)):
-            try:
-                doc = _read_bounded_json(self.descriptor_file)
-            except (OSError, ValueError) as exc:
-                raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD) from exc
-            if not isinstance(doc, dict) or doc.get("descriptorVersion") != DESCRIPTOR_VERSION:
-                raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
-            dirs = doc.get("dirs", {})
-            url = doc.get("url")
-            if not isinstance(url, str) or not isinstance(dirs, dict):
-                raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
-            return ServiceDescriptor(
-                url=url,
-                pid=int(doc.get("pid", 0) or 0),
-                version=str(doc.get("opencodeVersion", "")),
-                binary=str(doc.get("binary", "")),
-                root=str(dirs.get("root", self.root)),
-                password_file=str(self.secret_file),
-                home=str(dirs.get("home", self.home)),
-                xdg_config_home=str(dirs.get("xdgConfigHome", self.config_home)),
-                xdg_data_home=str(dirs.get("xdgDataHome", self.data_home)),
-                xdg_state_home=str(dirs.get("xdgStateHome", self.state_home)),
-                xdg_cache_home=str(dirs.get("xdgCacheHome", self.cache_home)),
-                cwd=str(dirs.get("cwd", self.cwd)),
-                provider_env_names=tuple(doc.get("providerEnvNames", ())),
-            )
-        return ServiceDescriptor(
-            url=self._base_url() or "",
-            pid=int(record.get("pid", 0) or 0),
+    def descriptor(self) -> ServiceDescriptor:
+        """The safe, secret-free descriptor of the *current* owned instance.
+
+        Values are derived from this manager's own expected paths plus the
+        validated live record — never trusted from the on-disk document. When a
+        descriptor document exists it must match this manager's own state
+        exactly; a drifted or tampered document is refused.
+        """
+        record = self._current_owned_record()
+        url = self._validated_base_url(record)
+        if url is None:  # pragma: no cover - re-checked after the proof above
+            raise ServiceProcessError("not_running", _MSG_PROBE)
+        expected = ServiceDescriptor(
+            url=url,
+            pid=int(record["pid"]),
             version=str(record.get("version", "")),
-            binary=str(record.get("exe", "")),
+            binary=self._descriptor_binary(record),
             root=str(self.root),
             password_file=str(self.secret_file),
             home=str(self.home),
@@ -2099,6 +2406,40 @@ class OpenCodeServiceManager:
             cwd=str(self.cwd),
             provider_env_names=tuple(record.get("providerEnvNames", ())),
         )
+        if os.path.lexists(str(self.descriptor_file)):
+            self._assert_descriptor_matches(expected)
+        return expected
+
+    def _assert_descriptor_matches(self, expected: ServiceDescriptor) -> None:
+        try:
+            doc = self._read_owned_json(self.descriptor_file)
+        except (OSError, ValueError) as exc:
+            raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD) from exc
+        if (
+            not isinstance(doc, dict)
+            or doc.get("descriptorVersion") != DESCRIPTOR_VERSION
+            or doc.get("kind") != DESCRIPTOR_KIND
+        ):
+            raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
+        dirs = doc.get("dirs")
+        if not isinstance(dirs, dict):
+            raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
+        matches = (
+            doc.get("url") == expected.url,
+            doc.get("pid") == expected.pid,
+            doc.get("opencodeVersion") == expected.version,
+            doc.get("binary") == expected.binary,
+            dirs.get("root") == expected.root,
+            dirs.get("home") == expected.home,
+            dirs.get("xdgConfigHome") == expected.xdg_config_home,
+            dirs.get("xdgDataHome") == expected.xdg_data_home,
+            dirs.get("xdgStateHome") == expected.xdg_state_home,
+            dirs.get("xdgCacheHome") == expected.xdg_cache_home,
+            dirs.get("cwd") == expected.cwd,
+            tuple(doc.get("providerEnvNames", ())) == expected.provider_env_names,
+        )
+        if not all(matches):
+            raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
 
     def config_sources(self) -> list[Any]:
         """The config *source* list from ``GET /api/config`` (readiness only).
@@ -2110,15 +2451,6 @@ class OpenCodeServiceManager:
         if not isinstance(sources, list):
             raise ServiceProcessError("bad_config_sources", _MSG_PROBE)
         return sources
-
-
-def _read_json_marker(path: Path) -> dict[str, Any] | None:
-    """Bounded strict JSON for a marker file; ``None`` on any anomaly."""
-    try:
-        doc = _read_bounded_json(path)
-    except (OSError, ValueError):
-        return None
-    return doc if isinstance(doc, dict) else None
 
 
 __all__ = [

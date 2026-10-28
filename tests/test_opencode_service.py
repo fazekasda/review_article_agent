@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -66,6 +67,7 @@ from review_article_agent.runtime.service import (  # noqa: E402
     ServiceLockError,
     ServiceOwnershipError,
     ServiceProcessError,
+    ServiceStartError,
     ServiceVersionError,
     build_service_config,
     service_config_bytes,
@@ -912,6 +914,222 @@ class RealServiceTests(_ServiceCase):
         manager.stop()
         after = [_file_fingerprint(path) for path in registrations]
         self.assertEqual(before, after)
+
+
+# --------------------------------------------------------------------------- #
+# Repair R2: full managed-path containment (hermetic unless noted)
+# --------------------------------------------------------------------------- #
+
+
+class Repair2ContainmentTests(_ServiceCase):
+    """Exact regressions for the remaining service containment gaps (repair R2).
+
+    Each test targets one reviewed hole: the leaf-only path check, non-private
+    secret modes, log-file truncation of a foreign/hardlinked file, the raw
+    ``OverflowError`` on a huge timeout, the provider-env ``$``/NUL gaps, the
+    split startup deadline, identity retention on a surviving child, and
+    ``descriptor()``/``connection()``/idempotent ``start`` trusting disk state.
+    """
+
+    def test_huge_timeout_int_refused(self) -> None:
+        for knob in ("start_timeout", "stop_timeout", "lock_timeout"):
+            with self.assertRaises(ServiceConfigError, msg=knob):
+                OpenCodeServiceManager(
+                    data_dir=self.data_dir,
+                    configuration=_role_config(),
+                    **{knob: 10 ** 10000},
+                )
+
+    def test_provider_env_name_newline_and_invalid_value_refused(self) -> None:
+        for bad in (
+            {"OPENROUTER_API_KEY\n": "x"},
+            {"OPENROUTER_API_KEY ": "x"},
+            {"OPENROUTER_API_KEY": "has\x00nul"},
+            {"OPENROUTER_API_KEY": "x" * (service.MAX_PROVIDER_ENV_VALUE_BYTES + 1)},
+        ):
+            with self.assertRaises(ServiceConfigError, msg=repr(bad)[:32]):
+                OpenCodeServiceManager(
+                    data_dir=self.data_dir, configuration=_role_config(), provider_env=bad
+                )
+
+    def test_swapped_run_dir_cannot_read_or_delete_external_files(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_swap")  # creates + marks the owned root
+        external = self.data_dir / "external"
+        external.mkdir()
+        (external / service.PID_RECORD_NAME).write_text(
+            json.dumps({"recordVersion": 1, "pid": 2}), encoding="utf-8"
+        )
+        (external / "password").write_text("external-secret", encoding="utf-8")
+        os.chmod(external / "password", 0o600)
+        shutil.rmtree(manager.run)
+        os.symlink(external, manager.run)
+
+        # The record is reported invalid (never absent/stopped), reads refuse,
+        # and the external files are neither read nor deleted.
+        self.assertEqual(manager.status().state, "invalid")
+        with self.assertRaises(ServiceProcessError):
+            manager.stop()
+        with self.assertRaises(ServiceOwnershipError):
+            manager.read_password()
+        self.assertTrue((external / service.PID_RECORD_NAME).exists())
+        self.assertEqual((external / "password").read_text(encoding="utf-8"), "external-secret")
+
+    def test_swapped_run_dir_without_record_is_invalid_not_stopped(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_swap2")
+        external = self.data_dir / "external2"
+        external.mkdir()
+        shutil.rmtree(manager.run)
+        os.symlink(external, manager.run)
+        self.assertEqual(manager.status().state, "invalid")
+        with self.assertRaises(ServiceProcessError):
+            manager.stop()
+
+    def test_group_readable_secret_refused(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_secret")
+        manager.secret_file.write_bytes(b"top-secret")
+        os.chmod(manager.secret_file, 0o644)
+        with self.assertRaises(ServiceOwnershipError):
+            manager.read_password()
+        os.chmod(manager.secret_file, 0o600)
+        self.assertEqual(manager.read_password(), "top-secret")
+
+    def test_log_open_refuses_symlink_dir_and_hardlink(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_log")
+        target = self.data_dir / "target.log"
+        target.write_text("keep", encoding="utf-8")
+        os.symlink(target, manager.stdout_file)
+        with self.assertRaises(ServiceOwnershipError):
+            manager._open_log(manager.stdout_file)
+        manager.stdout_file.unlink()
+        manager.stdout_file.mkdir()
+        with self.assertRaises(ServiceOwnershipError):
+            manager._open_log(manager.stdout_file)
+        manager.stdout_file.rmdir()
+        hard_target = self.data_dir / "hard.log"
+        hard_target.write_text("keep-hard", encoding="utf-8")
+        os.link(hard_target, manager.stdout_file)
+        with self.assertRaises(ServiceOwnershipError):
+            manager._open_log(manager.stdout_file)
+        self.assertEqual(hard_target.read_text(encoding="utf-8"), "keep-hard")
+        # A fresh, owned, singly-linked file is opened (and truncated) normally.
+        manager.stdout_file.unlink()
+        fd = manager._open_log(manager.stdout_file)
+        os.close(fd)
+        self.assertTrue(manager.stdout_file.exists())
+
+    def test_startup_deadline_is_shared_and_enforced(self) -> None:
+        manager = self.manager()
+        expired = time.monotonic() - 1.0
+        with self.assertRaises(ServiceStartError):
+            manager._verify_binary_version(OPENCODE_BIN or "/bin/true", expired)
+        with self.assertRaises(ServiceStartError):
+            manager._assert_server_owned(1, 1234, "pw", expired)
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        with self.assertRaises(ServiceStartError):
+            manager._await_ready(fake_proc, 1234, "pw", expired)
+
+    def test_start_failure_retains_identity_when_child_survives(self) -> None:
+        manager = self.manager()
+        fake_proc = mock.Mock()
+        fake_proc.pid = 999_999
+        fake_proc.poll.return_value = None
+        manager._spawn = mock.Mock(return_value=fake_proc)
+        manager._verify_binary_version = mock.Mock(return_value="2.2.0")
+        manager._await_ready = mock.Mock(side_effect=ServiceStartError("x", "x"))
+        manager._terminate_child = mock.Mock(return_value=False)
+        with self.assertRaises(ServiceStartError):
+            manager.start()
+        # The child could not be proven gone: its identity record is retained.
+        self.assertTrue(manager.pid_record.exists())
+        self.assertTrue(manager.secret_file.exists())
+
+    def test_start_failure_clears_identity_when_child_reaped(self) -> None:
+        manager = self.manager()
+        fake_proc = mock.Mock()
+        fake_proc.pid = 999_999
+        fake_proc.poll.return_value = None
+        manager._spawn = mock.Mock(return_value=fake_proc)
+        manager._verify_binary_version = mock.Mock(return_value="2.2.0")
+        manager._await_ready = mock.Mock(side_effect=ServiceStartError("x", "x"))
+        manager._terminate_child = mock.Mock(return_value=True)
+        with self.assertRaises(ServiceStartError):
+            manager.start()
+        self.assertFalse(manager.pid_record.exists())
+        self.assertFalse(manager.secret_file.exists())
+
+    @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+    def test_start_uses_a_single_deadline_for_all_steps(self) -> None:
+        manager = self.manager()
+        seen: list[float] = []
+        real_verify = manager._verify_binary_version
+        real_ready = manager._await_ready
+        real_owned = manager._assert_server_owned
+
+        def spy_verify(binary, deadline):  # noqa: ANN001
+            seen.append(deadline)
+            return real_verify(binary, deadline)
+
+        def spy_ready(proc, port, password, deadline):  # noqa: ANN001
+            seen.append(deadline)
+            return real_ready(proc, port, password, deadline)
+
+        def spy_owned(pid, port, password, deadline):  # noqa: ANN001
+            seen.append(deadline)
+            return real_owned(pid, port, password, deadline)
+
+        manager._verify_binary_version = spy_verify  # type: ignore[assignment]
+        manager._await_ready = spy_ready  # type: ignore[assignment]
+        manager._assert_server_owned = spy_owned  # type: ignore[assignment]
+        manager.start()
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(len(set(seen)), 1, seen)
+
+    @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+    def test_descriptor_refuses_tampered_document_and_requires_live_instance(self) -> None:
+        manager = self.manager()
+        manager.start()
+        good = manager.descriptor()
+        self.assertEqual(good.root, str(manager.root))
+        self.assertEqual(good.home, str(manager.home))
+        original = manager.descriptor_file.read_bytes()
+        doc = json.loads(original.decode("utf-8"))
+        doc["url"] = "http://evil.example:9999"
+        doc["dirs"]["home"] = "/etc"
+        manager.descriptor_file.write_text(json.dumps(doc), encoding="utf-8")
+        with self.assertRaises(ServiceProcessError):
+            manager.descriptor()
+        manager.descriptor_file.write_bytes(original)
+        self.assertEqual(manager.descriptor().url, good.url)
+        manager.stop()
+        with self.assertRaises(ServiceProcessError):
+            manager.descriptor()
+
+    @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+    def test_connection_refuses_changed_port_file(self) -> None:
+        manager = self.manager()
+        manager.start()
+        self.assertTrue(manager.connection().base_url.startswith("http://127.0.0.1:"))
+        manager.port_file.write_text("1", encoding="utf-8")
+        with self.assertRaises(ServiceProcessError):
+            manager.connection()
+
+    @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+    def test_idempotent_start_refuses_drifted_config_or_dirty_tree(self) -> None:
+        manager = self.manager()
+        manager.start()
+        manager.config_file.write_text("{}", encoding="utf-8")
+        with self.assertRaises(ServiceOwnershipError):
+            manager.start()
+        # Restore our config, then plant a risky entry in the owned tree.
+        manager._write_config()
+        (manager.home / "AGENTS.md").write_text("evil", encoding="utf-8")
+        with self.assertRaises(ServiceOwnershipError):
+            manager.start()
 
 
 if __name__ == "__main__":  # pragma: no cover
