@@ -19,10 +19,16 @@ including future artifact rows — is preserved across upgrades.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from typing import Callable, Mapping
 from urllib.parse import quote
 
 from ..domain.errors import MigrationError, StoreError, UnsupportedSchemaVersion
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 #: SQL statements that must hold for every connection.
 COMMON_PRAGMAS = (
@@ -38,9 +44,11 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 STORE_SCHEMA_VERSION = 3
 
-#: Registry maps project IDs to names and locations and records the single
-#: selected project. It is *not* a cache of project data.
-REGISTRY_SCHEMA_VERSION = 1
+#: Registry maps project IDs to names and locations, records the single
+#: *selected* project, and records durable **execution activation** (which
+#: project, if any, is authorized to execute). It is *not* a cache of project
+#: data.
+REGISTRY_SCHEMA_VERSION = 2
 
 
 def _store_v1(conn: sqlite3.Connection) -> None:
@@ -354,8 +362,49 @@ def _registry_v1(conn: sqlite3.Connection) -> None:
     )
 
 
+def _registry_v2(conn: sqlite3.Connection) -> None:
+    """Add the durable **execution-activation** singleton (C02 §8.5).
+
+    Selection (``active_project``) is a UI/bookkeeping choice and never proof
+    that a project is executing. Execution activation is a *separate* durable
+    record: at most one project may hold it, and it is fenced by an opaque
+    ``activation_token`` so a stale engine can never release it or authorize a
+    local write after a switch (``ARCH-ACTIVE-ENF``; step 03 AC4/AC5).
+
+    ``state`` is one of ``none``/``active``/``draining``.  ``active_project_id``
+    and ``activation_token`` are ``NULL`` **iff** ``state = 'none'`` — enforced
+    at the database, so a half-cleared activation can never persist (C02 §8.5,
+    §11.6).  This migration only *adds* a table and seeds the single ``none``
+    row; existing ``projects``/``active_project`` rows are never rewritten, so
+    mappings and the selected project are preserved across the upgrade.
+    """
+    conn.execute(
+        """
+        CREATE TABLE execution_activation (
+            singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
+            state             TEXT NOT NULL
+                              CHECK (state IN ('none', 'active', 'draining')),
+            active_project_id TEXT REFERENCES projects(project_id),
+            activation_token  TEXT,
+            activated_at_utc  TEXT,
+            updated_at_utc    TEXT NOT NULL,
+            CHECK ((state = 'none') = (active_project_id IS NULL)),
+            CHECK ((state = 'none') = (activation_token IS NULL))
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO execution_activation "
+        "(singleton, state, active_project_id, activation_token, "
+        " activated_at_utc, updated_at_utc) "
+        "VALUES (1, 'none', NULL, NULL, NULL, ?)",
+        (_utc_now(),),
+    )
+
+
 REGISTRY_MIGRATIONS: Mapping[int, Migration] = {
     1: _registry_v1,
+    2: _registry_v2,
 }
 
 
