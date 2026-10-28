@@ -61,12 +61,17 @@ What this module **is not**
 Reuse
 -----
 
-The exact-closure traversal deliberately reuses the tested read-only snapshot
-builder of :class:`~review_article_agent.storage.approvals.ApprovalRepository`
-(so the closure semantics — target entry 0, live-wins over ancestry, transitive
-``version_of`` lineage — match what a later approval repository records) and the
-tested :class:`~review_article_agent.storage.artifacts.ArtifactRepository`
-read API. This module never calls the fixture *write* path.
+The exact-closure traversal deliberately **mirrors** the tested read-only
+snapshot semantics of
+:class:`~review_article_agent.storage.approvals.ApprovalRepository` (target
+entry 0, live-wins over ancestry, transitive ``version_of`` lineage, one shared
+project) using the tested
+:class:`~review_article_agent.storage.artifacts.ArtifactRepository` read API,
+but it is a **bounded iterative traversal of its own**: the entry bound is
+enforced *during* the walk, so a pathological graph cannot be walked without
+limit before the bound is noticed. It reuses the approvals module's role
+vocabulary and ancestry constant so the two closures cannot drift. This module
+never calls the fixture *write* path and never mutates the store.
 
 LLM-annotated test file companion: ``tests/test_gate_snapshots.py``.
 """
@@ -77,6 +82,7 @@ import hashlib
 import json
 import sqlite3
 import types
+from collections import deque
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -94,7 +100,9 @@ from ..domain.records import (
 from ..storage.approvals import (
     SNAPSHOT_ENTRY_ROLES,
     VERSION_LINEAGE_ROLE,
-    ApprovalRepository,
+    FixtureSnapshotEntry,
+    _ANCESTRY_ROLE,
+    _KIND_TO_ROLE,
 )
 from ..storage.artifacts import ArtifactRepository, sha256_digest
 from .owner_auth import (
@@ -144,8 +152,71 @@ VERSION_SLOT_NOT_APPLICABLE = "not_applicable"
 HUMAN_GATE_REVALIDATION_STATUSES = ("unchanged", "stale", "invalid", "denied")
 
 #: Bound on the size of one exact dependency closure, so a pathological graph
-#: cannot be walked without limit. The traversal itself is cycle-safe.
+#: cannot be walked without limit. The traversal itself is cycle-safe and the
+#: bound is enforced **during** the walk (never after a full unbounded walk).
 MAX_GATE_SNAPSHOT_ENTRIES = 10000
+
+
+# --------------------------------------------------------------------------- #
+# Static, curated problem messages
+# --------------------------------------------------------------------------- #
+# These never contain a revision/artifact/rights/gate identifier, caller text, or
+# source/rights bytes: a revalidation outcome (and any typed error built from it)
+# is safe to surface without leaking store or caller content.
+_PROBLEM_CROSS_PROJECT = (
+    "the prepared snapshot belongs to a different project than the store"
+)
+_PROBLEM_SCHEMA_VERSION = (
+    "the prepared snapshot representation version is not supported"
+)
+_PROBLEM_GATE_METADATA = (
+    "the prepared gate identity is malformed or not one of the approved values"
+)
+_PROBLEM_TARGET_REFERENCE = (
+    "the prepared target is not an exact same-project revision reference"
+)
+_PROBLEM_TARGET_INCLUSION = (
+    "the prepared snapshot's first entry is not the exact target revision"
+)
+_PROBLEM_SNAPSHOT_ID = "the prepared snapshot id does not match its digest"
+_PROBLEM_CLOSURE_MISSING = (
+    "a revision in the re-derived dependency closure is missing from the store"
+)
+_PROBLEM_CLOSURE_MISMATCH = (
+    "the prepared entries do not match the re-derived exact dependency closure"
+)
+_PROBLEM_CANONICAL_BYTES = (
+    "the prepared canonical bytes do not match the re-derived structure"
+)
+_PROBLEM_DIGEST = (
+    "the prepared snapshot digest does not match the re-derived structure"
+)
+_PROBLEM_VERSION_SET = (
+    "the prepared version set does not match the re-derived closure"
+)
+_PROBLEM_STORE_DATA = (
+    "a stored revision or rights record is malformed and cannot be verified"
+)
+_PROBLEM_REVISION_MISSING = "a pinned revision is missing from the store"
+_PROBLEM_CONTENT_MISMATCH = (
+    "a pinned revision's stored bytes do not match its recorded digest"
+)
+_PROBLEM_CONTENT_SIZE = (
+    "a pinned revision's stored bytes do not match its recorded byte size"
+)
+_PROBLEM_CONTENT_CORRUPT = "a pinned revision's stored content is malformed"
+_PROBLEM_RIGHTS_MISSING = "a pinned rights record is missing from the store"
+_PROBLEM_RIGHTS_CORRUPT = "a pinned rights record's stored bytes are malformed"
+_PROBLEM_RIGHTS_IDENTITY = (
+    "a pinned rights record does not identify the pinned revision"
+)
+_PROBLEM_RIGHTS_INVALID = (
+    "a pinned rights record is not a valid storage-allowed record"
+)
+_PROBLEM_RIGHTS_SUPERSEDED = (
+    "a pinned rights record has been superseded by a newer revision"
+)
+_PROBLEM_LIVE_DRIFT = "a live input is not the current revision of its artifact"
 
 
 # --------------------------------------------------------------------------- #
@@ -324,7 +395,7 @@ class PreparedGate:
         setter(self, "_digest", digest)
         setter(self, "_canonical_bytes", bytes(canonical_bytes))
         setter(self, "_entries", tuple(entries))
-        setter(self, "_version_set", _deep_copy_plain(version_set))
+        setter(self, "_version_set", _deep_freeze(_deep_copy_plain(version_set)))
         setter(self, "_storage_schema_version", storage_schema_version)
         setter(self, "_snapshot_schema_version", snapshot_schema_version)
 
@@ -393,8 +464,8 @@ class PreparedGate:
 
     @property
     def version_set(self) -> Mapping:
-        """The C02 §6.1 ``VersionSet`` (immutable, human-authored)."""
-        return _deep_freeze(self._version_set)
+        """The C02 §6.1 ``VersionSet`` (immutable, frozen at construction)."""
+        return self._version_set
 
     @property
     def storage_schema_version(self) -> int:
@@ -490,30 +561,47 @@ def _deep_freeze(value: object) -> object:
 
 @contextmanager
 def _read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """Run a block in one consistent read transaction.
+    """Run a block in one consistent read transaction, failing closed.
 
     Opens a deferred ``BEGIN`` **only** when the connection is not already in a
     transaction, so the pinned reads are one coherent snapshot without ever
     taking a write lock or mutating the store.
+
+    This **fails closed**: if the store cannot open the read transaction, the
+    block is never run (a snapshot read against an unpinned connection is
+    refused); if the transaction cannot be committed, the block's result is
+    discarded and a typed :class:`GateSnapshotError` is raised rather than
+    silently trusting a read whose consistency could not be confirmed.
     """
     if conn.in_transaction:
         yield conn
         return
     try:
         conn.execute("BEGIN")
-    except sqlite3.Error:
-        yield conn
-        return
+    except sqlite3.Error as exc:
+        raise GateSnapshotError(
+            "the store could not open a consistent read transaction; refusing to "
+            "prepare or revalidate a gate snapshot from an unpinned read."
+        ) from exc
     try:
         yield conn
-    finally:
+    except BaseException:
         try:
-            conn.execute("COMMIT")
+            conn.execute("ROLLBACK")
         except sqlite3.Error:  # pragma: no cover - best effort
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:  # pragma: no cover - best effort
-                pass
+            pass
+        raise
+    try:
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:  # pragma: no cover - best effort
+            pass
+        raise GateSnapshotError(
+            "the store could not commit the read transaction; refusing to trust "
+            "an unconfirmed gate snapshot read."
+        ) from exc
 
 
 def _project_id(store) -> str:
@@ -521,6 +609,21 @@ def _project_id(store) -> str:
     if not isinstance(project_id, str) or project_id == "":
         raise GateSnapshotError(
             "the store does not expose a project identity; refusing to prepare a "
+            "gate snapshot."
+        )
+    # Bound the project identity with the same owner-action conventions the later
+    # confirmation applies, before any store read.
+    try:
+        validate_identifier(project_id, "project_id")
+    except RecordValidationError as exc:
+        raise GateDefinitionError(
+            "the store's project identity is not a valid identifier; refusing to "
+            "prepare a gate snapshot."
+        ) from exc
+    if len(project_id) > MAX_ACTION_IDENTIFIER_CHARS:
+        raise GateDefinitionError(
+            f"the store's project identity exceeds the "
+            f"{MAX_ACTION_IDENTIFIER_CHARS}-character bound; refusing to prepare a "
             "gate snapshot."
         )
     return project_id
@@ -536,13 +639,23 @@ def _validate_target(target: object, project_id: str) -> dict[str, str]:
             "permission, tool grant, or proposal payload cannot be a gate target."
         )
     try:
-        return validate_ref(dict(target), project_id)
+        ref = validate_ref(dict(target), project_id)
+        # Bound every target identifier with the owner-action convention, so a
+        # pathological artifact/revision id is refused before any store read and
+        # can never pass here only to be rejected later by the owner action.
+        for key in ("project_id", "artifact_id", "revision_id"):
+            if len(ref[key]) > MAX_ACTION_IDENTIFIER_CHARS:
+                raise RecordValidationError(
+                    f"target.{key}: exceeds the "
+                    f"{MAX_ACTION_IDENTIFIER_CHARS}-character bound"
+                )
     except (RecordValidationError, TypeError, ValueError) as exc:
         raise GateTargetError(
-            "the gate target is not an exact, same-project "
+            "the gate target is not an exact, same-project, bounded "
             "{project_id, artifact_id, revision_id} reference; it cannot be "
             "prepared."
         ) from exc
+    return ref
 
 
 def _validate_gate_kind(gate_kind: object) -> str:
@@ -586,6 +699,33 @@ def _validate_rationale(rationale: object) -> str:
             f"the rationale exceeds the {MAX_RATIONALE_CHARS}-character bound; it "
             "cannot be prepared."
         )
+    # Apply the owner-action conventions here, before any expensive store read, so
+    # a rationale that the later out-of-band confirmation could not render safely
+    # (whitespace-only, control/format characters, or an unencodable surrogate) is
+    # refused now instead of failing after the whole closure was captured.
+    if rationale.strip() == "":
+        raise GateDefinitionError(
+            "the rationale must contain visible text, not only whitespace; it "
+            "cannot be prepared."
+        )
+    for ch in rationale:
+        code = ord(ch)
+        if (
+            code < 0x20
+            or code == 0x7F
+            or 0x80 <= code <= 0x9F
+            or 0xD800 <= code <= 0xDFFF
+        ):
+            raise GateDefinitionError(
+                "the rationale contains a control character or an invalid Unicode "
+                "surrogate; it cannot be prepared."
+            )
+    try:
+        rationale.encode("utf-8", "strict")
+    except UnicodeError as exc:  # defensive: a lone surrogate could never render
+        raise GateDefinitionError(
+            "the rationale cannot be encoded for display; it cannot be prepared."
+        ) from exc
     return rationale
 
 
@@ -604,36 +744,108 @@ class _EntryFindings:
     rights_digest: str | None = None
 
 
-def _exact_closure(store, target_ref: dict[str, str]) -> list:
+def _role_for_artifact(artifacts: ArtifactRepository, artifact_id: str) -> str:
+    """Map an artifact kind to a snapshot entry role (approvals vocabulary)."""
+    artifact = artifacts.get_artifact(artifact_id)
+    kind = artifact.kind if artifact is not None else ""
+    return _KIND_TO_ROLE.get(kind, "other")
+
+
+def _exact_closure(store, artifacts: ArtifactRepository, target_ref: dict[str, str]) -> list:
     """Return the target plus its full transitive dependency closure.
 
-    Reuses the tested read-only snapshot builder of
-    :class:`ApprovalRepository` (the fixture *write* path is never called), so
-    the closure semantics match what a later approval repository records. The
-    traversal is cycle-safe; the result is bounded by
-    :data:`MAX_GATE_SNAPSHOT_ENTRIES`.
+    A **bounded iterative traversal** that mirrors the tested read-only snapshot
+    semantics of
+    :class:`~review_article_agent.storage.approvals.ApprovalRepository`
+    (target entry 0, live-wins over ancestry, transitive ``version_of`` lineage,
+    one shared project) without calling its unbounded builder: the
+    :data:`MAX_GATE_SNAPSHOT_ENTRIES` bound is enforced **during** the walk, so a
+    pathological graph is refused as soon as it exceeds the bound rather than
+    after a full unbounded walk. The traversal is cycle-safe.
     """
-    approvals = ApprovalRepository(store)
+    target_key = (target_ref["artifact_id"], target_ref["revision_id"])
+    order: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    live_keys: set[tuple[str, str]] = {target_key}
+    queue: deque[tuple[str, str]] = deque([target_key])
     try:
-        entries = approvals._build_snapshot(dict(target_ref))
+        while queue:
+            key = queue.popleft()
+            if key in seen:
+                continue
+            seen.add(key)
+            order.append(key)
+            if len(order) > MAX_GATE_SNAPSHOT_ENTRIES:
+                raise GateDependencyError(
+                    f"the dependency closure exceeds the "
+                    f"{MAX_GATE_SNAPSHOT_ENTRIES}-entry bound; the gate snapshot "
+                    "cannot be prepared."
+                )
+            artifact_id, revision_id = key
+            if artifacts.get_revision(artifact_id, revision_id) is None:
+                raise GateDependencyError(
+                    "a revision reachable from the target does not exist in this "
+                    "project; the gate snapshot cannot be prepared."
+                )
+            dependencies = sorted(
+                artifacts.list_dependencies(artifact_id, revision_id),
+                key=lambda d: (d.artifact_id, d.revision_id, d.role),
+            )
+            for dep in dependencies:
+                child = (dep.artifact_id, dep.revision_id)
+                if dep.role != _ANCESTRY_ROLE:
+                    # Any live (non-ancestry) edge marks the child as a live
+                    # input, even if it is also named as an ancestor ("live wins").
+                    live_keys.add(child)
+                if child not in seen:
+                    queue.append(child)
+
+        entries: list[FixtureSnapshotEntry] = []
+        for key in order:
+            artifact_id, revision_id = key
+            revision = artifacts.get_revision(artifact_id, revision_id)
+            if revision is None:  # pragma: no cover - validated during the walk
+                raise GateDependencyError(
+                    "a revision reachable from the target does not exist in this "
+                    "project; the gate snapshot cannot be prepared."
+                )
+            if key == target_key:
+                role = "target"
+            elif key in live_keys:
+                role = _role_for_artifact(artifacts, artifact_id)
+            else:
+                role = VERSION_LINEAGE_ROLE
+            entries.append(
+                FixtureSnapshotEntry(
+                    project_id=store.project_id,
+                    artifact_id=artifact_id,
+                    revision_id=revision_id,
+                    content_sha256=revision.content_sha256,
+                    role=role,
+                    rights_id=revision.rights_ref.rights_id,
+                    rights_record_revision=revision.rights_ref.record_revision,
+                    byte_size=revision.byte_size,
+                )
+            )
     except RecordValidationError as exc:
+        # A malformed stored reference (invalid id, missing revision) fails closed
+        # as a typed dependency error, never a raw validation error.
         raise GateDependencyError(
-            "a revision reachable from the target does not exist in this project; "
-            "the gate snapshot cannot be prepared."
+            "a revision reachable from the target does not exist or is malformed "
+            "in this project; the gate snapshot cannot be prepared."
         ) from exc
-    if len(entries) > MAX_GATE_SNAPSHOT_ENTRIES:
-        raise GateDependencyError(
-            f"the dependency closure exceeds the {MAX_GATE_SNAPSHOT_ENTRIES}-entry "
-            "bound; the gate snapshot cannot be prepared."
-        )
     return entries
 
 
-def _check_rights_pin(store, pin, findings: _EntryFindings, label: str) -> str | None:
+def _check_rights_pin(store, pin, findings: _EntryFindings) -> str | None:
     """Structurally verify one entry's pinned canonical rights record.
 
     Returns the pinned rights record's canonical digest, or ``None`` when the
-    record could not be read/decoded. Appends every problem to ``findings``.
+    record could not be read/decoded. Appends a **static, curated** problem to
+    ``findings`` (never the rights id, revision id, or any stored bytes). A
+    malformed stored value — a non-bytes canonical column, undecodable or
+    pathologically deep JSON, or a record the validator cannot process — is
+    reported as a problem rather than raising a raw ``TypeError``/``RecursionError``.
     """
     row = store.connection.execute(
         "SELECT * FROM rights_record WHERE project_id = ? AND rights_id = ? "
@@ -641,38 +853,35 @@ def _check_rights_pin(store, pin, findings: _EntryFindings, label: str) -> str |
         (pin.project_id, pin.rights_id, pin.rights_record_revision),
     ).fetchone()
     if row is None:
-        findings.rights.append(
-            f"pinned rights record {pin.rights_id!r}@"
-            f"{pin.rights_record_revision} is missing for {label!r}"
-        )
+        findings.rights.append(_PROBLEM_RIGHTS_MISSING)
         return None
-    canonical = bytes(row["canonical"])
-    digest = sha256_digest(canonical)
+    raw_canonical = row["canonical"]
+    if not isinstance(raw_canonical, (bytes, bytearray, memoryview)):
+        findings.rights.append(_PROBLEM_RIGHTS_CORRUPT)
+        return None
+    canonical = bytes(raw_canonical)
+    try:
+        digest = sha256_digest(canonical)
+    except TypeError:  # pragma: no cover - defensive; bytes are always hashable
+        findings.rights.append(_PROBLEM_RIGHTS_CORRUPT)
+        return None
     if digest != row["content_sha256"]:
-        findings.rights.append(
-            f"pinned rights record bytes are corrupt for {label!r}"
-        )
+        findings.rights.append(_PROBLEM_RIGHTS_CORRUPT)
         return None
     try:
         record = json.loads(canonical.decode("utf-8"))
-    except (ValueError, UnicodeError):
-        findings.rights.append(
-            f"pinned rights record is not decodable JSON for {label!r}"
-        )
+    except (ValueError, UnicodeError, RecursionError, TypeError):
+        findings.rights.append(_PROBLEM_RIGHTS_CORRUPT)
         return None
     if not isinstance(record, dict):
-        findings.rights.append(
-            f"pinned rights record is not an object for {label!r}"
-        )
+        findings.rights.append(_PROBLEM_RIGHTS_CORRUPT)
         return None
     if (
         record.get("project_id") != pin.project_id
         or record.get("rights_id") != pin.rights_id
         or record.get("record_revision") != pin.rights_record_revision
     ):
-        findings.rights.append(
-            f"pinned rights record identity mismatch for {label!r}"
-        )
+        findings.rights.append(_PROBLEM_RIGHTS_IDENTITY)
     subject = record.get("subject")
     if not (
         isinstance(subject, dict)
@@ -681,28 +890,22 @@ def _check_rights_pin(store, pin, findings: _EntryFindings, label: str) -> str |
         and subject.get("artifact_id") == pin.artifact_id
         and subject.get("revision_id") == pin.revision_id
     ):
-        findings.rights.append(
-            f"pinned rights record subject does not bind the pinned revision for "
-            f"{label!r}"
-        )
+        findings.rights.append(_PROBLEM_RIGHTS_IDENTITY)
     elif (
         row["subject_kind"],
         row["subject_project_id"],
         row["subject_artifact_id"],
         row["subject_revision_id"],
     ) != ("source_revision", pin.project_id, pin.artifact_id, pin.revision_id):
-        findings.rights.append(
-            f"pinned rights record row subject columns are inconsistent for "
-            f"{label!r}"
-        )
+        findings.rights.append(_PROBLEM_RIGHTS_IDENTITY)
     try:
         validated = validate_rights_record(record, pin.project_id)
         require_storage_allowed(validated)
     except RecordValidationError:
-        findings.rights.append(
-            f"pinned rights record is not a valid storage-allowed record for "
-            f"{label!r}"
-        )
+        findings.rights.append(_PROBLEM_RIGHTS_INVALID)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        # Deep/odd stored data must be a typed problem, never a raw crash.
+        findings.rights.append(_PROBLEM_RIGHTS_CORRUPT)
     newest = store.connection.execute(
         "SELECT MAX(record_revision) AS newest FROM rights_record "
         "WHERE project_id = ? AND rights_id = ?",
@@ -713,10 +916,7 @@ def _check_rights_pin(store, pin, findings: _EntryFindings, label: str) -> str |
         and newest["newest"] is not None
         and pin.rights_record_revision < newest["newest"]
     ):
-        findings.superseded_rights.append(
-            f"pinned rights record {pin.rights_id!r} has a newer revision "
-            f"{newest['newest']} for {label!r}"
-        )
+        findings.superseded_rights.append(_PROBLEM_RIGHTS_SUPERSEDED)
     return digest
 
 
@@ -726,46 +926,57 @@ def _check_entry(store, artifacts: ArtifactRepository, pin) -> _EntryFindings:
     ``pin`` is any object exposing ``project_id``/``artifact_id``/``revision_id``/
     ``role``/``content_sha256``/``byte_size``/``rights_id``/
     ``rights_record_revision`` (both the fixture builder's entries and
-    :class:`PreparedSnapshotEntry` qualify).
+    :class:`PreparedSnapshotEntry` qualify). Every problem is a **static,
+    curated** message that never contains an identifier or stored bytes.
     """
     findings = _EntryFindings()
-    label = f"{pin.artifact_id!r}/{pin.revision_id!r}"
-    revision = artifacts.get_revision(pin.artifact_id, pin.revision_id)
+    try:
+        revision = artifacts.get_revision(pin.artifact_id, pin.revision_id)
+    except (RecordValidationError, TypeError, ValueError):
+        findings.missing.append(_PROBLEM_REVISION_MISSING)
+        return findings
     if revision is None:
-        findings.missing.append(f"pinned revision {label} is missing")
+        findings.missing.append(_PROBLEM_REVISION_MISSING)
         return findings
     if (
         revision.rights_ref.project_id,
         revision.rights_ref.rights_id,
         revision.rights_ref.record_revision,
     ) != (pin.project_id, pin.rights_id, pin.rights_record_revision):
-        findings.rights.append(
-            f"pinned rights key does not match the revision's rights pin for {label}"
-        )
+        findings.rights.append(_PROBLEM_RIGHTS_IDENTITY)
     try:
         content = artifacts.read_content(pin.artifact_id, pin.revision_id)
     except RecordValidationError:
-        findings.missing.append(f"pinned revision {label} content is missing")
+        findings.missing.append(_PROBLEM_REVISION_MISSING)
         return findings
+    except (TypeError, ValueError):
+        findings.content.append(_PROBLEM_CONTENT_CORRUPT)
+        return findings
+    if not isinstance(content, (bytes, bytearray, memoryview)):
+        findings.content.append(_PROBLEM_CONTENT_CORRUPT)
+        return findings
+    content = bytes(content)
     if revision.content_sha256 != pin.content_sha256:
-        findings.content.append(f"stored content digest changed for {label}")
+        findings.content.append(_PROBLEM_CONTENT_MISMATCH)
     if revision.byte_size != pin.byte_size or len(content) != pin.byte_size:
-        findings.content.append(f"byte size does not match the pin for {label}")
-    if sha256_digest(content) != pin.content_sha256:
-        findings.content.append(
-            f"recomputed content digest does not match the pin for {label}"
-        )
-    findings.rights_digest = _check_rights_pin(store, pin, findings, label)
+        findings.content.append(_PROBLEM_CONTENT_SIZE)
+    try:
+        recomputed = sha256_digest(content)
+    except TypeError:  # pragma: no cover - defensive
+        findings.content.append(_PROBLEM_CONTENT_CORRUPT)
+        recomputed = None
+    if recomputed is not None and recomputed != pin.content_sha256:
+        findings.content.append(_PROBLEM_CONTENT_MISMATCH)
+    findings.rights_digest = _check_rights_pin(store, pin, findings)
     if pin.role != VERSION_LINEAGE_ROLE:
         # A live input (and the target) must be its artifact's current head; a
         # historical ``version_of`` ancestor is deliberately not head-compared.
-        current = artifacts.current_revision(pin.artifact_id)
-        current_id = None if current is None else current.revision_id
+        try:
+            current = artifacts.current_revision(pin.artifact_id)
+        except (RecordValidationError, TypeError, ValueError):
+            current = None
         if current is None or current.revision_id != pin.revision_id:
-            findings.drifted_head.append(
-                f"current revision of {pin.artifact_id!r} is {current_id!r}, not "
-                f"the pinned {pin.revision_id!r}"
-            )
+            findings.drifted_head.append(_PROBLEM_LIVE_DRIFT)
     return findings
 
 
@@ -910,7 +1121,7 @@ def prepare_gate_snapshot(
     artifacts = ArtifactRepository(store)
     storage_schema_version = store.schema_version
     with _read_transaction(store.connection):
-        closure = _exact_closure(store, ref)
+        closure = _exact_closure(store, artifacts, ref)
         entries: list[PreparedSnapshotEntry] = []
         for pin in closure:
             if pin.role not in SNAPSHOT_ENTRY_ROLES:
@@ -967,23 +1178,53 @@ def prepare_gate_snapshot(
     )
 
 
+def _entry_signature(entries) -> tuple:
+    """Return a comparable (identity, role, digest) signature of snapshot entries.
+
+    Defensive: a forged/hand-built entry that lacks a field contributes ``None``
+    rather than raising, so a malformed prepared object is reported as a mismatch
+    instead of crashing revalidation.
+    """
+    signature = []
+    for entry in entries:
+        signature.append(
+            (
+                getattr(entry, "project_id", None),
+                getattr(entry, "artifact_id", None),
+                getattr(entry, "revision_id", None),
+                getattr(entry, "role", None),
+                getattr(entry, "content_sha256", None),
+                getattr(entry, "byte_size", None),
+                getattr(entry, "rights_id", None),
+                getattr(entry, "rights_record_revision", None),
+                getattr(entry, "rights_digest", None),
+            )
+        )
+    return tuple(signature)
+
+
 def revalidate_prepared(store, prepared: object) -> GateRevalidation:
     """Re-check a prepared snapshot against the store, read-only and atomically.
 
-    Reconstructs the exact canonical structure from the prepared pins and
-    re-checks every pin in one read transaction:
+    This does **not** trust the prepared object: it **re-derives the exact
+    dependency closure from the store**, rebuilds the canonical structure from
+    the re-derived closure, and compares the prepared entries (set, order, and
+    roles), the prepared target inclusion, the representation/schema version,
+    the gate metadata, the canonical bytes, the snapshot digest, the snapshot id,
+    and the version set. It never relies on the mint sentinel as validation.
 
     * a current target/dependency revision that moved, or a pinned rights record
       a newer ``record_revision`` has superseded ⇒ ``stale``;
-    * a missing revision, a digest/byte-size/rights-bytes corruption, or a
-      rights identity/subject mismatch, or a prepared digest that no longer
-      matches its reconstructed structure ⇒ ``invalid``;
+    * a missing revision, a digest/byte-size/rights-bytes corruption, a rights
+      identity/subject mismatch, a malformed stored value, or any disagreement
+      between the prepared snapshot and the re-derived structure/closure ⇒
+      ``invalid``;
     * a prepared snapshot and store that disagree on project identity ⇒
       ``denied``.
 
-    This never trusts the object's fields beyond re-deriving them: a forged
-    :class:`PreparedGate` (or an object of another type) cannot bypass
-    revalidation. Nothing is written and nothing is authorized. Call
+    Every problem is a **static, curated** message: no revision/artifact/rights
+    identifier, caller text, or stored byte ever appears in the outcome. Nothing
+    is written and nothing is authorized. Call
     :meth:`GateRevalidation.raise_for_status` (or check :attr:`~.ok`) before an
     owner confirmation or an approval record is allowed to proceed.
     """
@@ -997,66 +1238,146 @@ def revalidate_prepared(store, prepared: object) -> GateRevalidation:
     artifacts = ArtifactRepository(store)
 
     with _read_transaction(store.connection):
+        prepared_entries = prepared.entries
+        target = prepared.target
+
         denied: list[str] = []
-        if prepared.project_id != project_id or prepared.target.get(
-            "project_id"
-        ) != project_id:
-            denied.append(
-                "the prepared snapshot belongs to a different project than the "
-                "store"
-            )
-        for pin in prepared.entries:
-            if pin.project_id != project_id:
-                denied.append(
-                    "a prepared snapshot entry belongs to a different project "
-                    "than the store"
-                )
+        if prepared.project_id != project_id:
+            denied.append(_PROBLEM_CROSS_PROJECT)
+        if not isinstance(target, Mapping) or target.get("project_id") != project_id:
+            denied.append(_PROBLEM_CROSS_PROJECT)
+        if not isinstance(prepared_entries, (tuple, list)):
+            denied.append(_PROBLEM_CROSS_PROJECT)
+        else:
+            for pin in prepared_entries:
+                if getattr(pin, "project_id", None) != project_id:
+                    denied.append(_PROBLEM_CROSS_PROJECT)
         if denied:
             return GateRevalidation(
                 project_id=project_id,
-                gate_kind=prepared.gate_kind,
-                gate_id=prepared.gate_id,
+                gate_kind=prepared.gate_kind if isinstance(prepared.gate_kind, str) else "",
+                gate_id=prepared.gate_id if isinstance(prepared.gate_id, str) else "",
                 status="denied",
                 prepared_digest=prepared.digest,
                 recomputed_digest="",
-                problems=tuple(denied),
+                problems=tuple(dict.fromkeys(denied)),
             )
-
-        recomputed_versions = _build_version_set(prepared.entries)
-        structure = _build_structure(
-            project_id=prepared.project_id,
-            target=dict(prepared.target),
-            gate_kind=prepared.gate_kind,
-            gate_id=prepared.gate_id,
-            decision=prepared.decision,
-            rationale=prepared.rationale,
-            storage_schema_version=prepared.storage_schema_version,
-            snapshot_schema_version=prepared.snapshot_schema_version,
-            version_set=recomputed_versions,
-            entries=prepared.entries,
-        )
-        recomputed = hashlib.sha256(canonical_json(structure)).hexdigest()
 
         invalid: list[str] = []
         stale: list[str] = []
-        if recomputed != prepared.digest:
-            invalid.append(
-                "the prepared snapshot digest does not match its reconstructed "
-                "structure"
-            )
-        if canonical_json(recomputed_versions) != canonical_json(
-            prepared._version_set
+        recomputed = ""
+
+        # -- representation / schema --------------------------------------- #
+        if prepared.snapshot_schema_version != HUMAN_GATE_SNAPSHOT_SCHEMA_VERSION:
+            invalid.append(_PROBLEM_SCHEMA_VERSION)
+
+        # -- gate metadata (owner-action conventions) ---------------------- #
+        metadata_ok = True
+        try:
+            _validate_gate_kind(prepared.gate_kind)
+            _validate_decision(prepared.decision)
+            _validate_gate_id(prepared.gate_id)
+            _validate_rationale(prepared.rationale)
+        except GateDefinitionError:
+            metadata_ok = False
+            invalid.append(_PROBLEM_GATE_METADATA)
+
+        # -- target reference ---------------------------------------------- #
+        validated_target: dict[str, str] | None = None
+        try:
+            validated_target = _validate_target(dict(target), project_id)
+        except (GateTargetError, TypeError, ValueError):
+            invalid.append(_PROBLEM_TARGET_REFERENCE)
+
+        # -- snapshot id binds the digest ---------------------------------- #
+        if not (
+            isinstance(prepared.snapshot_id, str)
+            and isinstance(prepared.digest, str)
+            and prepared.snapshot_id == "psnap_" + prepared.digest
         ):
-            invalid.append(
-                "the prepared version set does not match its pinned entries"
-            )
-        for pin in prepared.entries:
-            findings = _check_entry(store, artifacts, pin)
-            invalid.extend(findings.missing)
-            invalid.extend(findings.content)
-            invalid.extend(findings.rights)
-            stale.extend(findings.superseded_rights)
-            stale.extend(findings.drifted_head)
+            invalid.append(_PROBLEM_SNAPSHOT_ID)
+
+        # -- re-derive the exact closure from the store -------------------- #
+        derived_entries: list[PreparedSnapshotEntry] | None = None
+        if validated_target is not None:
+            try:
+                derived_pins = _exact_closure(store, artifacts, validated_target)
+            except GateDependencyError:
+                invalid.append(_PROBLEM_CLOSURE_MISSING)
+                derived_pins = None
+            except (TypeError, ValueError, UnicodeError, RecursionError):
+                invalid.append(_PROBLEM_STORE_DATA)
+                derived_pins = None
+            if derived_pins is not None:
+                derived_entries = []
+                for pin in derived_pins:
+                    try:
+                        findings = _check_entry(store, artifacts, pin)
+                    except (TypeError, ValueError, UnicodeError, RecursionError):
+                        invalid.append(_PROBLEM_STORE_DATA)
+                        continue
+                    invalid.extend(findings.missing)
+                    invalid.extend(findings.content)
+                    invalid.extend(findings.rights)
+                    stale.extend(findings.superseded_rights)
+                    stale.extend(findings.drifted_head)
+                    derived_entries.append(
+                        PreparedSnapshotEntry(
+                            project_id=pin.project_id,
+                            artifact_id=pin.artifact_id,
+                            revision_id=pin.revision_id,
+                            role=pin.role,
+                            content_sha256=pin.content_sha256,
+                            byte_size=pin.byte_size,
+                            rights_id=pin.rights_id,
+                            rights_record_revision=pin.rights_record_revision,
+                            rights_digest=findings.rights_digest or "",
+                        )
+                    )
+
+        if derived_entries is not None:
+            # Exact closure: same set, order, roles, and rights pins.
+            if _entry_signature(derived_entries) != _entry_signature(prepared_entries):
+                invalid.append(_PROBLEM_CLOSURE_MISMATCH)
+            # Exact target inclusion: the target is entry 0 with role ``target``.
+            if (
+                not prepared_entries
+                or getattr(prepared_entries[0], "role", None) != "target"
+            ):
+                invalid.append(_PROBLEM_TARGET_INCLUSION)
+
+            # Canonical structure, bytes, digest, and version set.
+            if metadata_ok:
+                try:
+                    recomputed_versions = _build_version_set(derived_entries)
+                    structure = _build_structure(
+                        project_id=prepared.project_id,
+                        target=validated_target,
+                        gate_kind=prepared.gate_kind,
+                        gate_id=prepared.gate_id,
+                        decision=prepared.decision,
+                        rationale=prepared.rationale,
+                        storage_schema_version=prepared.storage_schema_version,
+                        snapshot_schema_version=prepared.snapshot_schema_version,
+                        version_set=recomputed_versions,
+                        entries=derived_entries,
+                    )
+                    recomputed_bytes = canonical_json(structure)
+                except (RecordValidationError, TypeError, ValueError, UnicodeError, RecursionError):
+                    invalid.append(_PROBLEM_STORE_DATA)
+                else:
+                    recomputed = hashlib.sha256(recomputed_bytes).hexdigest()
+                    if recomputed_bytes != prepared.canonical_bytes:
+                        invalid.append(_PROBLEM_CANONICAL_BYTES)
+                    if recomputed != prepared.digest:
+                        invalid.append(_PROBLEM_DIGEST)
+                    try:
+                        if canonical_json(
+                            _deep_copy_plain(prepared.version_set)
+                        ) != canonical_json(recomputed_versions):
+                            invalid.append(_PROBLEM_VERSION_SET)
+                    except (RecordValidationError, TypeError, ValueError, UnicodeError, RecursionError):
+                        invalid.append(_PROBLEM_STORE_DATA)
 
         if invalid:
             status = "invalid"
@@ -1067,10 +1388,10 @@ def revalidate_prepared(store, prepared: object) -> GateRevalidation:
 
         return GateRevalidation(
             project_id=prepared.project_id,
-            gate_kind=prepared.gate_kind,
-            gate_id=prepared.gate_id,
+            gate_kind=prepared.gate_kind if isinstance(prepared.gate_kind, str) else "",
+            gate_id=prepared.gate_id if isinstance(prepared.gate_id, str) else "",
             status=status,
             prepared_digest=prepared.digest,
             recomputed_digest=recomputed,
-            problems=tuple(invalid + stale),
+            problems=tuple(dict.fromkeys(invalid + stale)),
         )

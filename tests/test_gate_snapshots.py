@@ -30,9 +30,12 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import sqlite3
 import sys
 import tempfile
+import types
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from unittest import mock
 
@@ -57,10 +60,12 @@ from review_article_agent.runtime.gates import (  # noqa: E402
     prepare_gate_snapshot,
     revalidate_prepared,
 )
-from review_article_agent.runtime.owner_auth import action_digest  # noqa: E402
+from review_article_agent.runtime.owner_auth import (  # noqa: E402
+    MAX_ACTION_IDENTIFIER_CHARS,
+    action_digest,
+)
 from review_article_agent.storage import ArtifactRepository, ProjectStore  # noqa: E402
 from review_article_agent.storage import paths  # noqa: E402
-from review_article_agent.storage.approvals import ApprovalRepository  # noqa: E402
 from review_article_agent.storage.artifacts import DependencyRef, sha256_digest  # noqa: E402
 
 _OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
@@ -265,6 +270,53 @@ class GateSnapshotTestBase(unittest.TestCase):
                 "2026-10-28T00:00:00+00:00",
             ),
         )
+
+
+# --------------------------------------------------------------------------- #
+# Read transaction fail-closed behavior
+# --------------------------------------------------------------------------- #
+class _FakeConn:
+    """A minimal sqlite connection double for the read-transaction context."""
+
+    def __init__(self, *, fail_on: str | None = None) -> None:
+        self.in_transaction = False
+        self.calls: list[str] = []
+        self._fail_on = fail_on
+
+    def execute(self, sql: str, *args: object):
+        self.calls.append(sql)
+        if self._fail_on is not None and self._fail_on in sql:
+            raise sqlite3.OperationalError("synthetic transaction failure")
+        return None
+
+
+class ReadTransactionTest(unittest.TestCase):
+    def test_fails_closed_when_begin_fails(self) -> None:
+        conn = _FakeConn(fail_on="BEGIN")
+        reached: list[bool] = []
+        with self.assertRaises(GateSnapshotError):
+            with gates._read_transaction(conn):  # noqa: SLF001
+                reached.append(True)
+        # The body never runs against an unpinned connection.
+        self.assertEqual(reached, [])
+        self.assertIn("BEGIN", conn.calls)
+
+    def test_fails_closed_when_commit_fails(self) -> None:
+        conn = _FakeConn(fail_on="COMMIT")
+        reached: list[bool] = []
+        with self.assertRaises(GateSnapshotError):
+            with gates._read_transaction(conn):  # noqa: SLF001
+                reached.append(True)
+        # The body ran, but the unconfirmed result is discarded (never swallowed).
+        self.assertEqual(reached, [True])
+        self.assertIn("COMMIT", conn.calls)
+
+    def test_reuses_an_open_transaction_without_nesting(self) -> None:
+        conn = _FakeConn()
+        conn.in_transaction = True
+        with gates._read_transaction(conn) as yielded:  # noqa: SLF001
+            self.assertIs(yielded, conn)
+        self.assertEqual(conn.calls, [])
 
 
 # --------------------------------------------------------------------------- #
@@ -674,19 +726,74 @@ class PrepareTest(GateSnapshotTestBase):
                 prepared = prepare_gate_snapshot(store, target, rationale="r", **_GATE_KW)
             self.assertEqual([e.revision_id for e in prepared.entries], ["rev-1"])
 
-    def test_closure_bound_is_enforced(self) -> None:
+    def test_closure_bound_is_enforced_during_bounded_traversal(self) -> None:
         with self.new_store() as store:
-            repo = ArtifactRepository(store)
-            repo.create_artifact("a-doc", kind="document")
-            self._import(repo, "a-doc", b"v1", "rev-1")
-            oversized = [object()] * (gates.MAX_GATE_SNAPSHOT_ENTRIES + 1)
-            with mock.patch.object(
-                ApprovalRepository, "_build_snapshot", return_value=oversized
-            ):
-                with self.assertRaises(GateDependencyError):
+            self._chain(store)
+            target = self._target(store, "a-rep", "rev-rep")
+            real_list = ArtifactRepository.list_dependencies
+            calls: list[tuple[str, str]] = []
+
+            def _spy(self, artifact_id, revision_id):
+                calls.append((artifact_id, revision_id))
+                return real_list(self, artifact_id, revision_id)
+
+            # With a 2-entry bound, the walk must stop as soon as the bound is
+            # exceeded instead of walking the whole (here 3-node) graph first.
+            with mock.patch.object(ArtifactRepository, "list_dependencies", _spy):
+                with mock.patch.object(gates, "MAX_GATE_SNAPSHOT_ENTRIES", 2):
+                    with self.assertRaises(GateDependencyError):
+                        prepare_gate_snapshot(store, target, rationale="r", **_GATE_KW)
+            self.assertLessEqual(len(calls), 2)
+
+    def test_rationale_owner_action_conventions_enforced_before_reads(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            target = self._target(store, "a-rep", "rev-rep")
+            for bad_rationale in ("   ", "\t\n", "bad\x00reason", "bad\ud800reason", "\x7f"):
+                with self.assertRaises(GateDefinitionError):
                     prepare_gate_snapshot(
-                        store, self._target(store, "a-doc", "rev-1"), rationale="r", **_GATE_KW
+                        store, target, rationale=bad_rationale, **_GATE_KW
                     )
+
+    def test_target_identifier_length_bound_rejected(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            long_id = "a" * (MAX_ACTION_IDENTIFIER_CHARS + 1)
+            with self.assertRaises(GateTargetError):
+                prepare_gate_snapshot(
+                    store,
+                    self._target(store, long_id, "rev-rep"),
+                    rationale="r",
+                    **_GATE_KW,
+                )
+
+    def test_project_identifier_length_bound_rejected_before_reads(self) -> None:
+        long_project_id = "prj_" + "a" * (MAX_ACTION_IDENTIFIER_CHARS + 1)
+        fake_store = types.SimpleNamespace(project_id=long_project_id)
+        with self.assertRaises(GateDefinitionError):
+            prepare_gate_snapshot(
+                fake_store,
+                {
+                    "project_id": long_project_id,
+                    "artifact_id": "a-rep",
+                    "revision_id": "rev-rep",
+                },
+                rationale="r",
+                **_GATE_KW,
+            )
+
+    def test_version_set_is_frozen_at_construction(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = prepare_gate_snapshot(
+                store, self._target(store, "a-rep", "rev-rep"), rationale="r", **_GATE_KW
+            )
+            self.assertIsInstance(prepared.version_set, Mapping)
+            self.assertNotIsInstance(prepared._version_set, dict)  # noqa: SLF001
+            with self.assertRaises(TypeError):
+                prepared._version_set["context_kind"] = "mixed"  # noqa: SLF001
+            with self.assertRaises(TypeError):
+                prepared._version_set["model"]["state"] = "x"  # noqa: SLF001
 
     def test_prepare_writes_nothing(self) -> None:
         with self.new_store() as store:
@@ -759,6 +866,30 @@ class RevalidationTest(GateSnapshotTestBase):
             store, self._target(store, "a-rep", "rev-rep"), rationale="r", **_GATE_KW
         )
 
+    def _forge(self, prepared: PreparedGate, **overrides) -> PreparedGate:
+        """Mint a PreparedGate with the private sentinel but altered fields.
+
+        Reaching the private sentinel is *not* validation: revalidation must
+        re-derive everything from the store and reject a tampered object.
+        """
+        kwargs = dict(
+            project_id=prepared.project_id,
+            target=dict(prepared.target),
+            gate_kind=prepared.gate_kind,
+            gate_id=prepared.gate_id,
+            decision=prepared.decision,
+            rationale=prepared.rationale,
+            snapshot_id=prepared.snapshot_id,
+            digest=prepared.digest,
+            canonical_bytes=prepared.canonical_bytes,
+            entries=prepared.entries,
+            version_set=dict(prepared.version_set),
+            storage_schema_version=prepared.storage_schema_version,
+            snapshot_schema_version=prepared.snapshot_schema_version,
+        )
+        kwargs.update(overrides)
+        return PreparedGate._mint(**kwargs)  # noqa: SLF001
+
     def test_revalidate_unchanged_returns_same_digest(self) -> None:
         with self.new_store() as store:
             self._chain(store)
@@ -825,8 +956,184 @@ class RevalidationTest(GateSnapshotTestBase):
             result = revalidate_prepared(store_b, prepared)
             self.assertEqual(result.status, "denied")
             self.assertFalse(result.ok)
+            self.assertIn(gates._PROBLEM_CROSS_PROJECT, result.problems)  # noqa: SLF001
             with self.assertRaises(PreparedGateDeniedError):
                 result.raise_for_status()
+
+    def test_revalidate_rederives_closure_and_rejects_a_dropped_pin(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            forged = self._forge(prepared, entries=prepared.entries[:-1])
+            result = revalidate_prepared(store, forged)
+            self.assertEqual(result.status, "invalid")
+            self.assertFalse(result.ok)
+            self.assertIn(
+                gates._PROBLEM_CLOSURE_MISMATCH, result.problems  # noqa: SLF001
+            )
+
+    def test_revalidate_rejects_a_relabelled_role(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            relabelled = dataclasses.replace(prepared.entries[1], role="target")
+            forged = self._forge(
+                prepared,
+                entries=(prepared.entries[0], relabelled, *prepared.entries[2:]),
+            )
+            result = revalidate_prepared(store, forged)
+            self.assertEqual(result.status, "invalid")
+            self.assertIn(
+                gates._PROBLEM_CLOSURE_MISMATCH, result.problems  # noqa: SLF001
+            )
+
+    def test_revalidate_detects_an_added_dependency_edge(self) -> None:
+        with self.new_store() as store:
+            repo = self._chain(store)
+            prepared = self._prepared_report(store)
+            pid = store.project_id
+            repo.create_artifact("a-extra", kind="document")
+            self._import(repo, "a-extra", b"extra-bytes", "rev-extra")
+            store.connection.execute(
+                "INSERT INTO dependency "
+                "(project_id, from_artifact_id, from_revision_id, dependency_id, role, "
+                " to_project_id, to_artifact_id, to_revision_id, created_at_utc) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pid,
+                    "a-rep",
+                    "rev-rep",
+                    "dep_extra",
+                    "derived_from",
+                    pid,
+                    "a-extra",
+                    "rev-extra",
+                    "2026-10-28T00:00:00+00:00",
+                ),
+            )
+            result = revalidate_prepared(store, prepared)
+            self.assertEqual(result.status, "invalid")
+            self.assertIn(
+                gates._PROBLEM_CLOSURE_MISMATCH, result.problems  # noqa: SLF001
+            )
+
+    def test_revalidate_unsupported_snapshot_schema_is_invalid(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            forged = self._forge(
+                prepared,
+                snapshot_schema_version=prepared.snapshot_schema_version + 1,
+            )
+            result = revalidate_prepared(store, forged)
+            self.assertEqual(result.status, "invalid")
+            self.assertIn(gates._PROBLEM_SCHEMA_VERSION, result.problems)  # noqa: SLF001
+
+    def test_revalidation_problems_are_static_and_curated(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            self._corrupt_revision(store, "a-base", "rev-base", content=b"tampered")
+            result = revalidate_prepared(store, prepared)
+            self.assertEqual(result.status, "invalid")
+            self.assertTrue(result.problems)
+            for problem in result.problems:
+                for canary in ("a-base", "rev-base", "RIGHTS-", "a-rep", "rev-rep"):
+                    self.assertNotIn(canary, problem)
+
+    def test_revalidate_malformed_stored_rights_is_invalid(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            self._drop_update_trigger(store, "rights_record")
+            bad = b"{"
+            store.connection.execute(
+                "UPDATE rights_record SET canonical = ?, content_sha256 = ? "
+                "WHERE project_id = ? AND rights_id = ? AND record_revision = 1",
+                (bad, sha256_digest(bad), store.project_id, "RIGHTS-rev-base"),
+            )
+            result = revalidate_prepared(store, prepared)
+            self.assertEqual(result.status, "invalid")
+            for problem in result.problems:
+                self.assertNotIn("RIGHTS-rev-base", problem)
+
+    def test_revalidate_non_bytes_stored_rights_is_invalid(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            self._drop_update_trigger(store, "rights_record")
+            store.connection.execute(
+                "UPDATE rights_record SET canonical = ?, content_sha256 = ? "
+                "WHERE project_id = ? AND rights_id = ? AND record_revision = 1",
+                (12345, sha256_digest(b"x"), store.project_id, "RIGHTS-rev-base"),
+            )
+            result = revalidate_prepared(store, prepared)
+            self.assertEqual(result.status, "invalid")
+
+    def test_revalidate_deeply_nested_stored_rights_is_invalid(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            self._drop_update_trigger(store, "rights_record")
+            deep = b"[" * 5000 + b"]" * 5000
+            store.connection.execute(
+                "UPDATE rights_record SET canonical = ?, content_sha256 = ? "
+                "WHERE project_id = ? AND rights_id = ? AND record_revision = 1",
+                (deep, sha256_digest(deep), store.project_id, "RIGHTS-rev-base"),
+            )
+            result = revalidate_prepared(store, prepared)
+            self.assertEqual(result.status, "invalid")
+
+    def test_revalidate_head_checks_live_entries_but_not_version_lineage(self) -> None:
+        with self.new_store() as store:
+            repo = ArtifactRepository(store)
+            pid = store.project_id
+            repo.create_artifact("a-chain", kind="report")
+            self._import(repo, "a-chain", b"v1", "rev-1")
+            self._import(
+                repo,
+                "a-chain",
+                b"v2",
+                "rev-2",
+                parent_revision_id="rev-1",
+                dependencies=[
+                    {
+                        "project_id": pid,
+                        "artifact_id": "a-chain",
+                        "revision_id": "rev-1",
+                        "role": "version_of",
+                    }
+                ],
+            )
+            repo.create_artifact("a-live", kind="document")
+            self._import(repo, "a-live", b"live1", "rev-live1")
+            repo.create_artifact("a-rep2", kind="report")
+            self._import(
+                repo,
+                "a-rep2",
+                b"rep",
+                "rev-rep2",
+                dependencies=[
+                    self._target(store, "a-chain", "rev-2"),
+                    self._target(store, "a-live", "rev-live1"),
+                ],
+            )
+            prepared = prepare_gate_snapshot(
+                store, self._target(store, "a-rep2", "rev-rep2"), rationale="r", **_GATE_KW
+            )
+            roles = {(e.artifact_id, e.revision_id): e.role for e in prepared.entries}
+            self.assertEqual(roles[("a-chain", "rev-2")], "summary")
+            self.assertEqual(roles[("a-chain", "rev-1")], "version_lineage")
+            self.assertEqual(roles[("a-live", "rev-live1")], "source_document")
+            # The historical lineage pin (rev-1 is not the head) does not by
+            # itself make revalidation stale.
+            self.assertEqual(revalidate_prepared(store, prepared).status, "unchanged")
+            # A live input moving does.
+            self._import(
+                repo, "a-live", b"live2", "rev-live2", parent_revision_id="rev-live1"
+            )
+            result = revalidate_prepared(store, prepared)
+            self.assertEqual(result.status, "stale")
 
     def test_revalidate_rejects_non_prepared_object(self) -> None:
         with self.new_store() as store:
