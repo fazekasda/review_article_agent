@@ -667,6 +667,11 @@ class QuestionDef:
         object.__setattr__(self, "levels", levels)
         if self.criteria is not None:
             self._check_criteria()
+            # Bound untrusted structure before the recursive defensive copy.
+            try:
+                canonical_json(self.criteria)
+            except ValueError as exc:
+                raise JevValidationError("criteria must be portable JSON") from exc
             # Defensive deep-freeze: mutating the caller's original criteria
             # container after construction must not drift the question's rubric,
             # and every serialization derives from this frozen copy.

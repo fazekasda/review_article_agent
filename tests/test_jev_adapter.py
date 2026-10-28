@@ -1427,5 +1427,22 @@ class R2MetadataAndDepthTests(unittest.TestCase):
         self.assertEqual(result.status, "protocol_error")
 
 
+class CriteriaStructureBoundTests(unittest.TestCase):
+    def test_cyclic_criteria_rejected_before_freezing(self):
+        criteria = {"true": {}, "false": "no"}
+        criteria["true"] = criteria
+        with self.assertRaises(jev.JevValidationError):
+            jev.QuestionDef("q", jev.PREDICATE, "p", criteria=criteria)
+
+    def test_overdeep_criteria_rejected_before_freezing(self):
+        nested = "value"
+        for _ in range(100):
+            nested = {"nested": nested}
+        with self.assertRaises(jev.JevValidationError):
+            jev.QuestionDef(
+                "q", jev.PREDICATE, "p", criteria={"true": nested, "false": "no"}
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
