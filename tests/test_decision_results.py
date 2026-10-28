@@ -74,6 +74,7 @@ from review_article_agent.storage.decision_results import (  # noqa: E402
     DecisionResultStateError,
     DecisionResultValidationError,
     decision_result_integrity_problems,
+    validate_result_set_mapping,
 )
 
 _OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
@@ -408,6 +409,98 @@ class ResultTestBase(unittest.TestCase):
     def _drop_set_trigger(self):
         self.store.connection.execute(
             "DROP TRIGGER IF EXISTS decision_result_set_no_update"
+        )
+
+    def _drop_immutability_triggers(self):
+        conn = self.store.connection
+        for trigger in (
+            "decision_result_question_no_delete",
+            "decision_result_question_no_update",
+            "decision_result_set_no_update",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    def _rewrite_record_and_set(self, dispatch_id, question_id, mutate):
+        """Rewrite one stored record, its row digest, and the set canonical+hash.
+
+        The set's own array is updated too, so set-vs-rows stay fully
+        self-consistent: only an *independent* intent/set cross-check can catch it.
+        """
+        conn = self.store.connection
+        row = conn.execute(
+            "SELECT * FROM decision_result_question WHERE project_id = ? AND "
+            "dispatch_id = ? AND question_id = ?",
+            (self.pid, dispatch_id, question_id),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        record = json.loads(bytes(row["canonical"]).decode())
+        mutate(record)
+        canonical = canonical_json(record)
+        digest = hashlib.sha256(canonical).hexdigest()
+        conn.execute(
+            "UPDATE decision_result_question SET canonical = ?, content_digest = ?, "
+            "question_kind = ?, outcome = ?, request_sha256 = ? WHERE project_id = ? "
+            "AND dispatch_id = ? AND question_id = ?",
+            (
+                canonical,
+                digest,
+                record["question_kind"],
+                record["outcome"],
+                record["request_sha256"],
+                self.pid,
+                dispatch_id,
+                question_id,
+            ),
+        )
+        set_row = conn.execute(
+            "SELECT * FROM decision_result_set WHERE project_id = ? AND dispatch_id = ?",
+            (self.pid, dispatch_id),
+        ).fetchone()
+        mapping = json.loads(bytes(set_row["canonical"]).decode())
+        for entry in mapping["questions"]:
+            if entry["question_id"] == question_id:
+                entry["record_digest"] = digest
+                entry["outcome"] = record["outcome"]
+                entry["question_kind"] = record["question_kind"]
+        self._sync_set_canonical(dispatch_id, mapping)
+
+    def _sync_set_canonical(self, dispatch_id, mapping):
+        canonical = canonical_json(mapping)
+        self.store.connection.execute(
+            "UPDATE decision_result_set SET canonical = ?, content_digest = ?, "
+            "status = ?, attempt_no = ?, prior_outcome = ?, cost_state = ?, "
+            "cost_amount_usd = ?, question_count = ? WHERE project_id = ? "
+            "AND dispatch_id = ?",
+            (
+                canonical,
+                hashlib.sha256(canonical).hexdigest(),
+                mapping["status"],
+                mapping["attempt_no"],
+                mapping["prior_outcome"],
+                mapping["cost"]["state"],
+                mapping["cost"].get("amount_usd"),
+                mapping["question_count"],
+                self.pid,
+                dispatch_id,
+            ),
+        )
+
+    def _assert_all_read_paths_corrupt(self, dispatch_id, *, task_id=None):
+        with self.assertRaises(DecisionResultCorruptionError):
+            self.results.get_result(dispatch_id)
+        with self.assertRaises(DecisionResultCorruptionError):
+            self.results.list_results()
+        if task_id is not None:
+            with self.assertRaises(DecisionResultCorruptionError):
+                self.results.get_result_for_task(task_id)
+        self.assertFalse(self.results.verify_result(dispatch_id))
+        with self.assertRaises(DecisionResultCorruptionError):
+            self.results.get_question_record(dispatch_id, "is_original_report")
+        with self.assertRaises(DecisionResultCorruptionError):
+            self.results.list_question_records(dispatch_id)
+        self.assertTrue(self.results.verify_all_integrity())
+        self.assertTrue(
+            decision_result_integrity_problems(self.store.connection, self.pid)
         )
 
 
@@ -856,6 +949,295 @@ class IntegrityAndHistoryTest(ResultTestBase):
         conn.execute("PRAGMA foreign_keys = ON")
         problems = decision_result_integrity_problems(conn, self.pid)
         self.assertTrue(any("orphan" in problem for problem in problems))
+
+
+class RepairRegressionTest(ResultTestBase):
+    """Focused T5g-R1 repairs: strict envelope ints and independent intent coverage."""
+
+    # -- strict integer quantities ------------------------------------------ #
+    def test_bool_or_float_envelope_quantities_refused_with_zero_writes(self) -> None:
+        self.submit()
+        base = self.valid_result()
+        for field, value in (
+            ("attempt_no", True),
+            ("attempt_no", 1.0),
+            ("calls_attempted", True),
+            ("calls_attempted", 1.0),
+        ):
+            forged = dataclasses.replace(base, **{field: value})
+            with self.assertRaises(DecisionResultValidationError):
+                self.record(forged)
+        self.assertEqual(self.results.list_results(), [])
+        for table in ("decision_result_set", "decision_result_question"):
+            count = self.store.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            self.assertEqual(count, 0)
+        # A valid envelope still lands afterwards.
+        self.assertEqual(self.record(base).question_count, len(_SPECS))
+
+    def test_mapping_validator_rejects_bool_or_float_quantities(self) -> None:
+        self.submit()
+        obs = self.record(self.valid_result())
+        mapping = obs.to_mapping()
+        self.assertEqual(validate_result_set_mapping(mapping)["attempt_no"], 1)
+        for field, value in (
+            ("attempt_no", True),
+            ("attempt_no", 1.0),
+            ("calls_attempted", True),
+            ("calls_attempted", 1.0),
+            ("question_count", True),
+            ("request_bytes", True),
+            ("schema_version", True),
+            ("schema_version", 1.0),
+        ):
+            forged = dict(mapping)
+            forged[field] = value
+            with self.assertRaises(DecisionResultValidationError):
+                validate_result_set_mapping(forged)
+
+    # -- completeness against the INDEPENDENT intent ------------------------ #
+    def test_selfconsistent_partial_set_rehash_refused_everywhere(self) -> None:
+        self.submit()
+        obs = self.record(self.valid_result())
+        self._drop_immutability_triggers()
+        conn = self.store.connection
+        set_row = conn.execute(
+            "SELECT * FROM decision_result_set WHERE project_id = ? AND dispatch_id = ?",
+            (self.pid, obs.dispatch_id),
+        ).fetchone()
+        mapping = json.loads(bytes(set_row["canonical"]).decode())
+        dropped = mapping["questions"].pop()
+        mapping["question_ids"].pop()
+        mapping["question_count"] -= 1
+        conn.execute(
+            "DELETE FROM decision_result_question WHERE project_id = ? AND "
+            "dispatch_id = ? AND record_id = ?",
+            (self.pid, obs.dispatch_id, dropped["record_id"]),
+        )
+        self._sync_set_canonical(obs.dispatch_id, mapping)
+        # Set and rows are now self-consistent (6 == 6) and rehashed; the intent
+        # still records 7 questions, so every read path and the sweep must refuse.
+        self._assert_all_read_paths_corrupt(
+            obs.dispatch_id, task_id=self.task.task_id
+        )
+        self.assertEqual(len(mapping["questions"]), 6)
+        self.assertEqual(len(self.intent.question_ids()), len(_SPECS))
+
+    def _assert_record_tamper_refused(self, mutate) -> None:
+        self.submit()
+        obs = self.record(self.valid_result())
+        self._drop_immutability_triggers()
+        self._rewrite_record_and_set(obs.dispatch_id, "study_design", mutate)
+        self._assert_all_read_paths_corrupt(
+            obs.dispatch_id, task_id=self.task.task_id
+        )
+
+    def test_selfconsistent_ref_tamper_refused(self) -> None:
+        def mutate(record):
+            # A real, readable revision — only the intent binding differs.
+            record["question_def_ref"] = dict(record["criteria_ref"])
+
+        self._assert_record_tamper_refused(mutate)
+
+    def test_selfconsistent_descriptor_tamper_refused(self) -> None:
+        self._assert_record_tamper_refused(
+            lambda record: record.__setitem__("question_def_digest", "9" * 64)
+        )
+
+    def test_selfconsistent_versions_tamper_refused(self) -> None:
+        def mutate(record):
+            record["versions"]["rubric"]["ref"]["digest"] = "8" * 64
+
+        self._assert_record_tamper_refused(mutate)
+
+    def test_selfconsistent_options_tamper_refused(self) -> None:
+        self._assert_record_tamper_refused(
+            lambda record: record.__setitem__("options", list(reversed(record["options"])))
+        )
+
+    def test_selfconsistent_cost_tamper_refused(self) -> None:
+        self._assert_record_tamper_refused(
+            lambda record: record["cost"].__setitem__("amount_usd", "0.00009999")
+        )
+
+    def test_selfconsistent_provider_tamper_refused(self) -> None:
+        self._assert_record_tamper_refused(
+            lambda record: record["provider"].__setitem__(
+                "actual_model", jev.MODEL + "-20260101"
+            )
+        )
+
+    # -- status <-> HTTP/cost/diagnostic consistency ------------------------ #
+    def _assert_set_tamper_refused(self, base_result, mutate) -> None:
+        self.submit()
+        obs = self.record(base_result)
+        self._drop_set_trigger()
+        conn = self.store.connection
+        set_row = conn.execute(
+            "SELECT * FROM decision_result_set WHERE project_id = ? AND dispatch_id = ?",
+            (self.pid, obs.dispatch_id),
+        ).fetchone()
+        mapping = json.loads(bytes(set_row["canonical"]).decode())
+        mutate(mapping)
+        self._sync_set_canonical(obs.dispatch_id, mapping)
+        self._assert_all_read_paths_corrupt(
+            obs.dispatch_id, task_id=self.task.task_id
+        )
+
+    def test_completed_status_cannot_carry_api_error(self) -> None:
+        def mutate(mapping):
+            mapping["status"] = "api_error"
+
+        self._assert_set_tamper_refused(self.valid_result(), mutate)
+
+    def test_completed_status_cannot_carry_non_200_http(self) -> None:
+        def mutate(mapping):
+            mapping["http_status"] = 429
+
+        self._assert_set_tamper_refused(self.valid_result(), mutate)
+
+    def test_completed_status_cannot_carry_not_incurred_cost(self) -> None:
+        def mutate(mapping):
+            mapping["cost"] = {
+                "state": "not_incurred",
+                "currency": "USD",
+                "route": "direct_call",
+                "accounting_bucket": "direct_call",
+                "reserve_usd": "0.25",
+                "dispatch_ref": mapping["dispatch_id"],
+            }
+
+        self._assert_set_tamper_refused(self.valid_result(), mutate)
+
+    def test_ambiguous_api_error_cannot_be_not_incurred(self) -> None:
+        def mutate(mapping):
+            mapping["cost"] = {
+                "state": "not_incurred",
+                "currency": "USD",
+                "route": "direct_call",
+                "accounting_bucket": "direct_call",
+                "reserve_usd": "0.25",
+                "dispatch_ref": mapping["dispatch_id"],
+            }
+
+        self._assert_set_tamper_refused(self.dispatch_result(_CannedTransport(429, "")), mutate)
+
+    def test_failed_status_requires_retained_global_diagnostic_on_records(self) -> None:
+        def mutate(mapping):
+            # Whole-call failure -> completed-looking status with answered records.
+            mapping["status"] = "transport_error"
+            mapping["http_status"] = None
+            mapping["cost"] = {
+                "state": "unknown",
+                "currency": "USD",
+                "route": "direct_call",
+                "accounting_bucket": "direct_call",
+                "reserve_usd": "0.25",
+                "dispatch_ref": mapping["dispatch_id"],
+            }
+            mapping["diagnostic"] = {
+                "code": "transport_error",
+                "detail_redacted": "the request did not complete",
+                "raised_at": "2026-10-27T00:00:00+00:00",
+            }
+
+        self._assert_set_tamper_refused(self.valid_result(), mutate)
+
+    def test_completed_set_cannot_carry_call_status_failure(self) -> None:
+        def mutate_record(record):
+            record.pop("per_question_error", None)
+            record["call_status"] = "transport_error"
+            record["diagnostics"] = {
+                "code": "transport_error",
+                "detail_redacted": "the request did not complete",
+                "raised_at": "2026-10-27T00:00:00+00:00",
+            }
+
+        self.submit()
+        obs = self.record(self.valid_result())
+        self._drop_immutability_triggers()
+        self._rewrite_record_and_set(obs.dispatch_id, "missing_q", mutate_record)
+        self._assert_all_read_paths_corrupt(
+            obs.dispatch_id, task_id=self.task.task_id
+        )
+
+    def test_whole_call_failure_diagnostic_must_match_set(self) -> None:
+        def mutate_record(record):
+            record["diagnostics"]["detail_redacted"] = "a different redaction"
+
+        self.submit()
+        obs = self.record(self.dispatch_result(_CannedTransport(500, "")))
+        self._drop_immutability_triggers()
+        self._rewrite_record_and_set(obs.dispatch_id, "is_original_report", mutate_record)
+        self._assert_all_read_paths_corrupt(
+            obs.dispatch_id, task_id=self.task.task_id
+        )
+
+    # -- blocked/unsubmitted ------------------------------------------------ #
+    def test_blocked_result_cannot_be_stored_even_forged_submitted(self) -> None:
+        self.submit()
+        blocked = jev.execute(
+            self.questions,
+            "state",
+            api_key=None,
+            reserve_usd="0.25",
+            authorized=False,
+        )
+        self.assertEqual(blocked.status, "blocked")
+        forged = dataclasses.replace(
+            blocked, submitted=True, calls_attempted=1, attempt_no=1
+        )
+        with self.assertRaises(DecisionResultValidationError):
+            self.record(forged)
+        self.assertEqual(self.results.list_results(), [])
+        count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM decision_result_question"
+        ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    # -- public reads -------------------------------------------------------- #
+    def test_public_question_reads_require_a_valid_parent_set(self) -> None:
+        self.submit()
+        obs = self.record(self.valid_result())
+        self._drop_immutability_triggers()
+        self.store.connection.execute(
+            "DELETE FROM decision_result_question WHERE project_id = ? AND "
+            "dispatch_id = ? AND question_id = ?",
+            (self.pid, obs.dispatch_id, "free_text"),
+        )
+        with self.assertRaises(DecisionResultCorruptionError):
+            self.results.get_question_record(obs.dispatch_id, "is_original_report")
+        with self.assertRaises(DecisionResultCorruptionError):
+            self.results.list_question_records(obs.dispatch_id)
+
+    def test_orphan_question_row_without_set_refused_on_read(self) -> None:
+        conn = self.store.connection
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
+            "INSERT INTO decision_result_question "
+            "(project_id, dispatch_id, result_id, record_id, question_id, "
+            " question_kind, outcome, ordinal, request_sha256, canonical, "
+            " content_digest, created_at_utc) "
+            "VALUES (?, 'disp_orphan_read', 'dres_o', 'dec_o', 'q_o', 'predicate', "
+            " 'answered', 0, ?, ?, ?, '2026-01-01T00:00:00+00:00')",
+            (self.pid, _DIG_A, b"{}", _DIG_A),
+        )
+        conn.execute("PRAGMA foreign_keys = ON")
+        with self.assertRaises(DecisionResultCorruptionError):
+            self.results.list_question_records("disp_orphan_read")
+
+    def test_valid_failure_history_still_readable(self) -> None:
+        self.submit()
+        obs = self.record(self.dispatch_result(_CannedTransport(429, "")))
+        again = self.results.get_result(obs.dispatch_id)
+        self.assertEqual(again.canonical, obs.canonical)
+        self.assertEqual(
+            len(self.results.list_question_records(obs.dispatch_id)), len(_SPECS)
+        )
+        self.assertEqual(self.results.verify_all_integrity(), [])
+        dispatch = self.dispatch.get_dispatch(obs.dispatch_id)
+        self.assertIn(dispatch.state, ("submitted", "unknown"))
 
 
 class MigrationTest(ResultTestBase):

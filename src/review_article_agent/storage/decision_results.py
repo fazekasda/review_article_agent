@@ -39,6 +39,16 @@ records are produced by :func:`review_article_agent.runtime.decision_records.pro
 with those rebuilt questions, the intent's own ``VersionSet``/consumed slots, and
 ``task_context = intent.task_id``.
 
+On every read the stored set and every stored per-question record are
+**independently** revalidated: completeness is measured against the recorded
+intent's exact question order/count/kinds (never the set's own array alone); each
+record's refs, target, task context, descriptor digest, options/levels/kind,
+versions/consumed slots, request pin, cost, and provider envelope are compared
+with the intent and the set; the whole-call ``call_status``/diagnostic relation and
+the adapter's documented ``status`` ↔ HTTP/cost/diagnostic relation are enforced;
+and counters (attempt, calls, counts, ordinals) are **plain integers** — a bool or
+float that merely compares equal to ``1`` is refused, never normalized.
+
 What this module **is not** (the boundary)
 ------------------------------------------
 
@@ -81,6 +91,7 @@ from ..domain.errors import StoreError
 from ..domain.records import canonical_json, validate_identifier, validate_ref
 from ..runtime import jev
 from ..runtime.decision_records import (
+    FAILED_SUBMITTED_STATUSES,
     OPTIONAL_CONSUMED_SLOTS,
     DecisionRecord,
     DecisionRecordError,
@@ -171,6 +182,19 @@ RESULT_OUTCOMES = (
 
 #: State of the *first* direct attempt envelope (no prior attempt).
 PRIOR_OUTCOME_NONE = "none"
+
+#: The documented **definitive, pre-billing** HTTP rejections (the adapter's own
+#: ``_DEFINITIVE_STATUSES`` in ``runtime.jev``, restated here as a status envelope
+#: invariant): only these may be recorded ``not_incurred``. Every other non-200
+#: status — including 429 and every 3xx/5xx — is ambiguous and stays ``unknown``.
+DEFINITIVE_REJECTION_STATUSES = frozenset({400, 401, 402, 403, 404, 413})
+
+#: Dispatch states in which a recorded observation remains valid history: a result
+#: may follow a recorded submission/admission/unknown outcome, and a later atomic
+#: bridge acceptance moves the dispatch to ``completed`` (or a remote failure to
+#: ``failed``). A ``reserved`` dispatch can never have issued a request, so a set
+#: row on one is corruption.
+_PARENT_STATES = frozenset(_ACCEPTABLE_STATES | {"completed", "failed"})
 
 _MAX_IDENTIFIER_CHARS = 512
 _MAX_META_CHARS = 256
@@ -302,6 +326,7 @@ _M_TIMESTAMP = "a decision-result timestamp is not an RFC 3339 UTC instant"
 _M_DIGEST = "a decision-result digest is not a lowercase hex SHA-256 digest"
 _M_DECIMAL = "a decision-result amount is not an exact bounded decimal"
 _M_CONSUMED = "the recorded consumed version slots do not match the intent"
+_M_CALL_STATUS = "the recorded per-question call-status audit contradicts the set status"
 
 
 # --------------------------------------------------------------------------- #
@@ -347,6 +372,21 @@ def _is_hex_digest(value: object) -> bool:
 
 def _bounded_str(value: object) -> bool:
     return isinstance(value, str) and 0 < len(value) <= _MAX_META_CHARS
+
+
+def _plain_int(value: object, *, minimum: int = 0, maximum: int | None = None,
+               message: str) -> int:
+    """Return *value* only if it is a plain ``int`` (never ``bool`` or ``float``).
+
+    ``True``/``False`` and ``1.0`` are rejected explicitly: a count, attempt number,
+    ordinal, or HTTP status is an integer quantity, and a bool/float that compares
+    equal to ``1`` must never be silently normalized into it.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DecisionResultValidationError(message)
+    if value < minimum or (maximum is not None and value > maximum):
+        raise DecisionResultValidationError(message)
+    return value
 
 
 def _bounded_decimal_string(amount: Decimal) -> str | None:
@@ -536,12 +576,28 @@ class DecisionResultObservation:
     canonical: bytes
 
     def __post_init__(self) -> None:
+        # Strict integer quantities: no bool/float that merely compares equal to 1.
+        _plain_int(self.schema_version, minimum=1, message=_M_CANONICAL)
+        _plain_int(self.request_bytes, minimum=1, message=_M_REQUEST)
+        if _plain_int(self.attempt_no, minimum=1, message=_M_ATTEMPT) != 1:
+            raise DecisionResultValidationError(_M_ATTEMPT)
+        if _plain_int(self.calls_attempted, minimum=1, message=_M_ATTEMPT) != 1:
+            raise DecisionResultValidationError(_M_ATTEMPT)
+        _plain_int(self.question_count, minimum=1, message=_M_QUESTION_COVERAGE)
+        if self.http_status is not None:
+            _plain_int(
+                self.http_status, minimum=100, maximum=599, message=_M_CANONICAL
+            )
         for name in ("usage", "cost", "diagnostic"):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _deep_freeze(dict(value)))
         object.__setattr__(self, "questions", tuple(self.questions))
         object.__setattr__(self, "question_ids", tuple(self.question_ids))
+        if len(self.questions) != self.question_count:
+            raise DecisionResultValidationError(_M_QUESTION_COVERAGE)
+        if len(self.question_ids) != self.question_count:
+            raise DecisionResultValidationError(_M_QUESTION_COVERAGE)
         object.__setattr__(self, "canonical", bytes(self.canonical))
 
     @property
@@ -606,6 +662,7 @@ class DecisionResultQuestion:
     canonical: bytes
 
     def __post_init__(self) -> None:
+        _plain_int(self.ordinal, minimum=0, message=_M_COLUMNS)
         object.__setattr__(self, "record", _deep_freeze(dict(self.record)))
         object.__setattr__(self, "canonical", bytes(self.canonical))
 
@@ -762,6 +819,74 @@ def _validate_diagnostic(diagnostic: object) -> dict[str, Any] | None:
     }
 
 
+def _validate_status_envelope(mapping: Mapping[str, Any]) -> None:
+    """Enforce the adapter's documented ``status`` <-> HTTP/cost/diagnostic relation.
+
+    The typed ``jev.DispatchResult`` is produced by the adapter's own classifier, so
+    the persisted envelope must not silently contradict it:
+
+    * ``blocked`` was refused *before* the send boundary — it can never be a
+      submitted observation, even if a forged envelope claims ``submitted``;
+    * ``completed`` is an HTTP 200 with no diagnostic and real provider metadata;
+    * ``api_error`` is a non-200 HTTP status with an ``api_error`` diagnostic and no
+      provider metadata, and its cost is ``not_incurred`` **iff** the status is one
+      of the documented definitive pre-billing rejections;
+    * ``protocol_error``/``transport_error`` carry a matching diagnostic and no
+      provider metadata; a transport failure has no HTTP status and an ``unknown``
+      cost.
+    """
+    status = mapping["status"]
+    http_status = mapping["http_status"]
+    cost_state = mapping["cost"]["state"]
+    diagnostic = mapping["diagnostic"]
+    actual_model = mapping["actual_model"]
+    provider = mapping["provider"]
+    response_id = mapping["response_id"]
+    usage = mapping["usage"]
+    if status == "blocked":
+        raise DecisionResultValidationError(_M_NOT_SUBMITTED)
+    if status == "completed":
+        if http_status != 200:
+            raise DecisionResultValidationError(_M_STATUS)
+        if cost_state == "not_incurred":
+            raise DecisionResultValidationError(_M_STATUS)
+        if diagnostic is not None:
+            raise DecisionResultValidationError(_M_STATUS)
+        if actual_model is None or usage is None:
+            raise DecisionResultValidationError(_M_STATUS)
+        return
+    if diagnostic is None:
+        raise DecisionResultValidationError(_M_STATUS)
+    if actual_model is not None or provider is not None or response_id is not None:
+        raise DecisionResultValidationError(_M_STATUS)
+    if usage is not None:
+        raise DecisionResultValidationError(_M_STATUS)
+    if status == "api_error":
+        if http_status is None or http_status == 200:
+            raise DecisionResultValidationError(_M_STATUS)
+        if diagnostic["code"] != "api_error":
+            raise DecisionResultValidationError(_M_STATUS)
+        definitive = http_status in DEFINITIVE_REJECTION_STATUSES
+        if definitive != (cost_state == "not_incurred"):
+            raise DecisionResultValidationError(_M_STATUS)
+        return
+    if status == "protocol_error":
+        if diagnostic["code"] != "protocol_error":
+            raise DecisionResultValidationError(_M_STATUS)
+        if cost_state == "not_incurred":
+            raise DecisionResultValidationError(_M_STATUS)
+        return
+    if status == "transport_error":
+        if http_status is not None:
+            raise DecisionResultValidationError(_M_STATUS)
+        if cost_state != "unknown":
+            raise DecisionResultValidationError(_M_STATUS)
+        if diagnostic["code"] != "transport_error":
+            raise DecisionResultValidationError(_M_STATUS)
+        return
+    raise DecisionResultValidationError(_M_STATUS)
+
+
 def validate_result_set_mapping(mapping: object) -> dict[str, Any]:
     """Structurally revalidate one canonical result-set mapping (no I/O)."""
     if not isinstance(mapping, Mapping):
@@ -798,14 +923,12 @@ def validate_result_set_mapping(mapping: object) -> dict[str, Any]:
     ):
         if not _is_hex_digest(mapping[field]):
             raise DecisionResultValidationError(_M_DIGEST)
-    request_bytes = mapping["request_bytes"]
-    if (
-        isinstance(request_bytes, bool)
-        or not isinstance(request_bytes, int)
-        or request_bytes < 1
-        or request_bytes > jev.SAFE_MAX_REQUEST_BYTES
-    ):
-        raise DecisionResultValidationError(_M_REQUEST)
+    request_bytes = _plain_int(
+        mapping["request_bytes"],
+        minimum=1,
+        maximum=jev.SAFE_MAX_REQUEST_BYTES,
+        message=_M_REQUEST,
+    )
     if _parse_exact_decimal(mapping["cost_upper_bound_usd"]) is None:
         raise DecisionResultValidationError(_M_DECIMAL)
     if _parse_exact_decimal(mapping["reserve_usd"], positive=True) is None:
@@ -813,7 +936,11 @@ def validate_result_set_mapping(mapping: object) -> dict[str, Any]:
     status = mapping["status"]
     if status not in jev.DISPATCH_STATUSES:
         raise DecisionResultValidationError(_M_STATUS)
-    if mapping["attempt_no"] != 1 or mapping["calls_attempted"] != 1:
+    attempt_no = _plain_int(mapping["attempt_no"], minimum=1, message=_M_ATTEMPT)
+    calls_attempted = _plain_int(
+        mapping["calls_attempted"], minimum=1, message=_M_ATTEMPT
+    )
+    if attempt_no != 1 or calls_attempted != 1:
         raise DecisionResultValidationError(_M_ATTEMPT)
     if mapping["prior_outcome"] != PRIOR_OUTCOME_NONE:
         raise DecisionResultValidationError(_M_ATTEMPT)
@@ -822,12 +949,10 @@ def validate_result_set_mapping(mapping: object) -> dict[str, Any]:
     if mapping["no_automatic_retry"] is not True:
         raise DecisionResultValidationError(_M_RETRY)
     http_status = mapping["http_status"]
-    if http_status is not None and (
-        isinstance(http_status, bool)
-        or not isinstance(http_status, int)
-        or not (100 <= http_status <= 599)
-    ):
-        raise DecisionResultValidationError(_M_CANONICAL)
+    if http_status is not None:
+        http_status = _plain_int(
+            http_status, minimum=100, maximum=599, message=_M_CANONICAL
+        )
     for name in ("provider", "response_id"):
         value = mapping[name]
         if value is not None and not _bounded_str(value):
@@ -843,9 +968,17 @@ def validate_result_set_mapping(mapping: object) -> dict[str, Any]:
     ids = [entry["question_id"] for entry in normalized_questions]
     if len(set(ids)) != len(ids):
         raise DecisionResultValidationError(_M_CANONICAL)
-    if list(mapping["question_ids"]) != ids:
+    raw_ids = mapping["question_ids"]
+    if (
+        not isinstance(raw_ids, (list, tuple))
+        or any(not isinstance(value, str) for value in raw_ids)
+        or list(raw_ids) != ids
+    ):
         raise DecisionResultValidationError(_M_QUESTION_COVERAGE)
-    if mapping["question_count"] != len(normalized_questions):
+    question_count = _plain_int(
+        mapping["question_count"], minimum=1, message=_M_QUESTION_COVERAGE
+    )
+    if question_count != len(normalized_questions):
         raise DecisionResultValidationError(_M_QUESTION_COVERAGE)
 
     normalized = {
@@ -864,8 +997,8 @@ def validate_result_set_mapping(mapping: object) -> dict[str, Any]:
         "cost_upper_bound_usd": mapping["cost_upper_bound_usd"],
         "reserve_usd": mapping["reserve_usd"],
         "status": status,
-        "attempt_no": 1,
-        "calls_attempted": 1,
+        "attempt_no": attempt_no,
+        "calls_attempted": calls_attempted,
         "prior_outcome": PRIOR_OUTCOME_NONE,
         "idempotent_admission_proven": False,
         "no_automatic_retry": True,
@@ -880,8 +1013,9 @@ def validate_result_set_mapping(mapping: object) -> dict[str, Any]:
         "diagnostic": _validate_diagnostic(mapping["diagnostic"]),
         "questions": normalized_questions,
         "question_ids": ids,
-        "question_count": len(normalized_questions),
+        "question_count": question_count,
     }
+    _validate_status_envelope(normalized)
     canonical_json(normalized)
     return normalized
 
@@ -1032,8 +1166,20 @@ class DecisionResultRepository:
     def get_question_record(
         self, dispatch_id: str, question_id: str
     ) -> DecisionResultQuestion | None:
+        """One stored per-question record, after the parent set revalidates.
+
+        The parent observation is validated in full first, so a corrupt or
+        incomplete set is refused rather than handing out a plausible-looking
+        single row. Missing set/question simply returns ``None``.
+        """
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         question_id = validate_identifier(question_id, "question_id")
+        set_row = self._set_row(dispatch_id)
+        if set_row is None:
+            if self._question_row_exists(dispatch_id):
+                raise DecisionResultCorruptionError(_M_PARTIAL_SET)
+            return None
+        self._validate_set_row(set_row)
         row = self._conn().execute(
             "SELECT * FROM decision_result_question WHERE project_id = ? "
             "AND dispatch_id = ? AND question_id = ?",
@@ -1044,13 +1190,33 @@ class DecisionResultRepository:
         return self._validate_question_row(row)
 
     def list_question_records(self, dispatch_id: str) -> list[DecisionResultQuestion]:
+        """Every stored per-question record in planned order, after the set validates.
+
+        The parent observation is validated in full first (coverage against the
+        independent intent included), so an incomplete set never yields a short
+        list.
+        """
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
+        set_row = self._set_row(dispatch_id)
+        if set_row is None:
+            if self._question_row_exists(dispatch_id):
+                raise DecisionResultCorruptionError(_M_PARTIAL_SET)
+            return []
+        self._validate_set_row(set_row)
         rows = self._conn().execute(
             "SELECT * FROM decision_result_question WHERE project_id = ? "
             "AND dispatch_id = ? ORDER BY ordinal",
             (self.project_id, dispatch_id),
         ).fetchall()
         return [self._validate_question_row(row) for row in rows]
+
+    def _question_row_exists(self, dispatch_id: str) -> bool:
+        row = self._conn().execute(
+            "SELECT 1 FROM decision_result_question WHERE project_id = ? "
+            "AND dispatch_id = ? LIMIT 1",
+            (self.project_id, dispatch_id),
+        ).fetchone()
+        return row is not None
 
     def verify_result(self, dispatch_id: str) -> bool:
         """``True`` iff the observation exists and revalidates."""
@@ -1087,6 +1253,10 @@ class DecisionResultRepository:
             raise DecisionResultValidationError(_M_BAD_INTENT)
         return task
 
+    def _read_verified_ref(self, ref: Mapping[str, str]) -> bytes:
+        """Resolve a ref through the intent repository's own bounded ref reader."""
+        return self._intents._read_verified_ref(ref, require_current=False)
+
     # -- internal: bind the trusted result to the recorded intent ------------ #
     def _assert_result_binds_intent(self, result, intent, dispatch) -> None:
         if result.endpoint != jev.ENDPOINT or result.endpoint != intent.endpoint:
@@ -1095,15 +1265,27 @@ class DecisionResultRepository:
             raise DecisionResultValidationError(_M_MODEL)
         if result.status not in jev.DISPATCH_STATUSES:
             raise DecisionResultValidationError(_M_STATUS)
+        # ``blocked`` was refused *before* the send boundary, so it can never be a
+        # recorded submitted observation — even a forged envelope claiming
+        # ``submitted=True``/``calls_attempted=1`` is refused.
+        if result.status == "blocked":
+            raise DecisionResultValidationError(_M_NOT_SUBMITTED)
         if result.submitted is not True:
             raise DecisionResultValidationError(_M_NOT_SUBMITTED)
-        if (
-            result.calls_attempted != 1
-            or result.attempt_no != 1
-            or result.no_automatic_retry is not True
-            or result.idempotent_admission_proven is not False
-        ):
+        # Plain integer quantities only: ``True``/``1.0`` are never normalized to 1.
+        if _plain_int(result.attempt_no, minimum=1, message=_M_ATTEMPT) != 1:
             raise DecisionResultValidationError(_M_ATTEMPT)
+        if _plain_int(result.calls_attempted, minimum=1, message=_M_ATTEMPT) != 1:
+            raise DecisionResultValidationError(_M_ATTEMPT)
+        if result.no_automatic_retry is not True:
+            raise DecisionResultValidationError(_M_ATTEMPT)
+        if result.idempotent_admission_proven is not False:
+            raise DecisionResultValidationError(_M_ATTEMPT)
+        _plain_int(result.request_bytes, minimum=1, message=_M_REQUEST)
+        if result.http_status is not None:
+            _plain_int(
+                result.http_status, minimum=100, maximum=599, message=_M_STATUS
+            )
         if (
             result.request_sha256 != intent.request_sha256
             or result.request_bytes != intent.request_bytes
@@ -1130,6 +1312,25 @@ class DecisionResultRepository:
         elif cost.amount_usd is not None:
             # An unknown/not-incurred cost is never recorded as a silent 0.
             raise DecisionResultValidationError(_M_UNKNOWN_COST)
+        _validate_status_envelope(
+            {
+                "status": result.status,
+                "http_status": result.http_status,
+                "actual_model": result.actual_model,
+                "provider": result.provider,
+                "response_id": result.response_id,
+                "usage": None
+                if result.usage is None
+                else {
+                    "input_tokens": result.usage.input_tokens,
+                    "output_tokens": result.usage.output_tokens,
+                },
+                "cost": {"state": cost.state},
+                "diagnostic": None
+                if result.diagnostic is None
+                else _project_diagnostic(result.diagnostic),
+            }
+        )
 
     # -- internal: build the canonical observation --------------------------- #
     def _build_observation(
@@ -1137,7 +1338,7 @@ class DecisionResultRepository:
     ) -> dict[str, Any]:
         def reader(ref: Mapping[str, str]) -> bytes:
             # The intent repository's own bounded, byte/rights-verifying reader.
-            return self._intents._read_verified_ref(ref, require_current=False)
+            return self._read_verified_ref(ref)
 
         questions = _rebuild_questions(intent, reader)
         if tuple(q.question_id for q in questions) != tuple(intent.question_ids()):
@@ -1350,12 +1551,14 @@ class DecisionResultRepository:
         if canonical_json(parsed) != canonical:
             raise DecisionResultCorruptionError(_M_CANONICAL_ROUNDTRIP)
         self._assert_columns_match(row, mapping)
-        self._assert_parent_links(mapping)
-        self._assert_question_set(mapping)
+        dispatch, intent = self._assert_parent_links(mapping)
+        self._assert_question_set(mapping, dispatch, intent)
         return self._row_to_observation(row, mapping, canonical)
 
     @_fail_closed_row("decision result question")
-    def _validate_question_row(self, row: sqlite3.Row) -> DecisionResultQuestion:
+    def _validate_question_row(
+        self, row: sqlite3.Row, *, intent: Any = None
+    ) -> DecisionResultQuestion:
         if row["project_id"] != self.project_id:
             raise DecisionResultCorruptionError(_M_PROJECT)
         canonical = bytes(row["canonical"])
@@ -1372,6 +1575,10 @@ class DecisionResultRepository:
         record = validate_decision_record_mapping(parsed)
         if canonical_json(parsed) != canonical:
             raise DecisionResultCorruptionError(_M_CANONICAL_ROUNDTRIP)
+        if row["result_id"] != _result_id(self.project_id, _identifier(row["dispatch_id"])):
+            raise DecisionResultCorruptionError(_M_BAD_ID)
+        if record["target"].get("project_id") != self.project_id:
+            raise DecisionResultCorruptionError(_M_PROJECT)
         if record["question_id"] != row["question_id"] or record["question_kind"] != row["question_kind"]:
             raise DecisionResultCorruptionError(_M_QUESTION)
         if record["question_id"] != validate_identifier(row["question_id"], "question_id"):
@@ -1382,8 +1589,13 @@ class DecisionResultRepository:
             raise DecisionResultCorruptionError(_M_REQUEST)
         if record["outcome"] != row["outcome"]:
             raise DecisionResultCorruptionError(_M_COLUMNS)
-        # The per-question canonical record's own receipt binds the intent.
-        intent = self._require_intent(row["dispatch_id"])
+        # The per-question canonical record's own receipt binds the intent. A caller
+        # validating a whole set passes the already-reloaded intent (reuse, no copy).
+        if intent is None:
+            intent = self._require_intent(row["dispatch_id"])
+        else:
+            if intent.dispatch_id != row["dispatch_id"]:
+                raise DecisionResultCorruptionError(_M_PARENT)
         if record["request_sha256"] != intent.request_sha256:
             raise DecisionResultCorruptionError(_M_REQUEST)
         # Re-hash the actual referenced bytes on read (history-preserving).
@@ -1415,7 +1627,7 @@ class DecisionResultRepository:
             record["criteria_ref"],
         ):
             try:
-                self._intents._read_verified_ref(ref, require_current=False)
+                self._read_verified_ref(ref)
             except DecisionIntentCorruptionError:
                 raise
             except Exception as exc:  # DecisionIntentValidationError / ...
@@ -1446,7 +1658,14 @@ class DecisionResultRepository:
             if row[column] != value:
                 raise DecisionResultCorruptionError(_M_COLUMNS)
 
-    def _assert_parent_links(self, mapping: Mapping[str, Any]) -> None:
+    def _assert_parent_links(self, mapping: Mapping[str, Any]) -> tuple[Any, Any]:
+        """Re-derive and compare the parent dispatch/task/intent pins.
+
+        The intent read here is the one authoritative intent read for the whole set
+        validation: the dispatch identity is already covered by it, so callers reuse
+        the returned intent rather than loading it a second time. Returns
+        ``(dispatch, intent)``.
+        """
         try:
             dispatch = self._dispatch.get_dispatch(mapping["dispatch_id"])
         except DispatchCorruptionError as exc:
@@ -1458,6 +1677,11 @@ class DecisionResultRepository:
             or dispatch.route != RESULT_ROUTE
             or dispatch.reserve_usd != mapping["reserve_usd"]
         ):
+            raise DecisionResultCorruptionError(_M_PARENT)
+        # An observation is valid history only on a dispatch that reached the send
+        # boundary (or a later accepted/terminal state); a ``reserved`` dispatch can
+        # never have issued a request.
+        if dispatch.state not in _PARENT_STATES:
             raise DecisionResultCorruptionError(_M_PARENT)
         try:
             task = self._runtime.get_task(mapping["task_id"])
@@ -1471,17 +1695,46 @@ class DecisionResultRepository:
             or intent.intent_id != mapping["intent_id"]
             or intent.content_digest != mapping["intent_digest"]
             or intent.task_id != mapping["task_id"]
+            or intent.task_fingerprint != dispatch.task_fingerprint
+            or intent.route != RESULT_ROUTE
+            or intent.stage != dispatch.stage
             or intent.input_digest != mapping["input_digest"]
             or intent.version_digest != mapping["version_digest"]
             or intent.request_sha256 != mapping["request_sha256"]
             or intent.request_bytes != mapping["request_bytes"]
             or intent.reserve_usd != mapping["reserve_usd"]
             or intent.cost_upper_bound_usd != mapping["cost_upper_bound_usd"]
+            or intent.bound_evidence_digest != dispatch.bound_evidence_digest
+            or intent.endpoint != jev.ENDPOINT
         ):
             raise DecisionResultCorruptionError(_M_PARENT)
+        # Completeness is measured against the INDEPENDENT recorded intent, not the
+        # set's own array: exact order, count, and kind.
+        intent_questions = intent.questions
+        intent_ids = tuple(question.question_id for question in intent_questions)
+        set_ids = tuple(mapping["question_ids"])
+        if intent_ids != set_ids:
+            raise DecisionResultCorruptionError(_M_QUESTION_COVERAGE)
+        if len(mapping["questions"]) != len(intent_questions):
+            raise DecisionResultCorruptionError(_M_QUESTION_COVERAGE)
+        for entry, recorded in zip(mapping["questions"], intent_questions):
+            if (
+                entry["question_id"] != recorded.question_id
+                or entry["question_kind"] != recorded.question_kind
+            ):
+                raise DecisionResultCorruptionError(_M_QUESTION_COVERAGE)
+        return dispatch, intent
 
-    def _assert_question_set(self, mapping: Mapping[str, Any]) -> None:
-        """The complete array must match exactly the stored per-question rows."""
+    def _assert_question_set(
+        self, mapping: Mapping[str, Any], dispatch: Any, intent: Any
+    ) -> None:
+        """Validate the complete set against the stored rows, the intent, and the set.
+
+        Every stored canonical record must match its own intent binding (refs,
+        target, task context, descriptor digest, options/levels/kind), the intent's
+        versions/consumed slots/request pins, the set's single dispatch cost, and the
+        set's provider envelope — not merely the set's own self-consistent array.
+        """
         rows = self._conn().execute(
             "SELECT * FROM decision_result_question WHERE project_id = ? "
             "AND dispatch_id = ? ORDER BY ordinal",
@@ -1493,7 +1746,28 @@ class DecisionResultRepository:
         found_ids = [row["record_id"] for row in rows]
         if found_ids != expected_ids:
             raise DecisionResultCorruptionError(_M_PARTIAL_SET)
-        for index, (entry, row) in enumerate(zip(mapping["questions"], rows)):
+
+        reader = self._read_verified_ref
+        questions = _rebuild_questions(intent, reader)
+        intent_questions = intent.questions
+        set_cost = mapping["cost"]
+        set_provider = {
+            "request_model": intent.model,
+            "actual_model": mapping["actual_model"],
+            "provider": mapping["provider"],
+            "response_id": mapping["response_id"],
+            "input_tokens": None
+            if mapping["usage"] is None
+            else mapping["usage"]["input_tokens"],
+            "output_tokens": None
+            if mapping["usage"] is None
+            else mapping["usage"]["output_tokens"],
+            "http_status": mapping["http_status"],
+        }
+        status = mapping["status"]
+        for index, (entry, row, question, recorded) in enumerate(
+            zip(mapping["questions"], rows, questions, intent_questions)
+        ):
             if row["ordinal"] != index:
                 raise DecisionResultCorruptionError(_M_PARTIAL_SET)
             if (
@@ -1505,8 +1779,95 @@ class DecisionResultRepository:
                 or row["result_id"] != mapping["result_id"]
             ):
                 raise DecisionResultCorruptionError(_M_PARTIAL_SET)
-        for row in rows:
-            self._validate_question_row(row)
+            validated = self._validate_question_row(row, intent=intent)
+            self._assert_record_binds_intent(
+                validated.record,
+                row=row,
+                dispatch=dispatch,
+                intent=intent,
+                question=question,
+                recorded=recorded,
+                set_cost=set_cost,
+                set_provider=set_provider,
+            )
+            # Status <-> per-question audit relation must be exact: a completed set
+            # never carries a whole-call failure audit; a failed set carries the
+            # retained global diagnostic on every supported question.
+            if status == "completed":
+                if "call_status" in validated.record:
+                    raise DecisionResultCorruptionError(_M_CALL_STATUS)
+            else:
+                if question.question_kind == "box":
+                    if validated.record["outcome"] != "unsupported":
+                        raise DecisionResultCorruptionError(_M_CALL_STATUS)
+                else:
+                    if validated.record["outcome"] != "omitted":
+                        raise DecisionResultCorruptionError(_M_CALL_STATUS)
+                    if validated.record.get("call_status") != status:
+                        raise DecisionResultCorruptionError(_M_CALL_STATUS)
+                    if validated.record.get("diagnostics") != _thaw(mapping["diagnostic"]):
+                        raise DecisionResultCorruptionError(_M_CALL_STATUS)
+
+    def _assert_record_binds_intent(
+        self,
+        record: Mapping[str, Any],
+        *,
+        row: sqlite3.Row,
+        dispatch: Any,
+        intent: Any,
+        question: jev.QuestionDef,
+        recorded: Any,
+        set_cost: Mapping[str, Any],
+        set_provider: Mapping[str, Any],
+    ) -> None:
+        """One stored canonical record must match its intent binding and the set."""
+        if record["question_id"] != question.question_id:
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if record["question_kind"] != question.question_kind:
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if record["question_def_digest"] != recorded.question_def_digest:
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if record["target"] != _thaw(intent.target):
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if record["question_def_ref"] != _thaw(recorded.question_def_ref):
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if record["criteria_ref"] != _thaw(recorded.criteria_ref):
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if record["task_context"] != intent.task_id:
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if list(record["options"]) != list(question.options):
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if list(record["levels"]) != list(question.levels):
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if record["versions"] != _thaw(intent.versions):
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if list(record["consumed_versions"]) != list(intent.consumed_versions):
+            raise DecisionResultCorruptionError(_M_QUESTION)
+        if record["request_sha256"] != intent.request_sha256:
+            raise DecisionResultCorruptionError(_M_REQUEST)
+        if record["cost"] != _thaw(set_cost):
+            raise DecisionResultCorruptionError(_M_COST)
+        if record["cost"]["dispatch_ref"] != dispatch.dispatch_id:
+            raise DecisionResultCorruptionError(_M_COST)
+        if record["provider"] != _thaw(set_provider):
+            raise DecisionResultCorruptionError(_M_COLUMNS)
+        if (
+            record["is_exclusion"] is not False
+            or record["grants_eligibility"] is not False
+            or record["retains_candidate"] is not True
+        ):
+            raise DecisionResultCorruptionError(_M_COLUMNS)
+        # The row columns must agree with the canonical record, too.
+        if row["question_id"] != record["question_id"]:
+            raise DecisionResultCorruptionError(_M_COLUMNS)
+        if row["question_kind"] != record["question_kind"]:
+            raise DecisionResultCorruptionError(_M_COLUMNS)
+        if row["outcome"] != record["outcome"]:
+            raise DecisionResultCorruptionError(_M_COLUMNS)
+        if row["request_sha256"] != record["request_sha256"]:
+            raise DecisionResultCorruptionError(_M_REQUEST)
+        # ``record`` already passed the structural validator, so a completed set can
+        # never contain an invented answer or an exclusion.
 
     def _row_to_observation(
         self, row: sqlite3.Row, mapping: Mapping[str, Any], canonical: bytes
@@ -1639,7 +2000,8 @@ def decision_result_integrity_problems(
     Reusable by a later backup verifier. Returns a list of static problem
     descriptions (empty when every observation is structurally intact, internally
     consistent, its parent dispatch/task/intent match, its recorded refs/versions
-    revalidate, and its complete per-question set matches the stored rows). Foreign,
+    revalidate, its complete per-question set matches the stored rows, and each
+    record independently matches the recorded intent and the set). Foreign,
     orphan/partial, dangling, and corrupt rows are all reported. The connection is
     never written to.
     """
