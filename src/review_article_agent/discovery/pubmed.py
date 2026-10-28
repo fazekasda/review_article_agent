@@ -56,8 +56,14 @@ here is taken from a tiny coordinator contract observation
 ``type=esearch``/``version=0.3`` and an ``esearchresult`` with ``count``,
 ``retmax``, ``retstart``, ``idlist``, ``translationset``, and
 ``querytranslation``). The EFetch XML shape is parsed defensively and only for
-the bibliographic fields named above. No live public API call is made by this
-module's tests.
+the bibliographic fields named above. A normal NCBI EFetch reply's plain external
+``<!DOCTYPE ... PUBLIC ...>`` declaration is accepted (stdlib ``ElementTree``
+never loads or resolves the external DTD); an internal DTD subset or any entity
+declaration is refused. Only ``PubmedArticle`` entries are supported:
+``PubmedBookArticle`` (or any other unexpected child) is an explicit
+``malformed_response`` rather than a silently dropped entry, so the adapter never
+misclaims that every entry in the requested window was represented. No live
+public API call is made by this module's tests.
 """
 
 from __future__ import annotations
@@ -75,6 +81,7 @@ from .records import (
     MAX_TITLE_LEN,
     MIN_PUBLICATION_YEAR,
     SOURCE_PUBMED,
+    DiscoveryRecordError,
     MetadataRecord,
     SearchPage,
     SearchResult,
@@ -183,10 +190,46 @@ def _default_utcnow() -> str:
 # --------------------------------------------------------------------------- #
 _DIGITS_RE = re.compile(r"\A[0-9]+\Z")
 _YEAR_RE = re.compile(r"\b(\d{4})\b")
-#: Reject any DTD/entity declaration before parsing so no external entity can be
-#: fetched and no entity expansion can be triggered (stdlib ElementTree does not
-#: resolve external entities, but a declaration is refused outright).
-_UNSAFE_XML_RE = re.compile(r"<!\s*(ENTITY|DOCTYPE)", re.IGNORECASE)
+#: A normal NCBI EFetch reply carries a plain **external** DOCTYPE
+#: (``<!DOCTYPE PubmedArticleSet PUBLIC "-//NLM//DTD PubMedArticle ...//EN"
+#: "https://dtd.nlm.nih.gov/...dtd">``). stdlib ``ElementTree`` never loads or
+#: resolves an external DTD, so such a declaration is accepted. An **internal**
+#: DTD subset (``[ ... ]``) or any entity declaration is refused, as is a
+#: DOCTYPE whose quoted literal references a non-http(s) scheme.
+_DOCTYPE_RE = re.compile(r"<!DOCTYPE\b[^>]*>", re.IGNORECASE | re.DOTALL)
+_ENTITY_RE = re.compile(r"<!\s*ENTITY\b", re.IGNORECASE)
+_UNSAFE_DOCTYPE_SCHEME_RE = re.compile(
+    r"\b(?:file|data|ftp|ftps|gopher|jar|php|expect|netdoc|ldap|dict|smb)\s*:",
+    re.IGNORECASE,
+)
+
+
+def _reject_unsafe_xml(text: str) -> None:
+    """Refuse an entity declaration, an internal DTD subset, or an unsafe scheme.
+
+    A plain external ``PUBLIC``/``SYSTEM`` DOCTYPE is allowed because stdlib
+    ``ElementTree`` never fetches or resolves the external DTD it names.
+    """
+    if _ENTITY_RE.search(text):
+        raise _MalformedResponse("xml entity declaration")
+    for match in _DOCTYPE_RE.finditer(text):
+        declaration = match.group(0)
+        if "[" in declaration:
+            raise _MalformedResponse("xml internal dtd subset")
+        if _UNSAFE_DOCTYPE_SCHEME_RE.search(declaration):
+            raise _MalformedResponse("xml unsafe dtd reference")
+
+
+def _decode_body(result) -> str:
+    """Decode a bounded response body as strict UTF-8.
+
+    Invalid UTF-8 is an explicit malformed response rather than a silent
+    ``errors="replace"`` decode that would quietly alter bibliographic metadata.
+    """
+    try:
+        return result.body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _MalformedResponse("invalid utf-8") from exc
 
 
 def _parse_nonneg_int(value: object, field_name: str) -> int:
@@ -198,7 +241,11 @@ def _parse_nonneg_int(value: object, field_name: str) -> int:
             raise _MalformedResponse(field_name)
         return value
     if isinstance(value, str) and _DIGITS_RE.match(value):
-        return int(value)
+        try:
+            return int(value)
+        except (ValueError, OverflowError) as exc:
+            # e.g. a digit string beyond CPython's int-conversion limit.
+            raise _MalformedResponse(field_name) from exc
     raise _MalformedResponse(field_name)
 
 
@@ -220,7 +267,9 @@ def _parse_esearch(text: str, *, requested_offset: int, requested_retmax: int) -
     """
     try:
         payload = json.loads(text)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, RecursionError) as exc:
+        # A deeply nested document raises RecursionError; it must stay an
+        # explicit malformed response, never an uncaught exception.
         raise _MalformedResponse("esearch json") from exc
     if not isinstance(payload, dict):
         raise _MalformedResponse("esearch json")
@@ -245,8 +294,12 @@ def _parse_esearch(text: str, *, requested_offset: int, requested_retmax: int) -
         if not isinstance(item, str) or not _DIGITS_RE.match(item):
             raise _MalformedResponse("idlist")
         idlist.append(item)
-    if len(idlist) > requested_retmax:
+    if len(idlist) > requested_retmax or len(idlist) > retmax:
         raise _MalformedResponse("idlist")
+    if len(idlist) != len(set(idlist)):
+        # A repeated PMID inside one window would let a short EFetch masquerade
+        # as progress; refuse it rather than accept a false advance.
+        raise _MalformedResponse("idlist duplicate")
     if count == 0 and idlist:
         raise _MalformedResponse("idlist")
     if count > 0 and requested_offset + len(idlist) > count:
@@ -312,7 +365,12 @@ def _parse_publication_year(citation: ET.Element | None) -> int | None:
     """Parse a 4-digit publication year; absent/out-of-range stays ``None``."""
     year_text = _find_text(citation, "Article/Journal/JournalIssue/PubDate/Year")
     if year_text is not None and _DIGITS_RE.match(year_text):
-        year = int(year_text)
+        try:
+            year = int(year_text)
+        except (ValueError, OverflowError):
+            # An unrepresentable year (e.g. a digit string beyond CPython's
+            # int-conversion limit) is treated as absent, never a crash.
+            return None
         if MIN_PUBLICATION_YEAR <= year <= MAX_PUBLICATION_YEAR:
             return year
     medline = _find_text(citation, "Article/Journal/JournalIssue/PubDate/MedlineDate")
@@ -326,15 +384,23 @@ def _parse_publication_year(citation: ET.Element | None) -> int | None:
 
 
 def _parse_efetch(text: str) -> tuple[_FetchedArticle, ...]:
-    """Parse a ``PubmedArticleSet`` into bibliographic articles only."""
-    if _UNSAFE_XML_RE.search(text):
-        raise _MalformedResponse("unsafe xml declaration")
+    """Parse a ``PubmedArticleSet`` into bibliographic articles only.
+
+    Only ``PubmedArticle`` entries are supported. A ``PubmedBookArticle`` (or any
+    other unexpected child) is an explicit ``malformed_response`` rather than a
+    silently dropped entry, so the adapter never misclaims that every entry in
+    the requested window was represented.
+    """
+    _reject_unsafe_xml(text)
     try:
         root = ET.fromstring(text)
     except ET.ParseError as exc:
         raise _MalformedResponse("xml") from exc
     if root.tag != "PubmedArticleSet":
         raise _MalformedResponse("xml root")
+    for child in root:
+        if child.tag != "PubmedArticle":
+            raise _MalformedResponse("unsupported article element")
     articles: list[_FetchedArticle] = []
     for article in root.findall("PubmedArticle"):
         citation = article.find("MedlineCitation")
@@ -343,7 +409,8 @@ def _parse_efetch(text: str) -> tuple[_FetchedArticle, ...]:
             raise _MalformedResponse("pmid")
         title = _find_text(citation, "Article/ArticleTitle")
         if title is not None and len(title) > MAX_TITLE_LEN:
-            title = title[:MAX_TITLE_LEN]
+            # Never silently truncate provider content.
+            raise _MalformedResponse("title too long")
         pubmed_data = article.find("PubmedData")
         article_id_list = (
             pubmed_data.find("ArticleIdList") if pubmed_data is not None else None
@@ -612,44 +679,64 @@ class PubMedClient:
     ) -> tuple[SearchPage, int | None, str | None, set[str], int | None]:
         """Fetch one ESearch+EFetch page.
 
-        Returns ``(page, expected_count, query_translation, seen, next_offset)``.
+        The ESearch ``retmax`` is clamped to the remaining provider window, so a
+        request can never reach past :data:`PUBMED_WINDOW_LIMIT`. Returns
+        ``(page, expected_count, query_translation, seen, next_offset)``;
         ``next_offset`` is ``None`` when the page failed or reached a natural end.
         """
         retrieved_at = self._utcnow()
+        # Never request past the provider's own result window.
+        effective_retmax = min(page_size, self._window_limit - offset)
         esearch_params = {
             "db": "pubmed",
             "retmode": "json",
             "term": query,
             "retstart": offset,
-            "retmax": page_size,
+            "retmax": effective_retmax,
         }
         esearch = self._transport.get(PUBMED_ESEARCH_URL, esearch_params)
         attempts: list[AttemptRecord] = list(esearch.attempts)
         if not esearch.ok:
             page = self._failed_page(
-                query, esearch.requested_url, retrieved_at, page_index, page_size,
-                attempts, esearch.failure,
+                query, esearch.requested_url, retrieved_at, page_index,
+                effective_retmax, attempts, esearch.failure,
             )
             return page, expected_count, query_translation, seen, None
         try:
             data = _parse_esearch(
-                esearch.text(), requested_offset=offset, requested_retmax=page_size
+                _decode_body(esearch),
+                requested_offset=offset,
+                requested_retmax=effective_retmax,
             )
         except _MalformedResponse:
             page = self._failed_page(
-                query, esearch.requested_url, retrieved_at, page_index, page_size,
-                attempts, "malformed_response",
+                query, esearch.requested_url, retrieved_at, page_index,
+                effective_retmax, attempts, "malformed_response",
             )
             return page, expected_count, query_translation, seen, None
 
-        translation = data.query_translation or query_translation
+        # The first translation is retained; a later page that reports a
+        # different translation is an explicit anomaly, never silent drift.
+        translation = query_translation
+        if data.query_translation is not None:
+            if translation is None:
+                translation = data.query_translation
+            elif data.query_translation != translation:
+                page = self._failed_page(
+                    query, esearch.requested_url, retrieved_at, page_index,
+                    effective_retmax, attempts, "malformed_response",
+                    total_count=data.count,
+                )
+                return page, expected_count, query_translation, seen, None
+
         if expected_count is None:
             expected_count = data.count
         elif data.count != expected_count:
             # The provider's total changed mid-run: never report this complete.
             page = self._failed_page(
-                query, esearch.requested_url, retrieved_at, page_index, page_size,
-                attempts, "malformed_response", total_count=data.count,
+                query, esearch.requested_url, retrieved_at, page_index,
+                effective_retmax, attempts, "malformed_response",
+                total_count=data.count,
             )
             return page, expected_count, translation, seen, None
 
@@ -657,7 +744,7 @@ class PubMedClient:
             page = SearchPage(
                 source=SOURCE_PUBMED, query=query,
                 requested_url=esearch.requested_url, retrieved_at=retrieved_at,
-                page_index=page_index, records=(), page_size=page_size,
+                page_index=page_index, records=(), page_size=effective_retmax,
                 total_count=0, next_cursor=None, complete=True,
                 stop_reason="completed", failure=None, attempts=tuple(attempts),
             )
@@ -666,8 +753,9 @@ class PubMedClient:
         if not data.idlist:
             # An empty page before the claimed total is never a natural end.
             page = self._failed_page(
-                query, esearch.requested_url, retrieved_at, page_index, page_size,
-                attempts, "malformed_response", total_count=data.count,
+                query, esearch.requested_url, retrieved_at, page_index,
+                effective_retmax, attempts, "malformed_response",
+                total_count=data.count,
             )
             return page, expected_count, translation, seen, None
 
@@ -678,16 +766,17 @@ class PubMedClient:
         attempts.extend(efetch.attempts)
         if not efetch.ok:
             page = self._failed_page(
-                query, esearch.requested_url, retrieved_at, page_index, page_size,
-                attempts, efetch.failure, total_count=data.count,
+                query, esearch.requested_url, retrieved_at, page_index,
+                effective_retmax, attempts, efetch.failure, total_count=data.count,
             )
             return page, expected_count, translation, seen, None
         try:
-            fetched = _parse_efetch(efetch.text())
+            fetched = _parse_efetch(_decode_body(efetch))
         except _MalformedResponse:
             page = self._failed_page(
-                query, esearch.requested_url, retrieved_at, page_index, page_size,
-                attempts, "malformed_response", total_count=data.count,
+                query, esearch.requested_url, retrieved_at, page_index,
+                effective_retmax, attempts, "malformed_response",
+                total_count=data.count,
             )
             return page, expected_count, translation, seen, None
 
@@ -699,26 +788,37 @@ class PubMedClient:
             or returned_set != requested_set  # missing and/or unrequested IDs
             or any(pmid in seen for pmid in returned_set)  # overlap with a prior page
         )
-        records = tuple(
-            MetadataRecord(
-                source=SOURCE_PUBMED,
-                source_id=article.pmid,
-                pmid=article.pmid,
-                pmcid=article.pmcid,
-                doi=article.doi,
-                title=article.title,
-                publication_year=article.publication_year,
+        try:
+            records = tuple(
+                MetadataRecord(
+                    source=SOURCE_PUBMED,
+                    source_id=article.pmid,
+                    pmid=article.pmid,
+                    pmcid=article.pmcid,
+                    doi=article.doi,
+                    title=article.title,
+                    publication_year=article.publication_year,
+                )
+                for article in fetched
+                if article.pmid in requested_set
             )
-            for article in fetched
-            if article.pmid in requested_set
-        )
+        except DiscoveryRecordError:
+            # Malformed provider metadata is an explicit failure, never an
+            # uncaught exception; the attempts above are retained.
+            page = self._failed_page(
+                query, esearch.requested_url, retrieved_at, page_index,
+                effective_retmax, attempts, "malformed_response",
+                total_count=data.count,
+            )
+            return page, expected_count, translation, seen, None
+
         next_offset = offset + len(data.idlist)
         if anomaly:
             # Keep the observations visible, but never claim this page complete.
             page = SearchPage(
                 source=SOURCE_PUBMED, query=query,
                 requested_url=esearch.requested_url, retrieved_at=retrieved_at,
-                page_index=page_index, records=records, page_size=page_size,
+                page_index=page_index, records=records, page_size=effective_retmax,
                 total_count=data.count, next_cursor=None, complete=False,
                 stop_reason="failure", failure="malformed_response",
                 attempts=tuple(attempts),
@@ -731,7 +831,7 @@ class PubMedClient:
         page = SearchPage(
             source=SOURCE_PUBMED, query=query,
             requested_url=esearch.requested_url, retrieved_at=retrieved_at,
-            page_index=page_index, records=records, page_size=page_size,
+            page_index=page_index, records=records, page_size=effective_retmax,
             total_count=data.count, next_cursor=next_cursor, complete=True,
             stop_reason="completed", failure=None, attempts=tuple(attempts),
         )
