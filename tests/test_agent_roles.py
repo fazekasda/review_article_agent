@@ -14,12 +14,25 @@ acceptance lines 17-19, ``docs/specification.md`` lines 20/38/39 and 52-63,
 * the emitted OpenCode **V2** config has broad deny rules and the proposal
   interface stays proposal-only.
 
+Repair R1 regressions (``RepairHardeningTests``):
+
+* a reference entry without a digest is a typed boundary error, never ``KeyError``;
+* self-referential / over-deep content is rejected cleanly and cheaply, with
+  canonical validation *before* any structural walk;
+* a direct ``BoundedTask`` constructor call cannot bypass validation;
+* frozen refs/content cannot be mutated after hashing, and the proposal does not
+  alias the caller's mutable payload;
+* a task cannot be relabelled to another role or model (configuration drift);
+* every external-input error is static and redacted (no echoed canary);
+* the task fingerprint covers scope/prompt version/config, not only refs.
+
 No model, provider, network, filesystem, or paid call is exercised here.
 """
 
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -40,6 +53,8 @@ from review_article_agent.runtime.roles import (  # noqa: E402
     build_opencode_config,
     submit_proposal,
 )
+
+CANARY = "SYNTHETIC_SECRET_CANARY"
 
 
 def _role_model(provider="openrouter", model="deepseek/deepseek-v4.1-flash", variant=None):
@@ -78,9 +93,7 @@ _CRITIC_MODEL = {"provider_id": "openrouter", "model_id": "openai/gpt-6.1-sol"}
 
 
 def _single_role_config(role, model):
-    return RoleConfiguration.from_mapping(
-        {"schema_version": 1, "roles": {role: model}}
-    )
+    return RoleConfiguration.from_mapping({"schema_version": 1, "roles": {role: model}})
 
 
 def _config(writer=None, section_critic=None):
@@ -144,7 +157,6 @@ class RoleVocabularyTests(unittest.TestCase):
             "fact_checker",
         ):
             self.assertIn(required, roles.SCIENTIFIC_ROLES)
-        # Every role has a bounded default step limit within the hard bound.
         for role in roles.SCIENTIFIC_ROLES:
             self.assertGreaterEqual(roles.ROLE_DEFAULT_STEPS[role], 1)
             self.assertLessEqual(roles.ROLE_DEFAULT_STEPS[role], roles.MAX_ROLE_STEPS)
@@ -247,9 +259,7 @@ class RoleConfigurationTests(unittest.TestCase):
 
     def test_no_fallback_for_unconfigured_role(self):
         partial = _single_role_config("writer", _WRITER_MODEL)
-        # The configured role resolves...
         self.assertEqual(partial.for_role("writer").model.model_id, "anthropic/claude-sonnet-5-5")
-        # ...and an unconfigured or unknown role fails closed, never borrowing one.
         with self.assertRaises(RoleConfigError):
             partial.for_role("section_critic")
         with self.assertRaises(RoleConfigError):
@@ -469,7 +479,7 @@ class ProposalBoundaryTests(unittest.TestCase):
         self.assertEqual(proposal.target, dict(self.task.target))
         self.assertEqual(len(proposal.proposal_id), 64)
         self.assertEqual(len(proposal.payload_digest), 64)
-        # No approval / authority surface is exposed at all.
+        self.assertEqual(proposal.task_digest, self.task.fingerprint())
         for forbidden in (
             "approved",
             "approval",
@@ -490,6 +500,8 @@ class ProposalBoundaryTests(unittest.TestCase):
             submit_proposal(self.task, ["nope"], configuration=self.config)
         with self.assertRaises(ProposalError):
             submit_proposal(self.task, {}, configuration=self.config)
+        with self.assertRaises(ProposalError):
+            submit_proposal(self.task, {"content": {}}, configuration="not a config")
 
     def test_payload_cannot_supply_actor_approval_authority_model_or_scope(self):
         for key, value in (
@@ -527,7 +539,6 @@ class ProposalBoundaryTests(unittest.TestCase):
                 submit_proposal(self.task, {"content": content}, configuration=self.config)
 
     def test_generic_permission_payload_cannot_become_approval(self):
-        # A "permission grant" cannot ride in-band and no output turns it into one.
         with self.assertRaises(ProposalError):
             submit_proposal(
                 self.task,
@@ -547,7 +558,6 @@ class ProposalBoundaryTests(unittest.TestCase):
         task = _task(other)
         proposal = submit_proposal(task, {"content": {"summary": "x"}}, configuration=other)
         self.assertEqual(proposal.model.ref, "openrouter/some/other-model#low")
-        # The trusted config, not any payload field, determines the model.
         self.assertEqual(proposal.model, other.for_role("writer").model)
 
     def test_content_size_bounded_by_task(self):
@@ -581,9 +591,294 @@ class ProposalBoundaryTests(unittest.TestCase):
             self.task, {"content": {"note": "data"}}, configuration=self.config
         )
         self.assertEqual(proposal.target, dict(self.task.target))
-        self.assertEqual(proposal.input_digest, proposal.input_digest)
-        # A task for one project keeps that project; the proposal carries no scope.
         self.assertFalse(hasattr(proposal, "scope"))
+
+
+class RepairHardeningTests(unittest.TestCase):
+    """Regressions for review R1: typed missing-digest, cycles/depth, constructor
+    bypass, mutation/aliasing, model-config drift, redaction, and fingerprints."""
+
+    def setUp(self):
+        self.config = _config()
+        self.task = _task(self.config)
+
+    # -- typed errors, never raw KeyError ---------------------------------- #
+    def test_missing_digest_is_typed_not_keyerror(self):
+        mapping = _task_mapping()
+        mapping["input_refs"] = [
+            {"project_id": "prj_demo", "artifact_id": "art", "revision_id": "rev"}
+        ]
+        with self.assertRaises(TaskBoundaryError) as ctx:
+            BoundedTask.from_mapping(mapping, configuration=self.config)
+        self.assertEqual(ctx.exception.code, "task_ref_missing")
+
+    def test_missing_target_key_is_typed(self):
+        mapping = _task_mapping()
+        mapping["target"] = {"project_id": "prj_demo", "artifact_id": "art"}
+        with self.assertRaises(TaskBoundaryError) as ctx:
+            BoundedTask.from_mapping(mapping, configuration=self.config)
+        self.assertEqual(ctx.exception.code, "task_ref_missing")
+
+    # -- cycle / depth rejection, canonical-first -------------------------- #
+    def test_self_referential_content_rejected_cleanly(self):
+        cyclic: dict = {}
+        cyclic["self"] = cyclic
+        start = time.monotonic()
+        with self.assertRaises(ProposalError) as ctx:
+            submit_proposal(self.task, {"content": cyclic}, configuration=self.config)
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertEqual(ctx.exception.code, "content_json")
+
+    def test_self_referential_content_inside_list_rejected(self):
+        cyclic: list = []
+        cyclic.append({"inner": cyclic})
+        with self.assertRaises(ProposalError) as ctx:
+            submit_proposal(self.task, {"content": {"items": cyclic}}, configuration=self.config)
+        self.assertEqual(ctx.exception.code, "content_json")
+
+    def test_over_deep_content_rejected_cleanly(self):
+        deep: dict = {}
+        node = deep
+        for _ in range(500):
+            node["n"] = {}
+            node = node["n"]
+        start = time.monotonic()
+        with self.assertRaises(ProposalError) as ctx:
+            submit_proposal(self.task, {"content": deep}, configuration=self.config)
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertEqual(ctx.exception.code, "content_json")
+
+    # -- direct construction cannot bypass validation ---------------------- #
+    def test_direct_constructor_validates(self):
+        with self.assertRaises(TaskBoundaryError):
+            BoundedTask(
+                project_id="prj_demo",
+                role="writer",
+                target={"project_id": "prj_demo", "artifact_id": "a", "revision_id": "r"},
+                input_refs=(),
+                scope=("s",),
+                prompt_version="v",
+                size_limit=10,
+                step_limit=999,  # over the writer limit of 16
+                role_config=self.config.for_role("writer"),
+            )
+        with self.assertRaises(TaskBoundaryError):
+            BoundedTask(
+                project_id="prj_demo",
+                role="writer",
+                target={"project_id": "prj_demo", "artifact_id": "a", "revision_id": "r"},
+                input_refs=({"project_id": "prj_demo", "artifact_id": "a", "revision_id": "r"},),
+                scope=("s",),
+                prompt_version="v",
+                size_limit=10,
+                step_limit=1,
+                role_config=self.config.for_role("writer"),  # missing digest in input_refs
+            )
+        with self.assertRaises(TaskBoundaryError):
+            BoundedTask(
+                project_id="prj_demo",
+                role="writer",
+                target={"project_id": "prj_other", "artifact_id": "a", "revision_id": "r"},
+                input_refs=(),
+                scope=("s",),
+                prompt_version="v",
+                size_limit=10,
+                step_limit=1,
+                role_config=self.config.for_role("writer"),
+            )
+
+    def test_direct_constructor_matches_from_mapping_and_freezes(self):
+        direct = BoundedTask(
+            project_id="prj_demo",
+            role="writer",
+            target={"project_id": "prj_demo", "artifact_id": "art_draft", "revision_id": "rev_1"},
+            input_refs=(
+                {
+                    "project_id": "prj_demo",
+                    "artifact_id": "art_source",
+                    "revision_id": "rev_9",
+                    "digest": "a" * 64,
+                },
+            ),
+            scope=("section:introduction", "paragraph:1"),
+            prompt_version="writer.v1",
+            size_limit=4096,
+            step_limit=4,
+            role_config=self.config.for_role("writer"),
+        )
+        self.assertEqual(direct, self.task)
+        # Frozen references: no post-construction mutation.
+        with self.assertRaises(TypeError):
+            direct.target["project_id"] = "foreign"  # type: ignore[index]
+        self.assertEqual(direct.project_id, "prj_demo")
+
+    def test_role_config_must_match_role(self):
+        with self.assertRaises(TaskBoundaryError) as ctx:
+            BoundedTask(
+                project_id="prj_demo",
+                role="writer",
+                target={"project_id": "prj_demo", "artifact_id": "a", "revision_id": "r"},
+                input_refs=(),
+                scope=("s",),
+                prompt_version="v",
+                size_limit=10,
+                step_limit=1,
+                role_config=self.config.for_role("section_critic"),
+            )
+        self.assertEqual(ctx.exception.code, "task_role_config")
+
+    # -- mutation / aliasing ---------------------------------------------- #
+    def test_task_target_is_immutable(self):
+        with self.assertRaises(TypeError):
+            self.task.target["project_id"] = "foreign"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            self.task.input_refs[0]["digest"] = "f" * 64  # type: ignore[index]
+        # A caller's original dict cannot retarget the frozen task.
+        raw = _task_mapping()
+        task = BoundedTask.from_mapping(raw, configuration=self.config)
+        raw["target"]["project_id"] = "prj_foreign"
+        raw["input_refs"][0]["digest"] = "f" * 64
+        self.assertEqual(task.target["project_id"], "prj_demo")
+        self.assertEqual(task.input_refs[0]["digest"], "a" * 64)
+
+    def test_proposal_content_is_not_aliased_and_is_frozen(self):
+        payload = {"content": {"summary": "original"}}
+        proposal = submit_proposal(self.task, payload, configuration=self.config)
+        digest = proposal.payload_digest
+        payload["content"]["summary"] = "mutated-after-submit"
+        self.assertEqual(proposal.content, {"summary": "original"})
+        self.assertEqual(proposal.payload_digest, digest)
+        with self.assertRaises(TypeError):
+            proposal.content["summary"] = "nope"  # type: ignore[index]
+        # Frozen deeply: nested content too.
+        nested = submit_proposal(
+            self.task, {"content": {"outline": [{"text": "x"}]}}, configuration=self.config
+        )
+        self.assertEqual(nested.content, {"outline": ({"text": "x"},)})
+        self.assertEqual(nested.to_mapping()["content"], {"outline": [{"text": "x"}]})
+
+    # -- model / config drift --------------------------------------------- #
+    def test_submit_refuses_configuration_drift(self):
+        drifted = _config(
+            writer={"provider_id": "openrouter", "model_id": "some/OTHER", "variant": "low"}
+        )
+        with self.assertRaises(ProposalError) as ctx:
+            submit_proposal(self.task, {"content": {"x": 1}}, configuration=drifted)
+        self.assertEqual(ctx.exception.code, "task_drift")
+
+    def test_submit_refuses_steps_drift(self):
+        drifted_roles = _full_roles()
+        drifted_roles["writer"] = dict(drifted_roles["writer"], steps=5)
+        drifted = RoleConfiguration.from_mapping(
+            {"schema_version": 1, "roles": drifted_roles}
+        )
+        with self.assertRaises(ProposalError) as ctx:
+            submit_proposal(self.task, {"content": {"x": 1}}, configuration=drifted)
+        self.assertEqual(ctx.exception.code, "task_drift")
+
+    def test_submit_refuses_role_relabel(self):
+        # A task whose role is not in the supplied configuration cannot be
+        # relabelled onto another model.
+        other = RoleConfiguration.from_mapping(
+            {"schema_version": 1, "roles": _full_roles()}
+        )
+        task = _task(other)
+        self.assertEqual(task.role, "writer")
+        with self.assertRaises(ProposalError):
+            submit_proposal(
+                task,
+                {"content": {"x": 1}},
+                configuration=_single_role_config("search", _role_model()),
+            )
+
+    # -- fingerprints cover more than refs -------------------------------- #
+    def test_fingerprint_covers_scope_prompt_and_config(self):
+        base = _task()
+        other_scope = _task(scope=["section:methods"])
+        other_prompt = _task(prompt_version="writer.v2")
+        other_steps = _task(step_limit=5)
+        digests = {
+            base.fingerprint(),
+            other_scope.fingerprint(),
+            other_prompt.fingerprint(),
+            other_steps.fingerprint(),
+        }
+        self.assertEqual(len(digests), 4)
+        # And the proposal identity changes with the scope pin.
+        p1 = submit_proposal(base, {"content": {"a": 1}}, configuration=self.config)
+        p2 = submit_proposal(other_scope, {"content": {"a": 1}}, configuration=self.config)
+        self.assertNotEqual(p1.proposal_id, p2.proposal_id)
+        self.assertNotEqual(p1.task_digest, p2.task_digest)
+
+    # -- redaction --------------------------------------------------------- #
+    def test_errors_are_static_and_redacted(self):
+        cyclic: dict = {}
+        cyclic["self"] = cyclic
+        cases = [
+            lambda: RoleConfiguration.from_mapping(
+                {"schema_version": 1, "roles": {CANARY: {"provider_id": "p", "model_id": "m"}}}
+            ),
+            lambda: RoleConfiguration.from_mapping(
+                {
+                    "schema_version": 1,
+                    "roles": {"writer": {"provider_id": "/" + CANARY, "model_id": "m"}},
+                }
+            ),
+            lambda: RoleConfiguration.from_mapping(
+                {"schema_version": 1, "roles": _full_roles(), CANARY: 1}
+            ),
+            lambda: BoundedTask.from_mapping(
+                _task_mapping(**{CANARY: True}), configuration=self.config
+            ),
+            lambda: BoundedTask.from_mapping(
+                _task_mapping(
+                    target={"project_id": CANARY, "artifact_id": "a", "revision_id": "r"}
+                ),
+                configuration=self.config,
+            ),
+            lambda: BoundedTask.from_mapping(
+                _task_mapping(
+                    input_refs=[
+                        {
+                            "project_id": "prj_demo",
+                            "artifact_id": "a",
+                            "revision_id": "r",
+                            "digest": CANARY,
+                        }
+                    ]
+                ),
+                configuration=self.config,
+            ),
+            lambda: submit_proposal(
+                self.task, {"content": {"x": 1}, CANARY: 2}, configuration=self.config
+            ),
+            lambda: submit_proposal(
+                self.task, {"content": {"approved": CANARY}}, configuration=self.config
+            ),
+            lambda: submit_proposal(
+                self.task, {"content": {"v": float("nan")}}, configuration=self.config
+            ),
+            lambda: submit_proposal(
+                self.task, {"content": cyclic}, configuration=self.config
+            ),
+            lambda: submit_proposal(
+                self.task,
+                {"content": {"note": CANARY}, "scope": [CANARY]},
+                configuration=self.config,
+            ),
+        ]
+        raised = 0
+        for case in cases:
+            with self.assertRaises(roles.AgentRoleError) as ctx:
+                case()
+            raised += 1
+            exc = ctx.exception
+            self.assertIsInstance(exc.code, str)
+            self.assertTrue(exc.code)
+            self.assertNotIn(CANARY, str(exc))
+            self.assertNotIn(CANARY, repr(exc))
+            self.assertNotIn(CANARY, repr(exc.__dict__))
+        self.assertEqual(raised, len(cases))
 
 
 class OpenCodeV2ConfigTests(unittest.TestCase):
@@ -597,7 +892,6 @@ class OpenCodeV2ConfigTests(unittest.TestCase):
         self.assertNotIn("default_agent", self.doc)
         for key in ("permissions", "policies", "agents", "mcp", "plugins", "skills"):
             self.assertIn(key, self.doc)
-        # No V1 / deprecated keys anywhere in the document.
         deprecated = roles.OPENCODE_DEPRECATED_V1_KEYS
         present = deprecated & _all_dict_keys(self.doc)
         self.assertFalse(present, present)
@@ -611,7 +905,6 @@ class OpenCodeV2ConfigTests(unittest.TestCase):
         }
         for action in roles.OPENCODE_BUILTIN_TOOL_ACTIONS:
             self.assertIn(action, denied_actions, action)
-        # Explicitly deny the filesystem/shell/subagent/web/execute/skill surface.
         for action in (
             "read",
             "edit",
@@ -668,9 +961,7 @@ class OpenCodeV2ConfigTests(unittest.TestCase):
         self.assertEqual(
             roles.opencode_config_bytes(self.config), roles.opencode_config_bytes(self.config)
         )
-        self.assertEqual(
-            roles.opencode_config_bytes(self.config), canonical_json(self.doc)
-        )
+        self.assertEqual(roles.opencode_config_bytes(self.config), canonical_json(self.doc))
 
 
 if __name__ == "__main__":

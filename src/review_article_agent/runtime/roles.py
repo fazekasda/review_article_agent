@@ -48,6 +48,34 @@ module and is not claimed here. This module also makes **no** scientific-claim:
 a validated structure is format/consistency only, never scientific correctness,
 eligibility, or approval.
 
+A proposal is **always non-authoritative regardless of its text**. The payload
+key denylist below is a strict *data-only envelope* aid, never a security proof:
+nothing here turns model text into an approval, and no text can grant authority.
+
+Hardening notes (repair R1)
+---------------------------
+
+* **Canonical, portable, bounded validation happens before any walk.** Every
+  externally-supplied JSON value is passed through
+  :func:`review_article_agent.domain.records.canonical_json` *first*; that
+  routine rejects circular references, over-deep nesting (> 64), non-string
+  keys, surrogates, and non-finite numbers, so a later structural walk is cheap
+  and cannot loop. The walk carries its own visited/depth guard as defence in
+  depth.
+* **Every mandatory key yields a typed boundary error.** A missing reference
+  digest is a :class:`TaskBoundaryError`, never a raw ``KeyError``.
+* **Tasks are frozen and revalidated.** ``BoundedTask`` validates in
+  ``__post_init__`` (so a direct constructor call cannot bypass validation) and
+  stores immutable views; :func:`submit_proposal` rebuilds the task from its
+  canonical form under the supplied configuration and requires exact equality,
+  so a task can never be relabelled to another role or model.
+* **No aliasing after hashing.** Reference maps and proposal content are frozen
+  (read-only mappings and tuples), so a caller mutating its own object after
+  submission cannot change a proposal's stored content or digests.
+* **Static, redacted errors.** Errors raised from external input carry a
+  value-free ``code`` and a constant message; they never echo a model id, role,
+  key, path, value, or exception text.
+
 What this module deliberately does **not** do
 ---------------------------------------------
 
@@ -66,6 +94,7 @@ import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from ..domain.errors import ReviewAgentError
@@ -113,8 +142,12 @@ MAX_INPUT_REFS = 256
 MAX_PROMPT_VERSION_LEN = 128
 MAX_MODEL_TOKEN_LEN = 200
 
+#: Maximum walk depth for the defence-in-depth content key scan. Independent of,
+#: and no larger than, ``records``' canonical JSON depth bound.
+MAX_CONTENT_DEPTH = 64
+
 #: ``docs/specification.md`` line 38: a section critique/repair loop is at most
-#: three rounds; line 15 of the same baseline fixes that limit.
+#: three rounds.
 MAX_SECTION_CRITIQUE_ROUNDS = 3
 
 #: ``docs/specification.md`` line 39: original-source factual checking is at most
@@ -246,12 +279,113 @@ _VARIANT_RE = re.compile(r"^[^\s#]+$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # --------------------------------------------------------------------------- #
+# Static, redacted error messages (never interpolate external input)
+# --------------------------------------------------------------------------- #
+
+_MSG_BAD_CONFIG = "A role configuration must be an object with schema_version and roles."
+_MSG_CONFIG_UNKNOWN_FIELD = (
+    "The role configuration contains a field that is not permitted; only "
+    "'schema_version' and 'roles' are allowed."
+)
+_MSG_CONFIG_SCHEMA = "The role configuration schema_version is missing or unsupported."
+_MSG_CONFIG_ROLES = "The role configuration 'roles' field must be an object of role entries."
+_MSG_CONFIG_UNKNOWN_ROLE = (
+    "The role configuration names a role that is not a known scientific role."
+)
+_MSG_CONFIG_ROLE_FIELD = "A role entry has a field that is not permitted."
+_MSG_CONFIG_MODEL = (
+    "A role entry must give an explicit provider_id and model_id (and only "
+    "those plus variant/steps)."
+)
+_MSG_MODEL_TYPE = (
+    "A role model must be a 'provider/model#variant' string or an object "
+    "naming a provider and model."
+)
+_MSG_MODEL_REF = "A role model reference must be 'provider/model' with an optional '#variant'."
+_MSG_MODEL_TOKEN = (
+    "A model reference component must be a non-empty, whitespace-free, "
+    "bounded string."
+)
+_MSG_STEPS = "Role steps must be a bounded positive integer."
+_MSG_ROLES_TYPE = "A role set must be a tuple of role entries."
+_MSG_ROLE_DUPLICATE = "A role is configured more than once."
+_MSG_KNOWN_ROLE = "The requested role is not a known scientific role."
+_MSG_ROLE_UNCONFIGURED = (
+    "The requested role has no configured provider/model; there is no fallback."
+)
+_MSG_CRITIC_SAME = (
+    "The section critic must be a different concrete provider/model than the writer; "
+    "a different variant is not a different model."
+)
+_MSG_TASK_OBJECT = "A bounded task must be an object."
+_MSG_TASK_UNKNOWN_FIELD = (
+    "The task contains a field that is not permitted; a task is data only and cannot "
+    "carry an actor, approval, authority, budget, or tool permission."
+)
+_MSG_TASK_MISSING_FIELD = "The task is missing a required field."
+_MSG_TASK_ROLE = "The task role must be a string naming a configured scientific role."
+_MSG_TASK_ID = "A task or artifact identifier is not a valid opaque identifier."
+_MSG_TASK_REF = "A task reference must be an exact same-project revision reference."
+_MSG_TASK_REF_FIELD = "A task reference contains a field that is not permitted."
+_MSG_TASK_REF_MISSING = "A task reference is missing a required field (including its digest)."
+_MSG_TASK_REF_DIGEST = "A task reference digest must be a lowercase hex SHA-256 digest."
+_MSG_TASK_REF_CROSS_PROJECT = "A task reference must belong to the task's own project."
+_MSG_TASK_REFS_TYPE = "Task input references must be a bounded list of exact references."
+_MSG_TASK_SCOPE_TYPE = "Task scope must be a bounded list of non-empty tokens."
+_MSG_TASK_SCOPE_TOKEN = "A task scope token must be a non-empty, whitespace-free, bounded string."
+_MSG_TASK_PROMPT = "Task prompt_version must be a non-empty, whitespace-free, bounded string."
+_MSG_TASK_SIZE = "Task size_limit must be a bounded positive integer."
+_MSG_TASK_STEP = (
+    "Task step_limit must be a bounded positive integer no larger than the "
+    "role's step limit."
+)
+_MSG_TASK_ROLE_CONFIG = "The task's role configuration must match its role."
+_MSG_PAYLOAD_OBJECT = "A proposal payload must be an object with a single 'content' field."
+_MSG_PAYLOAD_UNKNOWN_FIELD = (
+    "A proposal payload may carry only 'content'; it cannot supply an actor, approval, "
+    "authority, model, scope, or tool permission."
+)
+_MSG_PAYLOAD_MISSING_CONTENT = "A proposal payload must include a 'content' field."
+_MSG_PROPOSAL_TASK = "submit_proposal requires a validated BoundedTask."
+_MSG_PROPOSAL_CONFIG = "submit_proposal requires a validated RoleConfiguration."
+_MSG_PROPOSAL_TASK_DRIFT = (
+    "The task does not match the supplied configuration; refusing to relabel it to "
+    "another role or model."
+)
+_MSG_PROPOSAL_CONTENT_JSON = (
+    "Proposal content must be canonical, portable, bounded JSON (no cycles, no "
+    "over-deep nesting, no non-finite numbers, no non-string keys)."
+)
+_MSG_PROPOSAL_CONTENT_SIZE = "Proposal content is larger than the task size limit."
+_MSG_PROPOSAL_CONTENT_KEY = (
+    "Proposal content contains a key that is not permitted; a proposal may carry "
+    "scientific data only and cannot approve, edit state, set budgets, grant tool "
+    "permissions, or re-pin the task."
+)
+_MSG_PROPOSAL_CONTENT_SHAPE = "Proposal content nests too deeply or is circular."
+
+
+def _wrap(error_cls: type["AgentRoleError"], exc: "AgentRoleError") -> "AgentRoleError":
+    """Return a same-code error of ``error_cls`` carrying only a static message."""
+    return error_cls(exc.code, str(exc))
+
+
+# --------------------------------------------------------------------------- #
 # Errors
 # --------------------------------------------------------------------------- #
 
 
 class AgentRoleError(ReviewAgentError):
-    """Base class for every role/task/proposal boundary failure."""
+    """Base class for every role/task/proposal boundary failure.
+
+    ``code`` is a static, value-free identifier and the message is a constant, so
+    an error raised from untrusted input never echoes a model id, role name, key,
+    path, value, or exception text.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class RoleConfigError(AgentRoleError):
@@ -275,20 +409,33 @@ class ProposalError(AgentRoleError):
 # --------------------------------------------------------------------------- #
 
 
-def _canonical_bytes(value: object, *, error_cls: type[AgentRoleError], label: str) -> bytes:
-    """Return canonical JSON bytes or raise ``error_cls`` (never echo the value)."""
+def _canonical_bytes(
+    value: object,
+    *,
+    error_cls: type[AgentRoleError],
+    code: str,
+    message: str,
+) -> bytes:
+    """Return canonical, portable, bounded JSON bytes or raise ``error_cls``.
+
+    Runs first for any external value: it rejects cycles, over-deep nesting,
+    non-string keys, surrogates, and non-finite numbers, and never echoes input.
+    """
     try:
         return canonical_json(value)
     except ValueError as exc:  # RecordValidationError is a ValueError subclass
-        raise error_cls(
-            f"{label} is not bounded, well-formed JSON ({type(exc).__name__}); "
-            f"supply portable JSON data only."
-        ) from exc
+        raise error_cls(code, message) from exc
 
 
-def _require_plain_int(value: object, *, error_cls: type[AgentRoleError], field: str) -> int:
+def _require_plain_int(
+    value: object,
+    *,
+    error_cls: type[AgentRoleError],
+    code: str,
+    message: str,
+) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise error_cls(f"{field} must be an integer.")
+        raise error_cls(code, message)
     return value
 
 
@@ -296,25 +443,40 @@ def _normalize_key(key: str) -> str:
     return key.strip().lower().replace("-", "").replace("_", "")
 
 
-def _validate_model_token(
-    value: object,
-    *,
-    field: str,
-    pattern: re.Pattern[str],
-) -> str:
+def _freeze_mapping(value: Mapping[str, str]) -> Mapping[str, str]:
+    """Return a read-only view over a private copy of ``value`` (no aliasing)."""
+    return MappingProxyType(dict(value))
+
+
+def _deep_freeze(value: Any) -> Any:
+    """Return an immutable copy of a validated JSON value (run only post-canonical)."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    """Return a plain JSON-safe copy of a frozen value."""
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _valid_model_token(value: object, *, pattern: re.Pattern[str]) -> str:
     if not isinstance(value, str) or value == "":
-        raise RoleConfigError(f"model {field} must be a non-empty string.")
+        raise RoleConfigError("model_token", _MSG_MODEL_TOKEN)
     if value != value.strip() or any(ch.isspace() for ch in value):
-        raise RoleConfigError(f"model {field} must not contain whitespace.")
+        raise RoleConfigError("model_token", _MSG_MODEL_TOKEN)
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
-        raise RoleConfigError(f"model {field} must not contain control characters.")
+        raise RoleConfigError("model_token", _MSG_MODEL_TOKEN)
     if len(value) > MAX_MODEL_TOKEN_LEN:
-        raise RoleConfigError(f"model {field} is longer than {MAX_MODEL_TOKEN_LEN} characters.")
+        raise RoleConfigError("model_token", _MSG_MODEL_TOKEN)
     if not pattern.match(value):
-        raise RoleConfigError(
-            f"model {field} contains a character that is not allowed in a "
-            f"concrete provider/model reference."
-        )
+        raise RoleConfigError("model_token", _MSG_MODEL_TOKEN)
     return value
 
 
@@ -339,20 +501,14 @@ class ModelRef:
 
     def __post_init__(self) -> None:
         object.__setattr__(
-            self,
-            "provider_id",
-            _validate_model_token(self.provider_id, field="provider_id", pattern=_PROVIDER_RE),
+            self, "provider_id", _valid_model_token(self.provider_id, pattern=_PROVIDER_RE)
         )
         object.__setattr__(
-            self,
-            "model_id",
-            _validate_model_token(self.model_id, field="model_id", pattern=_MODEL_RE),
+            self, "model_id", _valid_model_token(self.model_id, pattern=_MODEL_RE)
         )
         if self.variant is not None:
             object.__setattr__(
-                self,
-                "variant",
-                _validate_model_token(self.variant, field="variant", pattern=_VARIANT_RE),
+                self, "variant", _valid_model_token(self.variant, pattern=_VARIANT_RE)
             )
 
     @property
@@ -389,21 +545,17 @@ class ModelRef:
         """Parse ``"provider/model#variant"`` or ``{provider_id, model_id, variant}``.
 
         Never invents a provider, model, or variant: every component must be
-        present in the input.
+        present in the input. Any failure is a redacted, typed error.
         """
         if isinstance(value, str):
             return cls._parse_ref_string(value, error_cls=error_cls)
         if isinstance(value, Mapping):
             allowed = {"provider_id", "model_id", "variant"}
-            unknown = [k for k in value if k not in allowed]
-            if unknown:
-                raise error_cls(
-                    "a role model has an unknown field; only provider_id, "
-                    "model_id, and variant are permitted."
-                )
-            for required in ("provider_id", "model_id"):
-                if required not in value:
-                    raise error_cls(f"a role model is missing required field {required!r}.")
+            for key in value:
+                if not isinstance(key, str) or key not in allowed:
+                    raise error_cls("model_field", _MSG_CONFIG_ROLE_FIELD)
+            if "provider_id" not in value or "model_id" not in value:
+                raise error_cls("model_missing", _MSG_CONFIG_MODEL)
             try:
                 return cls(
                     provider_id=value["provider_id"],
@@ -411,32 +563,26 @@ class ModelRef:
                     variant=value.get("variant"),
                 )
             except RoleConfigError as exc:
-                raise error_cls(str(exc)) from exc
-        raise error_cls(
-            "a role model must be a 'provider/model#variant' string or an object "
-            "with provider_id/model_id."
-        )
+                raise _wrap(error_cls, exc) from exc
+        raise error_cls("model_type", _MSG_MODEL_TYPE)
 
     @classmethod
     def _parse_ref_string(cls, value: str, *, error_cls: type[AgentRoleError]) -> "ModelRef":
         if value == "" or value != value.strip():
-            raise error_cls("a role model reference must be non-empty with no outer whitespace.")
+            raise error_cls("model_ref", _MSG_MODEL_REF)
         variant: str | None = None
         base = value
         if "#" in value:
             base, _, variant = value.partition("#")
             if variant == "":
-                raise error_cls("a role model variant after '#' must not be empty.")
+                raise error_cls("model_ref", _MSG_MODEL_REF)
         provider, sep, model = base.partition("/")
         if sep == "" or provider == "" or model == "":
-            raise error_cls(
-                "a role model reference must be 'provider/model' (optionally "
-                "'provider/model#variant'); a bare model name is not accepted."
-            )
+            raise error_cls("model_ref", _MSG_MODEL_REF)
         try:
             return cls(provider_id=provider, model_id=model, variant=variant)
         except RoleConfigError as exc:
-            raise error_cls(str(exc)) from exc
+            raise _wrap(error_cls, exc) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -453,18 +599,15 @@ class RoleConfig:
     steps: int
 
     def __post_init__(self) -> None:
-        if self.role not in SCIENTIFIC_ROLES:
-            raise RoleConfigError(
-                f"{self.role!r} is not a known scientific role; the known roles "
-                f"are {', '.join(SCIENTIFIC_ROLES)}."
-            )
+        if not isinstance(self.role, str) or self.role not in SCIENTIFIC_ROLES:
+            raise RoleConfigError("unknown_role", _MSG_KNOWN_ROLE)
         if not isinstance(self.model, ModelRef):
-            raise RoleConfigError("role model must be a ModelRef.")
-        steps = _require_plain_int(self.steps, error_cls=RoleConfigError, field="role steps")
+            raise RoleConfigError("model_type", _MSG_MODEL_TYPE)
+        steps = _require_plain_int(
+            self.steps, error_cls=RoleConfigError, code="steps", message=_MSG_STEPS
+        )
         if steps < 1 or steps > MAX_ROLE_STEPS:
-            raise RoleConfigError(
-                f"role steps must be between 1 and {MAX_ROLE_STEPS} (got {steps})."
-            )
+            raise RoleConfigError("steps", _MSG_STEPS)
 
 
 @dataclass(frozen=True)
@@ -480,13 +623,13 @@ class RoleConfiguration:
 
     def __post_init__(self) -> None:
         if not isinstance(self.roles, tuple):
-            raise RoleConfigError("roles must be a tuple of RoleConfig entries.")
+            raise RoleConfigError("roles_type", _MSG_ROLES_TYPE)
         seen: set[str] = set()
         for entry in self.roles:
             if not isinstance(entry, RoleConfig):
-                raise RoleConfigError("every configured role must be a RoleConfig.")
+                raise RoleConfigError("roles_type", _MSG_ROLES_TYPE)
             if entry.role in seen:
-                raise RoleConfigError(f"role {entry.role!r} is configured more than once.")
+                raise RoleConfigError("role_duplicate", _MSG_ROLE_DUPLICATE)
             seen.add(entry.role)
 
     @property
@@ -495,18 +638,12 @@ class RoleConfiguration:
 
     def for_role(self, role: str) -> RoleConfig:
         """Return the configured role, or fail closed (never a fallback)."""
-        if role not in SCIENTIFIC_ROLES:
-            raise RoleConfigError(
-                f"{role!r} is not a known scientific role; the known roles are "
-                f"{', '.join(SCIENTIFIC_ROLES)}."
-            )
+        if not isinstance(role, str) or role not in SCIENTIFIC_ROLES:
+            raise RoleConfigError("unknown_role", _MSG_KNOWN_ROLE)
         for entry in self.roles:
             if entry.role == role:
                 return entry
-        raise RoleConfigError(
-            f"role {role!r} has no configured provider/model; refusing to fall "
-            f"back to another role or a global default. Configure it explicitly."
-        )
+        raise RoleConfigError("role_unconfigured", _MSG_ROLE_UNCONFIGURED)
 
     def validate_section_critic(self) -> "CriticPlan":
         """Return the critic plan, requiring a distinct concrete model.
@@ -520,12 +657,7 @@ class RoleConfiguration:
         writer = self.for_role("writer")
         critic = self.for_role("section_critic")
         if critic.model.same_model(writer.model):
-            raise CriticConfigError(
-                "the section critic must be a different concrete provider/model "
-                f"than the writer; both resolve to '{critic.model.provider_id}/"
-                f"{critic.model.model_id}'. A different variant is not a different "
-                "model."
-            )
+            raise CriticConfigError("critic_same_model", _MSG_CRITIC_SAME)
         return CriticPlan(
             critic=critic,
             writer=writer,
@@ -559,48 +691,39 @@ class RoleConfiguration:
 
         Each role value may also be the ``"provider/model#variant"`` string form.
         Unknown fields, unknown roles, a missing/blank model, or an unsupported
-        schema version are all rejected.
+        schema version are all rejected with a redacted error.
         """
         if not isinstance(value, Mapping):
-            raise RoleConfigError("a role configuration must be an object.")
-        allowed_top = {"schema_version", "roles"}
-        unknown = [key for key in value if key not in allowed_top]
-        if unknown:
-            raise RoleConfigError(
-                "the role configuration contains an unknown field; only "
-                "'schema_version' and 'roles' are permitted."
-            )
+            raise RoleConfigError("config_type", _MSG_BAD_CONFIG)
+        for key in value:
+            if not isinstance(key, str) or key not in {"schema_version", "roles"}:
+                raise RoleConfigError("config_field", _MSG_CONFIG_UNKNOWN_FIELD)
         if "schema_version" not in value:
-            raise RoleConfigError(
-                f"the role configuration is missing 'schema_version' "
-                f"(expected {ROLE_CONFIG_SCHEMA_VERSION})."
-            )
+            raise RoleConfigError("config_schema", _MSG_CONFIG_SCHEMA)
         version = _require_plain_int(
-            value["schema_version"], error_cls=RoleConfigError, field="schema_version"
+            value["schema_version"],
+            error_cls=RoleConfigError,
+            code="config_schema",
+            message=_MSG_CONFIG_SCHEMA,
         )
         if version != ROLE_CONFIG_SCHEMA_VERSION:
-            raise RoleConfigError(
-                f"role configuration schema_version {version} is not supported "
-                f"(this build accepts exactly {ROLE_CONFIG_SCHEMA_VERSION})."
-            )
+            raise RoleConfigError("config_schema", _MSG_CONFIG_SCHEMA)
         roles_raw = value.get("roles")
         if not isinstance(roles_raw, Mapping):
-            raise RoleConfigError("the role configuration 'roles' field must be an object.")
+            raise RoleConfigError("config_roles", _MSG_CONFIG_ROLES)
         entries: list[RoleConfig] = []
         for role, spec in roles_raw.items():
-            if role not in SCIENTIFIC_ROLES:
-                raise RoleConfigError(
-                    f"{role!r} is not a known scientific role; the known roles "
-                    f"are {', '.join(SCIENTIFIC_ROLES)}."
-                )
+            if not isinstance(role, str) or role not in SCIENTIFIC_ROLES:
+                raise RoleConfigError("unknown_role", _MSG_CONFIG_UNKNOWN_ROLE)
             if isinstance(spec, Mapping):
-                allowed_spec = {"provider_id", "model_id", "variant", "steps"}
-                unknown_spec = [key for key in spec if key not in allowed_spec]
-                if unknown_spec:
-                    raise RoleConfigError(
-                        f"role {role!r} has an unknown field; only provider_id, "
-                        "model_id, variant, and steps are permitted."
-                    )
+                for key in spec:
+                    if not isinstance(key, str) or key not in {
+                        "provider_id",
+                        "model_id",
+                        "variant",
+                        "steps",
+                    }:
+                        raise RoleConfigError("role_field", _MSG_CONFIG_ROLE_FIELD)
                 _model_keys = ("provider_id", "model_id", "variant")
                 model_spec: object = {k: spec[k] for k in _model_keys if k in spec}
                 steps_raw = spec.get("steps")
@@ -612,7 +735,10 @@ class RoleConfiguration:
                 steps = ROLE_DEFAULT_STEPS[role]
             else:
                 steps = _require_plain_int(
-                    steps_raw, error_cls=RoleConfigError, field=f"{role}.steps"
+                    steps_raw,
+                    error_cls=RoleConfigError,
+                    code="steps",
+                    message=_MSG_STEPS,
                 )
             entries.append(RoleConfig(role=role, model=model, steps=steps))
         return cls(roles=tuple(entries))
@@ -637,20 +763,57 @@ class CriticPlan:
 # Bounded task
 # --------------------------------------------------------------------------- #
 
-_TASK_KEYS = frozenset(
-    {
-        "project_id",
-        "role",
-        "target",
-        "input_refs",
-        "scope",
-        "prompt_version",
-        "size_limit",
-        "step_limit",
-    }
+_TASK_KEYS = (
+    "project_id",
+    "role",
+    "target",
+    "input_refs",
+    "scope",
+    "prompt_version",
+    "size_limit",
+    "step_limit",
 )
+_TASK_KEY_SET = frozenset(_TASK_KEYS)
 _REF_KEYS = ("project_id", "artifact_id", "revision_id")
 _INPUT_REF_KEYS = ("project_id", "artifact_id", "revision_id", "digest")
+
+
+def _freeze_ref(
+    value: object,
+    project_id: str,
+    *,
+    with_digest: bool,
+) -> Mapping[str, str]:
+    """Validate and freeze one exact same-project revision reference."""
+    if not isinstance(value, Mapping):
+        raise TaskBoundaryError("task_ref", _MSG_TASK_REF)
+    allowed = set(_INPUT_REF_KEYS) if with_digest else set(_REF_KEYS)
+    for key in value:
+        if not isinstance(key, str) or key not in allowed:
+            raise TaskBoundaryError("task_ref_field", _MSG_TASK_REF_FIELD)
+    required = list(_INPUT_REF_KEYS) if with_digest else list(_REF_KEYS)
+    for key in required:
+        if key not in value:  # includes the digest: a missing digest is typed, not a KeyError
+            raise TaskBoundaryError("task_ref_missing", _MSG_TASK_REF_MISSING)
+    try:
+        ref_project = validate_identifier(value["project_id"], "project_id")
+        artifact_id = validate_identifier(value["artifact_id"], "artifact_id")
+        revision_id = validate_identifier(value["revision_id"], "revision_id")
+    except ValueError as exc:
+        raise TaskBoundaryError("task_id", _MSG_TASK_ID) from exc
+    if ref_project != project_id:
+        raise TaskBoundaryError("task_ref_cross_project", _MSG_TASK_REF_CROSS_PROJECT)
+    ref: dict[str, str] = {
+        "project_id": ref_project,
+        "artifact_id": artifact_id,
+        "revision_id": revision_id,
+    }
+    if with_digest:
+        digest = value["digest"]
+        if not isinstance(digest, str) or not _DIGEST_RE.match(digest):
+            raise TaskBoundaryError("task_ref_digest", _MSG_TASK_REF_DIGEST)
+        ref["digest"] = digest
+    return _freeze_mapping(ref)
 
 
 @dataclass(frozen=True)
@@ -662,6 +825,10 @@ class BoundedTask:
     the application (not the model): the exact project, the exact target
     revision, the exact input revision refs and their canonical digests, the
     explicit scope, prompt version, size limit, and step limit.
+
+    ``__post_init__`` validates and freezes the instance, so a **direct
+    constructor call cannot bypass validation**, and reference maps are read-only
+    views (``task.target["project_id"] = ...`` raises ``TypeError``).
     """
 
     project_id: str
@@ -673,6 +840,73 @@ class BoundedTask:
     size_limit: int
     step_limit: int
     role_config: RoleConfig
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.role, str) or self.role not in SCIENTIFIC_ROLES:
+            raise TaskBoundaryError("task_role", _MSG_TASK_ROLE)
+        if not isinstance(self.role_config, RoleConfig) or self.role_config.role != self.role:
+            raise TaskBoundaryError("task_role_config", _MSG_TASK_ROLE_CONFIG)
+        try:
+            project_id = validate_identifier(self.project_id, "project_id")
+        except ValueError as exc:
+            raise TaskBoundaryError("task_id", _MSG_TASK_ID) from exc
+
+        target = _freeze_ref(self.target, project_id, with_digest=False)
+
+        refs = self.input_refs
+        if not isinstance(refs, (list, tuple)):
+            raise TaskBoundaryError("task_refs_type", _MSG_TASK_REFS_TYPE)
+        if len(refs) > MAX_INPUT_REFS:
+            raise TaskBoundaryError("task_refs_type", _MSG_TASK_REFS_TYPE)
+        frozen_refs = tuple(
+            _freeze_ref(entry, project_id, with_digest=True) for entry in refs
+        )
+
+        scope_raw = self.scope
+        if not isinstance(scope_raw, (list, tuple)):
+            raise TaskBoundaryError("task_scope_type", _MSG_TASK_SCOPE_TYPE)
+        if len(scope_raw) > MAX_SCOPE_TOKENS:
+            raise TaskBoundaryError("task_scope_type", _MSG_TASK_SCOPE_TYPE)
+        scope: list[str] = []
+        for token in scope_raw:
+            if (
+                not isinstance(token, str)
+                or token == ""
+                or token != token.strip()
+                or len(token) > MAX_SCOPE_TOKEN_LEN
+            ):
+                raise TaskBoundaryError("task_scope_token", _MSG_TASK_SCOPE_TOKEN)
+            scope.append(token)
+
+        prompt_version = self.prompt_version
+        if (
+            not isinstance(prompt_version, str)
+            or prompt_version == ""
+            or prompt_version != prompt_version.strip()
+            or any(ch.isspace() for ch in prompt_version)
+            or len(prompt_version) > MAX_PROMPT_VERSION_LEN
+        ):
+            raise TaskBoundaryError("task_prompt", _MSG_TASK_PROMPT)
+
+        size_limit = _require_plain_int(
+            self.size_limit, error_cls=TaskBoundaryError, code="task_size", message=_MSG_TASK_SIZE
+        )
+        if size_limit < 1 or size_limit > MAX_TASK_SIZE_BYTES:
+            raise TaskBoundaryError("task_size", _MSG_TASK_SIZE)
+
+        step_limit = _require_plain_int(
+            self.step_limit, error_cls=TaskBoundaryError, code="task_step", message=_MSG_TASK_STEP
+        )
+        if step_limit < 1 or step_limit > self.role_config.steps:
+            raise TaskBoundaryError("task_step", _MSG_TASK_STEP)
+
+        object.__setattr__(self, "project_id", project_id)
+        object.__setattr__(self, "target", target)
+        object.__setattr__(self, "input_refs", frozen_refs)
+        object.__setattr__(self, "scope", tuple(scope))
+        object.__setattr__(self, "prompt_version", prompt_version)
+        object.__setattr__(self, "size_limit", size_limit)
+        object.__setattr__(self, "step_limit", step_limit)
 
     def to_mapping(self) -> dict[str, Any]:
         """A deterministic, JSON-safe representation (no authority fields)."""
@@ -687,9 +921,34 @@ class BoundedTask:
             "step_limit": self.step_limit,
         }
 
+    def fingerprint_mapping(self) -> dict[str, Any]:
+        """The full task identity: pins, scope/prompt versions, and role config."""
+        mapping = self.to_mapping()
+        mapping["role_config"] = {
+            "provider_id": self.role_config.model.provider_id,
+            "model_id": self.role_config.model.model_id,
+            "variant": self.role_config.model.variant,
+            "steps": self.role_config.steps,
+        }
+        return mapping
+
+    def fingerprint(self) -> str:
+        """Canonical SHA-256 over the full pinned task (not just the input refs)."""
+        return hashlib.sha256(
+            _canonical_bytes(
+                self.fingerprint_mapping(),
+                error_cls=TaskBoundaryError,
+                code="task_fingerprint",
+                message=_MSG_TASK_OBJECT,
+            )
+        ).hexdigest()
+
     def canonical_bytes(self) -> bytes:
         return _canonical_bytes(
-            self.to_mapping(), error_cls=TaskBoundaryError, label="bounded task"
+            self.to_mapping(),
+            error_cls=TaskBoundaryError,
+            code="task_canonical",
+            message=_MSG_TASK_OBJECT,
         )
 
     @classmethod
@@ -704,165 +963,45 @@ class BoundedTask:
         Unknown top-level fields (which is how an actor, approval, authority,
         budget, or tool-permission override would arrive) are rejected outright.
         """
+        if not isinstance(configuration, RoleConfiguration):
+            raise TaskBoundaryError("task_config", _MSG_PROPOSAL_CONFIG)
         if not isinstance(value, Mapping):
-            raise TaskBoundaryError("a bounded task must be an object.")
-        unknown = [key for key in value if key not in _TASK_KEYS]
-        if unknown:
-            raise TaskBoundaryError(
-                "the task contains a field that is not permitted; a task is "
-                "data only and cannot carry an actor, approval, authority, "
-                "budget, or tool permission."
-            )
+            raise TaskBoundaryError("task_object", _MSG_TASK_OBJECT)
+        for key in value:
+            if not isinstance(key, str) or key not in _TASK_KEY_SET:
+                raise TaskBoundaryError("task_field", _MSG_TASK_UNKNOWN_FIELD)
         for required in _TASK_KEYS:
             if required not in value:
-                raise TaskBoundaryError(f"the task is missing required field {required!r}.")
-
-        try:
-            project_id = validate_identifier(value["project_id"], "task.project_id")
-        except ValueError as exc:
-            raise TaskBoundaryError(f"task.project_id is invalid ({exc}).") from exc
-
+                raise TaskBoundaryError("task_missing", _MSG_TASK_MISSING_FIELD)
         role = value["role"]
         if not isinstance(role, str):
-            raise TaskBoundaryError("task.role must be a string.")
-        role_config = configuration.for_role(role)  # fail closed, no fallback
-
-        target = _validate_ref(value["target"], project_id, "task.target", with_digest=False)
-
-        input_refs = value["input_refs"]
-        if not isinstance(input_refs, (list, tuple)):
-            raise TaskBoundaryError("task.input_refs must be a list of exact references.")
-        if len(input_refs) > MAX_INPUT_REFS:
-            raise TaskBoundaryError(
-                f"task.input_refs has more than {MAX_INPUT_REFS} entries."
-            )
-        refs: list[dict[str, str]] = []
-        for index, entry in enumerate(input_refs):
-            refs.append(
-                _validate_ref(entry, project_id, f"task.input_refs[{index}]", with_digest=True)
-            )
-
-        scope_raw = value["scope"]
-        if not isinstance(scope_raw, (list, tuple)):
-            raise TaskBoundaryError("task.scope must be a list of scope tokens.")
-        if len(scope_raw) > MAX_SCOPE_TOKENS:
-            raise TaskBoundaryError(f"task.scope has more than {MAX_SCOPE_TOKENS} tokens.")
-        scope: list[str] = []
-        for index, token in enumerate(scope_raw):
-            if not isinstance(token, str) or token == "" or token != token.strip():
-                raise TaskBoundaryError(
-                    f"task.scope[{index}] must be a non-empty string with no outer whitespace."
-                )
-            if len(token) > MAX_SCOPE_TOKEN_LEN:
-                raise TaskBoundaryError(
-                    f"task.scope[{index}] is longer than {MAX_SCOPE_TOKEN_LEN} characters."
-                )
-            scope.append(token)
-
-        prompt_version = value["prompt_version"]
-        if (
-            not isinstance(prompt_version, str)
-            or prompt_version == ""
-            or prompt_version != prompt_version.strip()
-            or any(ch.isspace() for ch in prompt_version)
-            or len(prompt_version) > MAX_PROMPT_VERSION_LEN
-        ):
-            raise TaskBoundaryError(
-                "task.prompt_version must be a non-empty, whitespace-free string "
-                f"of at most {MAX_PROMPT_VERSION_LEN} characters."
-            )
-
-        size_limit = _require_plain_int(
-            value["size_limit"], error_cls=TaskBoundaryError, field="task.size_limit"
-        )
-        if size_limit < 1 or size_limit > MAX_TASK_SIZE_BYTES:
-            raise TaskBoundaryError(
-                f"task.size_limit must be between 1 and {MAX_TASK_SIZE_BYTES} bytes."
-            )
-
-        step_limit = _require_plain_int(
-            value["step_limit"], error_cls=TaskBoundaryError, field="task.step_limit"
-        )
-        if step_limit < 1 or step_limit > role_config.steps:
-            raise TaskBoundaryError(
-                f"task.step_limit must be between 1 and the configured {role!r} "
-                f"limit of {role_config.steps} steps (got {step_limit})."
-            )
-
+            raise TaskBoundaryError("task_role", _MSG_TASK_ROLE)
+        role_config = configuration.for_role(role)
         return cls(
-            project_id=project_id,
+            project_id=value["project_id"],
             role=role,
-            target=target,
-            input_refs=tuple(refs),
-            scope=tuple(scope),
-            prompt_version=prompt_version,
-            size_limit=size_limit,
-            step_limit=step_limit,
+            target=value["target"],
+            input_refs=value["input_refs"],
+            scope=value["scope"],
+            prompt_version=value["prompt_version"],
+            size_limit=value["size_limit"],
+            step_limit=value["step_limit"],
             role_config=role_config,
         )
-
-
-def _validate_ref(
-    value: object,
-    project_id: str,
-    label: str,
-    *,
-    with_digest: bool,
-) -> dict[str, str]:
-    """Validate an exact same-project revision reference (with optional digest)."""
-    if not isinstance(value, Mapping):
-        raise TaskBoundaryError(f"{label} must be a reference object.")
-    allowed = set(_INPUT_REF_KEYS) if with_digest else set(_REF_KEYS)
-    unknown = [key for key in value if key not in allowed]
-    if unknown:
-        pinned = (
-            "project_id/artifact_id/revision_id/digest"
-            if with_digest
-            else "project_id/artifact_id/revision_id"
-        )
-        raise TaskBoundaryError(
-            f"{label} contains an unknown field; a reference pins only {pinned}."
-        )
-    for required in ("project_id", "artifact_id", "revision_id"):
-        if required not in value:
-            raise TaskBoundaryError(f"{label} is missing required field {required!r}.")
-    try:
-        ref_project = validate_identifier(value["project_id"], f"{label}.project_id")
-        artifact_id = validate_identifier(value["artifact_id"], f"{label}.artifact_id")
-        revision_id = validate_identifier(value["revision_id"], f"{label}.revision_id")
-    except ValueError as exc:
-        raise TaskBoundaryError(f"{label} is invalid ({exc}).") from exc
-    if ref_project != project_id:
-        raise TaskBoundaryError(
-            f"{label} is a cross-project reference; it must belong to project "
-            f"{project_id!r}."
-        )
-    ref = {
-        "project_id": ref_project,
-        "artifact_id": artifact_id,
-        "revision_id": revision_id,
-    }
-    if with_digest:
-        digest = value["digest"]
-        if not isinstance(digest, str) or not _DIGEST_RE.match(digest):
-            raise TaskBoundaryError(
-                f"{label}.digest must be a lowercase hex SHA-256 digest."
-            )
-        ref["digest"] = digest
-    return ref
 
 
 # --------------------------------------------------------------------------- #
 # Proposal-only interface (pure; non-authorizing)
 # --------------------------------------------------------------------------- #
 
-_PAYLOAD_KEYS = frozenset({"content"})
+_PAYLOAD_KEY_SET = frozenset({"content"})
 
 #: Keys that must never appear inside a proposal payload (top level or nested).
 #: They spell authority, tool/permission control, budgets, gate/approval
-#: decisions, state edits, or task-shape/widening fields — none of which a model
-#: output may carry. Content keys are therefore restricted, on purpose and
-#: fail-closed; the payload envelope is ``{"content": <data>}`` only.
+#: decisions, state edits, or task-shape/widening fields. This is a strict
+#: *data-only envelope* aid, **not** a security proof: a proposal is
+#: non-authoritative regardless of its text. Content keys are therefore
+#: restricted on purpose and fail-closed; the envelope is ``{"content": <data>}``.
 _FORBIDDEN_CONTENT_KEYS = frozenset(
     _normalize_key(key)
     for key in (
@@ -962,7 +1101,8 @@ class Proposal:
     A proposal is opaque model data plus the trusted provenance the application
     attached. It has **no** authority field, no approval, and no way to widen the
     task, edit authoritative state, or grant a tool: it can only ever be input to
-    a separate owner/human handler (out of scope here).
+    a separate owner/human handler (out of scope here). ``content`` and ref maps
+    are frozen, so no post-hash mutation is possible.
     """
 
     kind: str
@@ -970,9 +1110,28 @@ class Proposal:
     role: str
     model: ModelRef
     target: Mapping[str, str]
+    task_digest: str
     input_digest: str
     payload_digest: str
     content: Any
+
+    def to_mapping(self) -> dict[str, Any]:
+        """A deterministic, JSON-safe view (authority-free)."""
+        return {
+            "kind": self.kind,
+            "proposal_id": self.proposal_id,
+            "role": self.role,
+            "model": {
+                "provider_id": self.model.provider_id,
+                "model_id": self.model.model_id,
+                "variant": self.model.variant,
+            },
+            "target": dict(self.target),
+            "task_digest": self.task_digest,
+            "input_digest": self.input_digest,
+            "payload_digest": self.payload_digest,
+            "content": _thaw(self.content),
+        }
 
 
 def submit_proposal(
@@ -984,43 +1143,58 @@ def submit_proposal(
     """Validate a payload and return a **non-authorizing** :class:`Proposal`.
 
     Pure function: no I/O, no state change, no approval. The payload envelope is
-    exactly ``{"content": <data>}``; the model provenance is taken from the
-    trusted configuration for the task's role, **never** from the payload. The
-    content is deep-scanned for authority/tool/budget/state keys and bounded by
-    the task's ``size_limit`` (canonical JSON bytes).
+    exactly ``{"content": <data>}``; the model provenance is taken from the task's
+    trusted role configuration, which must exactly match the supplied
+    configuration. The content is canonical-validated and bounded *before* any
+    structural walk, then deep-frozen.
     """
+    if not isinstance(configuration, RoleConfiguration):
+        raise ProposalError("invalid_configuration", _MSG_PROPOSAL_CONFIG)
     if not isinstance(task, BoundedTask):
-        raise ProposalError("submit_proposal requires a validated BoundedTask.")
+        raise ProposalError("invalid_task", _MSG_PROPOSAL_TASK)
+
+    # Rebuild the task from its canonical form under this configuration and
+    # require exact equality: this re-validates a directly-constructed task and
+    # refuses to relabel an earlier task to another role or model.
+    try:
+        canonical_task = BoundedTask.from_mapping(task.to_mapping(), configuration=configuration)
+    except AgentRoleError as exc:
+        raise _wrap(ProposalError, exc) from exc
+    if canonical_task != task:
+        raise ProposalError("task_drift", _MSG_PROPOSAL_TASK_DRIFT)
+    task = canonical_task
+
     if not isinstance(payload, Mapping):
-        raise ProposalError("a proposal payload must be an object with a single 'content' field.")
-    unknown = [key for key in payload if key not in _PAYLOAD_KEYS]
-    if unknown:
-        raise ProposalError(
-            "a proposal payload may carry only 'content'; it cannot supply an "
-            "actor, approval, authority, model, scope, or tool permission."
-        )
+        raise ProposalError("payload_type", _MSG_PAYLOAD_OBJECT)
+    for key in payload:
+        if not isinstance(key, str) or key not in _PAYLOAD_KEY_SET:
+            raise ProposalError("payload_field", _MSG_PAYLOAD_UNKNOWN_FIELD)
     if "content" not in payload:
-        raise ProposalError("a proposal payload must include a 'content' field.")
+        raise ProposalError("payload_content", _MSG_PAYLOAD_MISSING_CONTENT)
 
     content = payload["content"]
-    _reject_forbidden_keys(content, "proposal content")
-
-    encoded = _canonical_bytes(content, error_cls=ProposalError, label="proposal content")
+    # Canonical, portable, bounded validation FIRST (rejects cycles, over-deep
+    # nesting, non-finite numbers, non-string keys).
+    encoded = _canonical_bytes(
+        content,
+        error_cls=ProposalError,
+        code="content_json",
+        message=_MSG_PROPOSAL_CONTENT_JSON,
+    )
     if len(encoded) > task.size_limit:
-        raise ProposalError(
-            f"proposal content is {len(encoded)} bytes, over the task size limit "
-            f"of {task.size_limit}."
-        )
+        raise ProposalError("content_size", _MSG_PROPOSAL_CONTENT_SIZE)
+    # Only now is a structural walk cheap and guaranteed to terminate.
+    _reject_forbidden_keys(content)
 
-    # Provenance and identity come from the trusted configuration + task, not the
-    # payload: a model cannot name itself, another model, or another revision.
-    model = configuration.for_role(task.role).model
+    model = task.role_config.model  # trusted provenance; never in-band
     payload_digest = hashlib.sha256(encoded).hexdigest()
+    task_digest = task.fingerprint()
     input_digest = hashlib.sha256(
         _canonical_bytes(
             [dict(entry) for entry in task.input_refs],
             error_cls=ProposalError,
-            label="proposal input refs",
+            code="content_json",
+            message=_MSG_PROPOSAL_CONTENT_JSON,
         )
     ).hexdigest()
     identity = _canonical_bytes(
@@ -1029,11 +1203,13 @@ def submit_proposal(
             "role": task.role,
             "target": dict(task.target),
             "model": model.ref,
+            "task_digest": task_digest,
             "input_digest": input_digest,
             "payload_digest": payload_digest,
         },
         error_cls=ProposalError,
-        label="proposal identity",
+        code="content_json",
+        message=_MSG_PROPOSAL_CONTENT_JSON,
     )
     proposal_id = hashlib.sha256(identity).hexdigest()
 
@@ -1042,30 +1218,40 @@ def submit_proposal(
         proposal_id=proposal_id,
         role=task.role,
         model=model,
-        target=dict(task.target),
+        target=task.target,
+        task_digest=task_digest,
         input_digest=input_digest,
         payload_digest=payload_digest,
-        content=content,
+        content=_deep_freeze(content),
     )
 
 
-def _reject_forbidden_keys(value: object, label: str) -> None:
-    """Walk ``value`` and reject any nested key that tries to carry authority."""
-    stack: list[tuple[object, str]] = [(value, label)]
+def _reject_forbidden_keys(value: object) -> None:
+    """Reject a data-only envelope violation; bounded and cycle-safe by design.
+
+    Run only after canonical validation, so the value is acyclic and depth-bounded
+    (<= 64). The visited set and depth counter are defence in depth.
+    """
+    stack: list[tuple[object, int]] = [(value, 0)]
+    seen: set[int] = set()
     while stack:
-        node, path = stack.pop()
+        node, depth = stack.pop()
+        if depth > MAX_CONTENT_DEPTH:
+            raise ProposalError("content_shape", _MSG_PROPOSAL_CONTENT_SHAPE)
         if isinstance(node, Mapping):
+            if id(node) in seen:
+                raise ProposalError("content_shape", _MSG_PROPOSAL_CONTENT_SHAPE)
+            seen.add(id(node))
             for key, item in node.items():
                 if isinstance(key, str) and _normalize_key(key) in _FORBIDDEN_CONTENT_KEYS:
-                    raise ProposalError(
-                        f"{path} contains a forbidden key ({key!r}); a proposal "
-                        "may carry scientific data only and cannot approve, edit "
-                        "state, set budgets, or grant tool permissions."
-                    )
-                stack.append((item, f"{path}.{key}"))
+                    raise ProposalError("content_key", _MSG_PROPOSAL_CONTENT_KEY)
+                stack.append((item, depth + 1))
         elif isinstance(node, (list, tuple)):
-            for index, item in enumerate(node):
-                stack.append((item, f"{path}[{index}]"))
+            if id(node) in seen:
+                raise ProposalError("content_shape", _MSG_PROPOSAL_CONTENT_SHAPE)
+            seen.add(id(node))
+            for item in node:
+                stack.append((item, depth + 1))
 
 
 # --------------------------------------------------------------------------- #
@@ -1086,6 +1272,9 @@ def build_opencode_config(configuration: RoleConfiguration) -> dict[str, Any]:
     As documented in the module boundary note, these denies are a **model tool
     boundary**, not a same-UID OS sandbox.
     """
+    if not isinstance(configuration, RoleConfiguration):
+        raise RoleConfigError("config_type", _MSG_BAD_CONFIG)
+
     permissions: list[dict[str, str]] = [{"action": "*", "resource": "*", "effect": "deny"}]
     permissions.extend(
         {"action": action, "resource": "*", "effect": "deny"}
@@ -1129,7 +1318,8 @@ def opencode_config_bytes(configuration: RoleConfiguration) -> bytes:
     return _canonical_bytes(
         build_opencode_config(configuration),
         error_cls=RoleConfigError,
-        label="opencode configuration",
+        code="config_canonical",
+        message=_MSG_BAD_CONFIG,
     )
 
 
@@ -1151,6 +1341,7 @@ __all__ = [
     "CRITIC_REQUIRES_FRESH_CONTEXT",
     "CriticConfigError",
     "CriticPlan",
+    "MAX_CONTENT_DEPTH",
     "MAX_FACT_CHECK_ROUNDS",
     "MAX_INPUT_REFS",
     "MAX_PROMPT_VERSION_LEN",
