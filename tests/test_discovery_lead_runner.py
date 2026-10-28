@@ -835,8 +835,18 @@ class ExecuteLeadProposalTest(RunnerTestBase):
         outcome = self.run_lead()
         self.assertEqual(outcome["status"], "refused")
         self.assertEqual(outcome["cost_state"], "unknown")
+        # A diagnostic machine record is persisted, but it is NOT a successful
+        # lead proposal: the public proposal id is null and no proposal text is
+        # attributed.
+        self.assertIsNone(outcome["proposal_id"])
+        self.assertIsNone(outcome["proposal_record_id"])
+        self.assertIsNotNone(outcome["diagnostic_record_id"])
         task = self.runtime.get_task_by_request("req-1")
-        self.assertEqual(self.runtime.proposals_for_task(task.task_id), [])
+        proposals = self.runtime.proposals_for_task(task.task_id)
+        self.assertEqual(len(proposals), 1)
+        content = json.loads(proposals[0].canonical.decode("utf-8"))["content"]
+        self.assertEqual(content["outcome"], "refused")
+        self.assertIsNone(content["proposal_text"])
 
     def test_transport_unknown_retains_reserve_and_never_resends(self) -> None:
         self.approve_batch(self.interview_batch, "interview")
@@ -875,6 +885,157 @@ class ExecuteLeadProposalTest(RunnerTestBase):
         readback = get_lead_outcome(self.store, "req-1")
         self.assertEqual(readback["status"], "completed")
         self.assertIsNotNone(readback["proposal_id"])
+
+
+# --------------------------------------------------------------------------- #
+# Durable execution-metadata provenance
+# --------------------------------------------------------------------------- #
+class MetadataPersistenceTest(RunnerTestBase):
+    def _run_success(self, **kwargs):
+        self.approve_batch(self.interview_batch, "interview")
+        self.transport.responses.append(
+            TransportResponse(status=200, body_text=_completion_body())
+        )
+        return self.run_lead(**kwargs)
+
+    def test_success_metadata_survives_reopen(self) -> None:
+        first = self._run_success()
+        expected = {
+            "actual_model": _MODEL_ID,
+            "provider": "anthropic",
+            "response_id": "gen-synthetic-1",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+        }
+        for key, value in expected.items():
+            self.assertEqual(first[key], value)
+        self.assertIsNotNone(first["versions"])
+        self.assertEqual(first["http_status"], 200)
+        self.assertEqual(self.transport.call_count, 1)
+
+        # A fresh readback (no in-memory result) and a POST-free replay agree.
+        reopened = get_lead_outcome(self.store, "req-1")
+        for key, value in expected.items():
+            self.assertEqual(reopened[key], value)
+        self.assertEqual(reopened["versions"], first["versions"])
+        self.assertEqual(reopened["request_sha256"], first["request_sha256"])
+        self.assertEqual(reopened["proposal_id"], first["proposal_id"])
+
+        replay_transport = _FakeTransport()
+        replayed = self.run_lead(transport=replay_transport)
+        self.assertEqual(replay_transport.call_count, 0)
+        for key, value in expected.items():
+            self.assertEqual(replayed[key], value)
+        self.assertEqual(replayed["versions"], first["versions"])
+        self.assertTrue(first["posted"])
+        self.assertFalse(replayed["posted"])
+
+    def test_refusal_metadata_survives_reopen(self) -> None:
+        self.approve_batch(self.interview_batch, "interview")
+        refusal = json.dumps(
+            {
+                "id": "gen-refuse",
+                "model": _MODEL_ID,
+                "choices": [
+                    {"finish_reason": "content_filter", "message": {"role": "assistant", "content": ""}}
+                ],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7},
+            }
+        )
+        self.transport.responses.append(TransportResponse(status=200, body_text=refusal))
+        first = self.run_lead()
+        self.assertEqual(first["status"], "refused")
+        self.assertEqual(first["actual_model"], _MODEL_ID)
+        self.assertEqual(first["response_id"], "gen-refuse")
+        self.assertEqual(
+            first["usage"],
+            {"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7},
+        )
+        self.assertIsNone(first["proposal_id"])
+        self.assertIsNotNone(first["diagnostic_record_id"])
+        reopened = get_lead_outcome(self.store, "req-1")
+        self.assertEqual(reopened["actual_model"], first["actual_model"])
+        self.assertEqual(reopened["usage"], first["usage"])
+        self.assertEqual(reopened["response_id"], first["response_id"])
+        self.assertEqual(reopened["diagnostic_record_id"], first["diagnostic_record_id"])
+        self.assertEqual(self.transport.call_count, 1)
+
+    def test_protocol_metadata_survives_reopen(self) -> None:
+        self.approve_batch(self.interview_batch, "interview")
+        self.transport.responses.append(TransportResponse(status=200, body_text="{not-json"))
+        first = self.run_lead()
+        self.assertEqual(first["status"], "protocol_error")
+        self.assertEqual(first["http_status"], 200)
+        self.assertIsNotNone(first["request_sha256"])
+        self.assertIsNone(first["proposal_id"])
+        self.assertIsNotNone(first["diagnostic_record_id"])
+        reopened = get_lead_outcome(self.store, "req-1")
+        for key in (
+            "actual_model",
+            "provider",
+            "response_id",
+            "usage",
+            "versions",
+            "http_status",
+            "request_sha256",
+            "diagnostic_record_id",
+        ):
+            self.assertEqual(reopened[key], first[key])
+
+    def test_unknown_metadata_survives_reopen(self) -> None:
+        self.approve_batch(self.interview_batch, "interview")
+        self.transport.responses.append(RuntimeError("synthetic network failure"))
+        first = self.run_lead()
+        self.assertEqual(first["status"], "unknown")
+        self.assertEqual(first["cost_state"], "unknown")
+        self.assertEqual(first["reserve_usd"], "0.065536")
+        self.assertIsNotNone(first["request_sha256"])
+        self.assertIsNotNone(first["versions"])
+        self.assertIsNone(first["proposal_id"])
+        self.assertIsNotNone(first["diagnostic_record_id"])
+        reopened = get_lead_outcome(self.store, "req-1")
+        for key in (
+            "status",
+            "actual_model",
+            "response_id",
+            "usage",
+            "versions",
+            "request_sha256",
+            "diagnostic_record_id",
+            "reserve_usd",
+        ):
+            self.assertEqual(reopened[key], first[key])
+        # No rerun and the reserve is retained.
+        self.assertEqual(self.transport.call_count, 1)
+
+    def test_cost_is_dispatch_authoritative_not_copied(self) -> None:
+        self.approve_batch(self.interview_batch, "interview")
+        self.transport.responses.append(
+            TransportResponse(status=200, body_text=_completion_body(cost=0.0002))
+        )
+        outcome = self.run_lead()
+        dispatch_record = self.dispatch.get_dispatch_by_request("req-1")
+        self.assertEqual(outcome["cost_amount_usd"], dispatch_record.cost_amount_usd)
+        self.assertEqual(outcome["cost_state"], dispatch_record.cost_state)
+        self.assertEqual(outcome["cost_amount_usd"], "0.0002")
+        # The persisted envelope never carries a monetary cost (nothing to copy
+        # unchecked); the direct-dispatch ledger stays the single authority.
+        task = self.runtime.get_task_by_request("req-1")
+        for record in self.runtime.proposals_for_task(task.task_id):
+            text = record.canonical.decode("utf-8").lower()
+            self.assertNotIn("cost_amount", text)
+            self.assertNotIn('"cost"', text)
+
+    def test_tampered_dispatch_result_digest_rejected(self) -> None:
+        self._run_success()
+        dispatch_record = self.dispatch.get_dispatch_by_request("req-1")
+        self.store.connection.execute(
+            "UPDATE runtime_dispatch_state SET result_digest = ? "
+            "WHERE project_id = ? AND dispatch_id = ?",
+            ("b" * 64, self.project_id, dispatch_record.dispatch_id),
+        )
+        self.store.connection.commit()
+        with self.assertRaises(HostedLeadError):
+            get_lead_outcome(self.store, "req-1")
 
 
 # --------------------------------------------------------------------------- #

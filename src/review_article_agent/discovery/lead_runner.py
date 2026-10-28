@@ -39,6 +39,15 @@ What this module **is**
   gate and the execution activation, reserves a ``direct_call`` dispatch
   **before** the one POST, and commits the non-authoritative proposal together
   with the dispatch's accepted result and cost settlement.
+* The **execution-metadata envelope** — every received outcome (completed,
+  refused, protocol error, definitive failure, ambiguous) persists an
+  application-attached machine-observation record (actual model, upstream
+  provider, response id, token usage, a validated ``VersionSet``, HTTP status,
+  request digest, and the bound ``dispatch_id``) as the content of a
+  non-authorizing task-scoped proposal. It survives a process restart; only a
+  ``completed`` outcome carries lead proposal text, and the monetary cost is
+  always read from the authoritative direct-dispatch ledger, never copied from
+  the envelope.
 * :func:`get_lead_outcome` — a read-only readback of a durable logical request.
 
 What this module deliberately **is not**
@@ -196,11 +205,6 @@ class HostedUseRightsError(HostedLeadError):
 # --------------------------------------------------------------------------- #
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def _scoped_id(prefix: str, project_id: str, key: str) -> str:
-    digest = _sha256_hex((project_id + "\x00" + key).encode("utf-8"))
-    return f"{prefix}_{digest[:32]}"
 
 
 def _require_mapping(value: object, field: str) -> dict:
@@ -719,6 +723,7 @@ def _reported_versions(input_digest: str, model_ref: str, request_sha256: str) -
 # Outcome mapping / readback
 # --------------------------------------------------------------------------- #
 def _usage_mapping(result) -> dict | None:
+    """The safe token subset of a response's usage (never the monetary cost)."""
     if result is None or result.usage is None:
         return None
     usage = result.usage
@@ -726,6 +731,49 @@ def _usage_mapping(result) -> dict | None:
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.total_tokens,
+    }
+
+
+def _execution_metadata(prepared: dict, dispatch_id: str, result) -> dict:
+    """The application-attached machine-observation metadata envelope.
+
+    It is **data only** — never an approval, an exclusion, or a scientific claim,
+    and it is bound to the exact task (via the non-authorizing proposal record)
+    and the exact dispatch (``dispatch_id``). Monetary cost is deliberately
+    **absent**: the authoritative cost is the direct-dispatch ledger (C02 §6.3)
+    and is never copied from a response. An unknown actual value stays ``None``;
+    nothing is fabricated. The validated ``VersionSet`` is stored as its canonical
+    JSON **string**, so the machine envelope carries no nested ``model`` /
+    ``provider`` key that the role content-envelope forbids; the string is
+    re-parsed and re-validated on read.
+    """
+    versions = _reported_versions(
+        prepared["input_digest"], prepared["model_ref"], result.request_sha256
+    )
+    return {
+        "actual_model": result.actual_model,
+        "upstream_provider": result.provider,
+        "response_id": result.response_id,
+        "usage": _usage_mapping(result),
+        "version_set_json": canonical_json(versions).decode("utf-8"),
+        "http_status": result.http_status,
+        "request_sha256": result.request_sha256,
+        "dispatch_id": dispatch_id,
+        "no_automatic_retry": True,
+    }
+
+
+def _metadata_content(*, purpose: str, outcome: str, proposal_text, execution_metadata) -> dict:
+    """One outcome's non-authorizing proposal payload (machine metadata).
+
+    Only a ``completed`` outcome carries proposal text; every other outcome is a
+    diagnostic machine record with ``proposal_text`` ``None``.
+    """
+    return {
+        "purpose": purpose,
+        "outcome": outcome,
+        "proposal_text": proposal_text,
+        "execution_metadata": execution_metadata,
     }
 
 
@@ -747,52 +795,83 @@ def _outcome_from_dispatch(dispatch_record) -> str:
     return state  # "reserved" / "submitted"
 
 
-def _readback(store, request_id: str, *, result=None, posted: bool = False) -> dict:
-    """Build the durable outcome mapping from stored rows (no API key, no text)."""
+def _parse_reported_versions(value: object) -> dict | None:
+    """Re-parse and re-validate the persisted ``VersionSet`` string (fail closed)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HostedLeadError("metadata: the reported version set is malformed")
+    try:
+        return validate_version_set(json.loads(value))
+    except (ValueError, TypeError, RecordValidationError) as exc:
+        raise HostedLeadError("metadata: the reported version set is invalid") from exc
+
+
+def _resolve_metadata(runtime, task, dispatch_record, outcome):
+    """Deterministically select the exact metadata record for one outcome.
+
+    Selection matches the declared ``outcome`` **and** the exact ``dispatch_id``
+    (never "the first row"), so a diagnostic record can never be confused with a
+    completed proposal. When the dispatch carries an accepted result ref, the
+    selected record must be exactly it (id **and** digest), else the read fails
+    closed.
+    """
+    if task is None:
+        return None
+    chosen = None
+    for record in runtime.proposals_for_task(task.task_id):
+        try:
+            payload = json.loads(record.canonical.decode("utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            raise HostedLeadError("metadata: a stored machine record is malformed") from exc
+        content = payload.get("content") if isinstance(payload, dict) else None
+        if not isinstance(content, dict) or content.get("outcome") != outcome:
+            continue
+        metadata = content.get("execution_metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("dispatch_id") != dispatch_record.dispatch_id:
+            continue
+        chosen = (content, record)
+        break
+    if dispatch_record.result_ref is not None and (
+        chosen is None
+        or chosen[1].record_id != dispatch_record.result_ref
+        or chosen[1].stored_digest != dispatch_record.result_digest
+    ):
+        raise HostedLeadError(
+            "metadata: the recorded execution metadata does not match the accepted "
+            "dispatch result; refusing to report it"
+        )
+    return chosen
+
+
+def _readback(store, request_id: str, *, posted: bool = False) -> dict:
+    """Build the durable outcome mapping from stored rows (no API key, no text).
+
+    Every value is recomputed from the exact persisted task/dispatch/machine
+    records, so a crash between the runner commit and any outer job commit loses
+    nothing. The monetary cost comes **only** from the authoritative
+    direct-dispatch ledger, never from the machine envelope.
+    """
     runtime = RuntimeRepository(store)
     dispatch = RuntimeDispatchRepository(store)
     task = runtime.get_task_by_request(request_id)
     dispatch_record = dispatch.get_dispatch_by_request(request_id)
-    proposal = None
-    if task is not None:
-        proposals = runtime.proposals_for_task(task.task_id)
-        proposal = proposals[0] if proposals else None
-
-    if dispatch_record is None:
-        # A request that never reserved anything (blocked before dispatch).
-        return {
-            "request_id": request_id,
-            "status": "blocked",
-            "outcome": None,
-            "dispatch_id": None,
-            "dispatch_state": None,
-            "task_id": None if task is None else task.task_id,
-            "proposal_id": None,
-            "proposal_record_id": None,
-            "cost_state": None,
-            "cost_amount_usd": None,
-            "reserve_usd": None,
-            "posted": posted,
-            "no_automatic_retry": True,
-            "actual_model": None,
-            "provider": None,
-            "response_id": None,
-            "usage": None,
-            "versions": None,
-        }
 
     mapping = {
         "request_id": request_id,
-        "status": _outcome_from_dispatch(dispatch_record),
-        "outcome": _outcome_from_dispatch(dispatch_record),
-        "dispatch_id": dispatch_record.dispatch_id,
-        "dispatch_state": dispatch_record.state,
-        "task_id": dispatch_record.task_id,
-        "proposal_id": None if proposal is None else proposal.proposal_id,
-        "proposal_record_id": None if proposal is None else proposal.record_id,
-        "cost_state": dispatch_record.cost_state,
-        "cost_amount_usd": dispatch_record.cost_amount_usd,
-        "reserve_usd": dispatch_record.reserve_usd,
+        "status": "blocked",
+        "outcome": None,
+        "dispatch_id": None,
+        "dispatch_state": None,
+        "task_id": None if task is None else task.task_id,
+        "proposal_id": None,
+        "proposal_record_id": None,
+        "diagnostic_record_id": None,
+        "cost_state": None,
+        "cost_amount_usd": None,
+        "reserve_usd": None,
         "posted": posted,
         "no_automatic_retry": True,
         "actual_model": None,
@@ -800,21 +879,49 @@ def _readback(store, request_id: str, *, result=None, posted: bool = False) -> d
         "response_id": None,
         "usage": None,
         "versions": None,
+        "http_status": None,
+        "request_sha256": None,
     }
-    if result is not None:
-        mapping["actual_model"] = result.actual_model
-        mapping["provider"] = result.provider
-        mapping["response_id"] = result.response_id
-        mapping["usage"] = _usage_mapping(result)
-        mapping["versions"] = _reported_versions(
-            _input_digest(
-                store.project_id,
-                [dict(ref) for ref in (task.input_refs if task is not None else [])],
-            ),
-            result.model,
-            result.request_sha256,
-        )
+    if dispatch_record is None:
+        # A request that never reserved anything (blocked before dispatch).
+        return mapping
+
+    outcome = _outcome_from_dispatch(dispatch_record)
+    mapping.update(
+        {
+            "status": outcome,
+            "outcome": outcome,
+            "dispatch_id": dispatch_record.dispatch_id,
+            "dispatch_state": dispatch_record.state,
+            "task_id": dispatch_record.task_id,
+            "cost_state": dispatch_record.cost_state,
+            "cost_amount_usd": dispatch_record.cost_amount_usd,
+            "reserve_usd": dispatch_record.reserve_usd,
+        }
+    )
+
+    resolved = _resolve_metadata(runtime, task, dispatch_record, outcome)
+    if resolved is None:
+        return mapping
+    content, record = resolved
+    metadata = content["execution_metadata"]
+    mapping["actual_model"] = metadata.get("actual_model")
+    mapping["provider"] = metadata.get("upstream_provider")
+    mapping["response_id"] = metadata.get("response_id")
+    mapping["usage"] = metadata.get("usage")
+    mapping["versions"] = _parse_reported_versions(metadata.get("version_set_json"))
+    mapping["http_status"] = metadata.get("http_status")
+    mapping["request_sha256"] = metadata.get("request_sha256")
+    if outcome == "completed":
+        # Only a completed lead result contributes a (still non-authoritative)
+        # proposal; every other outcome is a diagnostic machine record, never a
+        # successful scientific/lead proposal.
+        mapping["proposal_id"] = record.proposal_id
+        mapping["proposal_record_id"] = record.record_id
+    else:
+        mapping["diagnostic_record_id"] = record.record_id
     return mapping
+
 
 
 def get_lead_outcome(store, request_id: str) -> dict | None:
@@ -929,50 +1036,35 @@ def _preflight(store, *, batch_ref, request_id, api_key):
 # --------------------------------------------------------------------------- #
 # Result commit (one project transaction, under the registry write guard)
 # --------------------------------------------------------------------------- #
-def _result_envelope_digest(prepared: dict, result) -> str:
-    """Canonical digest of a non-success outcome envelope (data only)."""
-    return _sha256_hex(
-        canonical_json(
-            {
-                "purpose": prepared["purpose"],
-                "outcome": result.outcome,
-                "cost_state": result.cost.state,
-                "cost_amount_usd": result.cost.amount_usd,
-                "actual_model": result.actual_model,
-                "provider": result.provider,
-                "response_id": result.response_id,
-                "http_status": result.http_status,
-                "request_sha256": result.request_sha256,
-            }
-        )
-    )
-
-
 def _commit_result(
     store, *, runtime, dispatch, prepared: dict, task_record, dispatch_id, fence, result
 ) -> dict:
-    """Commit the proposal/result + cost settlement atomically, then read back.
+    """Commit one outcome, its machine metadata, and its cost atomically.
 
-    A successful completion records the non-authoritative proposal, accepts the
-    dispatch's single local result, and settles a conservative cost in one
-    project transaction. A refusal / protocol error records a non-proposal
-    terminal result (never an acceptance or exclusion). A definitive HTTP
-    rejection is recorded ``failed`` with ``not_incurred``. An ambiguous
-    (unknown) outcome recovers the submission to ``unknown`` and retains the
-    reserve — never a blind retry.
+    In **one** project transaction this records exactly one non-authorizing
+    proposal carrying the exact task-bound/dispatch-bound execution-metadata
+    envelope, then accepts (``completed``/``refused``/``protocol_error``),
+    definitively fails (``failed``), or recovers (``unknown``) the dispatch and
+    settles a conservative cost. A successful completion carries the lead
+    proposal text; every other outcome carries ``proposal_text`` ``None`` (a
+    diagnostic machine record, never an acceptance or exclusion). The readback is
+    recomputed from the persisted rows, so nothing depends on the in-memory
+    result.
     """
-    proposal_record = None
     outcome = result.outcome
+    metadata = _execution_metadata(prepared, dispatch_id, result)
+    content = _metadata_content(
+        purpose=prepared["purpose"],
+        outcome=outcome,
+        proposal_text=result.proposal_text if outcome == "completed" else None,
+        execution_metadata=metadata,
+    )
 
     with store.transaction():
+        record = runtime._record_proposal_in_transaction(
+            task_record, {"content": content}, configuration=prepared["role_set"]
+        )
         if outcome == "completed":
-            content = {
-                "purpose": prepared["purpose"],
-                "proposal_text": result.proposal_text,
-            }
-            proposal_record = runtime._record_proposal_in_transaction(
-                task_record, {"content": content}, configuration=prepared["role_set"]
-            )
             cost_state = "known" if result.cost.state == "known" else "unknown"
             amount = result.cost.amount_usd if cost_state == "known" else None
             dispatch._settle_cost_in_transaction(
@@ -982,8 +1074,8 @@ def _commit_result(
                 dispatch_id,
                 fence=fence,
                 result_kind=RESULT_KIND_PROPOSAL,
-                result_ref=proposal_record.record_id,
-                result_digest=proposal_record.stored_digest,
+                result_ref=record.record_id,
+                result_digest=record.stored_digest,
             )
         elif outcome == "failed":
             dispatch._settle_cost_in_transaction(
@@ -1012,19 +1104,11 @@ def _commit_result(
                 dispatch_id,
                 fence=fence,
                 result_kind=kind,
-                result_ref=_scoped_id(
-                    "lres", store.project_id, prepared["request_id"] + "\x00" + kind
-                ),
-                result_digest=_result_envelope_digest(prepared, result),
+                result_ref=record.record_id,
+                result_digest=record.stored_digest,
             )
 
-    mapping = _readback(
-        store, prepared["request_id"], result=result, posted=True
-    )
-    if proposal_record is not None:
-        mapping["proposal_id"] = proposal_record.proposal_id
-        mapping["proposal_record_id"] = proposal_record.record_id
-    return mapping
+    return _readback(store, prepared["request_id"], posted=True)
 
 
 # --------------------------------------------------------------------------- #
