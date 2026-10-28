@@ -17,10 +17,18 @@
 
 - **Python stdlib only, Linux**: no third-party dep, no service manager, no root.
 - **Owner-only Unix-domain socket (UDS)** control: no TCP listener, no public/unauthenticated surface.
-- **Kernel-verified authority, out of band**: identity from `SO_PEERCRED` (uid, PID where relevant),
-  never a request field; a request cannot mint owner authority.
-- **Private paths**: data dir and `runtime/` are `0700`; socket and lock `0600`; a pre-existing
-  symlink, non-owner file/dir, or shared dir is refused, never chmodded or deleted.
+- **Owner identity, out of band**: the transport's owner identity comes from kernel `SO_PEERCRED`
+  (uid, and PID where relevant), never a request field. This is a *local transport* identity, not
+  proof of human presence or of scientific approval, and it does not distinguish same-UID processes as
+  human vs model. No real agent runs in this slice: role-restricted model tools and scientific
+  owner-approval gates belong to Step 04, and the engine's owner-control/audit record is not an
+  `Approval`.
+- **Private runtime paths**: the control transport validates existing paths before mutating them —
+  `<data_dir>/runtime/` must be owner-private (`0700`) and the socket/lock `0600`; a symlink, a
+  non-owner file/dir, or a foreign live endpoint at the control path is refused and left untouched,
+  never chmodded or deleted. This is the transport's behavior for its *runtime* paths, not a claim
+  that every application path is never chmodded (the registry may tighten the owner's data directory
+  to `0700` before transport startup).
 - **Explicit start only**: launched explicitly by the owner; no system service, no systemd lingering,
   no auto-start on logout/reboot.
 - **A separate app worker**, not OpenCode's HTTP service and not an ordinary coding session.
@@ -69,8 +77,8 @@ key allowlist; any extra key (including a caller-supplied `uid`/`actor`) is reje
 (project store **schema 4**):
 
 - **Opaque, exact IDs**: `job_id` derives from `(project_id, request_id)`, `UNIQUE` per request key
-  (repeat submit = same row; divergent payload = conflict); `attempt_id`/`fence` opaque and monotonic;
-  idempotent submit/accept never create a second identity.
+  (repeat submit = same row; divergent payload = conflict); `attempt_id` is an opaque UUID and `fence`
+  monotonically increments per attempt; idempotent submit/accept never create a second identity.
 - **One immutable accepted local result**: `job_accepted_result` unique per `(job, fence)` and per
   logical job; a stale-fence attempt cannot write one (`current_fence` re-checked on every mutation);
   accept is idempotent per fence+digest else conflict.
@@ -109,9 +117,12 @@ provider with no real egress:
 
 - Startup reconciles recorded attempts across all registered projects (`reconcile_startup`). A
   **local** predispatch attempt becomes a safe retryable `interrupted`; a **synthetic external**
-  attempt is treated as potentially ambiguous — reserve and unresolved bit retained, job becomes
-  `reconciliation_required` (or `accept_pending_local_result` when a local result was checkpointed).
-  No new identity is ever minted; paused/cancelled scheduling state is never silently undone.
+  attempt is treated as potentially ambiguous — reserve and unresolved bit retained, with the job
+  state persisted as `reconciliation_required`. `recover()` also returns a `RecoveryOutcome.disposition`
+  hint (`retry_safe`, `reconciliation_required`, `accept_pending_local_result`, or `terminal`); the
+  `accept_pending_local_result` value is that *return hint* (a local result was checkpointed), not a
+  persisted job state. No new identity is ever minted; paused/cancelled scheduling state is never
+  silently undone.
 - An unreadable store is never treated as safe: it is a recovery blocker forbidding new dispatch. If
   exactly one project holds unresolved remote work and no activation is held, the engine adopts it to
   reconcile it; multiple pending projects or any unreadable store block new dispatch/switch pending an
@@ -161,18 +172,21 @@ provider with no real egress:
 
 ## 9. Retention and data boundaries
 
-- **No prune implemented**: jobs, attempts, accepted results, reserves, and the provider journal are
-  retained until the user removes their own disposable data. A private project snapshot captures the
-  durable job rows (schema 4) and never the provider journal; backup **format 1 accepts store schemas
-  3 and 4**. It is a private snapshot, not a manuscript/redistribution export.
+- **No record pruning implemented**: job/attempt/result/reserve rows and the provider journal are
+  retained; there is no automatic prune. Real project data is not "disposable", and this document does
+  not instruct deleting it — project retention and backups stay user-controlled (only owned, throwaway
+  test fixtures are deleted, by tests). A private project snapshot captures the durable job rows
+  (schema 4) and never the provider journal; backup **format 1 accepts store schemas 3 and 4**. It is a
+  private snapshot, not a manuscript/redistribution export.
 - **Secrets excluded by allowlist** (a snapshot contains only `manifest.json` and `snapshot.sqlite3`),
   not by scanning; do not store credentials as artifact content.
 - **In memory, not durable**: the engine's owner-reconciliation audit, its `wait_reason` text, and its
   paused-project set are in-memory only and are not durable human approvals. Durable job
   states/results/reserves persist.
-- **Logout/reboot retains state only**, with no continuity guarantee for in-flight remote work: a
-  queued job with no attempt stays queued and needs an explicit owner resume/submit to acquire
-  execution after a restart; the system does not claim to auto-resume all jobs.
+- **Logout/reboot retains state only**, with no continuity guarantee for in-flight remote work. After
+  a restart, a queued job with no attempt needs an explicit owner resume/submit to acquire execution
+  *only when no activation is held*; if a persisted authorized execution activation exists, the engine
+  adopts it and may continue queued work. The system makes no blanket auto-resume claim.
 - **Scientific fixture approvals never authorize the worker**: a local fixture approval
   ([`cli.md`](cli.md) §8) never authorizes a job, a provider, or science.
 
@@ -206,5 +220,6 @@ provider with no real egress:
   engine recovery, process lifecycle, activation, fixture backend, worker+backup, lifecycle CLI.
 - **Verification**: `python3 scripts/check_contract_docs.py --self-test` stays green (this document
   adds no fixture/schema semantics); `git diff --check` is clean; local markdown link targets in this
-  document resolve to existing files. Full step acceptance status and latest test counts belong to the
-  pending Step 03 handoff, not here.
+  document resolve to existing files. Completion claims stay unticked here: the pending CLI/matrix
+  status and the full step acceptance (with latest test counts) will be recorded by the final Step 03
+  handoff, not by this partial reference.
