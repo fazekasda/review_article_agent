@@ -209,8 +209,16 @@ _BUCKET = "direct_call"
 #: recorded ``not_incurred``.
 _DEFINITIVE_STATUSES = frozenset({400, 401, 402, 403, 404, 413})
 
-#: The pinned model, including any dated response snapshot (``<MODEL>-<date>``).
-_MODEL_SNAPSHOT_PREFIX = MODEL + "-"
+#: The pinned model, including a real dated response snapshot of the form
+#: ``<MODEL>-YYYYMMDD`` (e.g. ``typesafe/jev-1.14-20261014``); any other suffix
+#: (``typesafe/jev-1.14-evil``) is not a Jev snapshot.
+_MODEL_SNAPSHOT_RE = re.compile(re.escape(MODEL) + r"-\d{8}")
+
+#: Fixed maximum accepted JSON nesting depth, matching ``domain.records``'
+#: canonical-JSON bound (64), applied to every parsed response.
+_MAX_JSON_DEPTH = 64
+#: Length bound on optional response metadata (model/provider/id).
+_MAX_META_LEN = 256
 
 #: Bounds on an accepted exact decimal (mirrors ``runtime.jobs`` patterns): a
 #: bounded input length/width, bounded significant digits, and a bounded base-10
@@ -421,12 +429,24 @@ def _require_model(model: object) -> str:
 
 
 def _require_jev_response_model(model: object) -> str:
-    """The **response** model must be the pinned model or a dated snapshot."""
+    """The response model must be exactly the pinned model or a real dated
+    snapshot ``<MODEL>-YYYYMMDD`` (never an arbitrary suffix)."""
     if not isinstance(model, str) or not model:
         raise JevProtocolError("response model must be a non-empty string")
-    if model != MODEL and not model.startswith(_MODEL_SNAPSHOT_PREFIX):
-        raise JevProtocolError("response model is not the pinned Jev model")
-    return model
+    if len(model) > _MAX_META_LEN:
+        raise JevProtocolError("response model is too long")
+    if model == MODEL or _MODEL_SNAPSHOT_RE.fullmatch(model):
+        return model
+    raise JevProtocolError("response model is not the pinned Jev model")
+
+
+def _optional_bounded_meta(value: object, field: str) -> str | None:
+    """Bound an optional response metadata string (``provider``/``id``)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > _MAX_META_LEN:
+        raise JevProtocolError(f"response {field} is not a bounded string")
+    return value
 
 
 #: Fixed precision for probability range checks, so an ambient ``localcontext``
@@ -470,8 +490,12 @@ class _FrozenDict(dict):
 
 
 def _deep_freeze(value: Any) -> Any:
-    """Recursively freeze a JSON-portable value to immutable containers."""
-    if isinstance(value, dict):
+    """Recursively freeze a JSON-portable value to immutable containers.
+
+    Any :class:`Mapping` becomes a :class:`_FrozenDict` (which is still a ``dict``
+    subclass, so canonical JSON accepts it) and any list/tuple becomes a tuple.
+    """
+    if isinstance(value, Mapping):
         if isinstance(value, _FrozenDict):
             return value
         return _FrozenDict({key: _deep_freeze(item) for key, item in value.items()})
@@ -490,6 +514,26 @@ def _no_duplicate_keys(pairs: Any) -> dict:
     return out
 
 
+def _json_depth_ok(value: Any, max_depth: int = _MAX_JSON_DEPTH) -> bool:
+    """Iteratively check that ``value`` does not nest past ``max_depth``.
+
+    Iterative (never recursive), so it cannot itself raise ``RecursionError`` on
+    a document that the parser accepted but that is deeper than our bound.
+    """
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > max_depth:
+            return False
+        if isinstance(node, Mapping):
+            for item in node.values():
+                stack.append((item, depth + 1))
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                stack.append((item, depth + 1))
+    return True
+
+
 def _parse_json(text: object) -> Any:
     """Strictly parse JSON with ``parse_float=Decimal`` (no float round-trip).
 
@@ -505,7 +549,7 @@ def _parse_json(text: object) -> Any:
         raise ValueError("non-finite JSON constant")
 
     try:
-        return json.loads(
+        payload = json.loads(
             text,
             parse_float=Decimal,
             parse_constant=_reject,
@@ -515,6 +559,9 @@ def _parse_json(text: object) -> Any:
         raise
     except Exception as exc:  # ValueError, RecursionError, ...
         raise JevProtocolError("response body is not valid JSON") from exc
+    if not _json_depth_ok(payload):
+        raise JevProtocolError("response body nests too deeply")
+    return payload
 
 
 def estimate_cost_bound(
@@ -620,6 +667,15 @@ class QuestionDef:
         object.__setattr__(self, "levels", levels)
         if self.criteria is not None:
             self._check_criteria()
+            # Defensive deep-freeze: mutating the caller's original criteria
+            # container after construction must not drift the question's rubric,
+            # and every serialization derives from this frozen copy.
+            frozen = _deep_freeze(self.criteria)
+            try:
+                canonical_json(frozen)
+            except Exception as exc:
+                raise JevValidationError("criteria must be portable JSON") from exc
+            object.__setattr__(self, "criteria", frozen)
 
     def _check_criteria(self) -> None:
         criteria = self.criteria
@@ -697,6 +753,9 @@ def _serialize_request(
     _require_model(model)
     if state is None:
         raise JevValidationError("state is required")
+    # The documented state is a plain string, an object, or an array.
+    if not isinstance(state, (str, Mapping, list, tuple)):
+        raise JevValidationError("state must be a string, object, or array")
     # Fail closed if the state is not portable JSON (rejects NaN, deep nesting…).
     try:
         canonical_json(state)
@@ -1157,12 +1216,12 @@ def validate_response(
             answer=normalised,
         )
 
-    provider = payload.get("provider")
-    response_id = payload.get("id")
+    provider = _optional_bounded_meta(payload.get("provider"), "provider")
+    response_id = _optional_bounded_meta(payload.get("id"), "id")
     return ValidatedResponse(
         model=model,
-        provider=provider if isinstance(provider, str) else None,
-        response_id=response_id if isinstance(response_id, str) else None,
+        provider=provider,
+        response_id=response_id,
         input_tokens=int(input_tokens),
         output_tokens=int(output_tokens),
         cost_usd=cost_usd,
@@ -1269,32 +1328,66 @@ def plan_dispatch(
     )
 
 
-def _check_plan_shape(plan: DispatchPlan) -> None:
-    """Re-verify the serialized plan request's shape (defense in depth)."""
-    if plan.request.get("model") != MODEL:
+def _check_plan_request_keys(plan: DispatchPlan) -> None:
+    """The serialized plan request must have **only** the documented keys.
+
+    Any extra top-level field (a scope/tool/asset override) or any provider
+    pricing field other than ``max_price.request`` is refused, so a plan cannot
+    silently smuggle an unrelated request override.
+    """
+    request = plan.request
+    if request.get("model") != MODEL:
         raise JevValidationError("plan request model is not the pinned Jev model")
-    if plan.request.get("state") is None:
-        raise JevValidationError("plan request state is missing")
-    wire = plan.request.get("questions")
+    allowed = {"model", "state", "questions"}
+    extra = set(request) - (allowed | {"provider"})
+    if extra:
+        raise JevValidationError("plan request has unsupported top-level fields")
+    state = request.get("state")
+    if not isinstance(state, (str, Mapping, list, tuple)):
+        raise JevValidationError("plan request state type is unsupported")
+    provider = request.get("provider")
+    if provider is not None:
+        if not isinstance(provider, Mapping) or set(provider) != {"max_price"}:
+            raise JevValidationError("plan provider object is malformed")
+        max_price = provider["max_price"]
+        if not isinstance(max_price, Mapping) or set(max_price) != {"request"}:
+            raise JevValidationError("plan provider max_price is malformed")
+        if not isinstance(max_price["request"], str):
+            raise JevValidationError(
+                "plan provider max_price.request must be a string"
+            )
+    wire = request.get("questions")
     if not isinstance(wire, Mapping) or not wire:
         raise JevValidationError("plan request questions are missing")
-    for name, question in wire.items():
-        if not isinstance(question, Mapping):
-            raise JevValidationError("plan request question is malformed")
-        qtype = question.get("type")
-        if qtype not in ("noul", "choice", "score"):
-            raise JevValidationError("plan request question type is unsupported")
-        if not isinstance(question.get("instructions"), str) or not question.get("instructions"):
-            raise JevValidationError("plan request question instructions are missing")
-        criteria = question.get("criteria")
-        if qtype == "noul":
-            if not isinstance(criteria, Mapping) or set(criteria) != {"true", "false"}:
-                raise JevValidationError("plan request noul criteria are malformed")
-        elif qtype == "choice":
-            if not isinstance(criteria, Mapping) or not criteria:
-                raise JevValidationError("plan request choice criteria are malformed")
-        elif not isinstance(criteria, (list, tuple)) or not criteria:
-            raise JevValidationError("plan request score criteria are malformed")
+
+
+def _check_plan_questions(plan: DispatchPlan) -> None:
+    """Bind the plan's typed questions to the exact submitted wire bytes.
+
+    The wire questions are **re-derived** from ``plan.questions`` (the immutable
+    canonical definitions) and compared byte-for-byte with the stored request
+    body, so a forged/replaced ``questions`` field (a ``dataclasses.replace`` or
+    a direct constructor) can never dispatch: the request that would be sent from
+    those questions is not the request the plan recorded. This also pins the
+    supported/unsupported question IDs and their order.
+    """
+    derived = _serialize_request(
+        plan.questions,
+        plan.request["state"],
+        model=plan.model,
+        server_cap_usd=plan.server_cap_usd,
+    )
+    derived_body = canonical_json(_deep_freeze(derived))
+    if derived_body != plan.request_body:
+        raise JevValidationError(
+            "plan questions do not match the submitted request"
+        )
+    supported = tuple(q.question_id for q in plan.questions if q.question_kind != BOX)
+    unsupported = tuple(q.question_id for q in plan.questions if q.question_kind == BOX)
+    if supported != tuple(plan.supported_question_ids):
+        raise JevValidationError("plan supported question ids do not match")
+    if unsupported != tuple(plan.unsupported_question_ids):
+        raise JevValidationError("plan unsupported question ids do not match")
 
 
 def _revalidate_plan(plan: object) -> DispatchPlan:
@@ -1353,7 +1446,8 @@ def _revalidate_plan_inner(plan: object) -> DispatchPlan:
     if current != body:
         raise JevValidationError("plan request was mutated after planning")
     validate_questions(plan.questions)
-    _check_plan_shape(plan)
+    _check_plan_request_keys(plan)
+    _check_plan_questions(plan)
     bound = estimate_cost_bound(plan.request_bytes)
     bound_amount = _bounded_decimal(
         plan.cost_upper_bound_usd, "cost_upper_bound_usd"
@@ -1699,6 +1793,11 @@ def _finish_dispatch(
             plan, attempt_no, status="protocol_error", http_status=status,
             code="protocol_error", message="response body exceeded the permitted size",
             reported_cost=_best_effort_cost(response.body_text),
+        )
+    if len(response.body_text) > MAX_RESPONSE_BYTES:
+        return _submitted_result(
+            plan, attempt_no, status="protocol_error", http_status=status,
+            code="protocol_error", message="response body exceeded the permitted size",
         )
     if status != 200:
         # Only the documented definitive pre-billing statuses may be

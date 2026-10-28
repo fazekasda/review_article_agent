@@ -1235,5 +1235,197 @@ class CostRecordInvariantRepairTests(unittest.TestCase):
             jev.CostRecord(state="unknown", reserve_usd=0.25, reserve_retained=True)
 
 
+# --------------------------------------------------------------------------- #
+# Focused repairs (T3-R2 reproductions)
+# --------------------------------------------------------------------------- #
+def _forged_consistent_plan(base, request_dict):
+    """A plan whose request/body/size/digest are self-consistent but forged."""
+    frozen = jev._deep_freeze(request_dict)
+    body = jev.canonical_json(frozen)
+    return dataclasses.replace(
+        base,
+        request=frozen,
+        request_body=body,
+        request_bytes=len(body),
+        request_sha256=hashlib.sha256(body).hexdigest(),
+        cost_upper_bound_usd=jev.estimate_cost_bound(len(body))["cost_upper_bound_usd"],
+    )
+
+
+class R2QuestionBindingTests(unittest.TestCase):
+    def _choice_plan(self):
+        q = jev.QuestionDef("q", jev.CHOICE, "choose", options=("A", "B"))
+        return jev.plan_dispatch([q], "synthetic", reserve_usd="0.01")
+
+    def test_wire_options_match_declared(self):
+        plan = self._choice_plan()
+        wire = json.loads(plan.request_body)["questions"]["q"]
+        self.assertEqual(list(wire["criteria"]), ["A", "B"])
+
+    def test_forged_questions_refused_before_transport(self):
+        plan = self._choice_plan()
+        forged = dataclasses.replace(
+            plan,
+            questions=(
+                jev.QuestionDef("q", jev.CHOICE, "DIFFERENT CRITERIA", options=("FORGED", "B")),
+            ),
+        )
+        calls = []
+
+        def transport(body, key, *, endpoint, timeout):
+            calls.append(body)
+            return jev.TransportResponse(
+                200,
+                json.dumps(
+                    {
+                        "model": "typesafe/jev-1.14-20261014",
+                        "answers": {"q": {"type": "choice", "choice": "FORGED"}},
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                ),
+            )
+
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(forged, api_key="synthetic", transport=transport)
+        self.assertEqual(calls, [])  # nothing was sent
+
+    def test_forged_instruction_only_refused(self):
+        plan = self._choice_plan()
+        forged = dataclasses.replace(
+            plan,
+            questions=(jev.QuestionDef("q", jev.CHOICE, "changed", options=("A", "B")),),
+        )
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(forged, api_key="synthetic", transport=FakeTransport())
+
+    def test_forged_supported_ids_refused(self):
+        plan = self._choice_plan()
+        forged = dataclasses.replace(plan, supported_question_ids=("other",))
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(forged, api_key="synthetic", transport=FakeTransport())
+
+    def test_criteria_alias_cannot_drift(self):
+        criteria = {"A": "aa", "B": "bb"}
+        q = jev.QuestionDef("q", jev.CHOICE, "choose", options=("A", "B"), criteria=criteria)
+        criteria["A"] = "MUTATED"
+        plan = jev.plan_dispatch([q], "synthetic", reserve_usd="0.01")
+        wire = json.loads(plan.request_body)["questions"]["q"]
+        self.assertEqual(wire["criteria"], {"A": "aa", "B": "bb"})
+        with self.assertRaises(TypeError):
+            q.criteria["A"] = "x"
+
+    def test_non_portable_criteria_refused(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.QuestionDef(
+                "q", jev.CHOICE, "c", options=("A", "B"),
+                criteria={"A": float("nan"), "B": "b"},
+            )
+
+    def test_forged_extra_top_level_key_refused(self):
+        plan = self._choice_plan()
+        request = {**dict(plan.request), "tools": [{"type": "x"}]}
+        forged = _forged_consistent_plan(plan, request)
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(forged, api_key="synthetic", transport=FakeTransport())
+
+    def test_forged_provider_extra_pricing_refused(self):
+        plan = self._choice_plan()
+        request = dict(plan.request)
+        request["provider"] = {"max_price": {"request": plan.reserve_usd, "prompt": "1"}}
+        forged = _forged_consistent_plan(plan, request)
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(forged, api_key="synthetic", transport=FakeTransport())
+
+    def test_state_type_enforced(self):
+        q = [jev.QuestionDef("q", jev.PREDICATE, "i")]
+        for bad in (123, True, 1.5):
+            with self.assertRaises(jev.JevValidationError):
+                jev.plan_dispatch(q, bad, reserve_usd="0.25")
+            with self.assertRaises(jev.JevValidationError):
+                jev.build_request(q, bad)
+        # documented state types are accepted
+        jev.plan_dispatch(q, "a string", reserve_usd="0.25")
+        jev.plan_dispatch(q, [1, 2], reserve_usd="0.25")
+
+
+class R2ResponseModelTests(unittest.TestCase):
+    def _status(self, model):
+        payload = valid_payload(model=model)
+        return run(FakeTransport(resp(200, payload))).status
+
+    def test_real_dated_snapshot_accepted(self):
+        self.assertEqual(self._status("typesafe/jev-1.14-20261014"), "completed")
+        self.assertEqual(self._status(jev.MODEL), "completed")
+
+    def test_arbitrary_suffix_rejected(self):
+        for bad in (
+            "typesafe/jev-1.14-evil",
+            "typesafe/jev-1.14-2026",
+            "typesafe/jev-1.14-2026101",
+            "typesafe/jev-1.14-20261014-extra",
+            "typesafe/jev-1.14-evil-20261014",
+            "openai/gpt-4o",
+        ):
+            self.assertEqual(self._status(bad), "protocol_error", bad)
+
+    def test_overlong_model_rejected(self):
+        self.assertEqual(self._status("typesafe/jev-1.14-" + "9" * 300), "protocol_error")
+
+
+class R2MetadataAndDepthTests(unittest.TestCase):
+    def test_provider_and_id_bounded(self):
+        for payload in (
+            valid_payload(provider="P" * 300),
+            valid_payload(id="x" * 300),
+            valid_payload(provider=123),
+            valid_payload(id={"a": 1}),
+        ):
+            result = run(FakeTransport(resp(200, payload)))
+            self.assertEqual(result.status, "protocol_error")
+
+    def test_json_depth_bound(self):
+        # modest nesting parses; a document deeper than 64 is refused.
+        jev._parse_json("[" * 32 + "]" * 32)
+        with self.assertRaises(jev.JevProtocolError):
+            jev._parse_json("[" * 200 + "]" * 200)
+
+    def test_deep_body_is_protocol_error_not_escape(self):
+        result = run(FakeTransport(resp(200, "[" * 500 + "]" * 500)))
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_response_body_over_byte_bound(self):
+        big = "x" * (jev.MAX_RESPONSE_BYTES + 1)
+        result = run(FakeTransport(jev.TransportResponse(200, big)))
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_huge_exponent_cost_is_bounded(self):
+        body = (
+            '{"model":"%s","answers":{"q":{"type":"noul","noul":0.5}},'
+            '"usage":{"input_tokens":1,"output_tokens":1,"cost":1e999999999}}' % jev.MODEL
+        )
+        result = run(
+            FakeTransport(resp(200, body)),
+            qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
+        )
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_duplicate_json_key_rejected_in_depth_check_path(self):
+        body = (
+            '{"model":"%s","answers":{"q":{"type":"noul","noul":0.5,"noul":0.6}},'
+            '"usage":{"input_tokens":1,"output_tokens":1}}' % jev.MODEL
+        )
+        result = run(
+            FakeTransport(resp(200, body)),
+            qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
+        )
+        self.assertEqual(result.status, "protocol_error")
+
+
 if __name__ == "__main__":
     unittest.main()
