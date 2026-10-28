@@ -42,6 +42,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import json
+import math
 import os
 import socket
 import stat
@@ -50,7 +51,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from ..domain.errors import ProjectPathError, ReviewAgentError
+from ..domain.errors import ReviewAgentError
 from ..storage import paths
 
 __all__ = [
@@ -91,8 +92,19 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 #: Maximum accepted JSON nesting depth (top-level object counts as depth 1).
 MAX_JSON_DEPTH = 8
 
+#: Maximum accepted nesting depth for a server response (more generous than a
+#: request so the engine may return structured results, but still bounded).
+MAX_RESPONSE_DEPTH = 64
+
 #: Default per-connection / connect I/O timeout, in seconds.
 DEFAULT_IO_TIMEOUT = 5.0
+
+#: Upper bounds for caller-supplied numeric knobs (positive, finite, bounded).
+MAX_REQUEST_BYTES_CAP = 64 * 1024 * 1024
+MAX_TIMEOUT_SECONDS = 3600.0
+
+#: Short timeout used only to probe whether a leftover socket is stale.
+DEFAULT_PROBE_TIMEOUT = 1.0
 
 #: Owner-private masks (no group/other access).
 _DIR_MODE = 0o700
@@ -105,6 +117,20 @@ _CODE_TIMEOUT = "request_timeout"
 _CODE_UNAUTHORIZED = "unauthorized_peer"
 _CODE_HANDLER = "handler_error"
 _CODE_INVALID = "invalid_response"
+
+#: The only error codes a client will surface as a curated transport error. An
+#: unknown code is never reflected (it cannot be trusted as curated), and any
+#: structured application result is passed through the ``ok`` success path.
+_CURATED_CODES = frozenset(
+    {
+        _CODE_MALFORMED,
+        _CODE_TOO_LARGE,
+        _CODE_TIMEOUT,
+        _CODE_UNAUTHORIZED,
+        _CODE_HANDLER,
+        _CODE_INVALID,
+    }
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +212,19 @@ def _reject_constant(value: str) -> Any:
     raise ValueError(f"non-finite JSON value {value!r} is not allowed")
 
 
+def _strict_float(text: str) -> float:
+    """Parse a JSON number, rejecting overflow to infinity.
+
+    ``parse_constant`` only catches the literal ``NaN``/``Infinity`` tokens; a
+    numeric literal such as ``1e400`` silently overflows to ``inf`` under the
+    default ``float`` parser, so floats must be parsed through this hook.
+    """
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number {text!r} is not allowed")
+    return value
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     seen: set[str] = set()
     result: dict[str, Any] = {}
@@ -213,29 +252,28 @@ def _check_depth(obj: Any, limit: int) -> None:
                 stack.append((value, depth + 1))
 
 
-def parse_request(payload: bytes, *, max_depth: int = MAX_JSON_DEPTH) -> dict[str, Any]:
-    """Parse one request payload as strict JSON and return a dict.
+def _load_strict_json(payload: bytes, *, what: str, max_depth: int) -> Any:
+    """Decode ``payload`` as strict JSON without imposing a top-level shape.
 
-    Rejects: invalid UTF-8, invalid JSON, duplicate keys, non-finite numbers
-    (``NaN``/``Infinity``), nesting deeper than ``max_depth``, and any top-level
-    value that is not a JSON object. Raises :class:`RequestError`.
+    Rejects invalid UTF-8, invalid JSON, duplicate keys, non-finite numbers
+    (including numeric overflow), and over-deep nesting. Raises
+    :class:`RequestError`.
     """
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise RequestError("request is not valid UTF-8") from exc
+        raise RequestError(f"{what} is not valid UTF-8") from exc
     try:
         obj = json.loads(
             text,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_constant,
+            parse_float=_strict_float,
         )
     except RecursionError as exc:
-        raise RequestError("request JSON is nested too deeply") from exc
+        raise RequestError(f"{what} JSON is nested too deeply") from exc
     except ValueError as exc:
-        raise RequestError("request is not valid strict JSON") from exc
-    if not isinstance(obj, dict):
-        raise RequestError("request must be a JSON object")
+        raise RequestError(f"{what} is not valid strict JSON") from exc
     try:
         _check_depth(obj, max_depth)
     except ValueError as exc:
@@ -243,12 +281,34 @@ def parse_request(payload: bytes, *, max_depth: int = MAX_JSON_DEPTH) -> dict[st
     return obj
 
 
+def parse_request(payload: bytes, *, max_depth: int = MAX_JSON_DEPTH) -> dict[str, Any]:
+    """Parse one request payload as strict JSON and return a dict.
+
+    Rejects: invalid UTF-8, invalid JSON, duplicate keys, non-finite numbers
+    (``NaN``/``Infinity`` and overflow such as ``1e400``), nesting deeper than
+    ``max_depth``, and any top-level value that is not a JSON object. Raises
+    :class:`RequestError`.
+    """
+    obj = _load_strict_json(payload, what="request", max_depth=max_depth)
+    if not isinstance(obj, dict):
+        raise RequestError("request must be a JSON object")
+    return obj
+
+
 def _encode_json(obj: Any) -> bytes:
-    """Serialise ``obj`` to compact UTF-8 JSON, refusing non-finite numbers."""
+    """Serialise ``obj`` to compact UTF-8 JSON, refusing non-finite numbers.
+
+    Raises :class:`RequestError` for unencodable values **and** for values whose
+    nesting overflows the recursion limit, so a pathological object can never
+    crash the caller.
+    """
     try:
-        return json.dumps(obj, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        data = json.dumps(obj, allow_nan=False, separators=(",", ":"))
+    except RecursionError as exc:
+        raise RequestError("value is nested too deeply to encode") from exc
     except (ValueError, TypeError) as exc:
         raise RequestError("value cannot be encoded as strict JSON") from exc
+    return data.encode("utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -257,6 +317,43 @@ def _encode_json(obj: Any) -> bytes:
 def runtime_dir_for(data_dir: str | os.PathLike[str]) -> str:
     """Return the owner-private runtime directory path for ``data_dir``."""
     return os.path.join(os.path.abspath(os.fspath(data_dir)), RUNTIME_DIR_NAME)
+
+
+def _validate_basename(name: object, *, what: str) -> str:
+    """Return ``name`` if it is a simple filename, else raise.
+
+    Rejects non-strings, empty names, ``.``/``..``, absolute paths, path
+    separators, and NUL bytes, so a caller cannot escape the runtime directory
+    via a filename.
+    """
+    if not isinstance(name, str) or not name:
+        raise IPCError(f"{what} must be a non-empty filename")
+    if name in (".", "..") or "\x00" in name:
+        raise IPCError(f"{what} {name!r} is not a valid filename")
+    if os.path.isabs(name) or os.path.basename(name) != name:
+        raise IPCError(
+            f"{what} {name!r} must be a simple filename with no path components"
+        )
+    if os.sep in name or (os.altsep and os.altsep in name):
+        raise IPCError(f"{what} {name!r} must not contain path separators")
+    return name
+
+
+def _validate_positive_int(value: object, *, what: str, cap: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise IPCError(f"{what} must be an integer")
+    if value <= 0 or value > cap:
+        raise IPCError(f"{what} must be between 1 and {cap}")
+    return value
+
+
+def _validate_timeout(value: object, *, what: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise IPCError(f"{what} must be a number")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0 or number > MAX_TIMEOUT_SECONDS:
+        raise IPCError(f"{what} must be a finite value in (0, {MAX_TIMEOUT_SECONDS}]")
+    return number
 
 
 class WorkerIPCServer:
@@ -291,12 +388,21 @@ class WorkerIPCServer:
     ) -> None:
         if not callable(handler):
             raise IPCError("handler must be callable")
+        socket_filename = _validate_basename(socket_filename, what="socket filename")
+        lock_filename = _validate_basename(lock_filename, what="lock filename")
+        if socket_filename == lock_filename:
+            raise IPCError("socket filename and lock filename must differ")
+        max_request_bytes = _validate_positive_int(
+            max_request_bytes, what="max_request_bytes", cap=MAX_REQUEST_BYTES_CAP
+        )
+        io_timeout = _validate_timeout(io_timeout, what="io_timeout")
         self._data_dir = os.path.abspath(os.fspath(data_dir))
         self._handler = handler
         self._socket_filename = socket_filename
         self._lock_filename = lock_filename
         self._max_request_bytes = max_request_bytes
         self._io_timeout = io_timeout
+        self._probe_timeout = min(io_timeout, DEFAULT_PROBE_TIMEOUT)
         self._owner_uid = os.getuid() if owner_uid is None else owner_uid
         self._listener: socket.socket | None = None
         self._lock_fd: int | None = None
@@ -321,27 +427,65 @@ class WorkerIPCServer:
         return self._running
 
     # -- safety helpers ------------------------------------------------------ #
-    def _assert_owned_by_us(self, path: str, *, what: str) -> os.stat_result:
-        st = os.lstat(path)
+    def _require_owner_private_dir(self, path: str, *, what: str) -> bool:
+        """Validate an existing directory before any mutation.
+
+        Returns ``False`` when the path does not exist. Otherwise it must be a
+        real directory (never a symlink), owned by the expected user, and
+        owner-private; anything else raises :class:`RuntimeDirectoryError`
+        **without** creating or chmodding anything.
+        """
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise RuntimeDirectoryError(
+                f"{what} {path!r} cannot be inspected."
+            ) from exc
+        if stat.S_ISLNK(st.st_mode):
+            raise RuntimeDirectoryError(
+                f"refusing to use {what} {path!r}: it is a symlink."
+            )
+        if not stat.S_ISDIR(st.st_mode):
+            raise RuntimeDirectoryError(
+                f"refusing to use {what} {path!r}: it is not a directory."
+            )
         if st.st_uid != self._owner_uid:
             raise RuntimeDirectoryError(
                 f"{what} {path!r} is owned by uid {st.st_uid}, not the expected "
                 f"uid {self._owner_uid}; refusing to use it."
             )
-        return st
+        if not paths.is_owner_private(st.st_mode):
+            raise RuntimeDirectoryError(
+                f"{what} {path!r} is not owner-private (mode "
+                f"{stat.S_IMODE(st.st_mode):04o}); refusing to use a shared "
+                f"directory rather than chmodding it."
+            )
+        return True
+
+    def _create_owner_private_dir(self, path: str, *, what: str) -> None:
+        """Create ``path`` (and parents) owner-private; only for missing paths."""
+        try:
+            os.makedirs(path, mode=_DIR_MODE, exist_ok=True)
+            os.chmod(path, _DIR_MODE)
+        except OSError as exc:
+            raise RuntimeDirectoryError(
+                f"cannot create {what} {path!r}: {exc.strerror}."
+            ) from exc
 
     def _ensure_runtime_dir(self) -> None:
-        # The explicit data directory must not be a symlink (it would redirect
-        # every app-owned file to a foreign location).
-        try:
-            paths.assert_not_symlink(self._data_dir, what="data directory")
-            paths.ensure_owner_private_dir(self.runtime_dir)
-            paths.assert_owner_private_dir(self.runtime_dir)
-        except ProjectPathError as exc:
-            raise RuntimeDirectoryError(str(exc)) from exc
-        if os.path.lexists(self._data_dir):
-            self._assert_owned_by_us(self._data_dir, what="data directory")
-        self._assert_owned_by_us(self.runtime_dir, what="runtime directory")
+        # Validate everything that already exists *before* creating or chmodding
+        # anything, so a foreign or shared path is never mutated.
+        if not self._require_owner_private_dir(self._data_dir, what="data directory"):
+            self._create_owner_private_dir(self._data_dir, what="data directory")
+        if not self._require_owner_private_dir(
+            self.runtime_dir, what="runtime directory"
+        ):
+            self._create_owner_private_dir(self.runtime_dir, what="runtime directory")
+        # Re-validate after creation (and close any race window).
+        self._require_owner_private_dir(self._data_dir, what="data directory")
+        self._require_owner_private_dir(self.runtime_dir, what="runtime directory")
 
     def _acquire_lock(self) -> None:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -360,7 +504,25 @@ class WorkerIPCServer:
                 f"cannot open lock file {self.lock_path!r}: {exc.strerror}."
             ) from exc
         try:
-            self._assert_owned_by_us(self.lock_path, what="lock file")
+            # Validate the *opened* file (not the path again) before chmodding:
+            # a regular file, owned by us, with a single link (no hardlink into
+            # a foreign location). O_NOFOLLOW already refused a symlink.
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise RuntimeDirectoryError(
+                    f"refusing to use lock file {self.lock_path!r}: it is not a "
+                    f"regular file."
+                )
+            if st.st_uid != self._owner_uid:
+                raise RuntimeDirectoryError(
+                    f"lock file {self.lock_path!r} is owned by uid {st.st_uid}, not "
+                    f"the expected uid {self._owner_uid}; refusing to use it."
+                )
+            if st.st_nlink != 1:
+                raise RuntimeDirectoryError(
+                    f"refusing to use lock file {self.lock_path!r}: it has "
+                    f"{st.st_nlink} hard links."
+                )
             os.fchmod(fd, _FILE_MODE)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -380,30 +542,83 @@ class WorkerIPCServer:
             raise
         self._lock_fd = fd
 
-    def _prepare_socket_path(self) -> None:
-        """Remove a stale owned socket, refusing anything else.
+    def _probe_socket_stale(self, path: str) -> bool | None:
+        """Report whether the socket at ``path`` is definitively stale.
 
-        Called only while the singleton lock is held, so a still-live server
-        cannot own the path.
+        ``True`` = connection refused (safe to remove), ``False`` = a live
+        listener accepted the probe (must not be removed), ``None`` = unknown
+        (timeout or any other error; must not be removed).
+        """
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(self._probe_timeout)
+            probe.connect(path)
+        except (ConnectionRefusedError, FileNotFoundError):
+            return True
+        except OSError:
+            return None
+        else:
+            return False
+        finally:
+            try:
+                probe.close()
+            except OSError:  # pragma: no cover - defensive
+                pass
+
+    def _prepare_socket_path(self) -> None:
+        """Remove a definitively stale owned socket, refusing anything else.
+
+        Called only while the singleton lock is held. A same-UID *non-worker*
+        service that does not hold our lock may legitimately own this fixed
+        path, so the existing socket is **probed**: only a connection-refused
+        socket is removed, and only after an inode re-check. A live or
+        unverifiable socket is left untouched.
         """
         path = self.socket_path
+        if not os.path.lexists(path):
+            return
         if os.path.islink(path):
             raise RuntimeDirectoryError(
                 f"refusing to use socket path {path!r}: it is a symlink."
             )
-        if os.path.lexists(path):
-            st = os.lstat(path)
-            if st.st_uid != self._owner_uid:
-                raise RuntimeDirectoryError(
-                    f"refusing to touch {path!r}: it is owned by uid {st.st_uid}, "
-                    f"not the expected uid {self._owner_uid}."
-                )
-            if not stat.S_ISSOCK(st.st_mode):
-                raise RuntimeDirectoryError(
-                    f"refusing to delete {path!r}: it is not a socket (foreign "
-                    f"file at the control path)."
-                )
-            os.unlink(path)
+        st = os.lstat(path)
+        if st.st_uid != self._owner_uid:
+            raise RuntimeDirectoryError(
+                f"refusing to touch {path!r}: it is owned by uid {st.st_uid}, "
+                f"not the expected uid {self._owner_uid}."
+            )
+        if not stat.S_ISSOCK(st.st_mode):
+            raise RuntimeDirectoryError(
+                f"refusing to delete {path!r}: it is not a socket (foreign "
+                f"file at the control path)."
+            )
+        verdict = self._probe_socket_stale(path)
+        if verdict is False:
+            raise RuntimeDirectoryError(
+                f"a live service is listening on {path!r}; refusing to remove a "
+                f"socket that is not ours to reclaim."
+            )
+        if verdict is None:
+            raise RuntimeDirectoryError(
+                f"could not confirm {path!r} is a stale socket; refusing to "
+                f"remove it."
+            )
+        # Re-check identity immediately before unlinking to avoid removing a
+        # socket that was replaced while we probed.
+        try:
+            st2 = os.lstat(path)
+        except FileNotFoundError:
+            return
+        if (
+            (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
+            or not stat.S_ISSOCK(st2.st_mode)
+            or st2.st_uid != self._owner_uid
+        ):
+            raise RuntimeDirectoryError(
+                f"{path!r} changed while checking for staleness; refusing to "
+                f"remove it."
+            )
+        os.unlink(path)
 
     # -- lifecycle ----------------------------------------------------------- #
     def start(self) -> None:
@@ -576,10 +791,22 @@ class WorkerIPCServer:
         except Exception:
             self._send_error(conn, _CODE_HANDLER, "the request could not be handled")
             return
+        if not isinstance(result, dict):
+            self._send_error(conn, _CODE_INVALID, "the handler returned an invalid result")
+            return
+        envelope = {"ok": True, "result": result}
         try:
-            encoded = _encode_json({"ok": True, "result": result})
+            _check_depth(envelope, MAX_RESPONSE_DEPTH)
+        except ValueError:
+            self._send_error(conn, _CODE_INVALID, "the handler returned too deep a result")
+            return
+        try:
+            encoded = _encode_json(envelope)
         except RequestError:
             self._send_error(conn, _CODE_INVALID, "the handler returned an invalid result")
+            return
+        if len(encoded) > MAX_RESPONSE_BYTES:
+            self._send_error(conn, _CODE_INVALID, "the handler returned too large a result")
             return
         self._send_bytes(conn, encoded)
 
@@ -654,8 +881,10 @@ class WorkerIPCClient:
         owner_uid: int | None = None,
     ) -> None:
         self._data_dir = os.path.abspath(os.fspath(data_dir))
-        self._socket_filename = socket_filename
-        self._io_timeout = io_timeout
+        self._socket_filename = _validate_basename(
+            socket_filename, what="socket filename"
+        )
+        self._io_timeout = _validate_timeout(io_timeout, what="io_timeout")
         self._owner_uid = os.getuid() if owner_uid is None else owner_uid
 
     @property
@@ -669,13 +898,19 @@ class WorkerIPCClient:
     def request(self, request: dict[str, Any], *, timeout: float | None = None) -> Any:
         """Send one request and return the handler's result.
 
-        Raises :class:`WorkerNotRunning` if no socket exists,
-        :class:`PeerNotAuthorized` if the server is not the owner, and
-        :class:`IPCRequestError` for a curated server error response.
+        Raises :class:`WorkerNotRunning` if no worker is listening,
+        :class:`PeerNotAuthorized` if the server is not the owner,
+        :class:`IPCRequestError` for a curated transport error response, and
+        :class:`IPCError` for any other transport or protocol failure.
         """
         if not isinstance(request, dict):
             raise RequestError("request must be a JSON object")
         payload = _encode_json(request) + b"\n"
+        effective_timeout = (
+            self._io_timeout
+            if timeout is None
+            else _validate_timeout(timeout, what="timeout")
+        )
         path = self.socket_path
         if os.path.islink(path):
             raise RuntimeDirectoryError(f"refusing to use socket {path!r}: it is a symlink.")
@@ -683,8 +918,20 @@ class WorkerIPCClient:
             raise WorkerNotRunning(f"no control socket at {path!r}.")
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock.settimeout(self._io_timeout if timeout is None else timeout)
-            sock.connect(path)
+            sock.settimeout(effective_timeout)
+            try:
+                sock.connect(path)
+            except (ConnectionRefusedError, FileNotFoundError) as exc:
+                # A leftover socket with no listener is a stopped worker, not a
+                # protocol failure; restart callers can recover from this.
+                raise WorkerNotRunning(
+                    f"no worker is listening at {path!r}."
+                ) from exc
+            except OSError as exc:
+                raise IPCError(
+                    f"could not connect to the control socket: "
+                    f"{getattr(exc, 'strerror', exc)}."
+                ) from exc
             peer = read_peer_credentials(sock)
             if peer.uid != self._owner_uid:
                 raise PeerNotAuthorized(
@@ -692,34 +939,68 @@ class WorkerIPCClient:
                     "trust its responses."
                 )
             sock.sendall(payload)
-            line = self._read_bounded_response(sock)
+            line = self._read_bounded_response(sock, effective_timeout)
         finally:
             sock.close()
+        return self._decode_response(line)
+
+    @staticmethod
+    def _decode_response(line: bytes | None) -> Any:
         if line is None:
             raise IPCError("the server closed the connection without a response")
         try:
-            response = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise IPCError("the server returned an invalid response") from exc
-        if not isinstance(response, dict) or "ok" not in response:
-            raise IPCError("the server returned an invalid response")
-        if not response["ok"]:
-            error = response.get("error") or {}
-            raise IPCRequestError(
-                str(error.get("code", "error")),
-                str(error.get("message", "the request was rejected")),
+            response = _load_strict_json(
+                line, what="response", max_depth=MAX_RESPONSE_DEPTH
             )
-        return response.get("result")
+        except RequestError as exc:
+            raise IPCError("the server returned an invalid response") from exc
+        if not isinstance(response, dict):
+            raise IPCError("the server returned an invalid response")
+        ok = response.get("ok")
+        if ok is True:
+            if "result" not in response:
+                raise IPCError("the server returned an invalid response")
+            return response["result"]
+        if ok is False:
+            error = response.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            message = error.get("message") if isinstance(error, dict) else None
+            # Only a code from the static transport allowlist, with a string
+            # message, is surfaced as a curated error. Anything else is not
+            # trusted (it could be arbitrary reflected content).
+            if code in _CURATED_CODES and isinstance(message, str):
+                raise IPCRequestError(code, message)
+            raise IPCError("the server rejected the request")
+        # Not a real boolean: never coerce truthiness from untrusted input.
+        raise IPCError("the server returned an invalid response")
 
-    def _read_bounded_response(self, conn: socket.socket) -> bytes | None:
+    def _read_bounded_response(self, conn: socket.socket, timeout: float) -> bytes | None:
+        """Read one newline-terminated response, bounded by time and size.
+
+        The whole read shares one monotonic deadline (a slow-drip sender cannot
+        reset it chunk by chunk), and the size cap is enforced before any line
+        is returned.
+        """
+        deadline = time.monotonic() + timeout
         buf = bytearray()
         while True:
-            chunk = conn.recv(4096)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise IPCError("the server response timed out")
+            conn.settimeout(remaining)
+            try:
+                chunk = conn.recv(4096)
+            except socket.timeout:
+                raise IPCError("the server response timed out") from None
+            except OSError as exc:
+                raise IPCError("the server connection failed") from exc
             if not chunk:
                 return bytes(buf) if buf else None
             buf.extend(chunk)
             idx = buf.find(b"\n")
             if idx != -1:
+                if idx > MAX_RESPONSE_BYTES:
+                    raise IPCError("the server response was too large")
                 return bytes(buf[:idx])
             if len(buf) > MAX_RESPONSE_BYTES:
-                return None
+                raise IPCError("the server response was too large")

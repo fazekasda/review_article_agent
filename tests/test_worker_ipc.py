@@ -69,9 +69,9 @@ class WorkerIPCTest(unittest.TestCase):
         self._threads: list[threading.Thread] = []
 
     # -- helpers ------------------------------------------------------------- #
-    def _serve(self, *, io_timeout: float = 1.0, **kw) -> ipc.WorkerIPCServer:
+    def _serve(self, *, io_timeout: float = 1.0, handler=None, **kw) -> ipc.WorkerIPCServer:
         server = ipc.WorkerIPCServer(
-            self.data_dir, self.handler, io_timeout=io_timeout, **kw
+            self.data_dir, handler or self.handler, io_timeout=io_timeout, **kw
         )
         server.start()
         stop = threading.Event()
@@ -93,6 +93,15 @@ class WorkerIPCTest(unittest.TestCase):
             thread.join(2)
         for server in self._servers:
             server.close()
+
+    def _private_runtime(self) -> str:
+        """Create an owner-private data dir + runtime dir and return the latter."""
+        os.makedirs(self.data_dir, mode=0o700, exist_ok=True)
+        os.chmod(self.data_dir, 0o700)
+        runtime = ipc.runtime_dir_for(self.data_dir)
+        os.makedirs(runtime, mode=0o700, exist_ok=True)
+        os.chmod(runtime, 0o700)
+        return runtime
 
     def _raw_request(self, server: ipc.WorkerIPCServer, payload: bytes,
                      timeout: float = 2.0) -> bytes:
@@ -220,8 +229,7 @@ class WorkerIPCTest(unittest.TestCase):
         self.assertEqual(self.handler.calls, [])
 
     def test_client_verifies_server_uid(self) -> None:
-        runtime = ipc.runtime_dir_for(self.data_dir)
-        os.makedirs(runtime, mode=0o700, exist_ok=True)
+        runtime = self._private_runtime()
         fake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(fake.close)
         fake.bind(ipc.WorkerIPCServer(self.data_dir, self.handler).socket_path)
@@ -241,8 +249,7 @@ class WorkerIPCTest(unittest.TestCase):
 
     # -- unsafe paths -------------------------------------------------------- #
     def test_symlinked_socket_refused_without_deleting_target(self) -> None:
-        runtime = ipc.runtime_dir_for(self.data_dir)
-        os.makedirs(runtime, mode=0o700)
+        runtime = self._private_runtime()
         target = self.tmp / "foreign-target"
         target.write_text("do not delete")
         os.symlink(str(target), os.path.join(runtime, ipc.DEFAULT_SOCKET_FILENAME))
@@ -253,8 +260,7 @@ class WorkerIPCTest(unittest.TestCase):
         self.assertEqual(target.read_text(), "do not delete")
 
     def test_foreign_regular_file_at_socket_path_refused(self) -> None:
-        runtime = ipc.runtime_dir_for(self.data_dir)
-        os.makedirs(runtime, mode=0o700)
+        runtime = self._private_runtime()
         victim = os.path.join(runtime, ipc.DEFAULT_SOCKET_FILENAME)
         Path(victim).write_text("foreign file")
         server = ipc.WorkerIPCServer(self.data_dir, self.handler, io_timeout=1.0)
@@ -274,8 +280,7 @@ class WorkerIPCTest(unittest.TestCase):
     def test_foreign_owner_runtime_dir_refused(self) -> None:
         # Simulate a runtime directory owned by someone else without root by
         # telling the server to expect a different owner UID.
-        runtime = ipc.runtime_dir_for(self.data_dir)
-        os.makedirs(runtime, mode=0o700)
+        runtime = self._private_runtime()
         server = ipc.WorkerIPCServer(
             self.data_dir, self.handler, io_timeout=1.0, owner_uid=os.getuid() + 1234
         )
@@ -284,8 +289,7 @@ class WorkerIPCTest(unittest.TestCase):
 
     # -- stale recovery ------------------------------------------------------ #
     def test_stale_owned_socket_recovered_without_touching_others(self) -> None:
-        runtime = ipc.runtime_dir_for(self.data_dir)
-        os.makedirs(runtime, mode=0o700)
+        runtime = self._private_runtime()
         other_sock_path = os.path.join(runtime, "unrelated.sock")
         other = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         other.bind(other_sock_path)
@@ -403,6 +407,258 @@ class WorkerIPCTest(unittest.TestCase):
         self.assertFalse(_decode(bad)["ok"])
         client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
         self.assertEqual(client.request({"x": 5})["echo"], 5)
+
+    # -- R1 repairs: strict numbers ------------------------------------------ #
+    def test_float_overflow_rejected(self) -> None:
+        with self.assertRaises(ipc.RequestError):
+            ipc.parse_request(b'{"x":1e400}')
+        server = self._serve()
+        for payload in (b'{"x":1e400}\n', b'{"x":-1e400}\n', b'{"x":1e309}\n'):
+            body = _decode(self._raw_request(server, payload))
+            self.assertFalse(body["ok"])
+            self.assertEqual(body["error"]["code"], "malformed_request")
+        # A large but finite value is still accepted.
+        self.assertTrue(_decode(self._raw_request(server, b'{"x":1e300}\n'))["ok"])
+
+    # -- R1 repairs: live vs stale socket ------------------------------------ #
+    def test_live_foreign_socket_preserved(self) -> None:
+        runtime = self._private_runtime()
+        svc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(svc.close)
+        svc.bind(os.path.join(runtime, ipc.DEFAULT_SOCKET_FILENAME))
+        svc.listen(4)
+        server = ipc.WorkerIPCServer(self.data_dir, self.handler, io_timeout=1.0)
+        with self.assertRaises(ipc.RuntimeDirectoryError):
+            server.start()
+        # The live (non-worker) service is untouched and still listening.
+        self.assertTrue(os.path.exists(server.socket_path))
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(2.0)
+        probe.connect(server.socket_path)
+        probe.close()
+
+    def test_unverifiable_socket_refused(self) -> None:
+        # A bound socket whose peer probe times out must not be removed.
+        runtime = self._private_runtime()
+        path = os.path.join(runtime, ipc.DEFAULT_SOCKET_FILENAME)
+        svc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(svc.close)
+        svc.bind(path)
+        svc.listen(1)
+        server = ipc.WorkerIPCServer(self.data_dir, self.handler, io_timeout=1.0)
+        with mock.patch.object(server, "_probe_socket_stale", return_value=None):
+            with self.assertRaises(ipc.RuntimeDirectoryError):
+                server.start()
+        self.assertTrue(os.path.exists(path))
+
+    # -- R1 repairs: validate-before-mutate ---------------------------------- #
+    def test_shared_runtime_dir_refused_without_chmod(self) -> None:
+        os.makedirs(self.data_dir, mode=0o700)
+        os.chmod(self.data_dir, 0o700)
+        runtime = ipc.runtime_dir_for(self.data_dir)
+        os.makedirs(runtime, mode=0o755)
+        os.chmod(runtime, 0o755)
+        server = ipc.WorkerIPCServer(self.data_dir, self.handler, io_timeout=1.0)
+        with self.assertRaises(ipc.RuntimeDirectoryError):
+            server.start()
+        # Refused, not silently tightened.
+        self.assertEqual(stat.S_IMODE(os.stat(runtime).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(self.data_dir).st_mode), 0o700)
+
+    def test_shared_data_dir_refused_without_chmod(self) -> None:
+        os.makedirs(self.data_dir, mode=0o755)
+        os.chmod(self.data_dir, 0o755)
+        server = ipc.WorkerIPCServer(self.data_dir, self.handler, io_timeout=1.0)
+        with self.assertRaises(ipc.RuntimeDirectoryError):
+            server.start()
+        self.assertEqual(stat.S_IMODE(os.stat(self.data_dir).st_mode), 0o755)
+
+    def test_lock_path_non_regular_refused(self) -> None:
+        runtime = self._private_runtime()
+        fifo = os.path.join(runtime, ipc.DEFAULT_LOCK_FILENAME)
+        os.mkfifo(fifo)
+        server = ipc.WorkerIPCServer(self.data_dir, self.handler, io_timeout=1.0)
+        with self.assertRaises(ipc.RuntimeDirectoryError):
+            server.start()
+        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode))
+        self.assertIsNone(server._lock_fd)
+
+    # -- R1 repairs: constructor guards -------------------------------------- #
+    def test_constructor_rejects_unsafe_filenames(self) -> None:
+        for bad in ("../evil.sock", "/abs.sock", "a/b", ".", "..", "", "a\x00b", 123):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ipc.IPCError):
+                    ipc.WorkerIPCServer(self.data_dir, self.handler, socket_filename=bad)
+        with self.assertRaises(ipc.IPCError):
+            ipc.WorkerIPCServer(
+                self.data_dir, self.handler, socket_filename="same", lock_filename="same"
+            )
+        with self.assertRaises(ipc.IPCError):
+            ipc.WorkerIPCClient(self.data_dir, socket_filename="../x")
+
+    def test_constructor_rejects_bad_limits(self) -> None:
+        for bad in (0, -1, True, ipc.MAX_REQUEST_BYTES_CAP + 1, "x", 1.5):
+            with self.subTest(max_request_bytes=bad):
+                with self.assertRaises(ipc.IPCError):
+                    ipc.WorkerIPCServer(self.data_dir, self.handler, max_request_bytes=bad)
+        for bad in (0, -1.0, float("nan"), float("inf"), ipc.MAX_TIMEOUT_SECONDS + 1):
+            with self.subTest(io_timeout=bad):
+                with self.assertRaises(ipc.IPCError):
+                    ipc.WorkerIPCServer(self.data_dir, self.handler, io_timeout=bad)
+
+    # -- R1 repairs: client framing + trust ---------------------------------- #
+    def _fake_server(self, responder):
+        runtime = self._private_runtime()
+        path = os.path.join(runtime, ipc.DEFAULT_SOCKET_FILENAME)
+        if os.path.lexists(path):
+            os.unlink(path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(1)
+
+        def run() -> None:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                responder(conn)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(listener.close)
+        self.addCleanup(thread.join, 3)
+        return listener
+
+    def test_client_slow_drip_response_bounded(self) -> None:
+        stop = threading.Event()
+
+        def responder(conn: socket.socket) -> None:
+            conn.sendall(b'{"ok":true')
+            stop.wait(5)
+
+        self._fake_server(responder)
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=0.4)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(ipc.IPCError):
+                client.request({"x": 1})
+        finally:
+            stop.set()
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_client_oversized_response_rejected(self) -> None:
+        def responder(conn: socket.socket) -> None:
+            try:
+                conn.sendall(
+                    b'{"ok":true,"result":"' + b"A" * (ipc.MAX_RESPONSE_BYTES + 128) + b'"}\n'
+                )
+            except OSError:
+                pass
+
+        self._fake_server(responder)
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=3.0)
+        with self.assertRaises(ipc.IPCError):
+            client.request({"x": 1})
+
+    def test_client_malformed_response_rejected(self) -> None:
+        for body in (
+            b'{"ok":"yes"}\n',              # not a real boolean
+            b'{"ok":true}\n',               # success without a result
+            b'not json\n',
+            b'{"ok":true,"ok":false}\n',    # duplicate key
+            b'{"ok":true,"result":NaN}\n',  # non-finite
+        ):
+            with self.subTest(body=body):
+                def responder(conn: socket.socket, _body=body) -> None:
+                    conn.sendall(_body)
+
+                self._fake_server(responder)
+                client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+                with self.assertRaises(ipc.IPCError):
+                    client.request({"x": 1})
+
+    def test_client_error_code_allowlist(self) -> None:
+        # A curated transport code is surfaced...
+        def curated(conn: socket.socket) -> None:
+            conn.sendall(
+                b'{"ok":false,"error":{"code":"malformed_request","message":"bad input"}}\n'
+            )
+
+        self._fake_server(curated)
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+        with self.assertRaises(ipc.IPCRequestError) as cm:
+            client.request({"x": 1})
+        self.assertEqual(cm.exception.code, "malformed_request")
+
+        # ...but an unknown code is never trusted as curated.
+        def uncurated(conn: socket.socket) -> None:
+            conn.sendall(
+                b'{"ok":false,"error":{"code":"engine-specific","message":"leak"}}\n'
+            )
+
+        self._fake_server(uncurated)
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+        with self.assertRaises(ipc.IPCError) as cm2:
+            client.request({"x": 1})
+        self.assertNotIsInstance(cm2.exception, ipc.IPCRequestError)
+
+    def test_client_connect_refused_is_worker_not_running(self) -> None:
+        runtime = self._private_runtime()
+        path = os.path.join(runtime, ipc.DEFAULT_SOCKET_FILENAME)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(path)
+        stale.close()  # leftover socket, no listener
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=1.0)
+        with self.assertRaises(ipc.WorkerNotRunning):
+            client.request({"x": 1})
+
+    # -- R1 repairs: handler result contract --------------------------------- #
+    def test_server_rejects_non_dict_result(self) -> None:
+        def list_handler(request, peer):
+            return ["not", "a", "dict"]
+
+        self._serve(handler=list_handler)
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=2.0)
+        with self.assertRaises(ipc.IPCRequestError) as cm:
+            client.request({"x": 1})
+        self.assertEqual(cm.exception.code, "invalid_response")
+
+    def test_server_rejects_deeply_nested_result(self) -> None:
+        deep: dict = {}
+        cursor = deep
+        for _ in range(5000):
+            cursor["n"] = {}
+            cursor = cursor["n"]
+
+        def deep_handler(request, peer):
+            return deep
+
+        self._serve(handler=deep_handler)
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=3.0)
+        with self.assertRaises(ipc.IPCRequestError) as cm:
+            client.request({"x": 1})
+        self.assertEqual(cm.exception.code, "invalid_response")
+
+    def test_server_rejects_oversized_result(self) -> None:
+        def big_handler(request, peer):
+            return {"data": "A" * (ipc.MAX_RESPONSE_BYTES + 256)}
+
+        self._serve(handler=big_handler)
+        client = ipc.WorkerIPCClient(self.data_dir, io_timeout=3.0)
+        with self.assertRaises(ipc.IPCRequestError) as cm:
+            client.request({"x": 1})
+        self.assertEqual(cm.exception.code, "invalid_response")
 
 
 if __name__ == "__main__":  # pragma: no cover
