@@ -46,14 +46,19 @@ add subcommands without reworking dispatch. This module also exposes:
   never cancels on exit. There is **no** ``model`` or scientific-``approve``
   command here: those belong to later steps once their execution and
   scientific-approval layers are integrated.
-* ``gate`` — **read-only exact human-gate preview** (``prepare``) over
-  :mod:`review_article_agent.runtime.gates`. It prepares the exact snapshot for
-  one named gate (target plus its full transitive dependency closure) and prints
-  a safe summary carrying ``approval_recorded=false``,
+* ``gate`` — **app-owned exact human gates** over
+  :mod:`review_article_agent.runtime.gates` and
+  :mod:`review_article_agent.storage.human_approvals`. ``gate prepare`` is a
+  read-only preview of the exact snapshot for one named gate (target plus its full
+  transitive dependency closure); ``gate confirm`` prepares the exact snapshot,
+  requires the caller to echo the previewed ``--snapshot-digest``, confirms it
+  out-of-band on the controlling terminal (``/dev/tty``; never stdin, never a
+  ``--yes``/actor/authenticated/capability flag), and records **one** durable
+  human approval through the integrated repository; ``gate status``/``gate list``
+  read back the computed lifecycle status. Every output carries
   ``authorizes_execution=false``, ``authorizes_export=false`` and
-  ``scientific_validation=false``. It records **no** approval, mints **no**
-  authority, and authorizes nothing; there is deliberately **no** ``gate
-  approve`` command and no raw actor/authority flag here.
+  ``scientific_validation=false``: a named-gate approval never authorizes global
+  execution, export, or scientific validity.
 """
 
 from __future__ import annotations
