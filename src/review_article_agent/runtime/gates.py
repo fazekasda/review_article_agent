@@ -34,12 +34,19 @@ What this module **is**
   it is verified exactly but is **never** compared against its artifact's
   current head (so honest history is not spuriously stale). Any live input that
   is not the artifact's current revision — or a pinned rights record a newer
-  ``record_revision`` has superseded — blocks preparation.
+  ``record_revision`` has superseded — blocks preparation. Every dependency pin
+  is validated **before** its revision is looked up: its ``project_id`` must be
+  this store's project, its role must be an approved dependency role, and a
+  ``version_of`` edge must target an older revision of the *same* artifact (a
+  foreign, unknown-role, or cross-artifact edge is a typed failure, never a
+  local alias or a fabricated historical lineage).
 * :func:`revalidate_prepared` — recomputes the exact structure from the
   prepared pins and re-checks **every** pin in one read transaction. A changed
   current target/dependency/rights is a typed ``stale``; a corrupt/missing
-  digest, byte size, or rights record is a typed ``invalid``; a cross-project
-  entry/target is ``denied``.
+  digest, byte size, or rights record, a malformed/foreign dependency edge, or a
+  recorded storage schema version outside ``1..STORE_SCHEMA_VERSION`` is a typed
+  ``invalid``; a cross-project entry/target is ``denied``. A legitimate historic
+  storage schema version is preserved exactly as recorded.
 
 What this module **is not**
 ---------------------------
@@ -68,10 +75,11 @@ entry 0, live-wins over ancestry, transitive ``version_of`` lineage, one shared
 project) using the tested
 :class:`~review_article_agent.storage.artifacts.ArtifactRepository` read API,
 but it is a **bounded iterative traversal of its own**: the entry bound is
-enforced *during* the walk, so a pathological graph cannot be walked without
-limit before the bound is noticed. It reuses the approvals module's role
-vocabulary and ancestry constant so the two closures cannot drift. This module
-never calls the fixture *write* path and never mutates the store.
+enforced *while discovering unique nodes* (at enqueue time), so a wide or dense
+pathological graph cannot be walked without limit and cannot blow up the pending
+queue with duplicate nodes. It reuses the approvals module's role vocabulary and
+ancestry constant so the two closures cannot drift. This module never calls the
+fixture *write* path and never mutates the store.
 
 LLM-annotated test file companion: ``tests/test_gate_snapshots.py``.
 """
@@ -104,7 +112,12 @@ from ..storage.approvals import (
     _ANCESTRY_ROLE,
     _KIND_TO_ROLE,
 )
-from ..storage.artifacts import ArtifactRepository, sha256_digest
+from ..storage.artifacts import (
+    GENERIC_DEPENDENCY_ROLES,
+    ArtifactRepository,
+    sha256_digest,
+)
+from ..storage.schema import STORE_SCHEMA_VERSION
 from .owner_auth import (
     APPROVAL_DECISIONS,
     APPROVAL_GATE_KINDS,
@@ -123,6 +136,7 @@ __all__ = [
     "GateDefinitionError",
     "GateTargetError",
     "GateDependencyError",
+    "GateDependencyEdgeError",
     "GateContentIntegrityError",
     "GateRightsError",
     "GateSupersededInputError",
@@ -185,6 +199,12 @@ _PROBLEM_CLOSURE_MISSING = (
 _PROBLEM_CLOSURE_MISMATCH = (
     "the prepared entries do not match the re-derived exact dependency closure"
 )
+_PROBLEM_DEPENDENCY_EDGE = (
+    "a dependency edge in the closure is malformed or crosses project identity"
+)
+_PROBLEM_STORAGE_SCHEMA = (
+    "the prepared snapshot records an unsupported storage schema version"
+)
 _PROBLEM_CANONICAL_BYTES = (
     "the prepared canonical bytes do not match the re-derived structure"
 )
@@ -245,6 +265,16 @@ class GateTargetError(GateSnapshotError, ValueError):
 
 class GateDependencyError(GateSnapshotError):
     """A reachable revision is missing, or the closure exceeds its bound."""
+
+
+class GateDependencyEdgeError(GateDependencyError):
+    """A dependency edge crosses project identity or is malformed.
+
+    Raised **before** the referenced revision is looked up: a foreign
+    ``project_id``, an unknown dependency role, or a ``version_of`` edge that is
+    not an older revision of the same artifact can never be aliased into a local
+    or historical entry.
+    """
 
 
 class GateContentIntegrityError(GateSnapshotError):
@@ -751,6 +781,66 @@ def _role_for_artifact(artifacts: ArtifactRepository, artifact_id: str) -> str:
     return _KIND_TO_ROLE.get(kind, "other")
 
 
+def _revision_rowid(store, artifact_id: str, revision_id: str) -> int | None:
+    """Return a revision's storage insertion order (``rowid``), or ``None``.
+
+    Used only to prove a ``version_of`` edge points at an *older* revision of the
+    same artifact; it is a read-only, project-scoped lookup.
+    """
+    row = store.connection.execute(
+        "SELECT rowid AS rid FROM revision WHERE project_id = ? "
+        "AND artifact_id = ? AND revision_id = ?",
+        (store.project_id, artifact_id, revision_id),
+    ).fetchone()
+    return None if row is None else int(row["rid"])
+
+
+def _validate_dependency_edge(store, parent_key: tuple[str, str], dep) -> None:
+    """Validate one dependency pin **before** the referenced revision is looked up.
+
+    Mirrors the storage layer's own edge rules (C01 §5.5 / C02 §2.2) at the read
+    boundary, so a corrupted or forged edge graph cannot smuggle a foreign
+    project, an unknown role, or a cross-artifact ``version_of`` (which would
+    otherwise be relabelled as historical lineage and skip the head check) into an
+    "exact" closure. Every failure is a typed :class:`GateDependencyEdgeError`.
+    """
+    try:
+        project_id = validate_identifier(dep.project_id, "dependency.project_id")
+        artifact_id = validate_identifier(dep.artifact_id, "dependency.artifact_id")
+        revision_id = validate_identifier(dep.revision_id, "dependency.revision_id")
+        role = dep.role
+    except (RecordValidationError, TypeError, ValueError, AttributeError) as exc:
+        raise GateDependencyEdgeError(
+            "a dependency edge in the closure is malformed; the gate snapshot "
+            "cannot be prepared or revalidated."
+        ) from exc
+    if project_id != store.project_id:
+        # A foreign-project edge can otherwise alias a same-id local revision.
+        raise GateDependencyEdgeError(
+            "a dependency edge crosses project identity; the gate snapshot cannot "
+            "be prepared or revalidated."
+        )
+    if role not in GENERIC_DEPENDENCY_ROLES:
+        raise GateDependencyEdgeError(
+            "a dependency edge carries a role outside the approved dependency "
+            "vocabulary; the gate snapshot cannot be prepared or revalidated."
+        )
+    if role == _ANCESTRY_ROLE:
+        parent_artifact_id, parent_revision_id = parent_key
+        if artifact_id != parent_artifact_id:
+            raise GateDependencyEdgeError(
+                "a version_of dependency edge does not target the same artifact; "
+                "it cannot be treated as historical lineage."
+            )
+        child_rowid = _revision_rowid(store, artifact_id, revision_id)
+        parent_rowid = _revision_rowid(store, parent_artifact_id, parent_revision_id)
+        if child_rowid is None or parent_rowid is None or child_rowid >= parent_rowid:
+            raise GateDependencyEdgeError(
+                "a version_of dependency edge does not target an older revision of "
+                "the same artifact; it cannot be treated as historical lineage."
+            )
+
+
 def _exact_closure(store, artifacts: ArtifactRepository, target_ref: dict[str, str]) -> list:
     """Return the target plus its full transitive dependency closure.
 
@@ -758,39 +848,46 @@ def _exact_closure(store, artifacts: ArtifactRepository, target_ref: dict[str, s
     semantics of
     :class:`~review_article_agent.storage.approvals.ApprovalRepository`
     (target entry 0, live-wins over ancestry, transitive ``version_of`` lineage,
-    one shared project) without calling its unbounded builder: the
-    :data:`MAX_GATE_SNAPSHOT_ENTRIES` bound is enforced **during** the walk, so a
-    pathological graph is refused as soon as it exceeds the bound rather than
-    after a full unbounded walk. The traversal is cycle-safe.
+    one shared project) without calling its unbounded builder.
+
+    The :data:`MAX_GATE_SNAPSHOT_ENTRIES` bound is enforced **while discovering
+    unique nodes** (at enqueue time), so a wide or dense graph is refused before
+    the overflowing node is ever looked up — never after a full unbounded walk.
+    ``seen`` tracks every *discovered* node, so the pending queue never holds a
+    duplicate of a node reached through many edges (a dense graph cannot blow up
+    the queue). The traversal is cycle-safe, and every dependency pin is validated
+    (same project, approved role, ``version_of`` = older same-artifact revision)
+    **before** its revision is looked up.
     """
     target_key = (target_ref["artifact_id"], target_ref["revision_id"])
     order: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str]] = {target_key}
     live_keys: set[tuple[str, str]] = {target_key}
     queue: deque[tuple[str, str]] = deque([target_key])
+    if len(seen) > MAX_GATE_SNAPSHOT_ENTRIES:
+        raise GateDependencyError(
+            f"the dependency closure exceeds the "
+            f"{MAX_GATE_SNAPSHOT_ENTRIES}-entry bound; the gate snapshot cannot be "
+            "prepared."
+        )
     try:
         while queue:
             key = queue.popleft()
-            if key in seen:
-                continue
-            seen.add(key)
             order.append(key)
-            if len(order) > MAX_GATE_SNAPSHOT_ENTRIES:
-                raise GateDependencyError(
-                    f"the dependency closure exceeds the "
-                    f"{MAX_GATE_SNAPSHOT_ENTRIES}-entry bound; the gate snapshot "
-                    "cannot be prepared."
-                )
             artifact_id, revision_id = key
             if artifacts.get_revision(artifact_id, revision_id) is None:
                 raise GateDependencyError(
                     "a revision reachable from the target does not exist in this "
                     "project; the gate snapshot cannot be prepared."
                 )
-            dependencies = sorted(
-                artifacts.list_dependencies(artifact_id, revision_id),
-                key=lambda d: (d.artifact_id, d.revision_id, d.role),
+            dependencies = list(
+                artifacts.list_dependencies(artifact_id, revision_id)
             )
+            # Validate every pin before sorting or enqueuing, so a malformed or
+            # foreign edge is rejected before any lookup.
+            for dep in dependencies:
+                _validate_dependency_edge(store, key, dep)
+            dependencies.sort(key=lambda d: (d.artifact_id, d.revision_id, d.role))
             for dep in dependencies:
                 child = (dep.artifact_id, dep.revision_id)
                 if dep.role != _ANCESTRY_ROLE:
@@ -798,6 +895,13 @@ def _exact_closure(store, artifacts: ArtifactRepository, target_ref: dict[str, s
                     # input, even if it is also named as an ancestor ("live wins").
                     live_keys.add(child)
                 if child not in seen:
+                    seen.add(child)
+                    if len(seen) > MAX_GATE_SNAPSHOT_ENTRIES:
+                        raise GateDependencyError(
+                            f"the dependency closure exceeds the "
+                            f"{MAX_GATE_SNAPSHOT_ENTRIES}-entry bound; the gate "
+                            "snapshot cannot be prepared."
+                        )
                     queue.append(child)
 
         entries: list[FixtureSnapshotEntry] = []
@@ -1037,6 +1141,22 @@ def _build_version_set(entries) -> dict[str, object]:
     }
 
 
+def _is_supported_storage_schema(value: object) -> bool:
+    """Return ``True`` iff ``value`` is a supported project store schema version.
+
+    A prepared snapshot records the store schema version it was prepared under.
+    A **legitimate older** version (``1..STORE_SCHEMA_VERSION``) is preserved and
+    revalidated exactly as recorded; a future version, a negative/zero value, a
+    boolean (``True``/``False`` are ``int`` subclasses), or a non-integer is not a
+    schema version at all and is refused.
+    """
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= STORE_SCHEMA_VERSION
+    )
+
+
 def _build_structure(
     *,
     project_id: str,
@@ -1270,6 +1390,8 @@ def revalidate_prepared(store, prepared: object) -> GateRevalidation:
         # -- representation / schema --------------------------------------- #
         if prepared.snapshot_schema_version != HUMAN_GATE_SNAPSHOT_SCHEMA_VERSION:
             invalid.append(_PROBLEM_SCHEMA_VERSION)
+        if not _is_supported_storage_schema(prepared.storage_schema_version):
+            invalid.append(_PROBLEM_STORAGE_SCHEMA)
 
         # -- gate metadata (owner-action conventions) ---------------------- #
         metadata_ok = True
@@ -1302,6 +1424,9 @@ def revalidate_prepared(store, prepared: object) -> GateRevalidation:
         if validated_target is not None:
             try:
                 derived_pins = _exact_closure(store, artifacts, validated_target)
+            except GateDependencyEdgeError:
+                invalid.append(_PROBLEM_DEPENDENCY_EDGE)
+                derived_pins = None
             except GateDependencyError:
                 invalid.append(_PROBLEM_CLOSURE_MISSING)
                 derived_pins = None

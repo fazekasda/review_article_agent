@@ -9,9 +9,16 @@ behavior of ``review_article_agent.runtime.gates``:
 * missing / corrupt-digest / byte-size / rights-identity / rights-bytes /
   rights-subject / superseded-rights / superseded-live-input / cross-project
   pins are blocked with static typed errors and write nothing;
+* a foreign-project dependency edge, an unknown dependency role, and a
+  cross-artifact ``version_of`` edge are rejected before lookup (never aliased
+  into a local entry or relabelled as historical lineage);
 * a later edit to the target, a live dependency, or a pinned rights record makes
   revalidation ``stale``; a digest/bytes corruption makes it ``invalid``; a
-  cross-project object is ``denied``;
+  cross-project object is ``denied``; a malformed/foreign edge and an unsupported
+  storage schema version are ``invalid``;
+* the traversal bound is enforced while discovering unique nodes (before the
+  overflowing node is looked up), and the pending queue de-duplicates a dense
+  graph's duplicate edges;
 * the preparation digest binds the gate kind/id, decision, and rationale, and
   the yielded ``OwnerAction`` binds that exact digest;
 * no generic saved permission, in-band authority keyword, or hand-built object
@@ -35,6 +42,7 @@ import sys
 import tempfile
 import types
 import unittest
+from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 from unittest import mock
@@ -48,6 +56,7 @@ from review_article_agent.runtime import gates  # noqa: E402
 from review_article_agent.runtime.gates import (  # noqa: E402
     GateContentIntegrityError,
     GateDefinitionError,
+    GateDependencyEdgeError,
     GateDependencyError,
     GateRightsError,
     GateSnapshotError,
@@ -67,6 +76,7 @@ from review_article_agent.runtime.owner_auth import (  # noqa: E402
 from review_article_agent.storage import ArtifactRepository, ProjectStore  # noqa: E402
 from review_article_agent.storage import paths  # noqa: E402
 from review_article_agent.storage.artifacts import DependencyRef, sha256_digest  # noqa: E402
+from review_article_agent.storage.schema import STORE_SCHEMA_VERSION  # noqa: E402
 
 _OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
 _GATE_KW = dict(gate_kind="artifact_revision", gate_id="gate-1", decision="approved")
@@ -267,6 +277,43 @@ class GateSnapshotTestBase(unittest.TestCase):
                 None,
                 canonical,
                 sha256_digest(canonical),
+                "2026-10-28T00:00:00+00:00",
+            ),
+        )
+
+    def _insert_dependency(
+        self,
+        store,
+        *,
+        from_artifact_id: str,
+        from_revision_id: str,
+        to_artifact_id: str,
+        to_revision_id: str,
+        role: str = "derived_from",
+        dependency_id: str = "dep_test",
+        to_project_id: str | None = None,
+    ) -> None:
+        """Insert a raw dependency edge, bypassing the import-time edge checks.
+
+        Simulates a corrupted/forged edge graph that the storage layer's own
+        validation could never write (a foreign project edge, an unknown role, or
+        a cross-artifact ``version_of``).
+        """
+        pid = store.project_id
+        store.connection.execute(
+            "INSERT INTO dependency "
+            "(project_id, from_artifact_id, from_revision_id, dependency_id, role, "
+            " to_project_id, to_artifact_id, to_revision_id, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                pid,
+                from_artifact_id,
+                from_revision_id,
+                dependency_id,
+                role,
+                to_project_id if to_project_id is not None else pid,
+                to_artifact_id,
+                to_revision_id,
                 "2026-10-28T00:00:00+00:00",
             ),
         )
@@ -745,6 +792,155 @@ class PrepareTest(GateSnapshotTestBase):
                         prepare_gate_snapshot(store, target, rationale="r", **_GATE_KW)
             self.assertLessEqual(len(calls), 2)
 
+    def test_foreign_dependency_edge_rejected_before_lookup(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            real_list = ArtifactRepository.list_dependencies
+
+            def _foreign(self, artifact_id, revision_id):
+                # Every real edge is rewritten to a syntactically valid but
+                # foreign project; it must never alias the same-id local revision.
+                return [
+                    DependencyRef(
+                        "prj_" + "f" * 32, d.artifact_id, d.revision_id, d.role
+                    )
+                    for d in real_list(self, artifact_id, revision_id)
+                ]
+
+            with mock.patch.object(ArtifactRepository, "list_dependencies", _foreign):
+                with self.assertRaises(GateDependencyEdgeError):
+                    prepare_gate_snapshot(
+                        store,
+                        self._target(store, "a-rep", "rev-rep"),
+                        rationale="r",
+                        **_GATE_KW,
+                    )
+
+    def test_cross_artifact_version_of_edge_rejected(self) -> None:
+        with self.new_store() as store:
+            repo = ArtifactRepository(store)
+            repo.create_artifact("a-other", kind="document")
+            self._import(repo, "a-other", b"o1", "rev-o1")
+            self._import(repo, "a-other", b"o2", "rev-o2", parent_revision_id="rev-o1")
+            repo.create_artifact("a-rep", kind="report")
+            self._import(repo, "a-rep", b"rep", "rev-rep")
+            # A forged version_of edge to a *different* artifact's stale revision
+            # must never be relabelled as historical lineage (which would skip the
+            # head check and hide a stale live input).
+            self._insert_dependency(
+                store,
+                from_artifact_id="a-rep",
+                from_revision_id="rev-rep",
+                to_artifact_id="a-other",
+                to_revision_id="rev-o1",
+                role="version_of",
+            )
+            with self.assertRaises(GateDependencyEdgeError):
+                prepare_gate_snapshot(
+                    store,
+                    self._target(store, "a-rep", "rev-rep"),
+                    rationale="r",
+                    **_GATE_KW,
+                )
+
+    def test_unknown_dependency_role_rejected(self) -> None:
+        with self.new_store() as store:
+            repo = ArtifactRepository(store)
+            repo.create_artifact("a-doc", kind="document")
+            self._import(repo, "a-doc", b"d", "rev-d")
+            repo.create_artifact("a-rep", kind="report")
+            self._import(repo, "a-rep", b"rep", "rev-rep")
+            self._insert_dependency(
+                store,
+                from_artifact_id="a-rep",
+                from_revision_id="rev-rep",
+                to_artifact_id="a-doc",
+                to_revision_id="rev-d",
+                role="not_a_real_role",
+            )
+            with self.assertRaises(GateDependencyEdgeError):
+                prepare_gate_snapshot(
+                    store,
+                    self._target(store, "a-rep", "rev-rep"),
+                    rationale="r",
+                    **_GATE_KW,
+                )
+
+    def test_bound_enforced_at_discovery_before_lookup(self) -> None:
+        with self.new_store() as store:
+            repo = ArtifactRepository(store)
+            repo.create_artifact("a-target", kind="report")
+            self._import(repo, "a-target", b"t", "rev-t")
+            for i in range(5):
+                repo.create_artifact(f"a-child{i}", kind="document")
+                self._import(repo, f"a-child{i}", b"c", f"rev-c{i}")
+                self._insert_dependency(
+                    store,
+                    from_artifact_id="a-target",
+                    from_revision_id="rev-t",
+                    to_artifact_id=f"a-child{i}",
+                    to_revision_id=f"rev-c{i}",
+                    dependency_id=f"dep_child_{i}",
+                )
+            real_get = ArtifactRepository.get_revision
+            looked_up: list[tuple[str, str]] = []
+
+            def _spy(self, artifact_id, revision_id):
+                looked_up.append((artifact_id, revision_id))
+                return real_get(self, artifact_id, revision_id)
+
+            with mock.patch.object(ArtifactRepository, "get_revision", _spy):
+                with mock.patch.object(gates, "MAX_GATE_SNAPSHOT_ENTRIES", 3):
+                    with self.assertRaises(GateDependencyError):
+                        prepare_gate_snapshot(
+                            store,
+                            self._target(store, "a-target", "rev-t"),
+                            rationale="r",
+                            **_GATE_KW,
+                        )
+            # The bound trips while *discovering* the 3rd unique child, before any
+            # child is ever looked up (only the target revision was read).
+            self.assertEqual(looked_up, [("a-target", "rev-t")])
+
+    def test_bounded_queue_dedups_duplicate_pending_edges(self) -> None:
+        with self.new_store() as store:
+            repo = ArtifactRepository(store)
+            repo.create_artifact("a-target", kind="report")
+            self._import(repo, "a-target", b"t", "rev-t")
+            repo.create_artifact("a-shared", kind="document")
+            self._import(repo, "a-shared", b"s", "rev-s")
+            # A dense graph: many edges (distinct dependency_id) all reach the
+            # *same* child. The pending queue must hold at most one copy of it.
+            for i in range(200):
+                self._insert_dependency(
+                    store,
+                    from_artifact_id="a-target",
+                    from_revision_id="rev-t",
+                    to_artifact_id="a-shared",
+                    to_revision_id="rev-s",
+                    dependency_id=f"dep_dup_{i}",
+                )
+
+            class _SpyDeque(deque):
+                max_len = 0
+
+                def append(self, item):
+                    super().append(item)
+                    type(self).max_len = max(type(self).max_len, len(self))
+
+            with mock.patch.object(gates, "deque", _SpyDeque):
+                prepared = prepare_gate_snapshot(
+                    store,
+                    self._target(store, "a-target", "rev-t"),
+                    rationale="r",
+                    **_GATE_KW,
+                )
+            self.assertEqual(
+                [(e.artifact_id, e.role) for e in prepared.entries],
+                [("a-target", "target"), ("a-shared", "source_document")],
+            )
+            self.assertLessEqual(_SpyDeque.max_len, 2)
+
     def test_rationale_owner_action_conventions_enforced_before_reads(self) -> None:
         with self.new_store() as store:
             self._chain(store)
@@ -1028,6 +1224,129 @@ class RevalidationTest(GateSnapshotTestBase):
             result = revalidate_prepared(store, forged)
             self.assertEqual(result.status, "invalid")
             self.assertIn(gates._PROBLEM_SCHEMA_VERSION, result.problems)  # noqa: SLF001
+
+    def test_revalidate_foreign_dependency_edge_is_invalid(self) -> None:
+        # The concrete review repro: every real dependency pin is rewritten to a
+        # foreign project while keeping the same artifact/revision ids. The old
+        # derivation ignored dep.project_id and rebuilt local entries, reporting
+        # "unchanged"; it must now be a typed invalid outcome with no approval.
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            real_list = ArtifactRepository.list_dependencies
+
+            def _foreign(self, artifact_id, revision_id):
+                return [
+                    DependencyRef(
+                        "foreign_project", d.artifact_id, d.revision_id, d.role
+                    )
+                    for d in real_list(self, artifact_id, revision_id)
+                ]
+
+            with mock.patch.object(ArtifactRepository, "list_dependencies", _foreign):
+                result = revalidate_prepared(store, prepared)
+            self.assertEqual(result.status, "invalid")
+            self.assertFalse(result.ok)
+            self.assertIn(
+                gates._PROBLEM_DEPENDENCY_EDGE, result.problems  # noqa: SLF001
+            )
+            self.assertEqual(result.recomputed_digest, "")
+            with self.assertRaises(PreparedGateInvalidError):
+                result.raise_for_status()
+            # Revalidation is read-only: no approval row is ever written.
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM fixture_approval"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_revalidate_cross_artifact_version_of_edge_is_invalid(self) -> None:
+        with self.new_store() as store:
+            repo = self._chain(store)
+            prepared = self._prepared_report(store)
+            repo.create_artifact("a-other", kind="document")
+            self._import(repo, "a-other", b"o1", "rev-o1")
+            self._import(repo, "a-other", b"o2", "rev-o2", parent_revision_id="rev-o1")
+            self._insert_dependency(
+                store,
+                from_artifact_id="a-rep",
+                from_revision_id="rev-rep",
+                to_artifact_id="a-other",
+                to_revision_id="rev-o1",
+                role="version_of",
+            )
+            result = revalidate_prepared(store, prepared)
+            self.assertEqual(result.status, "invalid")
+            self.assertIn(
+                gates._PROBLEM_DEPENDENCY_EDGE, result.problems  # noqa: SLF001
+            )
+
+    def test_supported_storage_schema_versions(self) -> None:
+        # Legitimate historic project schemas are preserved; future, boolean,
+        # negative, and non-integer values are not schema versions at all.
+        for version in range(1, STORE_SCHEMA_VERSION + 1):
+            self.assertTrue(gates._is_supported_storage_schema(version))  # noqa: SLF001
+        for bad in (
+            0,
+            -1,
+            True,
+            False,
+            STORE_SCHEMA_VERSION + 1,
+            2.0,
+            "2",
+            None,
+        ):
+            self.assertFalse(gates._is_supported_storage_schema(bad))  # noqa: SLF001
+
+    def test_revalidate_unsupported_storage_schema_is_invalid(self) -> None:
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            for bad in (0, -1, True, False, STORE_SCHEMA_VERSION + 1, "4"):
+                forged = self._forge(prepared, storage_schema_version=bad)
+                result = revalidate_prepared(store, forged)
+                self.assertEqual(result.status, "invalid", msg=repr(bad))
+                self.assertIn(
+                    gates._PROBLEM_STORAGE_SCHEMA, result.problems  # noqa: SLF001
+                )
+
+    def test_revalidate_preserves_a_legitimate_historic_storage_schema(self) -> None:
+        # A snapshot prepared under an older but supported schema must revalidate
+        # "unchanged" against its own recorded version (never upgraded/relabelled).
+        with self.new_store() as store:
+            self._chain(store)
+            prepared = self._prepared_report(store)
+            entries = prepared.entries
+            version_set = gates._build_version_set(entries)  # noqa: SLF001
+            structure = gates._build_structure(  # noqa: SLF001
+                project_id=prepared.project_id,
+                target=dict(prepared.target),
+                gate_kind=prepared.gate_kind,
+                gate_id=prepared.gate_id,
+                decision=prepared.decision,
+                rationale=prepared.rationale,
+                storage_schema_version=1,
+                snapshot_schema_version=prepared.snapshot_schema_version,
+                version_set=version_set,
+                entries=entries,
+            )
+            canonical = canonical_json(structure)
+            digest = hashlib.sha256(canonical).hexdigest()
+            forged = self._forge(
+                prepared,
+                storage_schema_version=1,
+                canonical_bytes=canonical,
+                digest=digest,
+                snapshot_id="psnap_" + digest,
+                version_set=version_set,
+            )
+            result = revalidate_prepared(store, forged)
+            self.assertEqual(result.status, "unchanged")
+            self.assertTrue(result.ok)
+            self.assertNotIn(
+                gates._PROBLEM_STORAGE_SCHEMA, result.problems  # noqa: SLF001
+            )
 
     def test_revalidation_problems_are_static_and_curated(self) -> None:
         with self.new_store() as store:
