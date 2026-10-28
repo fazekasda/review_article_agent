@@ -1367,6 +1367,14 @@ class JobRepository:
         attempts contribute no separate amount (their reserve bound is retained).
         Every stored value is re-validated as a bounded exact decimal, so a
         malformed stored value fails closed rather than mis-summing.
+
+        The total additionally counts the **runtime dispatch ledger's** exposure
+        (:func:`review_article_agent.runtime.dispatch.runtime_reserve_exposure`)
+        so the selected caps count every route/bucket in both directions: a new
+        synthetic reserve sees prior runtime reserves, and (via
+        :meth:`budget_usage`) a new runtime reserve sees prior synthetic reserves
+        (C02 §5.6/§6.3). The helper is a pure read and never calls back into this
+        repository, so there is no recursive budget loop.
         """
         join = (
             "SELECT r.amount_usd AS reserve_amount, a.cost_amount_usd AS cost_amount "
@@ -1391,6 +1399,14 @@ class JobRepository:
                 )
                 counted = max(counted, actual)
             total = _add_exact(total, counted)
+        # Deferred import: the dispatch module imports this module at top level, so
+        # a module-level import here would be circular. The helper itself is pure
+        # (a read over the same connection) and never re-enters this repository.
+        from .dispatch import runtime_reserve_exposure
+
+        total = _add_exact(
+            total, runtime_reserve_exposure(self._conn(), self.project_id, stage=stage)
+        )
         return format(total, "f")
 
     def _check_caps_and_reserve(

@@ -738,7 +738,7 @@ class SchemaUpgradeTest(RuntimeTestBase):
 
         reopened = ProjectStore.open_at(app_dir, expected_project_id=pid)
         self.addCleanup(reopened.close)
-        self.assertEqual(reopened.schema_version, 5)
+        self.assertEqual(reopened.schema_version, schema.STORE_SCHEMA_VERSION)
         names = {
             row[0]
             for row in reopened.connection.execute(
@@ -775,7 +775,7 @@ class SchemaUpgradeTest(RuntimeTestBase):
         store.close()
         conn = schema.open_connection(db_path)
         try:
-            conn.execute("PRAGMA user_version = 6")
+            conn.execute(f"PRAGMA user_version = {schema.STORE_SCHEMA_VERSION + 1}")
         finally:
             conn.close()
         with self.assertRaises(UnsupportedSchemaVersion):

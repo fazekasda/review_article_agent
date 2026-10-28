@@ -42,7 +42,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 5
+STORE_SCHEMA_VERSION = 6
 
 #: Registry maps project IDs to names and locations, records the single
 #: *selected* project, and records durable **execution activation** (which
@@ -676,12 +676,158 @@ def _store_v5(conn: sqlite3.Connection) -> None:
         )
 
 
+def _store_v6(conn: sqlite3.Connection) -> None:
+    """Add the durable **runtime dispatch + route-separated cost ledger** (C02 §5.6/§6.3/§8).
+
+    These tables back :mod:`review_article_agent.runtime.dispatch`: one immutable
+    *logical-call identity* row per dispatch (pinning the existing runtime task and
+    its fingerprint, the request/logical-call key, the ``opencode_session``/
+    ``direct_call`` route and its implied accounting bucket, the stage, the
+    canonical input/version digests, the exact-decimal pre-dispatch reserve, and
+    the immutable bound-evidence digest) plus a **mutable operational row** holding
+    the dispatch's explicit safe state (``reserved``/``submitted``/``admitted``/
+    ``completed``/``failed``/``unknown``), its fence, the retained admission, the
+    single fenced local result, and the settled cost.
+
+    Only new tables and triggers are added; migrations 1-5 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, and the runtime task/session/proposal
+    mappings) are never rewritten, so their exact bytes/refs are preserved across
+    the upgrade (``ARCH-ASSETS``; step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **Append-only identity + mutable operational row.** ``runtime_dispatch`` is
+      immutable (never ``UPDATE``d/``DELETE``d), so a request's pinned task,
+      fingerprint, route/bucket, stage, digests, reserve, and bound-evidence digest
+      can never be rewritten; only the paired ``runtime_dispatch_state`` row
+      changes, so a change is always a *state transition*, never a re-identity.
+    * **Logical-call identity is explicit and idempotent.** ``dispatch_id`` is
+      derived from ``(project_id, request_id)`` and ``UNIQUE(project_id,
+      request_id)`` makes a repeated reserve with the same key return the same one
+      row, so a reserve can never double-count.
+    * **Route/bucket separation.** ``CHECK ((route = 'direct_call') =
+      (accounting_bucket = 'direct_call'))`` makes a ``direct_call`` cost
+      un-aggregatable into OpenCode session statistics (C02 §6.3).
+    * **No durable admission on the direct route.** A trigger aborts any
+      ``runtime_dispatch_state`` row that carries an ``admission_id`` while its
+      dispatch's route is ``direct_call`` (C02 §8.1/§8.1.1) — the direct Jev route
+      has no proven durable/idempotent admission.
+    * **Conservative cost accounting.** The exact-decimal ``reserve_usd`` is
+      recorded before dispatch and counted until settlement; an ``unknown``/
+      ``not_incurred`` cost records **no** amount (never ``0``) and retains its
+      reserve (C02 §5.6/§6.3).
+
+    The schema deliberately stores **no** endpoint, credential, provider key, or
+    response content: only opaque ids, exact-decimal amounts, and canonical
+    SHA-256 digests (spec lines 62-63; ``docs/storage.md``).
+    """
+    conn.execute(
+        """
+        CREATE TABLE runtime_dispatch (
+            project_id            TEXT NOT NULL,
+            dispatch_id           TEXT NOT NULL,
+            request_id            TEXT NOT NULL,
+            task_id               TEXT NOT NULL,
+            task_fingerprint      TEXT NOT NULL,
+            route                 TEXT NOT NULL CHECK (route IN (
+                'opencode_session', 'direct_call')),
+            accounting_bucket     TEXT NOT NULL CHECK (accounting_bucket IN (
+                'session_statistics', 'direct_call')),
+            stage                 TEXT NOT NULL,
+            input_digest          TEXT NOT NULL,
+            version_digest        TEXT NOT NULL,
+            reserve_usd           TEXT NOT NULL,
+            bound_evidence_digest TEXT NOT NULL,
+            created_at_utc        TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            UNIQUE (project_id, request_id),
+            CHECK ((route = 'direct_call') = (accounting_bucket = 'direct_call')),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE runtime_dispatch_state (
+            project_id      TEXT NOT NULL,
+            dispatch_id     TEXT NOT NULL,
+            state           TEXT NOT NULL CHECK (state IN (
+                'reserved', 'submitted', 'admitted', 'completed', 'failed',
+                'unknown')),
+            current_fence   INTEGER NOT NULL DEFAULT 1 CHECK (current_fence >= 1),
+            admission_id    TEXT,
+            admission_ref   TEXT,
+            result_kind     TEXT,
+            result_ref      TEXT,
+            result_digest   TEXT,
+            cost_state      TEXT NOT NULL DEFAULT 'not_incurred' CHECK (cost_state IN (
+                'known', 'estimated', 'unknown', 'not_incurred')),
+            cost_amount_usd TEXT,
+            started_at_utc  TEXT,
+            ended_at_utc    TEXT,
+            updated_at_utc  TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            CHECK ((state = 'completed') = (result_digest IS NOT NULL)),
+            CHECK ((result_kind IS NULL) = (result_digest IS NULL)),
+            CHECK ((result_ref IS NULL) = (result_digest IS NULL)),
+            CHECK ((cost_state IN ('known', 'estimated'))
+                   = (cost_amount_usd IS NOT NULL)),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES runtime_dispatch (project_id, dispatch_id)
+        )
+        """
+    )
+
+    # The logical-call identity row is append-only: its pinned task, route/bucket,
+    # stage, digests, reserve, and bound evidence can never be rewritten or removed.
+    conn.execute(
+        """
+        CREATE TRIGGER runtime_dispatch_no_update
+        BEFORE UPDATE ON runtime_dispatch
+        BEGIN
+            SELECT RAISE(ABORT, 'runtime_dispatch identity rows are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER runtime_dispatch_no_delete
+        BEFORE DELETE ON runtime_dispatch
+        BEGIN
+            SELECT RAISE(ABORT, 'runtime_dispatch identity rows are immutable');
+        END
+        """
+    )
+
+    # The direct route has no proven durable/idempotent admission, so no
+    # operational row may ever carry an admission for a direct_call dispatch
+    # (C02 §8.1/§8.1.1).
+    for event in ("INSERT", "UPDATE"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER runtime_dispatch_state_direct_no_admission_{event.lower()}
+            BEFORE {event} ON runtime_dispatch_state
+            WHEN NEW.admission_id IS NOT NULL
+              AND (SELECT route FROM runtime_dispatch
+                   WHERE project_id = NEW.project_id
+                     AND dispatch_id = NEW.dispatch_id) = 'direct_call'
+            BEGIN
+                SELECT RAISE(ABORT,
+                    'a direct_call dispatch cannot carry a durable admission');
+            END
+            """
+        )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
     3: _store_v3,
     4: _store_v4,
     5: _store_v5,
+    6: _store_v6,
 }
 
 
