@@ -46,6 +46,14 @@ add subcommands without reworking dispatch. This module also exposes:
   never cancels on exit. There is **no** ``model`` or scientific-``approve``
   command here: those belong to later steps once their execution and
   scientific-approval layers are integrated.
+* ``gate`` — **read-only exact human-gate preview** (``prepare``) over
+  :mod:`review_article_agent.runtime.gates`. It prepares the exact snapshot for
+  one named gate (target plus its full transitive dependency closure) and prints
+  a safe summary carrying ``approval_recorded=false``,
+  ``authorizes_execution=false``, ``authorizes_export=false`` and
+  ``scientific_validation=false``. It records **no** approval, mints **no**
+  authority, and authorizes nothing; there is deliberately **no** ``gate
+  approve`` command and no raw actor/authority flag here.
 """
 
 from __future__ import annotations
@@ -107,6 +115,11 @@ from .jobs import (
     JOB_COMMANDS,
     StreamNDJSON,
     build_jobs_parser,
+)
+from .gates import (
+    GATE_COMMANDS,
+    GateControlError,
+    build_gates_parser,
 )
 
 PROG = "review-article-agent"
@@ -248,6 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_fixture_parser(sub)
     build_worker_parser(sub)
     build_jobs_parser(sub)
+    build_gates_parser(sub)
 
     return parser
 
@@ -958,6 +972,12 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
         except KeyError as exc:  # pragma: no cover - argparse enforces choices
             raise CliUsageError(f"unknown job command {args.job_command!r}") from exc
         return handler(args, ctx)
+    if args.command == "gate":
+        try:
+            handler = GATE_COMMANDS[args.gate_command]
+        except KeyError as exc:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(f"unknown gate command {args.gate_command!r}") from exc
+        return handler(args, ctx)
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -1010,6 +1030,15 @@ _BACKUP_CONFLICT_MESSAGE = (
 #: lifecycle outcome). ``worker`` raises :class:`WorkerControlError` with a
 #: curated, value-free message.
 _WORKER_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+
+#: Read-only gate-preview error categories mapped to the CLI's stable exit
+#: codes. ``gate`` raises :class:`GateControlError` with a curated, value-free
+#: message; a preparation failure records no approval.
+_GATE_CATEGORY_EXITS = {
     "validation": EXIT_VALIDATION,
     "conflict": EXIT_CONFLICT,
     "storage": EXIT_STORAGE,
@@ -1091,6 +1120,8 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
         return "usage", EXIT_USAGE
     if isinstance(exc, WorkerControlError):
         return exc.category, _WORKER_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, GateControlError):
+        return exc.category, _GATE_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1123,6 +1154,9 @@ def _error_message(exc: BaseException, category: str) -> str:
         return _INTERNAL_MESSAGE
     if isinstance(exc, WorkerControlError):
         # Authored in ``cli.worker``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, GateControlError):
+        # Authored in ``cli.gates``; a static, curated, value-free message.
         return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):
