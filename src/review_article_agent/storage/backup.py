@@ -26,8 +26,10 @@ the live database file or its ``-wal``/``-shm`` sidecars directly, so committed
 WAL content is captured transactionally and a concurrent writer cannot produce a
 torn backup. Immutable content is a SQLite BLOB, so the snapshot captures **all**
 project data (identity, artifacts, revisions, rights records, dependencies,
-import requests, local fixture approvals, and — under store schema 4 — the durable
-synthetic job/attempt/accepted-result/budget rows) in one consistent database.
+import requests, local fixture approvals, the durable synthetic
+job/attempt/accepted-result/budget rows under store schema 4, and the durable
+runtime configuration/session/task/proposal mappings under store schema 5) in one
+consistent database.
 
 The manifest is derived **from the closed snapshot**, never from live state, so
 the recorded digests describe exactly the bytes that were captured.
@@ -59,7 +61,14 @@ rewriting the outer database hash in the manifest does **not** bypass inner
 validation. Under store schema 4 it additionally re-validates every durable
 job/attempt/accepted-result/budget row (identity and parameter/result
 fingerprints, fences, counters, state/outcome flags, checkpoint JSON,
-bounded-exact-decimal budgets/reserves, and cross-project/dangling references).
+bounded-exact-decimal budgets/reserves, and cross-project/dangling references),
+and under store schema 5 it additionally re-validates every durable runtime
+configuration/session/task/proposal mapping (recomputed canonical digests and
+fingerprints, projected columns, config/task/input/proposal links, and
+cross-project keys) via the shared
+:func:`~review_article_agent.storage.agent_runtime.store_integrity_problems`
+sweep — without ever requiring a historical task to still name the *current*
+revision, and without treating a proposal as an approval.
 
 Restore validates first and is atomic
 -------------------------------------
@@ -72,19 +81,25 @@ and no stale approvals remain, and unrelated files in the target root are
 preserved. It never creates a new scientific identity: the restored project keeps
 the snapshot's exact ``project_id``.
 
-Supported store schemas are **3 and 4**. Schema 3 is the pre-Step-03 schema
+Supported store schemas are **3, 4, and 5**. Schema 3 is the pre-Step-03 schema
 (identity, artifacts, revisions, rights, dependencies, import requests, and local
 fixture approvals); schema 4 adds the durable worker's synthetic job/attempt/
-accepted-result/budget tables (``runtime/jobs.py``). Both are validated against
-the exact schema the canonical migrations generate for **that** version, and a
-schema-4 snapshot additionally re-validates every job row read-only (identity and
-parameter/result fingerprints, fences, counters, state/outcome flags, checkpoint
-JSON, bounded exact-decimal budgets/reserves, and cross-project/dangling
-references). A newer store schema is refused clearly. A schema-3 snapshot is
-restored as-is and is upgraded to schema 4 by the ordinary ``ProjectStore``
-migration on first open; no format churn is needed because the manifest
-``format_version`` stays 1 and the version-specific validation is driven by the
-recorded ``store_schema_version``.
+accepted-result/budget tables (``runtime/jobs.py``); schema 5 adds the durable
+runtime configuration/session/task/proposal mapping tables
+(``storage/agent_runtime.py``). Each is validated against the exact schema the
+canonical migrations generate for **that** version. A schema-4 snapshot
+additionally re-validates every job row read-only (identity and parameter/result
+fingerprints, fences, counters, state/outcome flags, checkpoint JSON, bounded
+exact-decimal budgets/reserves, and cross-project/dangling references); a
+schema-5 snapshot additionally re-validates every runtime mapping row read-only
+(recomputed canonical digests/fingerprints, projected columns, config/task/input/
+proposal links, and cross-project keys). A newer store schema is refused clearly.
+A schema-3/4 snapshot is restored as-is and is upgraded to the current schema by
+the ordinary ``ProjectStore`` migration on first open; no format churn is needed
+because the manifest ``format_version`` stays 1 and the version-specific
+validation is driven by the recorded ``store_schema_version`` through the
+extensible ``_SCHEMA_VALIDATORS`` hook (so a later schema-6 checkpoint can append
+its own validator without disturbing schema-3/4/5 compatibility).
 """
 
 from __future__ import annotations
@@ -143,6 +158,11 @@ SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset(
 #: The store schema version at (or above) which the durable job/attempt/budget
 #: tables exist and must be inner-validated.
 _JOB_SCHEMA_VERSION = 4
+
+#: The store schema version at (or above) which the durable runtime
+#: configuration/session/task/proposal mapping tables exist and must be
+#: inner-validated.
+_RUNTIME_SCHEMA_VERSION = 5
 
 #: Store schema versions whose *recorded* approval ``storage_schema_version`` is
 #: accepted (the historical version survives a restore where supported; an
@@ -1599,6 +1619,78 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
             )
 
 
+# --------------------------------------------------------------------------- #
+# Durable runtime mapping inner validation (schema 5)
+# --------------------------------------------------------------------------- #
+#: The five schema-5 tables that hold a project's durable runtime mappings. A
+#: backup must contain only rows for its own project in **every** one of them.
+_RUNTIME_TABLES = (
+    "runtime_config_snapshot",
+    "runtime_session_mapping",
+    "runtime_bounded_task",
+    "runtime_task_input",
+    "runtime_proposal",
+)
+
+
+def _verify_runtime_relations(conn: sqlite3.Connection, project_id: str) -> None:
+    """Read-only re-validation of the schema-5 durable runtime mapping rows.
+
+    The shared :func:`~review_article_agent.storage.agent_runtime.store_integrity_problems`
+    sweep re-derives every stored configuration/session/task/proposal from its
+    exact canonical bytes and linked rows (recomputed config/result digests, the
+    task fingerprint, projected columns, task inputs, proposal provenance), so a
+    corrupt archive whose outer database hash was rewritten still fails closed.
+
+    That helper filters its sweep by ``project_id``; this function therefore also
+    scans **every** row of all five runtime tables and refuses any foreign-project
+    key, so another project's mapping cannot be smuggled into a snapshot. It never
+    requires a historical task's target/inputs to remain the artifact's *current*
+    revision (a legitimate later head is valid history), and it never treats a
+    proposal as an approval.
+    """
+    for table in _RUNTIME_TABLES:
+        for row in conn.execute(f"SELECT project_id FROM {table}").fetchall():
+            if row["project_id"] != project_id:
+                raise BackupError(
+                    f"the snapshot contains a {table} row for a foreign project; "
+                    f"refusing."
+                )
+
+    # Local import keeps the storage layer decoupled at module-import time, just
+    # as the schema-4 job validator imports ``runtime.jobs`` lazily.
+    from .agent_runtime import store_integrity_problems
+
+    problems = store_integrity_problems(conn, project_id)
+    if problems:
+        # ``store_integrity_problems`` returns only static, value-free strings.
+        raise BackupError(
+            "the snapshot's durable runtime mappings do not revalidate ("
+            + "; ".join(problems)
+            + "); refusing."
+        )
+
+
+#: Ordered ``(minimum_store_schema_version, validator)`` hook. Each validator is
+#: applied for a snapshot whose recorded schema is **at or above** its minimum, so
+#: a future schema-6 checkpoint can append a validator here without touching the
+#: historical schema-3/4/5 compatibility paths. Validators are read-only and take
+#: ``(connection, project_id)``.
+_SCHEMA_VALIDATORS = (
+    (_JOB_SCHEMA_VERSION, _verify_job_relations),
+    (_RUNTIME_SCHEMA_VERSION, _verify_runtime_relations),
+)
+
+
+def _verify_schema_specific(
+    conn: sqlite3.Connection, project_id: str, version: int
+) -> None:
+    """Run every inner validator whose minimum schema version ``version`` meets."""
+    for minimum_version, validator in _SCHEMA_VALIDATORS:
+        if version >= minimum_version:
+            validator(conn, project_id)
+
+
 def verify_backup(backup_dir) -> dict[str, object]:
     """Read-only, fail-closed verification of a private backup directory.
 
@@ -1687,8 +1779,7 @@ def verify_backup(backup_dir) -> dict[str, object]:
         paths.validate_project_id(project_id)
 
         _verify_relations(conn, project_id, version)
-        if version >= _JOB_SCHEMA_VERSION:
-            _verify_job_relations(conn, project_id)
+        _verify_schema_specific(conn, project_id, version)
 
         # Recompute aggregate digests and counts from the snapshot itself.
         artifacts = conn.execute(
