@@ -126,6 +126,18 @@ DEFAULT_STAGE_CAP_USD = "10"
 #: Cost states whose settlement must carry an exact ``amount_usd``.
 _COST_STATES_WITH_AMOUNT = frozenset({"known", "estimated"})
 
+#: Job states that hold scheduling: a late durable event must never silently
+#: leave them (C02 §8.4 — pause is not terminal, cancel is terminal for
+#: scheduling only).
+_SCHEDULING_HELD_STATES = frozenset({"paused", "cancelled"})
+
+#: Bounds on an accepted exact decimal, so a hostile value such as
+#: ``'1e999999999'`` is rejected cleanly instead of format-expanding into a
+#: multi-megabyte string. ``adjusted`` is the base-10 position of the most
+#: significant digit.
+_MAX_ADJUSTED_EXPONENT = 24
+_MAX_SIGNIFICANT_DIGITS = 40
+
 #: Key under which a checkpoint carries a computed-but-uncommitted local result.
 _LOCAL_RESULT_KEY = "local_result"
 
@@ -194,7 +206,10 @@ def _exact_decimal(
     """Return the canonical exact-decimal string for ``value`` (fail closed).
 
     Rejects ``float``/``bool`` (never an inexact binary amount), non-finite
-    values, and negatives; optionally requires strictly positive.
+    values, and negatives; optionally requires strictly positive. The amount's
+    magnitude and precision are bounded so an adversarial exponent such as
+    ``'1e999999999'`` cannot force a huge expansion; error messages never echo
+    the offending value.
     """
     if isinstance(value, bool) or isinstance(value, float):
         raise JobValidationError(
@@ -207,9 +222,14 @@ def _exact_decimal(
     try:
         amount = Decimal(value)
     except (InvalidOperation, ValueError) as exc:
-        raise JobValidationError(f"{field}: {value!r} is not a decimal amount") from exc
+        raise JobValidationError(f"{field}: is not a valid decimal amount") from exc
     if not amount.is_finite():
         raise JobValidationError(f"{field}: must be a finite decimal amount")
+    _sign, digits, exponent = amount.as_tuple()
+    if len(digits) > _MAX_SIGNIFICANT_DIGITS:
+        raise JobValidationError(f"{field}: has too many significant digits")
+    if amount != 0 and abs(exponent + len(digits) - 1) > _MAX_ADJUSTED_EXPONENT:
+        raise JobValidationError(f"{field}: magnitude is out of the permitted range")
     if amount < 0:
         raise JobValidationError(f"{field}: must not be negative")
     if strictly_positive and amount == 0:
@@ -376,17 +396,20 @@ class JobRepository:
         fingerprint = _fingerprint({"task_kind": task_kind, "parameters": parameters})
         job_id = _job_id_for(self.project_id, request_id)
 
-        existing = self._job_row_by_request(request_id)
-        if existing is not None:
-            if existing["fingerprint"] != fingerprint:
-                raise JobConflictError(
-                    f"request {request_id!r} was already submitted with a "
-                    f"different task payload; refusing to create a second job."
-                )
-            return self._row_to_job(existing)
-
         now = _utc_now()
+        # The idempotency read and the insert share one BEGIN IMMEDIATE
+        # transaction, so two connections racing the same request key cannot
+        # both insert: the loser blocks on the write lock, then observes the
+        # committed row.
         with self._store.transaction():
+            existing = self._job_row_by_request(request_id)
+            if existing is not None:
+                if existing["fingerprint"] != fingerprint:
+                    raise JobConflictError(
+                        f"request {request_id!r} was already submitted with a "
+                        f"different task payload; refusing to create a second job."
+                    )
+                return self._row_to_job(existing)
             self._conn().execute(
                 "INSERT INTO job (project_id, job_id, request_id, fingerprint, "
                 " task_kind, parameters_json, state, outcome_unresolved, "
@@ -470,56 +493,8 @@ class JobRepository:
         """
         job_id = validate_identifier(job_id, "job_id")
         _require_enum(dispatch_kind, DISPATCH_KINDS, "dispatch_kind")
-        job = self._require_job(job_id)
 
-        if job.state in ("paused", "cancelled", "completed"):
-            raise JobStateError(
-                f"job {job_id!r} is {job.state!r}; it does not schedule new work."
-            )
-
-        prior: Attempt | None = None
-        if job.current_attempt_id is not None:
-            prior = self._require_attempt(job.current_attempt_id)
-            if prior.state in ACTIVE_ATTEMPT_STATES:
-                raise JobStateError(
-                    f"job {job_id!r} already has an active attempt "
-                    f"{prior.attempt_id!r}; refusing to start a second."
-                )
-
-        retries_used = job.retries_used
-        prior_outcome = "none"
-        if prior is not None:
-            if prior.state == "succeeded":
-                raise JobStateError(
-                    f"the prior attempt of job {job_id!r} succeeded; the job is done."
-                )
-            prior_outcome = prior.state
-            if prior.outcome_unresolved or prior.state == "ambiguous":
-                raise AmbiguousOutcomeError(
-                    f"the prior attempt of job {job_id!r} has an ambiguous/"
-                    f"unresolved outcome; reconcile the same attempt or escalate "
-                    f"to a human instead of dispatching a new identity."
-                )
-            if prior.admission_id is not None:
-                raise AmbiguousOutcomeError(
-                    f"the prior attempt of job {job_id!r} was externally admitted; "
-                    f"a safe predispatch retry is not permitted."
-                )
-            if retries_used >= MAX_SAFE_RETRIES:
-                raise RetryLimitExceeded(
-                    f"job {job_id!r} has used its {MAX_SAFE_RETRIES} safe "
-                    f"predispatch retries; refusing a further retry."
-                )
-            if retry_authorized_by is None:
-                raise JobStateError(
-                    f"retrying job {job_id!r} requires an explicit "
-                    f"retry_authorized_by actor label."
-                )
-            retry_authorized_by = _require_nonempty_str(
-                retry_authorized_by, "retry_authorized_by"
-            )
-            retries_used += 1
-
+        # Validate the dispatch inputs up front (pure, no state read).
         if dispatch_kind == "external_synthetic":
             if stage is None:
                 raise JobValidationError(
@@ -540,11 +515,64 @@ class JobRepository:
             reserve = None
 
         attempt_id = "att_" + uuid.uuid4().hex
-        fence = job.current_fence + 1
-        attempt_no = job.attempts_total + 1
         now = _utc_now()
 
+        # One BEGIN IMMEDIATE covers the state authorization, the fence bump, and
+        # the reserve, so a concurrent pause or a racing second begin cannot slip
+        # between the read and the write (no double reserve, no bypassed pause).
         with self._store.transaction():
+            job = self._require_job(job_id)
+            if job.state in ("paused", "cancelled", "completed"):
+                raise JobStateError(
+                    f"job {job_id!r} is {job.state!r}; it does not schedule new work."
+                )
+
+            prior: Attempt | None = None
+            if job.current_attempt_id is not None:
+                prior = self._require_attempt(job.current_attempt_id)
+                if prior.state in ACTIVE_ATTEMPT_STATES:
+                    raise JobStateError(
+                        f"job {job_id!r} already has an active attempt "
+                        f"{prior.attempt_id!r}; refusing to start a second."
+                    )
+
+            retries_used = job.retries_used
+            prior_outcome = "none"
+            if prior is not None:
+                if prior.state == "succeeded":
+                    raise JobStateError(
+                        f"the prior attempt of job {job_id!r} succeeded; the job is done."
+                    )
+                prior_outcome = prior.state
+                if prior.outcome_unresolved or prior.state == "ambiguous":
+                    raise AmbiguousOutcomeError(
+                        f"the prior attempt of job {job_id!r} has an ambiguous/"
+                        f"unresolved outcome; reconcile the same attempt or escalate "
+                        f"to a human instead of dispatching a new identity."
+                    )
+                if prior.admission_id is not None:
+                    raise AmbiguousOutcomeError(
+                        f"the prior attempt of job {job_id!r} was externally admitted; "
+                        f"a safe predispatch retry is not permitted."
+                    )
+                if retries_used >= MAX_SAFE_RETRIES:
+                    raise RetryLimitExceeded(
+                        f"job {job_id!r} has used its {MAX_SAFE_RETRIES} safe "
+                        f"predispatch retries; refusing a further retry."
+                    )
+                if retry_authorized_by is None:
+                    raise JobStateError(
+                        f"retrying job {job_id!r} requires an explicit "
+                        f"retry_authorized_by actor label."
+                    )
+                retry_authorized_by = _require_nonempty_str(
+                    retry_authorized_by, "retry_authorized_by"
+                )
+                retries_used += 1
+
+            fence = job.current_fence + 1
+            attempt_no = job.attempts_total + 1
+
             if reserve is not None:
                 self._check_caps_and_reserve(
                     job_id=job_id,
@@ -576,7 +604,8 @@ class JobRepository:
             self._conn().execute(
                 "UPDATE job SET current_attempt_id = ?, current_fence = ?, "
                 " attempts_total = ?, retries_used = ?, state = 'queued', "
-                " updated_at_utc = ? WHERE project_id = ? AND job_id = ?",
+                " resume_state = NULL, updated_at_utc = ? "
+                "WHERE project_id = ? AND job_id = ?",
                 (
                     attempt_id,
                     fence,
@@ -598,41 +627,60 @@ class JobRepository:
         admission_id: str,
         external_ref: str | None = None,
     ) -> Attempt:
-        """Record a durable admission receipt for the attempt (admission ≠ completion)."""
+        """Record a durable admission receipt for the attempt (admission ≠ completion).
+
+        Requires the attempt to be the job's **current** attempt; a late event on
+        a stale attempt is refused. Admission never leaves a paused/cancelled job.
+        """
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         admission_id = validate_identifier(admission_id, "admission_id")
         if external_ref is not None:
             external_ref = _require_nonempty_str(external_ref, "external_ref")
         with self._store.transaction():
             attempt = self._require_attempt(attempt_id)
-            self._require_active(attempt)
+            job = self._require_current_attempt(attempt)
+            if attempt.state == "admitted" and attempt.admission_id == admission_id:
+                return attempt  # idempotent replay of the same receipt
+            if attempt.state != "queued":
+                raise JobStateError(
+                    f"attempt {attempt_id!r} is {attempt.state!r}; cannot record "
+                    f"admission."
+                )
             self._conn().execute(
                 "UPDATE job_attempt SET state = 'admitted', admission_id = ?, "
                 " external_ref = ? WHERE project_id = ? AND attempt_id = ?",
                 (admission_id, external_ref, self.project_id, attempt_id),
             )
-            self._set_job_state(attempt.job_id, "admitted")
+            self._set_job_state(job.job_id, "admitted", preserve_held=True)
         return self._require_attempt(attempt_id)
 
     def mark_running(self, attempt_id: str) -> Attempt:
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         with self._store.transaction():
             attempt = self._require_attempt(attempt_id)
-            self._require_active(attempt)
+            job = self._require_current_attempt(attempt)
+            if attempt.state == "running":
+                return attempt
+            if attempt.state != "admitted":
+                raise JobStateError(
+                    f"attempt {attempt_id!r} is {attempt.state!r}; only an admitted "
+                    f"attempt can run."
+                )
             self._conn().execute(
                 "UPDATE job_attempt SET state = 'running' "
                 "WHERE project_id = ? AND attempt_id = ?",
                 (self.project_id, attempt_id),
             )
-            self._set_job_state(attempt.job_id, "running")
+            self._set_job_state(job.job_id, "running", preserve_held=True)
         return self._require_attempt(attempt_id)
 
     def record_checkpoint(self, attempt_id: str, checkpoint: object) -> Attempt:
-        """Persist a durable checkpoint on a non-terminal attempt."""
+        """Persist a durable checkpoint on the current, non-terminal attempt."""
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         payload = _json_dumps(checkpoint)
         with self._store.transaction():
             attempt = self._require_attempt(attempt_id)
+            self._require_current_attempt(attempt)
             if attempt.state not in ACTIVE_ATTEMPT_STATES:
                 raise JobStateError(
                     f"attempt {attempt_id!r} is {attempt.state!r}; "
@@ -646,25 +694,70 @@ class JobRepository:
         return self._require_attempt(attempt_id)
 
     def mark_definitive_failure(self, attempt_id: str) -> Attempt:
-        """Record a non-billing, definitive failure of the attempt."""
+        """Record a non-billing, definitive failure of the current attempt.
+
+        A definitive failure is a *resolved* outcome: it clears the unresolved
+        bit. From an active attempt it is direct; from an ``ambiguous``/
+        ``interrupted`` attempt it is only reached through explicit
+        reconciliation (:meth:`reconcile`) — never implicitly. A stale or
+        already-``succeeded`` attempt is refused.
+        """
+        return self._mark_definitive_failure(attempt_id, allow_from_unresolved=False)
+
+    def _mark_definitive_failure(
+        self, attempt_id: str, *, allow_from_unresolved: bool
+    ) -> Attempt:
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         with self._store.transaction():
             attempt = self._require_attempt(attempt_id)
-            self._require_active(attempt)
+            job = self._require_current_attempt(attempt)
+            if attempt.state == "definitive_failure":
+                return attempt  # idempotent
+            if attempt.state == "succeeded":
+                raise JobStateError(
+                    f"attempt {attempt_id!r} already succeeded; cannot mark it failed."
+                )
+            if attempt.state in ("ambiguous", "interrupted") and not allow_from_unresolved:
+                raise JobStateError(
+                    f"attempt {attempt_id!r} is {attempt.state!r}; a definitive "
+                    f"failure of an unresolved attempt requires explicit "
+                    f"reconciliation."
+                )
             now = _utc_now()
             self._conn().execute(
                 "UPDATE job_attempt SET state = 'definitive_failure', "
-                " ended_at_utc = ? WHERE project_id = ? AND attempt_id = ?",
+                " outcome_unresolved = 0, ended_at_utc = ? "
+                "WHERE project_id = ? AND attempt_id = ?",
                 (now, self.project_id, attempt_id),
             )
-            self._set_job_state(attempt.job_id, "failed")
+            self._conn().execute(
+                "UPDATE job SET outcome_unresolved = 0 "
+                "WHERE project_id = ? AND job_id = ?",
+                (self.project_id, job.job_id),
+            )
+            self._set_job_state(job.job_id, "failed", preserve_held=True)
         return self._require_attempt(attempt_id)
 
     def mark_ambiguous(self, attempt_id: str) -> Attempt:
-        """Mark the attempt ambiguous: the remote outcome is unknown."""
+        """Mark the current attempt ambiguous: the remote outcome is unknown.
+
+        Refused on a stale attempt or an already-``succeeded`` attempt, so it can
+        never regress a completed job.
+        """
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         with self._store.transaction():
             attempt = self._require_attempt(attempt_id)
+            job = self._require_current_attempt(attempt)
+            if attempt.state == "succeeded":
+                raise JobStateError(
+                    f"attempt {attempt_id!r} already succeeded; refusing to mark it "
+                    f"ambiguous."
+                )
+            if attempt.state == "definitive_failure":
+                raise JobStateError(
+                    f"attempt {attempt_id!r} is a definitive failure; refusing to "
+                    f"mark it ambiguous."
+                )
             now = _utc_now()
             self._conn().execute(
                 "UPDATE job_attempt SET state = 'ambiguous', outcome_unresolved = 1, "
@@ -672,10 +765,12 @@ class JobRepository:
                 (now, self.project_id, attempt_id),
             )
             self._conn().execute(
-                "UPDATE job SET outcome_unresolved = 1, state = "
-                "'reconciliation_required', updated_at_utc = ? "
+                "UPDATE job SET outcome_unresolved = 1 "
                 "WHERE project_id = ? AND job_id = ?",
-                (now, self.project_id, attempt.job_id),
+                (self.project_id, job.job_id),
+            )
+            self._set_job_state(
+                job.job_id, "reconciliation_required", preserve_held=True
             )
         return self._require_attempt(attempt_id)
 
@@ -694,7 +789,9 @@ class JobRepository:
         already-accepted job raises :class:`JobConflictError`. On success the job
         becomes ``completed`` and any unresolved bit is cleared, so accepting from
         a *current* ambiguous attempt is exactly the same-identity reconciliation
-        the contract permits.
+        the contract permits. A ``cancelled``/``paused`` job is **not** silently
+        advanced: the accepted result is retained and the unresolved bit cleared,
+        but the scheduling state stays ``cancelled``/``paused``.
         """
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         result_kind = _require_nonempty_str(result_kind, "result_kind")
@@ -704,16 +801,7 @@ class JobRepository:
 
         with self._store.transaction():
             attempt = self._require_attempt(attempt_id)
-            job = self._require_job(attempt.job_id)
-            if (
-                attempt.fence != job.current_fence
-                or attempt.attempt_id != job.current_attempt_id
-            ):
-                raise StaleFenceError(
-                    f"attempt {attempt_id!r} (fence {attempt.fence}) is not the "
-                    f"current attempt (fence {job.current_fence}); a stale attempt "
-                    f"cannot accept a result."
-                )
+            job = self._require_current_attempt(attempt)
             existing = self._conn().execute(
                 "SELECT * FROM job_accepted_result WHERE project_id = ? AND job_id = ?",
                 (self.project_id, job.job_id),
@@ -745,12 +833,21 @@ class JobRepository:
                 " ended_at_utc = ? WHERE project_id = ? AND attempt_id = ?",
                 (now, self.project_id, attempt_id),
             )
-            self._conn().execute(
-                "UPDATE job SET state = 'completed', outcome_unresolved = 0, "
-                " accepted_fence = ?, resume_state = NULL, updated_at_utc = ? "
-                "WHERE project_id = ? AND job_id = ?",
-                (attempt.fence, now, self.project_id, job.job_id),
-            )
+            if job.state in _SCHEDULING_HELD_STATES:
+                # Never silently undo a cancel/pause; retain the accepted write
+                # and clear the remote unresolved bit only.
+                self._conn().execute(
+                    "UPDATE job SET outcome_unresolved = 0, accepted_fence = ?, "
+                    " updated_at_utc = ? WHERE project_id = ? AND job_id = ?",
+                    (attempt.fence, now, self.project_id, job.job_id),
+                )
+            else:
+                self._conn().execute(
+                    "UPDATE job SET state = 'completed', outcome_unresolved = 0, "
+                    " accepted_fence = ?, resume_state = NULL, updated_at_utc = ? "
+                    "WHERE project_id = ? AND job_id = ?",
+                    (attempt.fence, now, self.project_id, job.job_id),
+                )
         stored = self._conn().execute(
             "SELECT * FROM job_accepted_result WHERE project_id = ? AND job_id = ?",
             (self.project_id, self._require_attempt(attempt_id).job_id),
@@ -781,6 +878,13 @@ class JobRepository:
             if job.state != "paused":
                 raise JobStateError(f"job {job_id!r} is not paused.")
             restored = job.resume_state or "queued"
+            accepted = self._conn().execute(
+                "SELECT 1 FROM job_accepted_result WHERE project_id = ? AND job_id = ?",
+                (self.project_id, job_id),
+            ).fetchone()
+            if accepted is not None:
+                # A result accepted while paused completes the job on resume.
+                restored = "completed"
             self._conn().execute(
                 "UPDATE job SET state = ?, resume_state = NULL, updated_at_utc = ? "
                 "WHERE project_id = ? AND job_id = ?",
@@ -806,32 +910,36 @@ class JobRepository:
         job_id = validate_identifier(job_id, "job_id")
         with self._store.transaction():
             self._require_job(job_id)
-            self._set_job_state(job_id, "waiting_human")
+            self._set_job_state(job_id, "waiting_human", preserve_held=True)
         return self._require_job(job_id)
 
     def mark_waiting_external(self, job_id: str) -> Job:
         job_id = validate_identifier(job_id, "job_id")
         with self._store.transaction():
             self._require_job(job_id)
-            self._set_job_state(job_id, "waiting_external")
+            self._set_job_state(job_id, "waiting_external", preserve_held=True)
         return self._require_job(job_id)
 
     # -- recovery / reconciliation ------------------------------------------- #
     def recover(self, attempt_id: str) -> RecoveryOutcome:
-        """Recover an attempt after a worker restart, from durable state only.
+        """Recover the current attempt after a worker restart, from durable state.
 
-        * a predispatch attempt (never admitted) becomes a **safe** ``interrupted``
-          disposition, retryable;
-        * an admitted/running attempt with a checkpointed computed local result
-          becomes ``accept_pending_local_result``;
-        * an admitted/running attempt without a result becomes
-          ``reconciliation_required`` with the unresolved bit set.
+        * a **local** predispatch attempt (no external side effect) becomes a
+          **safe** ``interrupted`` disposition, retryable;
+        * a **synthetic external** attempt is **always** treated as potentially
+          ambiguous: the absence of a local admission receipt is *not* proof the
+          request was never sent, so the reserve and the unresolved bit are
+          retained and the job becomes ``reconciliation_required`` (or
+          ``accept_pending_local_result`` when a local result was checkpointed);
+        * a terminal attempt is left untouched.
 
-        No new identity is ever minted; the same attempt is reconciled.
+        No new identity is ever minted; the same attempt is reconciled. Paused or
+        cancelled scheduling state is never silently undone.
         """
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         with self._store.transaction():
             attempt = self._require_attempt(attempt_id)
+            job = self._require_current_attempt(attempt)
             if attempt.state not in ACTIVE_ATTEMPT_STATES:
                 return RecoveryOutcome(
                     job_id=attempt.job_id,
@@ -843,29 +951,27 @@ class JobRepository:
                 isinstance(checkpoint, dict) and _LOCAL_RESULT_KEY in checkpoint
             )
             now = _utc_now()
-            if attempt.admission_id is None and not has_local_result:
-                self._conn().execute(
-                    "UPDATE job_attempt SET state = 'interrupted' "
-                    "WHERE project_id = ? AND attempt_id = ?",
-                    (self.project_id, attempt_id),
-                )
-                self._set_job_state(attempt.job_id, "interrupted")
-                disposition = "retry_safe"
-            elif attempt.admission_id is not None and has_local_result:
-                self._conn().execute(
-                    "UPDATE job_attempt SET state = 'interrupted', "
-                    " outcome_unresolved = 1, ended_at_utc = ? "
-                    "WHERE project_id = ? AND attempt_id = ?",
-                    (now, self.project_id, attempt_id),
-                )
-                self._conn().execute(
-                    "UPDATE job SET outcome_unresolved = 1, state = "
-                    "'reconciliation_required', updated_at_utc = ? "
-                    "WHERE project_id = ? AND job_id = ?",
-                    (now, self.project_id, attempt.job_id),
-                )
-                disposition = "accept_pending_local_result"
+            if attempt.dispatch_kind != "external_synthetic":
+                # Local-only: no external side effect to reconcile.
+                if has_local_result:
+                    self._conn().execute(
+                        "UPDATE job_attempt SET state = 'interrupted', "
+                        " ended_at_utc = ? WHERE project_id = ? AND attempt_id = ?",
+                        (now, self.project_id, attempt_id),
+                    )
+                    self._set_job_state(job.job_id, "interrupted", preserve_held=True)
+                    disposition = "accept_pending_local_result"
+                else:
+                    self._conn().execute(
+                        "UPDATE job_attempt SET state = 'interrupted' "
+                        "WHERE project_id = ? AND attempt_id = ?",
+                        (self.project_id, attempt_id),
+                    )
+                    self._set_job_state(job.job_id, "interrupted", preserve_held=True)
+                    disposition = "retry_safe"
             else:
+                # The request may have reached the backend with no local receipt
+                # recorded; retain the reserve and the unresolved bit.
                 self._conn().execute(
                     "UPDATE job_attempt SET state = 'interrupted', "
                     " outcome_unresolved = 1, ended_at_utc = ? "
@@ -873,12 +979,18 @@ class JobRepository:
                     (now, self.project_id, attempt_id),
                 )
                 self._conn().execute(
-                    "UPDATE job SET outcome_unresolved = 1, state = "
-                    "'reconciliation_required', updated_at_utc = ? "
+                    "UPDATE job SET outcome_unresolved = 1 "
                     "WHERE project_id = ? AND job_id = ?",
-                    (now, self.project_id, attempt.job_id),
+                    (self.project_id, job.job_id),
                 )
-                disposition = "reconciliation_required"
+                self._set_job_state(
+                    job.job_id, "reconciliation_required", preserve_held=True
+                )
+                disposition = (
+                    "accept_pending_local_result"
+                    if has_local_result
+                    else "reconciliation_required"
+                )
         return RecoveryOutcome(
             job_id=attempt.job_id,
             attempt_id=attempt_id,
@@ -920,7 +1032,7 @@ class JobRepository:
                 )
             self.accept_result(attempt_id, result_kind=result_kind, result=result)
         elif resolution == "definitive_failure":
-            self.mark_definitive_failure(attempt_id)
+            self._mark_definitive_failure(attempt_id, allow_from_unresolved=True)
         elif resolution == "human_escalation":
             self.escalate_to_human(job_id)
         else:  # keep_unresolved
@@ -996,11 +1108,14 @@ class JobRepository:
         cost_state: str,
         amount_usd: str | None = None,
     ) -> Attempt:
-        """Settle the attempt's reserved cost (C02 §6.3).
+        """Settle the current attempt's reserved cost (C02 §6.3).
 
-        ``known``/``estimated`` replace the reserve with the exact reported
-        amount; ``unknown`` **retains** the reserve unchanged; ``not_incurred``
-        zeroes the counted amount.
+        The reserve row is **never reduced**: the original upper bound stays
+        counted for ``known``/``estimated``/``unknown`` (conservative usage), so a
+        later estimate/known transition can never silently shrink a held reserve.
+        The reported/estimated amount is recorded on the attempt; an ``unknown``
+        cost records **no** amount (never zero), and ``not_incurred`` records no
+        amount either. Requires the current attempt.
         """
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         _require_enum(cost_state, COST_STATES, "cost_state")
@@ -1009,16 +1124,17 @@ class JobRepository:
                 raise JobValidationError(
                     f"cost_state {cost_state!r} requires an exact amount_usd."
                 )
-            amount = _exact_decimal(amount_usd, "amount_usd")
+            recorded: str | None = _exact_decimal(amount_usd, "amount_usd")
         else:
             if amount_usd is not None:
                 raise JobValidationError(
                     f"cost_state {cost_state!r} must not carry an amount_usd."
                 )
-            amount = None
+            recorded = None
 
         with self._store.transaction():
             attempt = self._require_attempt(attempt_id)
+            self._require_current_attempt(attempt)
             reserve = self._conn().execute(
                 "SELECT * FROM job_budget_reserve WHERE project_id = ? "
                 "AND attempt_id = ?",
@@ -1028,26 +1144,18 @@ class JobRepository:
                 raise JobStateError(
                     f"attempt {attempt_id!r} has no budget reserve to settle."
                 )
-            if cost_state == "unknown":
-                new_amount = reserve["amount_usd"]
-                reserve_state = "retained"
-            elif cost_state == "not_incurred":
-                new_amount = "0"
-                reserve_state = "settled"
-            else:
-                assert amount is not None
-                new_amount = amount
-                reserve_state = "settled"
+            reserve_state = (
+                "retained" if cost_state in ("unknown", "estimated") else "settled"
+            )
             self._conn().execute(
-                "UPDATE job_budget_reserve SET amount_usd = ?, state = ? "
+                "UPDATE job_budget_reserve SET state = ? "
                 "WHERE project_id = ? AND reserve_id = ?",
-                (new_amount, reserve_state, self.project_id, reserve["reserve_id"]),
+                (reserve_state, self.project_id, reserve["reserve_id"]),
             )
             self._conn().execute(
                 "UPDATE job_attempt SET cost_state = ?, cost_amount_usd = ? "
                 "WHERE project_id = ? AND attempt_id = ?",
-                (cost_state, new_amount if cost_state != "not_incurred" else None,
-                 self.project_id, attempt_id),
+                (cost_state, recorded, self.project_id, attempt_id),
             )
         return self._require_attempt(attempt_id)
 
@@ -1084,14 +1192,34 @@ class JobRepository:
             )
         return self._row_to_attempt(row)
 
-    def _require_active(self, attempt: Attempt) -> None:
-        if attempt.state not in ACTIVE_ATTEMPT_STATES:
-            raise JobStateError(
-                f"attempt {attempt.attempt_id!r} is {attempt.state!r}; "
-                f"the operation requires an active attempt."
-            )
+    def _require_current_attempt(self, attempt: Attempt) -> Job:
+        """Return the attempt's job, refusing a stale (non-current) attempt.
 
-    def _set_job_state(self, job_id: str, state: str) -> None:
+        Every mutator routes through this so a stale attempt can never write to
+        (or regress) a job whose fence has moved on.
+        """
+        job = self._require_job(attempt.job_id)
+        if (
+            job.current_attempt_id != attempt.attempt_id
+            or job.current_fence != attempt.fence
+        ):
+            raise StaleFenceError(
+                f"attempt {attempt.attempt_id!r} (fence {attempt.fence}) is not the "
+                f"current attempt of job {attempt.job_id!r} "
+                f"(fence {job.current_fence}); a stale attempt cannot mutate the job."
+            )
+        return job
+
+    def _set_job_state(
+        self, job_id: str, state: str, *, preserve_held: bool = False
+    ) -> None:
+        if preserve_held:
+            row = self._conn().execute(
+                "SELECT state FROM job WHERE project_id = ? AND job_id = ?",
+                (self.project_id, job_id),
+            ).fetchone()
+            if row is not None and row["state"] in _SCHEDULING_HELD_STATES:
+                return
         self._conn().execute(
             "UPDATE job SET state = ?, updated_at_utc = ? "
             "WHERE project_id = ? AND job_id = ?",

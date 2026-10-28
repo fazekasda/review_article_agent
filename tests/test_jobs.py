@@ -283,16 +283,42 @@ class BudgetTest(JobTestBase):
         with self.assertRaises(BudgetExceededError):
             self._external(job2, reserve="0.01")
 
-        # A known settlement releases the unused reserve portion.
+    def test_estimated_settlement_keeps_full_reserve(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self._external(job, reserve="1")
+        settled = self.jobs.settle_cost(
+            attempt.attempt_id, cost_state="estimated", amount_usd="0.01"
+        )
+        # The estimate is recorded on the attempt, but the held reserve bound is
+        # retained (counted conservatively) and never shrunk to the estimate.
+        self.assertEqual(settled.cost_amount_usd, "0.01")
+        self.assertEqual(settled.cost_state, "estimated")
+        self.assertEqual(
+            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "1"
+        )
+        row = self.store.connection.execute(
+            "SELECT amount_usd, state FROM job_budget_reserve WHERE project_id = ?",
+            (self.store.project_id,),
+        ).fetchone()
+        self.assertEqual(row["amount_usd"], "1")
+        self.assertEqual(row["state"], "retained")
+
+        # A later known settlement still must not silently shrink the held bound.
         self.jobs.settle_cost(
-            attempt.attempt_id, cost_state="known", amount_usd="3"
+            attempt.attempt_id, cost_state="known", amount_usd="0.5"
         )
         self.assertEqual(
-            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "3"
+            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "1"
         )
-        self._external(job2, reserve="5")
+
+    def test_unknown_cost_records_no_amount(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self._external(job, reserve="2")
+        settled = self.jobs.settle_cost(attempt.attempt_id, cost_state="unknown")
+        self.assertIsNone(settled.cost_amount_usd)
+        self.assertEqual(settled.cost_state, "unknown")
         self.assertEqual(
-            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "8"
+            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "2"
         )
 
     def test_project_cap_refuses_further_dispatch(self) -> None:
@@ -309,7 +335,7 @@ class BudgetTest(JobTestBase):
 
     def test_invalid_budget_values_are_rejected(self) -> None:
         job = self.jobs.submit("req-1", task_kind="probe")
-        for bad in ("-1", "abc", 1.0, 0):
+        for bad in ("-1", "abc", 1.0, 0, "1e999999999", "1e-999999999"):
             with self.assertRaises(JobValidationError):
                 self._external(job, reserve=bad)  # type: ignore[arg-type]
         with self.assertRaises(JobValidationError):
@@ -339,6 +365,193 @@ class BudgetTest(JobTestBase):
             self.jobs.begin_attempt(
                 job.job_id, dispatch_kind="local", reserve_usd="1"
             )
+
+
+class RepairRegressionTest(JobTestBase):
+    def test_external_missing_receipt_recovery_is_unresolved(self) -> None:
+        # An external attempt with no local admission receipt must NOT be treated
+        # as retry_safe: the request may have reached the backend already.
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self.jobs.begin_attempt(
+            job.job_id,
+            dispatch_kind="external_synthetic",
+            stage="s1",
+            reserve_usd="0.10",
+        )
+        outcome = self.jobs.recover(attempt.attempt_id)
+        self.assertEqual(outcome.disposition, "reconciliation_required")
+        final = self.jobs.get(job.job_id)
+        self.assertTrue(final.outcome_unresolved)
+        self.assertEqual(final.state, "reconciliation_required")
+        # The reserve is retained.
+        self.assertEqual(
+            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "0.10"
+        )
+        with self.assertRaises(AmbiguousOutcomeError):
+            self.jobs.begin_attempt(
+                job.job_id, dispatch_kind="local", retry_authorized_by="owner"
+            )
+
+    def test_local_missing_result_recovery_is_safe(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self.jobs.begin_attempt(job.job_id, dispatch_kind="local")
+        outcome = self.jobs.recover(attempt.attempt_id)
+        self.assertEqual(outcome.disposition, "retry_safe")
+        self.assertFalse(self.jobs.get(job.job_id).outcome_unresolved)
+
+    def test_cancelled_never_completed_by_acceptance(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self.jobs.begin_attempt(job.job_id, dispatch_kind="local")
+        self.jobs.cancel(job.job_id)
+        accepted = self.jobs.accept_result(
+            attempt.attempt_id, result_kind="synthetic", result={"late": True}
+        )
+        self.assertEqual(accepted.result, {"late": True})
+        final = self.jobs.get(job.job_id)
+        self.assertEqual(final.state, "cancelled")
+        self.assertNotEqual(final.state, "completed")
+        # The remote unresolved bit may be resolved while scheduling stays cancelled.
+        self.assertFalse(final.outcome_unresolved)
+
+    def test_pause_survives_late_admission_and_recovery(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self.jobs.begin_attempt(job.job_id, dispatch_kind="local")
+        self.jobs.pause(job.job_id)
+        self.jobs.mark_admitted(attempt.attempt_id, admission_id="adm-1")
+        self.assertEqual(self.jobs.get(job.job_id).state, "paused")
+        self.jobs.mark_running(attempt.attempt_id)
+        self.assertEqual(self.jobs.get(job.job_id).state, "paused")
+        self.jobs.recover(attempt.attempt_id)
+        self.assertEqual(self.jobs.get(job.job_id).state, "paused")
+
+    def test_stale_state_mutators_refuse(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        first = self.jobs.begin_attempt(job.job_id, dispatch_kind="local")
+        self.jobs.mark_definitive_failure(first.attempt_id)
+        second = self.jobs.begin_attempt(
+            job.job_id, dispatch_kind="local", retry_authorized_by="owner"
+        )
+        stale = first.attempt_id
+        with self.assertRaises(StaleFenceError):
+            self.jobs.mark_admitted(stale, admission_id="adm-x")
+        with self.assertRaises(StaleFenceError):
+            self.jobs.mark_running(stale)
+        with self.assertRaises(StaleFenceError):
+            self.jobs.record_checkpoint(stale, {"x": 1})
+        with self.assertRaises(StaleFenceError):
+            self.jobs.mark_ambiguous(stale)
+        with self.assertRaises(StaleFenceError):
+            self.jobs.mark_definitive_failure(stale)
+        with self.assertRaises(StaleFenceError):
+            self.jobs.recover(stale)
+        with self.assertRaises(StaleFenceError):
+            self.jobs.accept_result(stale, result_kind="synthetic", result={})
+        # The current attempt is untouched and still usable.
+        self.assertEqual(self.jobs.attempt(second.attempt_id).state, "queued")
+
+    def test_mark_ambiguous_cannot_regress_completed(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self.jobs.begin_attempt(job.job_id, dispatch_kind="local")
+        self.jobs.accept_result(
+            attempt.attempt_id, result_kind="synthetic", result={"ok": True}
+        )
+        self.assertEqual(self.jobs.get(job.job_id).state, "completed")
+        with self.assertRaises(JobStateError):
+            self.jobs.mark_ambiguous(attempt.attempt_id)
+        self.assertEqual(self.jobs.get(job.job_id).state, "completed")
+
+    def test_reconcile_definitive_failure_from_ambiguous(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self.jobs.begin_attempt(
+            job.job_id,
+            dispatch_kind="external_synthetic",
+            stage="s1",
+            reserve_usd="0.10",
+        )
+        self.jobs.mark_ambiguous(attempt.attempt_id)
+        self.assertTrue(self.jobs.get(job.job_id).outcome_unresolved)
+        resolved = self.jobs.reconcile(job.job_id, resolution="definitive_failure")
+        self.assertEqual(resolved.state, "failed")
+        self.assertFalse(resolved.outcome_unresolved)
+        self.assertEqual(
+            self.jobs.attempt(attempt.attempt_id).state, "definitive_failure"
+        )
+
+
+class ConcurrencyTest(JobTestBase):
+    def _race(self, operation):
+        import threading
+
+        pid = self.store.project_id
+        app_dir = str(self.app_dir)
+        barrier = threading.Barrier(2)
+        outcomes: list[tuple[str, object]] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            store = ProjectStore.open_at(app_dir, expected_project_id=pid)
+            try:
+                barrier.wait(timeout=10)
+                value = operation(JobRepository(store), store)
+                with lock:
+                    outcomes.append(("ok", value))
+            except BaseException as exc:  # noqa: BLE001 - recorded for assertion
+                with lock:
+                    outcomes.append(("err", exc))
+            finally:
+                store.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertFalse(any(t.is_alive() for t in threads), "race deadlocked")
+        return outcomes
+
+    def test_two_connections_racing_submit_yield_one_job(self) -> None:
+        outcomes = self._race(
+            lambda repo, store: repo.submit("req-race", task_kind="probe", parameters={"n": 1})
+        )
+        errors = [v for status, v in outcomes if status == "err"]
+        self.assertEqual(errors, [])
+        job_ids = {v.job_id for status, v in outcomes if status == "ok"}
+        self.assertEqual(len(job_ids), 1)
+        count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM job WHERE project_id = ?",
+            (self.store.project_id,),
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_two_connections_racing_begin_yield_one_attempt(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        outcomes = self._race(
+            lambda repo, store: repo.begin_attempt(
+                job.job_id,
+                dispatch_kind="external_synthetic",
+                stage="s1",
+                reserve_usd="0.10",
+            )
+        )
+        started = [v for status, v in outcomes if status == "ok"]
+        failed = [v for status, v in outcomes if status == "err"]
+        self.assertEqual(len(started), 1)
+        self.assertEqual(len(failed), 1)
+        self.assertIsInstance(failed[0], JobStateError)
+        count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM job_attempt WHERE project_id = ?",
+            (self.store.project_id,),
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+        # No double reserve: exactly one reserve row, counted once.
+        reserve_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM job_budget_reserve WHERE project_id = ?",
+            (self.store.project_id,),
+        ).fetchone()[0]
+        self.assertEqual(reserve_count, 1)
+        self.assertEqual(
+            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "0.10"
+        )
 
 
 class MigrationTest(JobTestBase):

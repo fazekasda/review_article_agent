@@ -499,6 +499,19 @@ def _store_v4(conn: sqlite3.Connection) -> None:
         """
     )
 
+    # A budget reserve's amount is the upper bound recorded before dispatch and
+    # must never shrink (C02 §5.6/§6.3); settlement only changes its state.
+    conn.execute(
+        """
+        CREATE TRIGGER job_budget_reserve_amount_immutable
+        BEFORE UPDATE ON job_budget_reserve
+        WHEN NEW.amount_usd <> OLD.amount_usd
+        BEGIN
+            SELECT RAISE(ABORT, 'job_budget_reserve amount is immutable');
+        END
+        """
+    )
+
 
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
