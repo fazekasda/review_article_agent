@@ -863,6 +863,55 @@ class ReconcileSessionTurnTest(SessionRunnerTestBase):
         self.assertEqual(len(client2.calls), calls_before)
         self.assertEqual(len(RuntimeRepository(store2).list_proposals()), 1)
 
+    def test_real_token_usage_cache_write_is_preserved_not_a_forbidden_key(self) -> None:
+        """The real V2.2.0 ``tokens.cache.write`` usage is preserved as metadata.
+
+        The live assistant message carries ``tokens`` (not ``usage``) shaped
+        ``{input, output, reasoning, cache: {read, write}}`` with ``cost`` at the
+        top level. ``write`` also names a proposal-content denylist key, so the
+        trusted usage value must be preserved under ``reported_write`` instead of
+        colliding with the authority-free proposal guard. The repair is narrow:
+        the denylist is **not** relaxed and a raw ``write`` key is still refused.
+        """
+        from review_article_agent.runtime.roles import (
+            ProposalError,
+            _reject_forbidden_keys,
+        )
+
+        scenario = self._scenario()
+        receipt = self._admitted(scenario)
+        message = self.client.append_assistant(
+            receipt.session_id,
+            text="real-shape token usage",
+            usage={
+                "input": 0,
+                "output": 0,
+                "reasoning": 0,
+                "cache": {"read": 0, "write": 0},
+            },
+        )
+        # The real 2.2.0 message carries ``cost`` at the top level (not in tokens).
+        message["cost"] = 0
+        self.client.append_idle(receipt.session_id, "succeeded")
+        outcome = self._reconcile(scenario)
+        self.assertEqual(outcome.state, "completed")
+
+        proposal = RuntimeRepository(self.store).get_proposal(outcome.proposal_record_id)
+        content = json.loads(proposal.canonical.decode("utf-8"))["content"]
+        usage = content["actual_usage"]
+        self.assertEqual(usage["cache"], {"read": 0, "reported_write": 0})
+        self.assertEqual(
+            content["assistant_steps"][0]["actual_usage"]["cache"]["reported_write"], 0
+        )
+        self.assertEqual(content["actual_cost_usd"], "0")
+        self.assertEqual(content["final_cost_usd"], "0")
+        # The raw denied key never appears anywhere in the accepted content.
+        self.assertNotIn('"write"', json.dumps(content))
+
+        # The repair does not weaken the guard: a raw ``write`` is still refused.
+        with self.assertRaises(ProposalError):
+            _reject_forbidden_keys({"content": {"cache": {"write": 0}}})
+
     def test_unknown_cost_retains_the_reserve(self) -> None:
         scenario = self._scenario()
         receipt = self._admitted(scenario)

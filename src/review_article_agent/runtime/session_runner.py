@@ -1643,6 +1643,13 @@ _USAGE_KEY_ALIASES = {
     "providerid": "reported_provider_id",
     "modelid": "reported_model_id",
     "variant": "reported_variant",
+    # The real OpenCode V2.2.0 token-usage object carries
+    # ``cache: {"read": n, "write": n}``. ``write`` also names a proposal
+    # content denylist key, so it is preserved under an explicit
+    # ``reported_*`` name (the trusted usage value stays metadata) instead of
+    # being mistaken for a state-edit field. ``read`` is not denied today, so
+    # it is left as-is.
+    "write": "reported_write",
 }
 
 
