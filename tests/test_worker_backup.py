@@ -212,6 +212,14 @@ class WorkerBackupBase(unittest.TestCase):
         jobs.mark_ambiguous(unresolved_att.attempt_id)
         jobs.settle_cost(unresolved_att.attempt_id, cost_state="unknown")
 
+        # a bounded safe predispatch retry: definitive failure then a local retry.
+        retried = jobs.submit("req-retried", task_kind="probe")
+        retried_first = jobs.begin_attempt(retried.job_id, dispatch_kind="local")
+        jobs.mark_definitive_failure(retried_first.attempt_id)
+        retried_second = jobs.begin_attempt(
+            retried.job_id, dispatch_kind="local", retry_authorized_by="owner"
+        )
+
         return {
             "done": done,
             "done_attempt": done_att,
@@ -221,6 +229,9 @@ class WorkerBackupBase(unittest.TestCase):
             "cancelled": cancelled,
             "unresolved": unresolved,
             "unresolved_attempt": unresolved_att,
+            "retried": retried,
+            "retried_first": retried_first,
+            "retried_second": retried_second,
         }
 
     # -- tamper helpers ------------------------------------------------------ #
@@ -603,6 +614,288 @@ class FailClosedJobVerificationTest(WorkerBackupBase):
             restore_backup(dest, self.tmp / "never", registry)
         self.assertFalse(os.path.exists(paths.app_dir_for(str(self.tmp / "never"))))
         self.assertEqual(registry.list_projects(), [])
+
+
+class ZeroCostBudgetTest(WorkerBackupBase):
+    """A reported zero actual cost is valid and must not be rejected."""
+
+    def _store_with_settled(self, cost_state: str):
+        store = self.new_store()
+        self.addCleanup(store.close)
+        jobs = JobRepository(store)
+        job = jobs.submit(f"req-{cost_state}", task_kind="probe")
+        attempt = jobs.begin_attempt(
+            job.job_id,
+            dispatch_kind="external_synthetic",
+            stage="s1",
+            reserve_usd="0.10",
+        )
+        jobs.settle_cost(attempt.attempt_id, cost_state=cost_state, amount_usd="0")
+        return store, jobs, job, attempt
+
+    def test_known_zero_actual_cost_roundtrips(self) -> None:
+        store, jobs, job, attempt = self._store_with_settled("known")
+        dest = self.tmp / "backup-known0"
+        create_backup(store, dest)
+        report = verify_backup(dest)
+        self.assertTrue(report["ok"])
+        registry = Registry(self.tmp / "state")
+        info = restore_backup(dest, self.tmp / "restored-known0", registry)
+        restored = ProjectStore.open_at(
+            paths.app_dir_for(info.root_path), expected_project_id=info.project_id
+        )
+        try:
+            rjobs = JobRepository(restored)
+            restored_attempt = rjobs.attempt(attempt.attempt_id)
+            self.assertEqual(restored_attempt.cost_state, "known")
+            self.assertEqual(restored_attempt.cost_amount_usd, "0")
+            # The immutable reserve upper bound is retained.
+            self.assertEqual(restored_attempt.reserve_usd, "0.10")
+            self.assertEqual(rjobs.get(job.job_id).state, "queued")
+        finally:
+            restored.close()
+
+    def test_estimated_zero_retains_reserve_roundtrip(self) -> None:
+        store, jobs, job, attempt = self._store_with_settled("estimated")
+        # An estimated amount settles the reserve to 'retained', never zeroed.
+        reserve_before = store.connection.execute(
+            "SELECT amount_usd, state FROM job_budget_reserve WHERE attempt_id = ?",
+            (attempt.attempt_id,),
+        ).fetchone()
+        self.assertEqual((reserve_before["amount_usd"], reserve_before["state"]), ("0.10", "retained"))
+        dest = self.tmp / "backup-est0"
+        create_backup(store, dest)
+        verify_backup(dest)
+        registry = Registry(self.tmp / "state")
+        info = restore_backup(dest, self.tmp / "restored-est0", registry)
+        restored = ProjectStore.open_at(
+            paths.app_dir_for(info.root_path), expected_project_id=info.project_id
+        )
+        try:
+            row = restored.connection.execute(
+                "SELECT amount_usd, state FROM job_budget_reserve WHERE attempt_id = ?",
+                (attempt.attempt_id,),
+            ).fetchone()
+            self.assertEqual((row["amount_usd"], row["state"]), ("0.10", "retained"))
+            restored_attempt = JobRepository(restored).attempt(attempt.attempt_id)
+            self.assertEqual(restored_attempt.cost_state, "estimated")
+            self.assertEqual(restored_attempt.cost_amount_usd, "0")
+        finally:
+            restored.close()
+
+
+class HeldAcceptedResultTest(WorkerBackupBase):
+    """A paused/cancelled job may legitimately hold an accepted result."""
+
+    def _held_accepted_backup(self, *, hold: str):
+        store = self.new_store()
+        self.addCleanup(store.close)
+        jobs = JobRepository(store)
+        job = jobs.submit(f"req-{hold}", task_kind="probe")
+        attempt = jobs.begin_attempt(
+            job.job_id,
+            dispatch_kind="external_synthetic",
+            stage="s1",
+            reserve_usd="0.10",
+        )
+        jobs.mark_admitted(attempt.attempt_id, admission_id="adm-held")
+        jobs.mark_running(attempt.attempt_id)
+        if hold == "pause":
+            jobs.pause(job.job_id)
+        else:
+            jobs.cancel(job.job_id)
+        # Accepting while held retains the result and preserves the held state.
+        accepted = jobs.accept_result(
+            attempt.attempt_id, result_kind="summary", result={"ok": True}
+        )
+        expected_state = "paused" if hold == "pause" else "cancelled"
+        self.assertEqual(jobs.get(job.job_id).state, expected_state)
+        dest = self.tmp / f"backup-{hold}"
+        create_backup(store, dest)
+        verify_backup(dest)
+        return store, jobs, job, attempt, accepted, dest
+
+    def test_paused_job_accepted_result_roundtrips(self) -> None:
+        store, jobs, job, attempt, accepted, dest = self._held_accepted_backup(hold="pause")
+        registry = Registry(self.tmp / "state")
+        info = restore_backup(dest, self.tmp / "restored-pause-acc", registry)
+        restored = ProjectStore.open_at(
+            paths.app_dir_for(info.root_path), expected_project_id=info.project_id
+        )
+        try:
+            rjobs = JobRepository(restored)
+            self.assertEqual(rjobs.get(job.job_id).state, "paused")
+            self.assertEqual(rjobs.get(job.job_id).resume_state, "running")
+            stored = rjobs.accepted_result(job.job_id)
+            self.assertEqual(stored.result, {"ok": True})
+            self.assertEqual(stored.result_digest, accepted.result_digest)
+            self.assertFalse(rjobs.get(job.job_id).outcome_unresolved)
+        finally:
+            restored.close()
+
+    def test_cancelled_job_accepted_result_roundtrips(self) -> None:
+        store, jobs, job, attempt, accepted, dest = self._held_accepted_backup(hold="cancel")
+        registry = Registry(self.tmp / "state")
+        info = restore_backup(dest, self.tmp / "restored-cancel-acc", registry)
+        restored = ProjectStore.open_at(
+            paths.app_dir_for(info.root_path), expected_project_id=info.project_id
+        )
+        try:
+            rjobs = JobRepository(restored)
+            self.assertEqual(rjobs.get(job.job_id).state, "cancelled")
+            stored = rjobs.accepted_result(job.job_id)
+            self.assertEqual(stored.result, {"ok": True})
+            self.assertFalse(rjobs.get(job.job_id).outcome_unresolved)
+        finally:
+            restored.close()
+
+
+class LifecycleFailClosedTest(WorkerBackupBase):
+    """Reject forged lifecycle/flag/retry states before any restore."""
+
+    def _schema4_backup(self):
+        store = self.new_store()
+        self.addCleanup(store.close)
+        self.seed_artifacts(store)
+        seeded = self.seed_jobs(store)
+        dest = self.tmp / "backup4"
+        create_backup(store, dest)
+        verify_backup(dest)
+        return store, seeded, dest
+
+    def _reject(self, dest: Path) -> None:
+        self.rewrite_outer_db_hash(dest)
+        registry = Registry(self.tmp / "state")
+        with self.assertRaises(BackupError):
+            verify_backup(dest)
+        # And a corrupt archive is rejected before any restore target is created.
+        with self.assertRaises(BackupError):
+            restore_backup(dest, self.tmp / "never", registry)
+        self.assertFalse(os.path.exists(paths.app_dir_for(str(self.tmp / "never"))))
+        self.assertEqual(registry.list_projects(), [])
+
+    def test_completed_job_without_accepted_result_rejected(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        self.tamper_db(
+            dest,
+            "DROP TRIGGER job_accepted_result_no_delete",
+            "DELETE FROM job_accepted_result",
+            f"UPDATE job SET accepted_fence = NULL WHERE job_id = "
+            f"'{seeded['done'].job_id}'",
+            preserve_schema=True,
+        )
+        self._reject(dest)
+
+    def test_succeeded_attempt_without_accepted_result_rejected(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        self.tamper_db(
+            dest,
+            "UPDATE job_attempt SET state = 'succeeded', ended_at_utc = "
+            "'2026-01-01T00:00:00+00:00' "
+            f"WHERE attempt_id = '{seeded['pending_attempt'].attempt_id}'",
+        )
+        self._reject(dest)
+
+    def test_accepted_result_on_nonterminal_job_rejected(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        self.tamper_db(
+            dest,
+            f"UPDATE job SET state = 'running' WHERE job_id = "
+            f"'{seeded['done'].job_id}'",
+        )
+        self._reject(dest)
+
+    def test_job_unresolved_flag_mismatch_rejected(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        self.tamper_db(
+            dest,
+            f"UPDATE job SET outcome_unresolved = 1 WHERE job_id = "
+            f"'{seeded['pending'].job_id}'",
+        )
+        self._reject(dest)
+
+    def test_job_without_attempt_claiming_unresolved_rejected(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        self.tamper_db(
+            dest,
+            f"UPDATE job SET outcome_unresolved = 1 WHERE job_id = "
+            f"'{seeded['paused'].job_id}'",
+        )
+        self._reject(dest)
+
+    def test_retry_after_ambiguous_prior_rejected(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        self.tamper_db(
+            dest,
+            "UPDATE job_attempt SET state = 'ambiguous', outcome_unresolved = 1 "
+            f"WHERE attempt_id = '{seeded['retried_first'].attempt_id}'",
+        )
+        self._reject(dest)
+
+    def test_retry_after_admitted_prior_rejected(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        self.tamper_db(
+            dest,
+            "UPDATE job_attempt SET admission_id = 'adm-prior' "
+            f"WHERE attempt_id = '{seeded['retried_first'].attempt_id}'",
+        )
+        self._reject(dest)
+
+    def test_retry_after_succeeded_prior_rejected(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        self.tamper_db(
+            dest,
+            "UPDATE job_attempt SET state = 'succeeded' "
+            f"WHERE attempt_id = '{seeded['retried_first'].attempt_id}'",
+        )
+        self._reject(dest)
+
+    def test_retries_used_over_bound_rejected(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        job_id = seeded["retried"].job_id
+        # A forged 4-attempt chain: structurally chained but over the retry bound.
+        self.tamper_db(
+            dest,
+            "UPDATE job_attempt SET state = 'definitive_failure' "
+            f"WHERE attempt_id = '{seeded['retried_second'].attempt_id}'",
+            "INSERT INTO job_attempt (project_id, attempt_id, job_id, fence, "
+            " attempt_no, dispatch_kind, state, prior_outcome, retry_authorized_by, "
+            " outcome_unresolved, admission_id, external_ref, checkpoint_json, "
+            " reserve_usd, cost_state, cost_amount_usd, started_at_utc, ended_at_utc) "
+            "SELECT project_id, 'att_forged_3', job_id, 3, 3, 'local', "
+            "'definitive_failure', 'definitive_failure', 'owner', 0, NULL, NULL, NULL, "
+            "NULL, 'not_incurred', NULL, '2026-01-01T00:00:00+00:00', NULL "
+            f"FROM job WHERE job_id = '{job_id}'",
+            "INSERT INTO job_attempt (project_id, attempt_id, job_id, fence, "
+            " attempt_no, dispatch_kind, state, prior_outcome, retry_authorized_by, "
+            " outcome_unresolved, admission_id, external_ref, checkpoint_json, "
+            " reserve_usd, cost_state, cost_amount_usd, started_at_utc, ended_at_utc) "
+            "SELECT project_id, 'att_forged_4', job_id, 4, 4, 'local', 'queued', "
+            "'definitive_failure', 'owner', 0, NULL, NULL, NULL, NULL, "
+            "'not_incurred', NULL, '2026-01-01T00:00:00+00:00', NULL "
+            f"FROM job WHERE job_id = '{job_id}'",
+            f"UPDATE job SET attempts_total = 4, retries_used = 3, current_fence = 4, "
+            f"current_attempt_id = 'att_forged_4', state = 'queued', "
+            f"outcome_unresolved = 0 WHERE job_id = '{job_id}'",
+        )
+        self._reject(dest)
+
+    def test_deep_json_checkpoint_rejected_cleanly(self) -> None:
+        _, seeded, dest = self._schema4_backup()
+        # Deep enough that ``json.loads`` itself raises RecursionError; deep and
+        # long enough that the diagnostic must never echo the raw payload.
+        deep = "[" * 150000 + "]" * 150000
+        self.tamper_db(
+            dest,
+            "UPDATE job_attempt SET checkpoint_json = '" + deep + "' "
+            f"WHERE attempt_id = '{seeded['pending_attempt'].attempt_id}'",
+        )
+        self.rewrite_outer_db_hash(dest)
+        with self.assertRaises(BackupError) as ctx:
+            verify_backup(dest)
+        # The diagnostic never leaks the raw (deep) payload.
+        self.assertNotIn(deep, str(ctx.exception))
+        self.assertNotIn("[", str(ctx.exception))
 
 
 if __name__ == "__main__":  # pragma: no cover

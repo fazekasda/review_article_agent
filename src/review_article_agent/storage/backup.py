@@ -1061,11 +1061,14 @@ def _parse_canonical_json_text(value: object, field: str) -> object:
         raise BackupError(f"{field}: must be a JSON text string")
     try:
         parsed = json.loads(value)
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+        # ``json.loads`` can raise RecursionError on pathologically deep nesting;
+        # every failure (including an over-long/deep body) is a clean, payload-free
+        # BackupError, never a leaked raw payload or an escaping RecursionError.
         raise BackupError(f"{field}: is not valid JSON") from exc
     try:
         canonical = canonical_json(parsed)
-    except RecordValidationError as exc:
+    except (RecordValidationError, RecursionError) as exc:
         raise BackupError(f"{field}: is not portable canonical JSON") from exc
     if canonical.decode("utf-8") != value:
         raise BackupError(f"{field}: is not stored as canonical JSON; refusing.")
@@ -1073,7 +1076,13 @@ def _parse_canonical_json_text(value: object, field: str) -> object:
 
 
 def _require_exact_decimal(value: object, field: str, *, positive: bool = True) -> Decimal:
-    """Validate a stored exact-decimal amount (bounded, finite, non-negative)."""
+    """Validate a stored exact-decimal amount (bounded, finite, non-negative).
+
+    ``positive=True`` (default) additionally requires a strictly positive amount
+    and is used for caps and reserves. A **reported cost amount** uses
+    ``positive=False``: a synthetic local completion can legitimately report a
+    known/estimated actual cost of exactly ``0`` without the reserve shrinking.
+    """
     from ..runtime.jobs import _bounded_decimal_amount  # local: avoid layering cost
 
     try:
@@ -1083,6 +1092,14 @@ def _require_exact_decimal(value: object, field: str, *, positive: bool = True) 
     if positive and amount == 0:
         raise BackupError(f"{field}: must be greater than zero")
     return amount
+
+
+def _require_identifier(value: object, field: str) -> str:
+    """Validate a stored opaque identifier with the domain identifier validator."""
+    try:
+        return validate_identifier(value, field)
+    except RecordValidationError as exc:
+        raise BackupError(f"{field}: is not a valid identifier") from exc
 
 
 def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
@@ -1101,6 +1118,7 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
         COST_STATES,
         DISPATCH_KINDS,
         JOB_STATES,
+        MAX_SAFE_RETRIES,
         _fingerprint,
         _job_id_for,
     )
@@ -1114,8 +1132,8 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
         request_id = row["request_id"]
         if not isinstance(job_id, str) or not job_id:
             raise BackupError("a job row has a malformed job id; refusing.")
-        if not isinstance(request_id, str) or not request_id or request_id != request_id.strip():
-            raise BackupError(f"job {job_id!r} has a malformed request key; refusing.")
+        _require_identifier(job_id, "job id")
+        _require_identifier(request_id, f"job {job_id!r} request key")
         if _job_id_for(project_id, request_id) != job_id:
             raise BackupError(
                 f"job {job_id!r} identity does not derive from its project/request "
@@ -1170,6 +1188,7 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
         job_id = row["job_id"]
         if not isinstance(attempt_id, str) or not attempt_id:
             raise BackupError("a job attempt has a malformed attempt id; refusing.")
+        _require_identifier(attempt_id, "attempt id")
         if attempt_id in attempts_by_id:
             raise BackupError("the snapshot contains a duplicate attempt id; refusing.")
         if job_id not in jobs_by_id:
@@ -1239,7 +1258,9 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
                     f"no amount; refusing."
                 )
             _require_exact_decimal(
-                row["cost_amount_usd"], f"attempt {attempt_id!r} cost amount"
+                row["cost_amount_usd"],
+                f"attempt {attempt_id!r} cost amount",
+                positive=False,
             )
         elif row["cost_amount_usd"] is not None:
             raise BackupError(
@@ -1299,10 +1320,11 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
                 or job["retries_used"] != 0
                 or job["current_fence"] != 0
                 or job["current_attempt_id"] is not None
+                or job["outcome_unresolved"] != 0
             ):
                 raise BackupError(
-                    f"job {job_id!r} has no attempts but non-zero counters/fence; "
-                    f"refusing."
+                    f"job {job_id!r} has no attempts but non-zero counters/fence or "
+                    f"a claimed unresolved outcome; refusing."
                 )
             continue
         ordered = sorted(attempts, key=lambda a: a["attempt_no"])
@@ -1313,6 +1335,11 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
         if job["retries_used"] != len(ordered) - 1:
             raise BackupError(
                 f"job {job_id!r} retry count does not match its attempts; refusing."
+            )
+        if job["retries_used"] > MAX_SAFE_RETRIES:
+            raise BackupError(
+                f"job {job_id!r} has used more than the bounded {MAX_SAFE_RETRIES} "
+                f"safe retries; refusing."
             )
         for index, attempt in enumerate(ordered, start=1):
             if attempt["attempt_no"] != index or attempt["fence"] != index:
@@ -1340,6 +1367,25 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
                 f"refusing."
             )
         for previous, attempt in zip(ordered, ordered[1:]):
+            # A follow-up attempt is only ever a bounded *safe predispatch* retry:
+            # the prior attempt must have failed definitively or been a local
+            # interruption, must leave no unresolved outcome, and must not have
+            # been externally admitted (C02 §8.1.1/§8.2; ``JobRepository``).
+            if previous["state"] not in ("definitive_failure", "interrupted"):
+                raise BackupError(
+                    f"job {job_id!r} attempt {attempt['attempt_no']} follows a "
+                    f"{previous['state']!r} prior attempt; refusing."
+                )
+            if previous["outcome_unresolved"] != 0:
+                raise BackupError(
+                    f"job {job_id!r} attempt {attempt['attempt_no']} follows an "
+                    f"unresolved prior attempt; refusing."
+                )
+            if previous["admission_id"] is not None:
+                raise BackupError(
+                    f"job {job_id!r} attempt {attempt['attempt_no']} follows an "
+                    f"externally admitted prior attempt; refusing."
+                )
             if attempt["prior_outcome"] != previous["state"]:
                 raise BackupError(
                     f"job {job_id!r} attempt {attempt['attempt_no']} prior outcome "
@@ -1404,6 +1450,19 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
                 f"an accepted result for job {job_id!r} is not backed by a succeeded, "
                 f"resolved attempt; refusing."
             )
+        # An accepted result may only survive on a completed job, or on a
+        # paused/cancelled job whose scheduling was held when the result landed
+        # (its unresolved bit is cleared, but the held state is preserved).
+        if job["state"] not in ("completed", "paused", "cancelled"):
+            raise BackupError(
+                f"job {job_id!r} holds an accepted result in state {job['state']!r}; "
+                f"refusing."
+            )
+        if job["outcome_unresolved"] != 0:
+            raise BackupError(
+                f"job {job_id!r} holds an accepted result but claims an unresolved "
+                f"outcome; refusing."
+            )
         result = _parse_canonical_json_text(
             row["result_json"], f"job {job_id!r} accepted result"
         )
@@ -1415,19 +1474,69 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
             )
         accepted_by_job[job_id] = row
 
+    # ---- lifecycle correspondence (completed iff accepted result, flags) --- #
+    current_attempt_by_job: dict[str, sqlite3.Row | None] = {}
     for job in job_rows:
+        attempts = attempts_by_job.get(job["job_id"], [])
+        current_attempt_by_job[job["job_id"]] = (
+            max(attempts, key=lambda a: a["fence"]) if attempts else None
+        )
+    for job in job_rows:
+        job_id = job["job_id"]
+        accepted = accepted_by_job.get(job_id)
+        current = current_attempt_by_job[job_id]
+        # A job's unresolved bit mirrors its current attempt; a job with no
+        # attempt cannot claim a remote unresolved outcome.
+        if current is None:
+            if job["outcome_unresolved"] != 0:
+                raise BackupError(
+                    f"job {job_id!r} claims a remote unresolved outcome with no "
+                    f"attempt; refusing."
+                )
+        elif job["outcome_unresolved"] != current["outcome_unresolved"]:
+            raise BackupError(
+                f"job {job_id!r} unresolved flag does not match its current attempt; "
+                f"refusing."
+            )
+        # ``completed`` is exactly a job whose current attempt has the one,
+        # fenced accepted result.
+        if job["state"] == "completed" and accepted is None:
+            raise BackupError(
+                f"job {job_id!r} is completed with no accepted result; refusing."
+            )
+        # ``accepted_fence`` is set iff an accepted result exists.
         accepted_fence = job["accepted_fence"]
         if accepted_fence is not None:
             if not isinstance(accepted_fence, int) or accepted_fence < 1:
                 raise BackupError(
-                    f"job {job['job_id']!r} has an illegal accepted fence; refusing."
+                    f"job {job_id!r} has an illegal accepted fence; refusing."
                 )
-            record = accepted_by_job.get(job["job_id"])
-            if record is None or record["fence"] != accepted_fence:
+            if accepted is None or accepted["fence"] != accepted_fence:
                 raise BackupError(
-                    f"job {job['job_id']!r} records an accepted fence with no matching "
+                    f"job {job_id!r} records an accepted fence with no matching "
                     f"accepted result; refusing."
                 )
+        elif accepted is not None:
+            raise BackupError(
+                f"job {job_id!r} holds an accepted result with no accepted fence; "
+                f"refusing."
+            )
+
+    # Every succeeded attempt must be exactly the one backed by its job's accepted
+    # result (a forged "succeeded" attempt with no accepted result is refused).
+    for attempt in attempt_rows:
+        if attempt["state"] != "succeeded":
+            continue
+        accepted = accepted_by_job.get(attempt["job_id"])
+        if (
+            accepted is None
+            or accepted["attempt_id"] != attempt["attempt_id"]
+            or accepted["fence"] != attempt["fence"]
+        ):
+            raise BackupError(
+                f"attempt {attempt['attempt_id']!r} is succeeded but is not backed by "
+                f"its job's accepted result; refusing."
+            )
 
     # ---- budget policy + reserves ------------------------------------------ #
     for row in conn.execute("SELECT * FROM job_budget_policy").fetchall():
@@ -1450,6 +1559,7 @@ def _verify_job_relations(conn: sqlite3.Connection, project_id: str) -> None:
         stage = row["stage"]
         if not isinstance(stage, str) or not stage or stage != stage.strip():
             raise BackupError("a budget reserve has a malformed stage; refusing.")
+        _require_identifier(stage, "budget reserve stage")
         amount = _require_exact_decimal(row["amount_usd"], "budget reserve amount")
         attempt_id = row["attempt_id"]
         if attempt_id is None:

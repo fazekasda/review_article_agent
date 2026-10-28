@@ -146,13 +146,25 @@ newer manifest/store schema) on any of:
   hash/size, counts, aggregate digests, or per-approval snapshots);
 - **schema-4 only** — a durable job/attempt/result/budget row that does not verify
   read-only: a cross-project key, a `job_id` that does not derive from its
-  `(project_id, request_id)` key, a parameter or accepted-result fingerprint that
-  does not match the stored canonical JSON, a stale/foreign accepted result that
-  is not the job's current attempt and fence, an illegal job/attempt state or
-  outcome flag, tampered attempt counters or `current_fence`, a malformed
-  checkpoint, a bounded-exact-decimal budget/reserve violation, a duplicate
-  reserve for one attempt, a reserve whose attempt belongs to another job, or a
-  dangling reserve/attempt reference.
+  `(project_id, request_id)` key, a malformed identifier (job/attempt id, request
+  key, reserve stage), a parameter or accepted-result fingerprint that does not
+  match the stored canonical JSON, an illegal job/attempt state or outcome flag,
+  tampered attempt counters or `current_fence`, a malformed checkpoint (including a
+  pathologically deep JSON body, rejected as a clean error rather than a leaked
+  payload), a budget/reserve exact-decimal that is not bounded (or a reserve that
+  is not strictly positive), a duplicate reserve for one attempt, a reserve whose
+  attempt belongs to another job, or a dangling reserve/attempt reference;
+- **schema-4 lifecycle correspondence** — a `completed` job with no accepted
+  result; a `succeeded` attempt not backed by its job's single accepted result; an
+  accepted result on a job that is not `completed`/`paused`/`cancelled` (a
+  paused/cancelled job may legitimately retain one); a job whose unresolved bit
+  disagrees with its current attempt (or a job with no attempt that nonetheless
+  claims a remote unresolved outcome); and a forged retry chain — more than the
+  bounded safe retries, or a follow-up attempt after an `ambiguous`/`succeeded`/
+  `admitted`/unresolved prior attempt (`definitive_failure` or a local
+  `interrupted` prior only). A reported `known`/`estimated` actual cost of exactly
+  `0` is valid and is not rejected; the immutable reserve upper bound is never
+  reduced.
 
 Because verification **recomputes every inner digest**, rewriting the outer
 `database.sha256` in the manifest does not bypass inner validation.
