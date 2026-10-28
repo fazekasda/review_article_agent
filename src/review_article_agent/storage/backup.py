@@ -103,7 +103,17 @@ columns, and the independent binding to the persisted dispatch/task/mapping/
 configuration parents) via the shared
 :func:`~review_article_agent.storage.session_intents.session_intent_integrity_problems`
 sweep — read-only and without requiring a live service, a live filesystem path, or
-the target's *current* head revision.
+the target's *current* head revision. Under store schema 11 it additionally
+re-validates every inert project-local discovery search observation (the exact
+canonical result bytes and their digest/size, the canonical project/request/time/
+content binding, every projected source/query/count/failure column re-derived
+from the decoded result, and the deterministic project-local run identity) via the
+shared
+:func:`~review_article_agent.storage.discovery.discovery_integrity_problems`
+sweep — read-only and without any network, provider, current-service, approval, or
+authority read. A corrupted payload, digest, projection, foreign row, or invalid
+observation therefore fails even when an attacker rewrites the outer manifest
+database hash.
 
 Restore validates first and is atomic
 -------------------------------------
@@ -116,7 +126,7 @@ and no stale approvals remain, and unrelated files in the target root are
 preserved. It never creates a new scientific identity: the restored project keeps
 the snapshot's exact ``project_id``.
 
-Supported store schemas are **3 through 10**. Schema 3 is the pre-Step-03 schema
+Supported store schemas are **3 through 11**. Schema 3 is the pre-Step-03 schema
 (identity, artifacts, revisions, rights, dependencies, import requests, and local
 fixture approvals); schema 4 adds the durable worker's synthetic job/attempt/
 accepted-result/budget tables (``runtime/jobs.py``); schema 5 adds the durable
@@ -126,9 +136,10 @@ runtime configuration/session/task/proposal mapping tables
 (``storage/human_approvals.py``); schema 8 adds the immutable durable
 pre-dispatch Jev decision-request intent (``storage/decision_intents.py``);
 schema 9 adds the immutable durable full per-question Jev decision-result
-observation (``storage/decision_results.py``); and schema 10 adds the immutable
+observation (``storage/decision_results.py``); schema 10 adds the immutable
 durable pre-transport session-turn intent correlation
-(``storage/session_intents.py``). Each is
+(``storage/session_intents.py``); and schema 11 adds the inert immutable
+project-local discovery search observation (``storage/discovery.py``). Each is
 validated against the exact schema the
 canonical migrations generate for **that** version. A schema-4 snapshot
 additionally re-validates every job row read-only (identity and parameter/result
@@ -229,6 +240,10 @@ _DECISION_RESULT_SCHEMA_VERSION = 9
 #: pre-transport session-turn intent correlation table exists and must be
 #: inner-validated.
 _SESSION_INTENT_SCHEMA_VERSION = 10
+
+#: The store schema version at (or above) which the inert, immutable
+#: project-local discovery search observations exist and must be inner-validated.
+_DISCOVERY_SCHEMA_VERSION = 11
 
 #: Store schema versions whose *recorded* approval ``storage_schema_version`` is
 #: accepted (the historical version survives a restore where supported; an
@@ -2004,6 +2019,52 @@ def _verify_session_intent_relations(
         )
 
 
+# --------------------------------------------------------------------------- #
+# Inert discovery search observation inner validation (schema 11)
+# --------------------------------------------------------------------------- #
+def _verify_discovery_relations(
+    conn: sqlite3.Connection, project_id: str
+) -> None:
+    """Read-only re-validation of the schema-11 discovery search observations.
+
+    The shared
+    :func:`~review_article_agent.storage.discovery.discovery_integrity_problems`
+    sweep decodes every stored canonical result, recomputes its digest/size,
+    re-derives the deterministic project/request run identity and canonical
+    metadata/content binding, and compares every projected source/query/time/
+    count/failure column with the decoded result. It reports a foreign-project
+    row and a corrupt row, so a forged archive whose outer database hash was
+    rewritten still fails inner verification.
+
+    The sweep is read-only and imposes **no** network, provider, current-service,
+    acceptance, approval, or authority requirement: a recorded historical search
+    remains valid provenance even when provider data has since changed. It records
+    inert untrusted observations only and preserves explicit failures and
+    incompleteness exactly. Any boundary failure of the helper is converted into a
+    curated :class:`BackupError`, so raw payload text is never surfaced.
+    """
+    # The helper already scans every row in the table and reports a foreign-project
+    # row itself, so no separate table foreign-row scan is duplicated here.
+    try:
+        from .discovery import discovery_integrity_problems
+
+        problems = discovery_integrity_problems(conn, project_id)
+    except BackupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a boundary failure is a refusal
+        raise BackupError(
+            "the snapshot's discovery search observations could not be "
+            "revalidated; refusing."
+        ) from exc
+    if problems:
+        # ``discovery_integrity_problems`` returns static, value-free strings.
+        raise BackupError(
+            "the snapshot's discovery search observations do not revalidate ("
+            + "; ".join(problems)
+            + "); refusing."
+        )
+
+
 #: Ordered ``(minimum_store_schema_version, validator)`` hook. Each validator is
 #: applied for a snapshot whose recorded schema is **at or above** its minimum, so
 #: a later schema checkpoint can append a validator here without touching the
@@ -2017,6 +2078,7 @@ _SCHEMA_VALIDATORS = (
     (_INTENT_SCHEMA_VERSION, _verify_intent_relations),
     (_DECISION_RESULT_SCHEMA_VERSION, _verify_decision_result_relations),
     (_SESSION_INTENT_SCHEMA_VERSION, _verify_session_intent_relations),
+    (_DISCOVERY_SCHEMA_VERSION, _verify_discovery_relations),
 )
 
 

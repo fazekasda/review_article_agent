@@ -42,7 +42,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 10
+STORE_SCHEMA_VERSION = 11
 
 #: Registry maps project IDs to names and locations, records the single
 #: *selected* project, and records durable **execution activation** (which
@@ -1288,6 +1288,99 @@ def _store_v10(conn: sqlite3.Connection) -> None:
         )
 
 
+def _store_v11(conn: sqlite3.Connection) -> None:
+    """Add the inert, immutable **project-local search observation** table (Step 05 D3).
+
+    This table backs :mod:`review_article_agent.storage.discovery`: one immutable
+    row per exact provider search observation, holding the complete canonical
+    result bytes (the T1 codec), their SHA-256 digest/byte size, a canonical
+    metadata/content binding, and projected source/query/time/count/failure
+    columns for reconstruction.
+
+    Only a new table and triggers are added; migrations 1-10 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, the runtime task/session/proposal
+    mappings, the runtime dispatch/cost ledger, the human approvals, the
+    pre-dispatch decision request intent, the per-question decision result
+    observation, and the pre-transport session-turn intent) are never rewritten,
+    so their exact bytes/refs are preserved across the upgrade (``ARCH-ASSETS``;
+    step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **Project-local deterministic identity.** The row is keyed by
+      ``(project_id, run_id)`` and unique per ``(project_id, request_id)``, with a
+      project foreign key, so a run can never be stored for a missing project and
+      a request replay key can never name two rows in one project.
+    * **Append-only.** Every row is immutable (never ``UPDATE``d/``DELETE``d); an
+      identical replay returns the historical row and a divergent result is
+      refused by the repository, never written over.
+    * **Canonical bytes are the truth.** ``canonical`` holds the exact canonical
+      T1 search-result bytes and ``result_sha256``/``result_bytes`` their
+      recomputed SHA-256 and size. ``binding`` holds a canonical metadata/content
+      binding (``binding_sha256``/``binding_bytes``) tying the actual
+      ``project_id``, deterministic ``run_id``, ``request_id``, recorded UTC time,
+      result type and result digest/size together. Projected columns must agree
+      with the decoded canonical result on every read, so a tampered projection is
+      detected rather than trusted.
+    * **No authority or scientific decision.** The row is inert untrusted
+      provenance: it records no approval, accepted context, candidate identity,
+      deduplication decision, coverage claim, cost, or completeness guarantee.
+      Overlapping/duplicate/missing-ID pages and explicit failures are preserved
+      exactly as observed.
+    * **No secret-scanner claim.** The private canonical bytes may contain exact
+      queries, source URLs, titles, and provider identifiers by design; no
+      credential is read by this schema and no "never contains source" guarantee
+      is made (spec lines 62-63; ``docs/storage.md``).
+    """
+    conn.execute(
+        """
+        CREATE TABLE discovery_search_run (
+            project_id       TEXT NOT NULL,
+            run_id           TEXT NOT NULL,
+            request_id       TEXT NOT NULL,
+            schema_version   INTEGER NOT NULL
+                             CHECK (schema_version = 1),
+            recorded_at_utc  TEXT NOT NULL,
+            result_type      TEXT NOT NULL
+                             CHECK (result_type IN (
+                                 'search_result', 'pubmed_search_result')),
+            source           TEXT NOT NULL,
+            query            TEXT NOT NULL,
+            started_at       TEXT NOT NULL,
+            completed_at     TEXT NOT NULL,
+            stop_reason      TEXT NOT NULL,
+            total_count      INTEGER
+                             CHECK (total_count IS NULL OR total_count >= 0),
+            complete         INTEGER NOT NULL CHECK (complete IN (0, 1)),
+            failure          TEXT,
+            page_count       INTEGER NOT NULL CHECK (page_count >= 0),
+            record_count     INTEGER NOT NULL CHECK (record_count >= 0),
+            attempt_count    INTEGER NOT NULL CHECK (attempt_count >= 0),
+            result_sha256    TEXT NOT NULL,
+            result_bytes     INTEGER NOT NULL CHECK (result_bytes >= 1),
+            canonical        BLOB NOT NULL,
+            binding_sha256   TEXT NOT NULL,
+            binding_bytes    INTEGER NOT NULL CHECK (binding_bytes >= 1),
+            binding          BLOB NOT NULL,
+            PRIMARY KEY (project_id, run_id),
+            UNIQUE (project_id, request_id),
+            FOREIGN KEY (project_id) REFERENCES project (project_id)
+        )
+        """
+    )
+    for event in ("UPDATE", "DELETE"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER discovery_search_run_no_{event.lower()}
+            BEFORE {event} ON discovery_search_run
+            BEGIN
+                SELECT RAISE(ABORT, 'discovery_search_run rows are immutable');
+            END
+            """
+        )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
@@ -1299,6 +1392,7 @@ STORE_MIGRATIONS: Mapping[int, Migration] = {
     8: _store_v8,
     9: _store_v9,
     10: _store_v10,
+    11: _store_v11,
 }
 
 
