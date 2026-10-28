@@ -740,8 +740,11 @@ class _RealTty:
         # itself, not merely a preceding select.
         try:
             os.set_blocking(self._fd, False)
-        except OSError:  # pragma: no cover - defensive; keep the fd usable
-            pass
+        except OSError as exc:
+            os.close(self._fd)
+            raise OwnerAuthTtyUnavailable(
+                "the controlling terminal cannot provide bounded non-blocking I/O."
+            ) from exc
 
     def is_tty(self) -> bool:
         return os.isatty(self._fd)

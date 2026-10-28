@@ -40,6 +40,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+
+class NonBlockingRequirementTest(unittest.TestCase):
+    def test_nonblocking_setup_failure_closes_owned_fd_and_fails_closed(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with mock.patch.object(os, "set_blocking", side_effect=OSError("unsupported")):
+                with self.assertRaises(OwnerAuthTtyUnavailable):
+                    owner_auth._RealTty(read_fd)
+            with self.assertRaises(OSError):
+                os.fstat(read_fd)
+        finally:
+            os.close(write_fd)
+
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
