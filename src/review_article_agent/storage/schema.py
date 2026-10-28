@@ -535,6 +535,11 @@ def _store_v5(conn: sqlite3.Connection) -> None:
     challenge value: those never reach a durable row (spec lines 62-63;
     ``docs/storage.md``). ``config_digest``/``fingerprint``/``stored_digest``
     values are recomputed from the exact canonical bytes the application wrote.
+
+    ``runtime_proposal`` is keyed by an immutable **task-scoped** ``record_id``
+    (unique per ``(project_id, task_id, proposal_id)``), so the machine
+    ``proposal_id`` alone never collapses two identical task rows into one
+    proposal: the logical task association is preserved.
     """
     conn.execute(
         """
@@ -621,6 +626,7 @@ def _store_v5(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE runtime_proposal (
             project_id         TEXT NOT NULL,
+            record_id          TEXT NOT NULL,
             proposal_id        TEXT NOT NULL,
             task_id            TEXT NOT NULL,
             role               TEXT NOT NULL,
@@ -635,7 +641,8 @@ def _store_v5(conn: sqlite3.Connection) -> None:
             stored_digest      TEXT NOT NULL,
             canonical          BLOB NOT NULL,
             created_at_utc     TEXT NOT NULL,
-            PRIMARY KEY (project_id, proposal_id),
+            PRIMARY KEY (project_id, record_id),
+            UNIQUE (project_id, task_id, proposal_id),
             FOREIGN KEY (project_id, task_id)
                 REFERENCES runtime_bounded_task (project_id, task_id)
         )

@@ -61,9 +61,12 @@ from review_article_agent.storage.agent_runtime import (  # noqa: E402
     VERSION_SLOT_STATES,
     PureJsonVersionSet,
     RuntimeConflictError,
+    RuntimeCorruptionError,
     RuntimeRepository,
     RuntimeValidationError,
+    store_integrity_problems,
     validate_version_set,
+    verify_store_integrity,
 )
 
 _OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
@@ -539,15 +542,15 @@ class ProposalRecordTest(RuntimeTestBase):
         self.assertEqual(proposal.proposal_id, expected.proposal_id)
         self.assertEqual(proposal.payload_digest, expected.payload_digest)
         self.assertEqual(proposal.role, "writer")
-        self.assertTrue(runtime.verify_proposal(proposal.proposal_id))
+        self.assertTrue(runtime.verify_proposal(proposal.record_id))
 
         # Same task+payload is idempotent (derived id is stable).
         replay = runtime.record_proposal(
             record, {"content": {"finding": "synthetic"}}, configuration=cfg
         )
-        self.assertEqual(replay.proposal_id, proposal.proposal_id)
+        self.assertEqual(replay.record_id, proposal.record_id)
         self.assertEqual(
-            RuntimeRepository(store).get_proposal(proposal.proposal_id).stored_digest,
+            RuntimeRepository(store).get_proposal(proposal.record_id).stored_digest,
             proposal.stored_digest,
         )
 
@@ -667,7 +670,9 @@ class ImmutabilityTest(RuntimeTestBase):
         with self.assertRaises(sqlite3.IntegrityError):
             conn.execute("DELETE FROM runtime_task_input")
 
-    def test_recomputed_digest_detects_tamper(self) -> None:
+    def test_tampered_config_canonical_is_denied_on_read(self) -> None:
+        # R1 repro: dropping the immutability trigger and rewriting the canonical
+        # bytes must NOT yield corrupt bytes from a read.
         store, runtime, snap = self._populated()
         conn = store.connection
         conn.execute("DROP TRIGGER runtime_config_snapshot_no_update")
@@ -676,7 +681,12 @@ class ImmutabilityTest(RuntimeTestBase):
             "AND snapshot_id = ?",
             (b'{"schema_version":1,"roles":{}}', snap.project_id, snap.snapshot_id),
         )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_configuration(snap.snapshot_id)
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.list_configurations()
         self.assertFalse(runtime.verify_configuration(snap.snapshot_id))
+        self.assertTrue(runtime.verify_all_integrity())
 
 
 class SchemaUpgradeTest(RuntimeTestBase):
@@ -807,8 +817,8 @@ class VersionSetTest(unittest.TestCase):
     def _known_ref(self):
         return {"version": "1.2.0", "digest": "a" * 64}
 
-    def test_valid_model_derived_consumed(self) -> None:
-        vs = {
+    def _valid(self):
+        return {
             "context_kind": "model_derived",
             "input_digest": "b" * 64,
             "model": {"state": "known", "ref": self._known_ref()},
@@ -818,12 +828,53 @@ class VersionSetTest(unittest.TestCase):
             "adapter": {"state": "known", "ref": self._known_ref()},
             "route": "opencode_session",
         }
+
+    def test_valid_model_derived_consumed(self) -> None:
+        vs = self._valid()
         normalized = validate_version_set(vs, consumed=("model", "prompt", "adapter"))
         self.assertEqual(normalized["context_kind"], "model_derived")
-        self.assertEqual(normalized["model"]["version"], "1.2.0")
+        # The canonical NESTED shape is preserved.
+        self.assertEqual(normalized["model"]["state"], "known")
+        self.assertEqual(normalized["model"]["ref"]["version"], "1.2.0")
+        self.assertEqual(normalized["rubric"], {"state": "unknown"})
         wrapper = PureJsonVersionSet.from_mapping(vs, consumed=("model",))
         self.assertEqual(wrapper.route, "opencode_session")
-        self.assertEqual(wrapper.slot("model")["digest"], "a" * 64)
+        self.assertEqual(wrapper.slot("model")["ref"]["digest"], "a" * 64)
+
+    def test_validator_is_idempotent(self) -> None:
+        once = validate_version_set(self._valid())
+        twice = validate_version_set(once)
+        self.assertEqual(once, twice)
+
+    def test_wrapper_roundtrips(self) -> None:
+        wrapper = PureJsonVersionSet.from_mapping(self._valid())
+        self.assertEqual(validate_version_set(wrapper.as_mapping()), self._valid())
+
+    def test_direct_constructor_validates(self) -> None:
+        with self.assertRaises(RecordValidationError):
+            PureJsonVersionSet({"bad": True})
+        # A valid mapping is accepted through the direct constructor.
+        direct = PureJsonVersionSet(self._valid())
+        self.assertEqual(direct.context_kind, "model_derived")
+
+    def test_wrapper_is_deeply_immutable(self) -> None:
+        wrapper = PureJsonVersionSet.from_mapping(self._valid())
+        # Mutating a returned copy never changes the stored value.
+        out = wrapper.as_mapping()
+        out["model"]["ref"]["digest"] = "0" * 64
+        self.assertEqual(wrapper.slot("model")["ref"]["digest"], "a" * 64)
+        with self.assertRaises(TypeError):
+            wrapper._mapping["model"]["ref"]["digest"] = "0" * 64  # type: ignore[index]
+
+    def test_errors_are_static_and_do_not_echo_input(self) -> None:
+        vs = self._valid()
+        vs["model"] = {"state": "SYNTHETIC_CANARY_STATE"}
+        try:
+            validate_version_set(vs)
+        except RecordValidationError as exc:
+            self.assertNotIn("SYNTHETIC_CANARY_STATE", str(exc))
+        else:  # pragma: no cover - the state is invalid
+            self.fail("invalid state accepted")
 
     def test_human_authored_not_applicable(self) -> None:
         vs = {
@@ -869,7 +920,6 @@ class VersionSetTest(unittest.TestCase):
         }
         with self.assertRaises(RecordValidationError):
             validate_version_set(vs)
-        self.assertIn("guessed", "guessed")  # keep VERSION_SLOT_STATES exercised
         self.assertIn("known", VERSION_SLOT_STATES)
 
     def test_known_slot_requires_real_ref(self) -> None:
@@ -900,6 +950,296 @@ class VersionSetTest(unittest.TestCase):
         with self.assertRaises(RecordValidationError):
             validate_version_set(vs, consumed=("adapter",))
         self.assertIn("model_derived", CONTEXT_KINDS)
+
+
+class TaskProposalAssociationTest(RuntimeTestBase):
+    """Repair R1: proposals are scoped to the logical persisted task id."""
+
+    def _two_identical_tasks(self):
+        store = self.new_store()
+        self.addCleanup(store.close)
+        artifact, _ = self.seed_revision(store)
+        runtime = RuntimeRepository(store)
+        task, cfg = self.make_task(store, artifact)
+        r1 = runtime.record_task(task, request_id="one", configuration=cfg)
+        r2 = runtime.record_task(task, request_id="two", configuration=cfg)
+        return store, runtime, cfg, r1, r2
+
+    def test_two_identical_tasks_keep_independent_proposals(self) -> None:
+        _store, runtime, cfg, r1, r2 = self._two_identical_tasks()
+        self.assertTrue(r1.task_id != r2.task_id)
+        self.assertEqual(r1.fingerprint, r2.fingerprint)  # same logical task content
+        p1 = runtime.record_proposal(r1, {"content": {"n": 1}}, configuration=cfg)
+        p2 = runtime.record_proposal(r2, {"content": {"n": 1}}, configuration=cfg)
+        # Same machine proposal id, but a distinct task-scoped record id, and the
+        # association is to each task — never lost or relabelled.
+        self.assertEqual(p1.proposal_id, p2.proposal_id)
+        self.assertNotEqual(p1.record_id, p2.record_id)
+        self.assertEqual(p1.task_id, r1.task_id)
+        self.assertEqual(p2.task_id, r2.task_id)
+        self.assertEqual(
+            [p.record_id for p in runtime.proposals_for_task(r2.task_id)],
+            [p2.record_id],
+        )
+        self.assertEqual(
+            [p.record_id for p in runtime.proposals_for_task(r1.task_id)],
+            [p1.record_id],
+        )
+        self.assertEqual(len(runtime.list_proposals()), 2)
+
+    def test_same_task_replay_is_idempotent(self) -> None:
+        _store, runtime, cfg, r1, _r2 = self._two_identical_tasks()
+        first = runtime.record_proposal(r1, {"content": {"n": 1}}, configuration=cfg)
+        again = runtime.record_proposal(r1, {"content": {"n": 1}}, configuration=cfg)
+        self.assertEqual(first.record_id, again.record_id)
+        self.assertEqual(len(runtime.proposals_for_task(r1.task_id)), 1)
+
+    def test_bare_task_with_two_matches_is_refused(self) -> None:
+        store, runtime, cfg, _r1, _r2 = self._two_identical_tasks()
+        artifact = ArtifactRepository(store).list_artifacts()[0]
+        task, _cfg = self.make_task(store, artifact)
+        with self.assertRaises(RuntimeValidationError):
+            runtime.record_proposal(task, {"content": {"n": 1}}, configuration=cfg)
+
+
+class ReadIntegrityDenialTest(RuntimeTestBase):
+    """Repair R1: every read/replay path structurally revalidates and denies."""
+
+    def _populated(self):
+        store = self.new_store()
+        self.addCleanup(store.close)
+        artifact, _ = self.seed_revision(store)
+        input_artifact, _ = self.seed_revision(
+            store, b"input-bytes", artifact_id="art_in", revision_id="rev_in"
+        )
+        runtime = RuntimeRepository(store)
+        snap = runtime.record_configuration(_config())
+        runtime.record_session_mapping(
+            service_instance_id="svc_1",
+            clean_location=str(self.tmp / "clean"),
+            session_id="ses_1",
+            role="writer",
+            model="openrouter/anthropic/claude-sonnet-5-5#high",
+            configuration=_config(),
+        )
+        task, cfg = self.make_task(
+            store,
+            artifact,
+            input_refs=[
+                {
+                    "project_id": store.project_id,
+                    "artifact_id": input_artifact.artifact_id,
+                    "revision_id": "rev_in",
+                    "digest": _bare(b"input-bytes"),
+                }
+            ],
+        )
+        record = runtime.record_task(task, request_id="req-1", configuration=cfg)
+        proposal = runtime.record_proposal(
+            record, {"content": {"finding": "x"}}, configuration=cfg
+        )
+        return store, runtime, snap, record, proposal
+
+    def test_integrity_ok_and_exported_validator(self) -> None:
+        store, runtime, _snap, _record, _proposal = self._populated()
+        self.assertEqual(runtime.verify_all_integrity(), [])
+        self.assertEqual(store_integrity_problems(store.connection, store.project_id), [])
+        self.assertTrue(verify_store_integrity(store.connection, store.project_id))
+
+    def test_tampered_config_link_in_session_is_denied(self) -> None:
+        store, runtime, _snap, _record, _proposal = self._populated()
+        conn = store.connection
+        conn.execute("DROP TRIGGER runtime_session_mapping_no_update")
+        conn.execute(
+            "UPDATE runtime_session_mapping SET config_digest = ? WHERE project_id = ?",
+            ("0" * 64, store.project_id),
+        )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_session_mapping_for("ses_1")
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.list_session_mappings()
+        self.assertTrue(runtime.verify_all_integrity())
+
+    def test_tampered_task_projection_is_denied(self) -> None:
+        store, runtime, _snap, record, _proposal = self._populated()
+        conn = store.connection
+        conn.execute("DROP TRIGGER runtime_bounded_task_no_update")
+        conn.execute(
+            "UPDATE runtime_bounded_task SET prompt_version = 'tampered' "
+            "WHERE project_id = ? AND task_id = ?",
+            (store.project_id, record.task_id),
+        )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_task(record.task_id)
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_task_by_request("req-1")
+        self.assertTrue(runtime.verify_all_integrity())
+
+    def test_tampered_child_input_row_is_denied(self) -> None:
+        store, runtime, _snap, record, _proposal = self._populated()
+        conn = store.connection
+        conn.execute("DROP TRIGGER runtime_task_input_no_update")
+        conn.execute(
+            "UPDATE runtime_task_input SET digest = ? WHERE project_id = ? "
+            "AND task_id = ?",
+            ("0" * 64, store.project_id, record.task_id),
+        )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_task(record.task_id)
+        self.assertTrue(runtime.verify_all_integrity())
+
+    def test_tampered_proposal_provenance_is_denied(self) -> None:
+        store, runtime, _snap, _record, proposal = self._populated()
+        conn = store.connection
+        conn.execute("DROP TRIGGER runtime_proposal_no_update")
+        conn.execute(
+            "UPDATE runtime_proposal SET payload_digest = ? WHERE project_id = ? "
+            "AND record_id = ?",
+            ("0" * 64, store.project_id, proposal.record_id),
+        )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_proposal(proposal.record_id)
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.proposals_for_task(proposal.task_id)
+        self.assertTrue(runtime.verify_all_integrity())
+
+    def test_tampered_config_reuse_is_denied(self) -> None:
+        # A corrupt config row must not be silently reused as an idempotent write.
+        store, runtime, snap, _record, _proposal = self._populated()
+        conn = store.connection
+        conn.execute("DROP TRIGGER runtime_config_snapshot_no_update")
+        # Corrupt the canonical bytes while keeping the (now invalid) digest, so a
+        # same-bytes replay would find and try to reuse the corrupt row.
+        conn.execute(
+            "UPDATE runtime_config_snapshot SET canonical = ? WHERE project_id = ? "
+            "AND snapshot_id = ?",
+            (b'{"schema_version":1,"roles":{}}', store.project_id, snap.snapshot_id),
+        )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.record_configuration(_config())
+
+    def test_historical_task_read_survives_head_change(self) -> None:
+        # Audit reads must keep working after a legitimate current-revision change.
+        store, runtime, _snap, record, proposal = self._populated()
+        artifact_id = record.target["artifact_id"]
+        repo = ArtifactRepository(store)
+        repo.import_revision(
+            artifact_id=artifact_id,
+            content=b"second-generation",
+            origin_locator="import:synthetic",
+            rights=_rights(
+                store.project_id, artifact_id, "rev_2",
+                rights_id=f"RIGHTS-{artifact_id}-r2",
+            ),
+            revision_id="rev_2",
+            parent_revision_id="rev_1",
+        )
+        # The historical task and its proposal remain readable/verifiable.
+        reread = runtime.get_task(record.task_id)
+        self.assertEqual(reread.target["revision_id"], "rev_1")
+        self.assertEqual(runtime.verify_all_integrity(), [])
+        self.assertTrue(runtime.verify_proposal(proposal.record_id))
+        # A NEW task pinned to the now-stale rev_1 is refused.
+        stale, cfg = self.make_task(store, repo.get_artifact(artifact_id), target_revision="rev_1")
+        with self.assertRaises(RuntimeValidationError):
+            runtime.record_task(stale, request_id="req-2", configuration=cfg)
+
+    def test_outdated_input_fails_closed(self) -> None:
+        store = self.new_store()
+        self.addCleanup(store.close)
+        artifact, _ = self.seed_revision(store)
+        input_artifact, _ = self.seed_revision(
+            store, b"input-bytes", artifact_id="art_in", revision_id="rev_in"
+        )
+        repo = ArtifactRepository(store)
+        # A newer revision of the input artifact supersedes rev_in.
+        repo.import_revision(
+            artifact_id=input_artifact.artifact_id,
+            content=b"newer-input",
+            origin_locator="import:synthetic",
+            rights=_rights(
+                store.project_id, input_artifact.artifact_id, "rev_in2",
+                rights_id=f"RIGHTS-{input_artifact.artifact_id}-2",
+            ),
+            revision_id="rev_in2",
+            parent_revision_id="rev_in",
+        )
+        task, cfg = self.make_task(
+            store,
+            artifact,
+            input_refs=[
+                {
+                    "project_id": store.project_id,
+                    "artifact_id": input_artifact.artifact_id,
+                    "revision_id": "rev_in",
+                    "digest": _bare(b"input-bytes"),
+                }
+            ],
+        )
+        with self.assertRaises(RuntimeValidationError):
+            RuntimeRepository(store).record_task(task, request_id="r", configuration=cfg)
+
+
+class AtomicityAndTimestampTest(RuntimeTestBase):
+    def test_no_writes_on_proposal_failure(self) -> None:
+        store = self.new_store()
+        self.addCleanup(store.close)
+        artifact, _ = self.seed_revision(store)
+        runtime = RuntimeRepository(store)
+        task, cfg = self.make_task(store, artifact)
+        record = runtime.record_task(task, request_id="req-1", configuration=cfg)
+        before = store.connection.execute(
+            "SELECT COUNT(*) AS n FROM runtime_proposal"
+        ).fetchone()["n"]
+        with self.assertRaises(ProposalError):
+            runtime.record_proposal(record, {"content": {"actor": "owner"}}, configuration=cfg)
+        self.assertEqual(
+            store.connection.execute(
+                "SELECT COUNT(*) AS n FROM runtime_proposal"
+            ).fetchone()["n"],
+            before,
+        )
+        self.assertEqual(runtime.verify_all_integrity(), [])
+
+    def test_no_task_or_config_rows_on_failed_task_write(self) -> None:
+        store = self.new_store()
+        self.addCleanup(store.close)
+        artifact, _ = self.seed_revision(store)
+        runtime = RuntimeRepository(store)
+        bad, cfg = self.make_task(store, artifact, target_revision="rev_missing")
+        with self.assertRaises(RuntimeValidationError):
+            runtime.record_task(bad, request_id="r-bad", configuration=cfg)
+        # Neither the task row nor its just-inserted config snapshot survive the
+        # rolled-back transaction.
+        self.assertEqual(runtime.list_tasks(), [])
+        self.assertEqual(
+            store.connection.execute(
+                "SELECT COUNT(*) AS n FROM runtime_bounded_task"
+            ).fetchone()["n"],
+            0,
+        )
+        self.assertEqual(
+            store.connection.execute(
+                "SELECT COUNT(*) AS n FROM runtime_config_snapshot"
+            ).fetchone()["n"],
+            0,
+        )
+
+    def test_non_timestamp_created_at_is_rejected(self) -> None:
+        store = self.new_store()
+        self.addCleanup(store.close)
+        runtime = RuntimeRepository(store)
+        with self.assertRaises(RuntimeValidationError):
+            runtime.record_configuration(_config(), created_at_utc="not-a-timestamp")
+        with self.assertRaises(RuntimeValidationError):
+            runtime.record_configuration(
+                _config(), created_at_utc="2026-10-27T00:00:00"  # no offset
+            )
+        # A valid UTC timestamp is accepted.
+        snap = runtime.record_configuration(
+            _config(), created_at_utc="2026-10-27T00:00:00Z"
+        )
+        self.assertEqual(snap.created_at_utc, "2026-10-27T00:00:00Z")
 
 
 if __name__ == "__main__":  # pragma: no cover
