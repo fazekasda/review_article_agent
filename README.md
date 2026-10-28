@@ -42,6 +42,12 @@ scientific feature, production model run, or **scientific validation is claimed*
 Step 04 is **complete as a restricted runtime**: its full local verification passed
 at `c1f927b` (**2,105 tests, no skips**; see the
 [Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)).
+Step 05 (reproducible discovery and corpus freeze) is **partial — metadata adapter
+foundation**: a bounded, stdlib-only public-metadata transport and two provider
+adapters exist as a **library** only (see the
+[Step 05 handoff](docs/implementation/handoffs/05-discovery.md) and the
+[discovery API/limits](docs/discovery.md)); no workflow, persistence, approval
+gate, or corpus freeze is built, and the step is **not** complete.
 
 ## Getting started (local core only)
 
@@ -80,6 +86,39 @@ surface in [CLI contract §10](docs/cli.md); the runtime safety contract is in
 [Worker runtime safety contract](docs/worker.md), with the completion evidence in
 the [Step 03 handoff](docs/implementation/handoffs/03-durable-worker.md).
 
+### Discovery metadata adapters (Step 05, partial)
+
+A bounded, stdlib-only **library** foundation for public literature metadata now
+exists under `src/review_article_agent/discovery/`: a fixed-allowlist HTTPS GET
+transport (no credentials, redirects/proxies disabled, bounded retries, size cap,
+per-instance rate spacing) and two provider adapters — PubMed ESearch+EFetch and
+Europe PMC cursor-paginated search. Constructing a transport and the adapters
+performs **no** network I/O; a request happens only when `search()` is called. The
+calls below are **placeholders** and are **not** executed by the docs or the tests:
+
+```python
+from review_article_agent.discovery.transport import DiscoveryTransport
+from review_article_agent.discovery.pubmed import PubMedClient
+from review_article_agent.discovery.europepmc import EuropePMCClient
+
+transport = DiscoveryTransport()            # constructed; no I/O until search()
+pubmed = PubMedClient(transport=transport)  # shares the one transport instance
+europepmc = EuropePMCClient(transport)      # positional transport argument
+
+# Placeholders only — never executed by docs or tests:
+# pubmed_result = pubmed.search("asthma AND review[pt]")
+# epmc_result = europepmc.search("EXT_ID:31452104 AND SRC:MED")
+```
+
+This is **not** a workflow: there is **no** CLI, worker scheduling, approval gate,
+or persistence (the storage schema remains **10**), and metadata is an **untrusted
+observation** — no accepted context, eligibility, scientific identity, or corpus
+freeze. Each `search()` invocation **repeats** the provider observations; it is
+**not** idempotent persisted candidate ingestion. The exact API, defaults, and
+maximum limits are in the [discovery API/limits](docs/discovery.md), and the
+criterion-by-criterion status is in the
+[Step 05 handoff](docs/implementation/handoffs/05-discovery.md).
+
 ## Planning documents
 
 - [Scientific and product baseline](docs/specification.md)
@@ -90,6 +129,8 @@ the [Step 03 handoff](docs/implementation/handoffs/03-durable-worker.md).
 - [Step 02 handoff (complete, local foundation)](docs/implementation/handoffs/02-project-foundation.md)
 - [Step 03 handoff (complete, synthetic detached worker)](docs/implementation/handoffs/03-durable-worker.md)
 - [Step 04 handoff (complete, restricted runtime)](docs/implementation/handoffs/04-agent-runtime.md)
+- [Step 05 handoff (partial, metadata adapter foundation)](docs/implementation/handoffs/05-discovery.md)
+- [Discovery metadata adapters API and limits (Step 05, partial)](docs/discovery.md)
 - [Step 02 CLI contract](docs/cli.md)
 - [Step 02 storage contract](docs/storage.md)
 - [Step 03 worker runtime safety contract](docs/worker.md)
@@ -113,4 +154,9 @@ execution and no scientific approval, step 03 is a synthetic detached worker wit
 model, provider, or scientific approval, and step 04 is a **restricted** runtime
 whose only model transport is a loopback fixture — no scientific autonomous
 workflow, production paid generation, hosted transfer, scientific feature, or
-scientific validation is implemented or claimed.
+scientific validation is implemented or claimed. Step 05 is **partial — metadata
+adapter foundation**: a bounded public-metadata transport and two provider adapters
+exist as a **library** only (see the
+[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); no workflow,
+persistence, approval gate, corpus freeze, or scientific feature is implemented or
+claimed, and the step is **not** complete.
