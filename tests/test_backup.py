@@ -589,14 +589,14 @@ class FailClosedVerificationTest(BackupTestBase):
     def test_newer_store_schema_in_manifest_rejected(self) -> None:
         _, dest = self._fresh_backup()
         manifest = json.loads((dest / MANIFEST_FILENAME).read_text())
-        manifest["store_schema_version"] = 4
+        manifest["store_schema_version"] = 5
         (dest / MANIFEST_FILENAME).write_text(json.dumps(manifest))
         with self.assertRaises(UnsupportedSchemaVersion):
             verify_backup(dest)
 
     def test_newer_snapshot_store_schema_rejected(self) -> None:
         _, dest = self._fresh_backup()
-        self.tamper_db(dest, "PRAGMA user_version = 4")
+        self.tamper_db(dest, "PRAGMA user_version = 5")
         self.rewrite_outer_db_hash(dest)
         with self.assertRaises(UnsupportedSchemaVersion):
             verify_backup(dest)

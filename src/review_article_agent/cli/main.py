@@ -33,10 +33,19 @@ add subcommands without reworking dispatch. This module also exposes:
   ``authorizes_execution=false``, ``authorizes_export=false`` and
   ``scientific_validation=false``; no real protocol/pilot/outline/release gate
   and no in-band actor/authority flag is accepted.
-
-No ``run``/``worker``/``model`` or **scientific** ``approve`` command exists
-here: those belong to later steps once their execution and scientific-approval
-layers are integrated.
+* ``worker`` — **lifecycle control only** (``start``/``status``/``stop``) over
+  :mod:`review_article_agent.worker.process` and the owner-only local control
+  socket. ``worker start`` reports readiness (never job completion) and
+  ``worker stop`` routes an authenticated control request (never a signal);
+  selection/starts are not execution.
+* ``job`` — **synthetic durable job control** (``run``/``status``/``list``/
+  ``pause``/``resume``/``cancel``/``switch``/``drain``/``reconcile``/``attach``)
+  over the integrated worker engine, reached through the owner-authenticated
+  control transport. ``job run`` ensures a worker and submits one synthetic job
+  (admission only, never completion); ``job attach`` reads status snapshots and
+  never cancels on exit. There is **no** ``model`` or scientific-``approve``
+  command here: those belong to later steps once their execution and
+  scientific-approval layers are integrated.
 """
 
 from __future__ import annotations
@@ -88,6 +97,16 @@ from .config import (
     load_config_file,
     load_strict_json,
     resolve_data_dir,
+)
+from .worker import (
+    WORKER_COMMANDS,
+    build_worker_parser,
+    WorkerControlError,
+)
+from .jobs import (
+    JOB_COMMANDS,
+    StreamNDJSON,
+    build_jobs_parser,
 )
 
 PROG = "review-article-agent"
@@ -227,6 +246,8 @@ def build_parser() -> argparse.ArgumentParser:
     _build_artifact_parser(sub)
     _build_backup_parser(sub)
     _build_fixture_parser(sub)
+    build_worker_parser(sub)
+    build_jobs_parser(sub)
 
     return parser
 
@@ -925,6 +946,18 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
         except KeyError as exc:  # pragma: no cover - argparse enforces choices
             raise CliUsageError(f"unknown fixture command {args.fixture_command!r}") from exc
         return handler(args, ctx)
+    if args.command == "worker":
+        try:
+            handler = WORKER_COMMANDS[args.worker_command]
+        except KeyError as exc:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(f"unknown worker command {args.worker_command!r}") from exc
+        return handler(args, ctx)
+    if args.command == "job":
+        try:
+            handler = JOB_COMMANDS[args.job_command]
+        except KeyError as exc:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(f"unknown job command {args.job_command!r}") from exc
+        return handler(args, ctx)
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -971,9 +1004,71 @@ _BACKUP_CONFLICT_MESSAGE = (
     "target whose data directory does not already hold that identity."
 )
 
+#: Worker lifecycle error categories mapped to the CLI's stable exit codes:
+#: ``validation`` (2, a bad option value), ``conflict`` (3, a foreign endpoint
+#: occupies the control path), ``storage`` (4, an unavailable/unconfirmed
+#: lifecycle outcome). ``worker`` raises :class:`WorkerControlError` with a
+#: curated, value-free message.
+_WORKER_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+
+
+def _redirect_broken_stdout(out: TextIO) -> None:
+    """Point a broken stdout stream's file descriptor at the null device.
+
+    After a broken pipe, the interpreter's final flush of ``sys.stdout`` can raise
+    a *second* ``BrokenPipeError`` (printing an "Exception ignored" traceback and
+    exiting 120). Redirecting the real file descriptor to ``os.devnull`` prevents
+    that. Best effort and bounded: it does nothing for an in-memory stream with no
+    real fileno, never closes or replaces the caller's stream object, and never
+    touches a stream it did not write to.
+    """
+    try:
+        fileno = out.fileno()
+    except (OSError, ValueError, AttributeError):
+        return
+    if isinstance(fileno, bool) or not isinstance(fileno, int) or fileno < 0:
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(devnull, fileno)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(devnull)
+        except OSError:
+            pass
+
 
 def _emit_result(result: object, stdout: TextIO | None = None) -> None:
     out = stdout if stdout is not None else sys.stdout
+    if isinstance(result, StreamNDJSON):
+        # ``job attach --watch`` is the one documented exception to the
+        # single-JSON-document rule: one object per line, streamed as the watch
+        # polls. A closed downstream consumer (broken pipe) is a clean detach,
+        # not an error, and never triggers any worker control.
+        try:
+            for document in result.documents:
+                out.write(
+                    json.dumps(document, sort_keys=True, ensure_ascii=True) + "\n"
+                )
+                out.flush()
+        except BrokenPipeError:
+            # The consumer closed the pipe. Redirect the *real* stdout file
+            # descriptor to the null device so the interpreter's final flush
+            # cannot raise a second BrokenPipeError (which would print an ignored
+            # traceback and exit 120). Only a stream with a real fileno is
+            # redirected; an in-memory test stream is left untouched.
+            _redirect_broken_stdout(out)
+            return
+        return
     if isinstance(result, RawBytes):
         # ``artifact content`` deliberately emits stored bytes verbatim; this is
         # the one explicit content read, not an error/log path.
@@ -994,6 +1089,8 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
     """Map an exception to a stable ``(category, exit_code)`` pair."""
     if isinstance(exc, (CliUsageError, ConfigError)):
         return "usage", EXIT_USAGE
+    if isinstance(exc, WorkerControlError):
+        return exc.category, _WORKER_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1024,6 +1121,9 @@ def _error_message(exc: BaseException, category: str) -> str:
     """
     if category == "internal":
         return _INTERNAL_MESSAGE
+    if isinstance(exc, WorkerControlError):
+        # Authored in ``cli.worker``; a static, curated, value-free message.
+        return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):
             return str(exc)
@@ -1094,11 +1194,17 @@ def main(
             env=dict(os.environ if env is None else env),
         )
         result = dispatch(args, ctx)
+    except KeyboardInterrupt:
+        # A Ctrl-C during a command (e.g. a job watch) detaches cleanly: no
+        # traceback, and no worker control is emitted by the CLI itself.
+        return 130
     except Exception as exc:  # noqa: BLE001 - convert every failure to JSON
         return _emit_error(exc, stderr)
 
     try:
         _emit_result(result, stdout)
+    except KeyboardInterrupt:
+        return 130
     except Exception as exc:  # noqa: BLE001 - an output failure is never a traceback
         return _emit_error(exc, stderr)
     return EXIT_SUCCESS

@@ -23,8 +23,9 @@ store plus a manifest.
 
 - It **is**: a consistent, transactionally captured copy of all project data
   (identity, artifacts, immutable revisions with their BLOB content, rights
-  records, dependencies, import requests, and local fixture approvals), suitable
-  for restoring that project later.
+  records, dependencies, import requests, local fixture approvals, and — under
+  store schema 4 — the durable synthetic job/attempt/accepted-result/budget rows),
+  suitable for restoring that project later.
 - It **is not**: a manuscript export, a redistribution package, or a portable
   interchange format. **Never publish an archive** and **never store credentials
   as artifact content**. Private storage backup is distinct from manuscript
@@ -62,12 +63,16 @@ application never scans for or automatically ingests secrets; the guarantee is
 withdrawal-by-design (only allowlisted members are written), **not** a general
 credential scanner.
 
-The snapshot database must match the schema-3 project schema **exactly**: the
-full set of tables, indices, triggers, and views — including foreign keys and the
-immutability triggers — is compared against the schema the canonical migrations
-generate in memory. Any other ("external") table, a missing or altered object, or
-a hidden added column is refused, so a forged database that merely reuses the
-right table names (and would pass `foreign_key_check`) is never accepted.
+The snapshot database must match the canonical project schema for its recorded
+store schema version **exactly**: the full set of tables, indices, triggers, and
+views — including foreign keys and the immutability triggers — is compared against
+the schema the canonical migrations generate **for that version** in memory. Two
+store schema versions are supported: **3** (identity, artifacts, revisions,
+rights, dependencies, import requests, and local fixture approvals) and **4**
+(which adds the durable worker's synthetic job/attempt/accepted-result/budget
+tables). Any other ("external") table, a missing or altered object, or a hidden
+added column is refused, so a forged database that merely reuses the right table
+names (and would pass `foreign_key_check`) is never accepted.
 
 All output is owner-private: the backup directory is `0o700`, and
 `manifest.json`/`snapshot.sqlite3` are `0o600`.
@@ -81,7 +86,7 @@ All output is owner-private: the backup directory is `0o700`, and
 | `format` | `review_article_agent.private_storage_backup` (foreign-JSON guard) |
 | `format_version` | `1` (the only supported version) |
 | `created_at_utc`, `app_version`, `project_id` | provenance and stable identity |
-| `store_schema_version` | the snapshot's store schema (only `3` is supported) |
+| `store_schema_version` | the snapshot's store schema (`3` or `4` are supported) |
 | `database` | `{filename, sha256, byte_size}` of `snapshot.sqlite3` |
 | `counts` | row counts for artifacts/revisions/rights/dependencies/imports/approvals/approval entries |
 | `artifact_digest`, `revision_digest`, `rights_digest` | deterministic aggregate digests over identity + integrity columns |
@@ -119,9 +124,9 @@ newer manifest/store schema) on any of:
   `store_schema_version`;
 - an identity mismatch between the manifest and the snapshot; a failed
   `PRAGMA integrity_check` or non-empty `PRAGMA foreign_key_check`;
-- a snapshot schema that is not byte-for-byte the canonical schema-3 definition
-  (a missing/altered trigger or constraint, an added hidden column, or an
-  external table);
+- a snapshot schema that is not byte-for-byte the canonical definition for its
+  recorded version (a missing/altered trigger or constraint, an added hidden
+  column, or an external table);
 - a **recomputed** revision/rights BLOB digest or byte size that does not match
   the stored column;
 - a rights record whose canonical body does not equal its denormalized identity
@@ -138,7 +143,28 @@ newer manifest/store schema) on any of:
   verify — including valid historical `stale`/`superseded` rows, which are never
   rejected as honest history;
 - a mismatch between the snapshot and any manifest expected value (database
-  hash/size, counts, aggregate digests, or per-approval snapshots).
+  hash/size, counts, aggregate digests, or per-approval snapshots);
+- **schema-4 only** — a durable job/attempt/result/budget row that does not verify
+  read-only: a cross-project key, a `job_id` that does not derive from its
+  `(project_id, request_id)` key, a malformed identifier (job/attempt id, request
+  key, reserve stage), a parameter or accepted-result fingerprint that does not
+  match the stored canonical JSON, an illegal job/attempt state or outcome flag,
+  tampered attempt counters or `current_fence`, a malformed checkpoint (including a
+  pathologically deep JSON body, rejected as a clean error rather than a leaked
+  payload), a budget/reserve exact-decimal that is not bounded (or a reserve that
+  is not strictly positive), a duplicate reserve for one attempt, a reserve whose
+  attempt belongs to another job, or a dangling reserve/attempt reference;
+- **schema-4 lifecycle correspondence** — a `completed` job with no accepted
+  result; a `succeeded` attempt not backed by its job's single accepted result; an
+  accepted result on a job that is not `completed`/`paused`/`cancelled` (a
+  paused/cancelled job may legitimately retain one); a job whose unresolved bit
+  disagrees with its current attempt (or a job with no attempt that nonetheless
+  claims a remote unresolved outcome); and a forged retry chain — more than the
+  bounded safe retries, or a follow-up attempt after an `ambiguous`/`succeeded`/
+  `admitted`/unresolved prior attempt (`definitive_failure` or a local
+  `interrupted` prior only). A reported `known`/`estimated` actual cost of exactly
+  `0` is valid and is not rejected; the immutable reserve upper bound is never
+  reduced.
 
 Because verification **recomputes every inner digest**, rewriting the outer
 `database.sha256` in the manifest does not bypass inner validation.
@@ -166,17 +192,37 @@ The restored project keeps the snapshot's exact `project_id`; all exact IDs and
 immutable historical approval snapshots are preserved. A new scientific identity
 is never created.
 
+A **schema-3** snapshot is restored as-is; the ordinary `ProjectStore` open that
+runs while the restore is registered migrates it `3 -> 4` (adding the empty
+job/attempt/budget tables) and preserves every prior artifact byte and fixture
+approval snapshot exactly. A **schema-4** snapshot is restored with its completed
+job results, unresolved attempts, and budget reserves preserved exactly.
+
+**Restore proves storage integrity, not remote quiescence.** A restored snapshot
+records admitted/ambiguous durable attempts but is **not** proof that any external
+operation has quiesced: no app-level execution activation and no synthetic
+external provider journal is part of a per-project snapshot. A worker that opens a
+restored project MUST reconcile or hold every restored `admitted`/`ambiguous`
+attempt before dispatching new work or switching the active project; that
+reconciliation is the engine's responsibility and is out of scope for this
+module. A restore never fabricates a scientific or model approval.
+
 ## 7. Compatibility and limitations
 
-- Only the **current store schema (version 3)** backups are supported. A newer
-  store schema is refused clearly; migrations from older schemas (`2 -> 3`) are
-  tested separately and are not part of this module. A fixture approval's
-  *recorded* `storage_schema_version` is validated against the supported range
-  (`1..current`), so a historical version is preserved where supported while an
-  arbitrary/unknown version is refused.
+- The supported store schema versions are **3 and 4**. A newer store schema is
+  refused clearly; the `2 -> 3` and `3 -> 4` migrations are tested separately and
+  are not part of this module (a schema-3 snapshot is upgraded to schema 4 by the
+  ordinary `ProjectStore` open on restore). A fixture approval's *recorded*
+  `storage_schema_version` is validated against the supported range (`1..current`),
+  so a historical version is preserved where supported while an
+  arbitrary/unknown version is refused. Determining the version-specific canonical
+  schema and the job-row validation both reuse the canonical migration and
+  `runtime.jobs` definitions, so a schema change cannot silently desynchronise
+  verification.
 - `verify_backup` re-validates stored rights records and recomputes content
-  digests; it is a structural/integrity check, not a scientific or rights
-  decision.
+  digests; for a schema-4 snapshot it additionally re-validates the durable
+  job/attempt/result/budget rows. It is a structural/integrity check, not a
+  scientific, rights, or remote-quiescence decision.
 - The application never automatically ingests secrets; this module cannot prove
   the absence of any secret a user manually stored as artifact content. Do not
   store credentials as artifact content.

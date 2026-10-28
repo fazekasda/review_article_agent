@@ -1,17 +1,31 @@
-# CLI contract — `review-article-agent` (Step 02)
+# CLI contract — `review-article-agent` (Step 02, with the Step 03 worker + job-control slice)
 
-> **Scope: Step 02 only.** This document is the **contract** for the command-line
-> surface over the durable local project foundation. It describes exactly what the
-> commands accept, what they print, and how they fail. It is **not** a scientific
-> or approval contract and it claims **no** scientific validation.
+> **Scope: Step 02, plus clearly bounded Step 03 additions.** This document is
+> the **contract** for the command-line surface over the durable local project
+> foundation. It describes exactly what the commands accept, what they print, and
+> how they fail. It is **not** a scientific or approval contract and it claims
+> **no** scientific validation.
 >
 > It covers: projects/registry, immutable artifact revisions, a **private local
-> storage snapshot** (`backup`/`export`) and **non-authorizing local
-> storage-fixture review state** (`fixture`). The `fixture` commands record a
-> local *fixture* only; they are **never** a real protocol/pilot/outline/final
-> release approval and never authorize execution, export, or science. No
-> agent-execution (`run`/`worker`/`model`) or scientific-`approve` command exists
-> here.
+> storage snapshot** (`backup`/`export`), **non-authorizing local storage-fixture
+> review state** (`fixture`), the **worker lifecycle** commands
+> `worker start|status|stop` over the already-integrated detached-worker process
+> layer, and — the later Step 03 addition — **synthetic durable job control**
+> (`job run|status|list|pause|resume|cancel|switch|drain|reconcile|attach`) over
+> the integrated synthetic worker engine. The `fixture` commands record a local
+> *fixture* only; they are **never** a real protocol/pilot/outline/final release
+> approval and never authorize execution, export, or science. The `worker`
+> commands manage the worker **process lifecycle** only. The `job` commands run
+> and control **bounded synthetic** tasks only: they accept **no** real model,
+> provider, credential, or budget setting, make no network call, and perform or
+> imply no scientific approval.
+>
+> **This is not a real-execution product.** Every task is a bounded *synthetic
+> numeric* task or a synthetic *waiting-human* gate. Durable job states, run/
+> attach/job control, recovery, budgets, and project activation are all exercised
+> locally against the synthetic engine; real agent integration follows in a later
+> step. A `job run` reserve is a small, clearly **virtual** synthetic value — not
+> real money — and nothing here is a scientific result.
 
 The contract was decided in task T6a; the exact spellings below are the T6a
 decision. The behavior boundaries are fixed by
@@ -341,38 +355,229 @@ $ review-article-agent --data-dir ./other-state backup restore ./snap-1 ./restor
 $ review-article-agent --data-dir "$DD" export ./snap-1b --project <PROJECT_ID>   # same private format
 ```
 
-## 9. Explicit exclusions (Step 02)
+## 9. Worker lifecycle — `worker` (Step 03 boundary)
 
-* No scientific `approve`/`reject` and no `run`/`pause`/`resume`, `worker`, or
-  `model`/provider command exists here. Those depend on later steps' execution
-  and scientific-approval layers and are **not** reimplemented in the CLI.
+`worker` manages the **process lifecycle** of the detached background worker over
+the already-integrated launcher
+[`review_article_agent.worker.process`](../src/review_article_agent/worker/process.py)
+and the owner-only local control socket
+([`review_article_agent.runtime.ipc`](../src/review_article_agent/runtime/ipc.py)).
+It is **lifecycle control only**. Together with `job run` (which may ensure a
+worker is running before it submits), it is the only surface that acts on the
+worker *process*; no ordinary project command starts or stops a worker (see
+below).
+
+| Command | Synopsis |
+| --- | --- |
+| `worker start [--timeout SECONDS]` | Ensure a detached worker is running for the resolved data directory. Idempotent: if a verified worker already answers, no process is launched. Reports **readiness**, never job completion. |
+| `worker status [--timeout SECONDS]` | Show the **verified** worker status for the data directory. |
+| `worker stop [--timeout SECONDS]` | Stop the worker by **authenticated control request** (never a signal, never a PID file, never a deletion of an ordinary service). |
+
+All three use the **global** data-directory resolution (`--data-dir` > config
+`data_dir` > XDG default, §2) and the same optional config file (§4). No worker
+command accepts a project, a model/provider/credential, or a budget setting.
+
+`--timeout SECONDS` is optional and bounded: it is parsed from the raw string and
+must be a finite number greater than `0` and at most `3600`. When omitted, the
+launcher's own default is used. The value is **never echoed** — an invalid or
+secret-looking token yields a static validation error (§3).
+
+**`worker start` — readiness, not execution.** On success the result carries
+`readiness="ready"`, `job_completion=false`, `scientific_validation=false`, and
+the verified `pid`/`state`; `started` is `true` only when this call launched the
+process (`false` for an idempotent re-start). Starting a worker runs no task and
+proves no job completed.
+
+**`worker status` — an explicit reason.** Output has `running` and `verified`
+plus, for a non-running result, an explicit curated `reason` (`not_running`,
+`foreign_endpoint`, or `unavailable`). `running=false` is **not** by itself proof
+that all is well; the `reason` distinguishes a cleanly stopped worker from an
+unavailable control plane or a foreign endpoint. `status` itself does not start,
+stop, or otherwise act on a worker.
+
+**`worker stop` — confirmed or not success.** The request is routed through the
+owner-authenticated control socket and is credited only when the socket is then
+**confirmed gone**:
+
+| Outcome | Result |
+| --- | --- |
+| Stop confirmed (worker acknowledged and the endpoint is gone) | exit `0`; `stopped=true`, `already_stopped=false`. |
+| Worker already confirmed **not running** | exit `0`; idempotent `stopped=true`, **`already_stopped=true`**. |
+| Stop **unconfirmed** (delivered but the worker never confirmed shutdown) | exit `4` (`storage`), not success. |
+| Control endpoint **unavailable** | exit `4` (`storage`), not success. |
+| A **foreign** endpoint occupies the control path, or its acknowledgement is missing/malformed (not our verified worker) | exit `3` (`conflict`), not success; the shutdown is unconfirmed and nothing was signalled. |
+
+An unconfirmed, unavailable, or foreign stop is a **stable non-success** with a
+curated, actionable message; it is never reported as a successful stop, and no
+signal is ever sent. `worker start` that never becomes ready is exit `4`
+(`storage`). These typed errors use the existing exit taxonomy (§3):
+`validation` `2`, `conflict` `3`, `storage` `4`.
+
+**Selection is not execution.** `create`, `list`, `select`, and the top-level
+`status` never start, stop, or probe the worker; selecting or creating a project
+is not running it.
+
+## 10. Synthetic job control — `job` (Step 03)
+
+`job` runs and controls **bounded synthetic** durable jobs over the integrated
+worker engine ([`review_article_agent.worker.engine`](../src/review_article_agent/worker/engine.py)),
+reached through the owner-authenticated control transport
+([`review_article_agent.runtime.ipc`](../src/review_article_agent/runtime/ipc.py)).
+There is **no** real model, provider, network call, or scientific approval: the
+only submittable task kinds are `synthetic_numeric` and
+`synthetic_waiting_human`. No arbitrary result JSON, source document, path, or
+credential is ever accepted.
+
+| Command | Synopsis |
+| --- | --- |
+| `job run --request-id ID [--task-kind K] [--steps N] [--delay-ms MS] [--outcome O] [--stage S] [--reserve USD] [--project ID] [--timeout SECONDS]` | Ensure a worker is running and submit one synthetic job. Returns **admission**, never completion. |
+| `job status JOB_ID [--project ID] [--timeout SECONDS]` | One job's durable status (read-only). |
+| `job list [--project ID] [--timeout SECONDS]` | A project's jobs (read-only). |
+| `job pause [JOB_ID] [--project ID]` | Stop scheduling new work (a durable state; preserves an unresolved outcome). |
+| `job resume [JOB_ID] [--project ID]` | Re-acquire execution and resume scheduling. |
+| `job cancel [JOB_ID] [--project ID]` | Stop scheduling; terminal for **scheduling** only. |
+| `job switch --project ID [--timeout SECONDS]` | Safely make another project execution-active (drains the old one). |
+| `job drain [--project ID] [--timeout SECONDS]` | Persist a durable pause and begin draining the execution-active project. |
+| `job reconcile JOB_ID --resolution R [--result-value N] [--confirm-quiesced] [--project ID]` | Record an explicit **owner disposition**; no arbitrary result payload. |
+| `job attach JOB_ID [--once\|--watch] [--poll-interval SECONDS] [--timeout SECONDS] [--project ID]` | Read-only status snapshots; `--watch` streams newline-delimited JSON. |
+
+All commands use the **global** data-directory resolution (`--data-dir` > config
+`data_dir` > XDG default, §2) and the same optional config file (§4). When
+`--project` is omitted, the **active selected project** is used (§5). No `job`
+command accepts a model/provider/credential/budget setting.
+
+### `job run` — admission, not completion
+
+`job run` **explicitly ensures a worker is running** (starting one only if
+needed) and then sends one `submit` control request. It returns the durable job
+acknowledgement with `submitted=true`, `job_completion=false`,
+`virtual_reserve=true`, and `scientific_validation=false`. A returning `run`
+means the job was **admitted**, never that it completed; completion is observed
+later from a *new* CLI via `job status`/`job attach`. `--request-id` is a
+required stable idempotency key: an identical replay is stable and a divergent
+replay is a `conflict`.
+
+Bounded parameters (all parsed as strings so an invalid or secret-looking token
+is never echoed):
+
+| Option | Meaning |
+| --- | --- |
+| `--task-kind K` | `synthetic_numeric` (default) or `synthetic_waiting_human`. |
+| `--steps N` | Integer `1..1000` (default `1`). |
+| `--delay-ms MS` | Integer `0..60000` (default `0`). |
+| `--outcome O` | `complete` (default), `failure`, or `ambiguous`. |
+| `--stage S` | Synthetic stage identifier (default `cli`). |
+| `--reserve USD` | Small, exact, strictly positive **virtual** synthetic reserve (default `0.01`). It is **not real money** and no provider is contacted. |
+
+### Authentication and detachment
+
+Every `job` command first probes the worker
+(`worker.process.worker_status`, verifying our application marker and the
+kernel-reported PID) and sends its control request bound to that verified PID
+(`expected_peer_pid`), so a replaced or foreign listener at the control path
+cannot receive a payload. **Only `job run` ever starts a worker**; queries and
+controls never start one implicitly. A missing/unverified worker is a stable
+non-success (exit `4`); a foreign endpoint is a `conflict` (exit `3`).
+
+`job attach` reads fresh job status snapshots and **never** cancels a job on CLI
+exit — a normal exit, a Ctrl-C, or a closed downstream pipe detaches cleanly with
+no traceback and sends no cancel. It is bounded by a poll interval
+(`--poll-interval`, accepted range `0.05..60`, default `0.5`) and an overall
+`--timeout` (default `60`), and stops at a terminal scheduling state. The overall
+deadline is fixed **before** the first probe, every query's timeout is capped by
+the remaining budget, and no query is issued after the deadline. By default it
+prints one JSON snapshot (`--once`); `--watch` streams **one JSON object per
+line** (newline-delimited JSON) — the one documented exception to the
+single-JSON-document rule (§3).
+
+To keep a read-only exit unambiguous, **each** `--watch` line carries
+`"snapshot": true` and `"terminal": <bool>`, and the stream ends with an explicit
+`{"watch_end": {"reason": "terminal"|"timeout", "terminal_reached": <bool>}}`
+marker. A `timeout` marker reports `terminal_reached=false` and never claims a
+terminal result; `job attach` never dispatches new work.
+
+### Truthful outcomes (no blanket atomicity claim)
+
+Because the control request may reach the worker and change durable state *before*
+the CLI observes a reply, only a **pure local pre-RPC validation** (or a pre-send
+peer refusal) states that nothing was sent. Every other failure is honest about
+uncertainty:
+
+* A **transport failure at or after the send boundary** (a timeout, a lost or
+  truncated response, a closed connection, a socket error) is reported with an
+  **unconfirmed outcome**: the request may already have been applied. Inspect the
+  durable job with `job status`/`job list`, or retry with the **exact same
+  `--request-id`** (never a new identity) so an idempotent replay cannot create a
+  second job.
+* A **conflict** (including a blocked `job switch`) is reported as not-success
+  with a direction to inspect the state first — it makes **no** "nothing changed"
+  claim, because a blocked switch persists a durable pause on the old project
+  before it can find that arbitration is still blocked.
+* A worker-reported **internal** failure is likewise reported as unconfirmed.
+
+### `job reconcile` — explicit owner disposition only
+
+`job reconcile` accepts only the engine's fixed owner dispositions, never an
+arbitrary JSON result:
+
+| `--resolution` | Meaning |
+| --- | --- |
+| `accepted_local_result` | Accept a fixed synthetic numeric result; requires `--result-value N` (`0..999999`) and `--confirm-quiesced`. |
+| `definitive_failure` | Record a definitive local failure; requires `--confirm-quiesced`. |
+| `human_escalation` | Move the job to `waiting_human` (a safe option). |
+| `keep_unresolved` | Keep the job unresolved (`waiting_external`) (a safe option). |
+
+A terminal disposition (`accepted_local_result`, `definitive_failure`) requires
+the explicit **`--confirm-quiesced`** acknowledgement; without it the command
+fails with a validation error and nothing is changed.
+
+**Scientific approvals are not exposed.** There is no `approve`/`reject` command
+and no in-band result, actor, or authority flag. `job resume` does not clear an
+unknown/unresolved outcome, raise a budget cap, or bypass a waiting gate; it
+reports the visible job state instead. `job cancel` stops scheduling but never
+terminal-clears an ambiguous remote outcome.
+
+## 11. Explicit exclusions (Step 02, and the Step 03 boundary)
+
+* No scientific `approve`/`reject` command exists here, and no arbitrary job
+  `result` payload is accepted. `job reconcile` takes only the fixed owner
+  dispositions in §10. Real agent integration follows in a later step.
+* No `model`/provider/credential/budget command or setting exists here, and none
+  is read from the config file (§4). `worker` and `job` accept no such setting.
 * `fixture` records a local, non-authorizing fixture only. No real
   protocol/pilot/outline/final-release gate and no in-band actor/authority is
   accepted; an imported document still cannot self-grant any approval.
 * No scientific acquisition, evidence validation, or approval is performed or
-  implied. All fixtures and archives are synthetic/private and non-authorizing.
+  implied. All jobs, fixtures, and archives are synthetic/private and
+  non-authorizing, and the worker lifecycle and job control are exercised only
+  with owned disposable processes.
 * `backup`/`export` is a **private local storage snapshot**, not a manuscript
   (Markdown/BibTeX/RIS) or redistribution export; never publish an archive.
 
-## 10. Extension hooks
+## 12. Extension hooks
 
 Adding a subcommand is intentionally small:
 
 1. Add a parser in `build_parser()` (`review_article_agent/cli/main.py`).
-2. Add a handler `cmd_<name>(args, ctx) -> dict | RawBytes` that returns a
-   JSON-ready object.
-3. Register it in `_COMMANDS`, `_ARTIFACT_COMMANDS`, `_BACKUP_COMMANDS`, or
-   `_FIXTURE_COMMANDS`.
+2. Add a handler `cmd_<name>(args, ctx) -> dict | RawBytes | StreamNDJSON` that
+   returns a JSON-ready object (or a newline-delimited stream for a `--watch`).
+3. Register it in `_COMMANDS`, `_ARTIFACT_COMMANDS`, `_BACKUP_COMMANDS`,
+   `_FIXTURE_COMMANDS`, `WORKER_COMMANDS` (in
+   `review_article_agent/cli/worker.py`), or `JOB_COMMANDS` (in
+   `review_article_agent/cli/jobs.py`).
 
 Handlers receive a `Context` holding the resolved `Registry`, the data directory,
 the parsed config, and the environment, and never touch global state. New exit
 categories are added to `classify_error()` and this table.
 
-## 11. Verification
+## 13. Verification
 
 * `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` — includes
   the real-subprocess CLI acceptance tests (`tests/test_cli.py`,
-  `tests/test_cli_snapshot.py`) and the config tests (`tests/test_config.py`).
+  `tests/test_cli_snapshot.py`), the config tests (`tests/test_config.py`), the
+  worker-lifecycle CLI tests (`tests/test_cli_worker.py`), the real
+  detached worker-process tests (`tests/test_worker_process.py`), and the
+  real-subprocess job-control CLI tests (`tests/test_cli_jobs.py`).
 * `python3 scripts/check_contract_docs.py --self-test` — the Step 01 contract
   checks remain green (this document adds no fixtures or schema field semantics).
 * The packaged console script and the absence of an invented license are checked
