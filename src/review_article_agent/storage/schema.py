@@ -42,7 +42,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 9
+STORE_SCHEMA_VERSION = 10
 
 #: Registry maps project IDs to names and locations, records the single
 #: *selected* project, and records durable **execution activation** (which
@@ -1196,6 +1196,98 @@ def _store_v9(conn: sqlite3.Connection) -> None:
         )
 
 
+def _store_v10(conn: sqlite3.Connection) -> None:
+    """Add the durable **pre-transport session-turn intent correlation** (C02 §6.1/§8.1).
+
+    This table backs :mod:`review_article_agent.storage.session_intents`: the
+    immutable record of the **exact** deterministic session-turn specification a
+    future runner will transport, recorded **before** transport so a restart can
+    prove the exact session/dispatch/message/admission pins without a live
+    service or manager.
+
+    Only a new table and triggers are added; migrations 1-9 (project identity,
+    artifacts, revisions, rights, dependencies, import requests, fixture approvals,
+    the synthetic job/attempt/budget tables, the runtime task/session/proposal
+    mappings, the runtime dispatch/cost ledger, the human approvals, the
+    pre-dispatch decision request intent, and the per-question decision result
+    observation) are never rewritten, so their exact bytes/refs are preserved
+    across the upgrade (``ARCH-ASSETS``; step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **One immutable intent per dispatch.** The row is keyed by the same-project
+      ``(project_id, dispatch_id)`` and foreign-keys the existing
+      ``runtime_dispatch`` identity, its ``runtime_bounded_task``, and its
+      ``runtime_session_mapping``, so an intent can never name a foreign project,
+      a missing parent, or a task/session mapping the dispatch does not pin.
+    * **One correlation per session/admission.** ``UNIQUE (project_id, session_id,
+      admission_id)`` prevents the same client admission id from being reused by a
+      second session in the same project.
+    * **Append-only.** The row is immutable (never ``UPDATE``d/``DELETE``d), so the
+      exact canonical spec bytes, message bytes, digests, IDs, and time can never
+      be rewritten; a change is always refused (divergence), never an update.
+    * **Canonical bytes are the truth.** ``canonical`` holds the exact canonical
+      session-turn plan bytes and ``message`` the exact canonical application
+      message bytes; ``spec_digest``/``message_digest`` are their recomputed
+      SHA-256 values. Projected columns must agree with the canonical bytes on
+      every read, so a tampered column is detected rather than trusted.
+    * **No authority or source guarantee.** The row grants no admission, approval,
+      or execution authority and never changes the dispatch's operational state or
+      cost. ``message`` contains the private application source text by design;
+      this schema makes **no** secret-scanner or no-source guarantee (spec lines
+      62-63; ``docs/storage.md``).
+    """
+    conn.execute(
+        """
+        CREATE TABLE session_turn_intent (
+            project_id          TEXT NOT NULL,
+            dispatch_id         TEXT NOT NULL,
+            intent_id           TEXT NOT NULL,
+            schema_version      INTEGER NOT NULL,
+            fence               INTEGER NOT NULL CHECK (fence >= 1),
+            admission_id        TEXT NOT NULL,
+            session_id          TEXT NOT NULL,
+            mapping_id          TEXT NOT NULL,
+            service_instance_id TEXT NOT NULL,
+            task_id             TEXT NOT NULL,
+            task_fingerprint    TEXT NOT NULL,
+            role                TEXT NOT NULL,
+            model               TEXT NOT NULL,
+            prompt_version      TEXT NOT NULL,
+            input_digest        TEXT NOT NULL,
+            version_digest      TEXT NOT NULL,
+            config_snapshot_id  TEXT NOT NULL,
+            config_digest       TEXT NOT NULL,
+            spec_digest         TEXT NOT NULL,
+            message_digest      TEXT NOT NULL,
+            message_bytes       INTEGER NOT NULL CHECK (message_bytes >= 1),
+            canonical           BLOB NOT NULL,
+            message             BLOB NOT NULL,
+            created_at_utc      TEXT NOT NULL,
+            PRIMARY KEY (project_id, dispatch_id),
+            UNIQUE (project_id, intent_id),
+            UNIQUE (project_id, session_id, admission_id),
+            FOREIGN KEY (project_id, dispatch_id)
+                REFERENCES runtime_dispatch (project_id, dispatch_id),
+            FOREIGN KEY (project_id, task_id)
+                REFERENCES runtime_bounded_task (project_id, task_id),
+            FOREIGN KEY (project_id, mapping_id)
+                REFERENCES runtime_session_mapping (project_id, mapping_id)
+        )
+        """
+    )
+    for event in ("UPDATE", "DELETE"):
+        conn.execute(
+            f"""
+            CREATE TRIGGER session_turn_intent_no_{event.lower()}
+            BEFORE {event} ON session_turn_intent
+            BEGIN
+                SELECT RAISE(ABORT, 'session_turn_intent rows are immutable');
+            END
+            """
+        )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
@@ -1206,6 +1298,7 @@ STORE_MIGRATIONS: Mapping[int, Migration] = {
     7: _store_v7,
     8: _store_v8,
     9: _store_v9,
+    10: _store_v10,
 }
 
 
