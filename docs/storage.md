@@ -399,9 +399,9 @@ bridge (`commit_result`) is implemented, and the bounded session-runner library 
 (`submit_session_turn`/`reconcile_session_turn`) is integrated. No production paid
 generation or hosted transfer is authorized, so no snapshot or restore API claims to
 execute, carry, accept, resume, or retry a runner. A restored snapshot is a storage
-artifact only; it is not proof of remote quiescence. Step 04's acceptance evidence is
-complete but final repository verification is pending, so Step 04 is **not** declared
-complete and no autonomous/unattended runner is live.
+artifact only; it is not proof of remote quiescence. Step 04 is **complete as a
+restricted runtime** (full local verification passed), but no autonomous/unattended
+runner and no scientific workflow is implemented or live.
 
 **Restore proves storage integrity, not remote quiescence.** A restored snapshot
 records admitted/ambiguous durable attempts but is **not** proof that any external

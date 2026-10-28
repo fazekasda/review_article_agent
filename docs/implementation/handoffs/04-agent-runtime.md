@@ -1,12 +1,11 @@
 # Handoff — step 04: restricted agent roles, model adapters, and approvals
 
-**Status: implementation/acceptance evidence complete; final repository
-verification pending.** Step 04 is deliberately left **unticked** in
+**Status: COMPLETE (restricted runtime).** Step 04 is **ticked** in
 [`docs/implementation/README.md`](../README.md). Every original deliverable and
-acceptance criterion has concrete evidence at the integrated revision `8626cee`,
-but the coordinator's **final frozen full-repository verification has not yet run
-against the final documentation head**, so completion is not claimed here. The
-coordinator owns the final run and the tick.
+acceptance criterion has concrete evidence, and the coordinator's **final frozen
+full-repository run passed at `c1f927b`** (see §6.3). Step 04 completes as a
+**restricted runtime validated against a real app-owned service and a fixture
+model** — it is **not** a scientific or paid-generation milestone.
 
 **Scope boundary (authority).** The step document
 [`docs/implementation/04-agent-runtime.md`](../04-agent-runtime.md) is
@@ -22,12 +21,12 @@ are [C01 v1.4](../../contracts/01-identities.md),
 not a replacement specification. Steps 05–15 scientific workflows are out of
 scope. No baseline invariant, acceptance criterion, or policy was weakened.
 
-> **Evidence distinction.** All test numbers below are the **coordinator's**
-> targeted integrated runs at `8626cee` (paths are provenance, with no runtime
-> dependency). The frozen full-core result (1,776 tests at `7ef7a07`) is an
-> **older, historical** checkpoint and is **not** a current full-head verification.
-> The final full run against the final head is **pending**; no frozen latest-head
-> green is claimed.
+> **Evidence distinction.** Each targeted log below is the coordinator's run at
+> its **own** revision (paths are provenance, with no runtime dependency); they are
+> **not** all at one SHA. The frozen full-core result (1,776 tests at `7ef7a07`) is
+> an **older, historical** checkpoint. The **final full run passed at `c1f927b`**
+> (§6.3); this completion update is a **docs-only** change made after that run, and
+> no full run is claimed at this update's own (still-unknown) commit.
 
 ## 1. Scope, base revisions, and authority used
 
@@ -36,12 +35,13 @@ scope. No baseline invariant, acceptance criterion, or policy was weakened.
   handoff/exclusions unedited.
 - **Baseline:** [`docs/specification.md`](../../specification.md) (confirmed; not
   weakened).
-- **Step 04 scope base:** the integrated Step 03 end-state (`2530955`, PR #5). The
-  Step 04 commits are `c2f3907..8626cee` (65 commits).
-- **Current reviewed / integrated revision:** `8626cee`
-  (`8626cee9e3c511a26a899abf21b6da2c2c0d943a`).
-- **This handoff branch:** `task/step04-final-handoff`, based at `8626cee`. It
-  changes **documentation only** (see §9).
+- **Step 04 scope base:** the Step 03 implementation `2530955`, merged as
+  `c9ee4e69a981b101e59e2c61330c5906105817d1`.
+- **Integrated product code:** `8626cee`
+  (`8626cee9e3c511a26a899abf21b6da2c2c0d943a`); the docs-only handoff commit is
+  `c1f927b` (this handoff, integrated).
+- **This handoff branch:** `task/step04-final-handoff`. It changes
+  **documentation only** (see §9).
 
 ## 2. Deliverables → implementation and tests
 
@@ -76,8 +76,9 @@ Boundaries kept: the caller supplies the activation token; the manager and the
 registered store/tasks/dispatches already exist; there is **one external serial
 slot**; the app-owned service owns the bounded turn **after the submitting process
 exits**; reconciliation is an **explicit application call**, **not** an automatic
-workflow daemon. **No autonomous scientific run happens until the human gate.**
-There is **no** new model-task CLI and **no** detached executor. The Step 03
+workflow daemon. **No scientific autonomous workflow is implemented at all** —
+there is no run surface (and no upcoming run) beyond the human-gated library
+calls. There is **no** new model-task CLI and **no** detached executor. The Step 03
 worker remains a **synthetic** executor but now sees runtime-outstanding /
 switch-blocking arbitration; it does not natively schedule model tasks.
 
@@ -114,42 +115,43 @@ Step document AC1–AC7. Names are `tests/<module>::<Class>::<test>`.
 
 ## 6. Verification — commands and results
 
-### 6.1 Coordinator targeted integrated runs at `8626cee` (read-only logs)
+### 6.1 Coordinator targeted integrated runs (read-only logs; each at its own SHA)
 
-| Log | Result |
-| --- | --- |
-| `/tmp/opencode/step04-real-runner-integrated.log` | **41 OK** = 37 deterministic (`test_session_runner.py`) + 4 real-service acceptance (`test_session_runner_acceptance.py`); only a pre-existing `ResourceWarning: subprocess … is still running` |
-| `/tmp/opencode/step04-session-path-integrated.log` | **314 OK** |
-| `/tmp/opencode/step04-consolidation-integrated.log` | **159 OK** (backup suite) + **56 OK** (intent/commit suite) + **29 contract-doc checks OK** |
-| `/tmp/opencode/step04-saved-grant-integrated.log` | **17 OK, no skips** (real-service acceptance module) |
+| Log | Revision | Result |
+| --- | --- | --- |
+| `/tmp/opencode/step04-real-runner-integrated.log` | `8626cee` | **41 OK** = 37 deterministic (`test_session_runner.py`) + 4 real-service acceptance (`test_session_runner_acceptance.py`); only a pre-existing `ResourceWarning: subprocess … is still running` |
+| `/tmp/opencode/step04-session-path-integrated.log` | `b791d6f` | **314 OK** |
+| `/tmp/opencode/step04-consolidation-integrated.log` | `f6005df` | **159 OK** (backup suite) + **56 OK** (intent/commit suite) + **29 contract-doc checks OK** |
+| `/tmp/opencode/step04-saved-grant-integrated.log` | `3106687` | **17 OK, no skips** (real-service acceptance module) |
 
 ### 6.2 Frozen historical checkpoint (older, **not** current)
 
 - `/tmp/opencode/step04-frozen-7ef7a07-core.log` — **1,776 tests OK** at the older
   `7ef7a07`. This is **historical** and does **not** verify the current head.
 
-### 6.3 Full verification to reproduce (coordinator runs once, after doc integration)
+### 6.3 Final full verification — `bash /tmp/opencode/step04-checks.sh`
 
-From the repository root (`bash /tmp/opencode/step04-checks.sh`):
+Coordinator run at `c1f927b` (clean, unchanged head), log
+`/tmp/opencode/step04-final-all-checks.log`; **ALL LOCAL CHECKS PASSED**:
 
-```console
-$ git rev-parse HEAD                       # expect the final head
-$ python3 --version
-$ PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
-$ python3 -m unittest discover -s scripts -p 'test_*.py'
-$ python3 scripts/check_contract_docs.py --self-test
-$ (cd spikes/runtime/python && python3 -m unittest)
-$ (cd spikes/runtime/live-jev && python3 -m unittest)
-$ (cd spikes/runtime/integration && python3 -m unittest)
-$ npm --prefix spikes/runtime/typescript test
-$ (cd spikes/runtime/typescript && npx tsc --noEmit)
-$ python3 -m compileall -q src tests
-$ git diff --check
-```
+| Check | Result |
+| --- | --- |
+| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` | **1890 OK**, no skips |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **20 OK** |
+| `python3 scripts/check_contract_docs.py --self-test` | **29 checks passed** |
+| `spikes/runtime/python` | **79 OK** |
+| `spikes/runtime/live-jev` | **51 OK** |
+| `spikes/runtime/integration` | **7 OK** |
+| `npm --prefix spikes/runtime/typescript test` | **58 OK** |
+| `(cd spikes/runtime/typescript && npx tsc --noEmit)` | passed |
+| `python3 -m compileall -q src tests` + `git diff --check` | passed |
 
-`scripts/check_contract_docs.py --self-test` was re-run on this documentation
-checkout and reports **29 checks ok, 0 failed**. **CI:** no CI workflows are
-configured (local verification only); there is **no** CI-green claim.
+**Total 2,105 tests, no skips.** Pre-existing SQLite/subprocess
+`ResourceWarning`s remain (disclosed, not failures). **CI:** `gh` API reports **0
+workflows**; no CI-green claim. This run is at `c1f927b` and is **pre** this
+docs-only completion update; the reproduce command is the script above, and
+`scripts/check_contract_docs.py --self-test` on this checkout reports **29 checks
+ok, 0 failed**.
 
 ## 7. REAL vs FIXTURE, and the explicit limits (do not overclaim)
 
@@ -162,8 +164,9 @@ permission-evaluation API; the runner's **default real client** construction; th
 durable intent/mapping/dispatch/proposal rows; a **real** durable saved `always`
 grant and the app human-approval boundary that refuses it; and a **fresh** critic
 with a different concrete model and empty history. **Permission deny** here means
-**no tools + a proposal-only API**, **not** an OS sandbox and **not** native
-same-UID containment.
+an **enforced denial** by the service's permission API plus a **proposal-only**
+application interface — **not** tool absence (`skill` may remain advertised but is
+denied), **not** an OS sandbox, and **not** native same-UID containment.
 
 **FIXTURE (synthetic):** **only the model transport** —
 [`tests/_runtime_model_fixture.py`](../../../tests/_runtime_model_fixture.py), a
@@ -211,30 +214,27 @@ no real OpenRouter call, **no new daemon or direct CLI loop**.
 
 ## 9. Commits, changed files, and next actions
 
-- **Step 04 scope base:** the integrated Step 03 end-state (`2530955`, PR #5).
-  **Step 04 commits:** `c2f3907..8626cee` (65 commits). **HEAD:** `8626cee`
-  (`8626cee9e3c511a26a899abf21b6da2c2c0d943a`).
-- **This documentation-only handoff branch** (`task/step04-final-handoff`, based at
-  `8626cee`) changes exactly these paths — **no source, test, config, contract,
-  schema, baseline, step-criteria, or policy edit**:
+- **Step 04 scope base:** Step 03 implementation `2530955`, merged as
+  `c9ee4e69a981b101e59e2c61330c5906105817d1`. **Integrated product code:**
+  `8626cee` (`8626cee9e3c511a26a899abf21b6da2c2c0d943a`). **Docs-only handoff
+  commit:** `c1f927b` (this handoff, integrated; same file tree as the branch
+  commit `8440c9b`).
+- **This documentation-only branch** (`task/step04-final-handoff`) changes only
+  docs — **no source, test, config, contract, schema, baseline, step-criteria, or
+  policy edit**:
   - `docs/implementation/handoffs/04-agent-runtime.md` (**new**, this file);
-  - `docs/implementation/README.md` — replaces the stale Step 04 line with an
-    accurate status and this handoff link; the line stays **unticked**
-    (*implementation/acceptance evidence complete; final repository verification
-    pending*);
+  - `docs/implementation/README.md` — ticks Step 04 as **complete (restricted
+    runtime)** and links this handoff;
   - `README.md` — replaces the false *"no model, provider, network, agent
-    execution"* claim with the accurate restricted-runtime state (real owned
-    service + fixture-model validation; not a working review writer) and links this
-    handoff;
-  - `docs/storage.md` — corrects the stale *"runner/CLI integration is not done /
-    no runner is live"* paragraphs to the now-integrated bounded session-runner
-    library state (production live generation/hosted transfer still blocked);
-  - `docs/worker.md` — clarifies the runtime arbitration / API boundary (the Step 03
-    worker stays a synthetic executor but shares the single serial slot and
-    switch-blocking with the Step 04 runtime dispatch ledger);
-  - `docs/cli.md` — a tiny accuracy fix to the stale *"Step 04 execution surface
-    still pending"* / *"real agent integration follows in a later step"* wording.
-- **Next actions:** the coordinator runs the §6.3 full verification once against the
-  final head, then ticks Step 04 and opens the PR (using the repository template);
-  review and merge are the user's. The next implementation step is **Step 05 —
-  reproducible discovery and corpus freeze** ([`05-discovery.md`](../05-discovery.md)).
+    execution"* claim with the accurate restricted-runtime state;
+  - `docs/storage.md` — corrects the stale *"runner/CLI integration is not done"*
+    paragraphs to the integrated bounded session-runner library state;
+  - `docs/worker.md` — clarifies the runtime arbitration / API boundary;
+  - `docs/cli.md` — a tiny accuracy fix to the stale Step 04 wording.
+- **Provenance of the tick:** the coordinator's final run was at `c1f927b`; the
+  completion edits above are a **later docs-only** change. The coordinator will
+  prove the product tree is code-identical and re-check the final docs at the final
+  head (no SHA invented here).
+- **Next actions:** review and merge are the user's. The next implementation step is
+  **Step 05 — reproducible discovery and corpus freeze**
+  ([`05-discovery.md`](../05-discovery.md)); no other feature is needed here.

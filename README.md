@@ -39,8 +39,9 @@ loopback fixture**: there is **no** paid provider call, provider credential, or
 network egress (actual spend **USD 0**), **no** production paid generation or hosted
 transfer is authorized, and this is **still not** a working review writer — **no**
 scientific feature, production model run, or **scientific validation is claimed**.
-Step 04's acceptance evidence is complete; final repository verification is pending
-(see the [Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)).
+Step 04 is **complete as a restricted runtime**: its full local verification passed
+at `c1f927b` (**2,105 tests, no skips**; see the
+[Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)).
 
 ## Getting started (local core only)
 
@@ -88,7 +89,7 @@ the [Step 03 handoff](docs/implementation/handoffs/03-durable-worker.md).
 - [Step 01 handoff (complete)](docs/implementation/handoffs/01-contracts.md)
 - [Step 02 handoff (complete, local foundation)](docs/implementation/handoffs/02-project-foundation.md)
 - [Step 03 handoff (complete, synthetic detached worker)](docs/implementation/handoffs/03-durable-worker.md)
-- [Step 04 handoff (acceptance evidence complete; final verification pending)](docs/implementation/handoffs/04-agent-runtime.md)
+- [Step 04 handoff (complete, restricted runtime)](docs/implementation/handoffs/04-agent-runtime.md)
 - [Step 02 CLI contract](docs/cli.md)
 - [Step 02 storage contract](docs/storage.md)
 - [Step 03 worker runtime safety contract](docs/worker.md)
@@ -98,11 +99,11 @@ the [Step 03 handoff](docs/implementation/handoffs/03-durable-worker.md).
 - [Implementation decision record template](docs/implementation/decision-template.md)
 
 Implementation step 04 (restricted agent roles, model adapters, and approvals; see
-its [step document](docs/implementation/04-agent-runtime.md)) is now **integrated**
-at `8626cee` as a restricted runtime (see the
-[Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)); its acceptance
-evidence is complete and final repository verification is pending, so the step is
-**not yet ticked**. Each implementation session must follow its step document and
+its [step document](docs/implementation/04-agent-runtime.md)) is now **complete as a
+restricted runtime** (integrated at `8626cee`; final full-repository verification
+passed at `c1f927b` — see the
+[Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)). Each
+implementation session must follow its step document and
 leave a handoff report. The step-00 prototypes and the accepted decision records do
 not claim any production feature is implemented or scientifically validated: step 00
 is a spike with a bounded evidence ceiling (the model transport was a fixture; the
@@ -110,5 +111,6 @@ native decision route and per-question live failures remain unexercised), step 0
 a decision/contract session, step 02 is a durable **local** core with no agent
 execution and no scientific approval, step 03 is a synthetic detached worker with no
 model, provider, or scientific approval, and step 04 is a **restricted** runtime
-whose only model transport is a loopback fixture — no production paid generation,
-hosted transfer, scientific feature, or scientific validation is claimed.
+whose only model transport is a loopback fixture — no scientific autonomous
+workflow, production paid generation, hosted transfer, scientific feature, or
+scientific validation is implemented or claimed.
