@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -256,6 +257,27 @@ class _FakeTransport:
         return len(self.calls)
 
 
+class _BlockingTransport(_FakeTransport):
+    """A transport double that signals entry then blocks until released."""
+
+    def __init__(self, entered, release, response):
+        super().__init__([response])
+        self._entered = entered
+        self._release = release
+
+    def __call__(self, body, api_key, *, endpoint, timeout, max_response_bytes):
+        self._entered.set()
+        if not self._release.wait(timeout=10):
+            raise RuntimeError("synthetic blocking transport was never released")
+        return super().__call__(
+            body,
+            api_key,
+            endpoint=endpoint,
+            timeout=timeout,
+            max_response_bytes=max_response_bytes,
+        )
+
+
 class RunnerTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="raa-lead-runner-")
@@ -264,7 +286,8 @@ class RunnerTestBase(unittest.TestCase):
         self.registry = Registry(str(self.tmp / "app"))
         info = self.registry.create_project(str(self.tmp / "proj"))
         self.addCleanup(self._close_store)
-        self.store = ProjectStore.open_at(paths.app_dir_for(info.root_path))
+        self.app_dir = paths.app_dir_for(info.root_path)
+        self.store = ProjectStore.open_at(self.app_dir)
         self.project_id = self.store.project_id
         self.artifacts = ArtifactRepository(self.store)
         self.runtime = RuntimeRepository(self.store)
@@ -358,25 +381,28 @@ class RunnerTestBase(unittest.TestCase):
         config=None,
         document=None,
         parent=None,
+        extra_dependencies=(),
     ):
         document = document if document is not None else _hosted_use_document(
             purpose, config or _config_map(), source_refs
         )
         self.artifacts.create_artifact(artifact_id, kind="report")
+        dependencies = [
+            {
+                "project_id": ref["project_id"],
+                "artifact_id": ref["artifact_id"],
+                "revision_id": ref["revision_id"],
+            }
+            for ref in source_refs
+        ]
+        dependencies.extend(extra_dependencies)
         self.artifacts.import_revision(
             artifact_id=artifact_id,
             content=document,
             origin_locator="import:synthetic",
             rights=_rights(self.project_id, artifact_id, revision_id),
             revision_id=revision_id,
-            dependencies=[
-                {
-                    "project_id": ref["project_id"],
-                    "artifact_id": ref["artifact_id"],
-                    "revision_id": ref["revision_id"],
-                }
-                for ref in source_refs
-            ],
+            dependencies=dependencies,
             parent_revision_id=parent,
         )
         return self.ref(artifact_id, revision_id)
@@ -885,6 +911,226 @@ class ExecuteLeadProposalTest(RunnerTestBase):
         readback = get_lead_outcome(self.store, "req-1")
         self.assertEqual(readback["status"], "completed")
         self.assertIsNotNone(readback["proposal_id"])
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency, amendments, drain, bounded output
+# --------------------------------------------------------------------------- #
+class ConcurrencyAndLifecycleTest(RunnerTestBase):
+    def test_concurrent_duplicate_send_exactly_one_post(self) -> None:
+        # Two callers, two ProjectStore connections (each owned by its thread),
+        # one shared Registry. The new-send decision is made inside the registry
+        # write guard, so at most one caller can ever reach the POST.
+        self.approve_batch(self.interview_batch, "interview")
+        entered = threading.Event()
+        release = threading.Event()
+        transport_a = _BlockingTransport(
+            entered, release, TransportResponse(status=200, body_text=_completion_body())
+        )
+        transport_b = _FakeTransport()
+        results: dict[str, object] = {}
+
+        def worker(name, transport):
+            store = ProjectStore.open_at(self.app_dir)
+            try:
+                results[name] = execute_lead_proposal(
+                    store,
+                    registry=self.registry,
+                    activation_token=self.token,
+                    batch_ref=self.interview_batch,
+                    request_id="race-1",
+                    api_key="sk-or-test-key",
+                    transport=transport,
+                )
+            except BaseException as exc:  # recorded so the assertion can report it
+                results[name] = exc
+            finally:
+                store.close()
+
+        thread_a = threading.Thread(target=worker, args=("a", transport_a))
+        thread_a.start()
+        self.assertTrue(entered.wait(timeout=10), "first caller never reached the POST")
+        thread_b = threading.Thread(target=worker, args=("b", transport_b))
+        thread_b.start()
+        thread_b.join(timeout=20)
+        self.assertFalse(thread_b.is_alive(), "second caller did not finish")
+        release.set()
+        thread_a.join(timeout=20)
+        self.assertFalse(thread_a.is_alive(), "first caller did not finish")
+
+        result_a = results.get("a")
+        result_b = results.get("b")
+        self.assertIsInstance(result_a, dict, msg=f"first caller failed: {result_a!r}")
+        self.assertEqual(result_a["status"], "completed")
+        self.assertIsInstance(result_b, dict, msg=f"second caller failed: {result_b!r}")
+        # The loser observes the in-flight/stored state without mutating remote
+        # execution and without a second POST.
+        self.assertIn(result_b["status"], ("submitted", "completed"))
+        self.assertEqual(transport_a.call_count, 1)
+        self.assertEqual(transport_b.call_count, 0)
+
+        self.assertEqual(len(self.dispatch.list_dispatches()), 1)
+        record = self.dispatch.get_dispatch_by_request("race-1")
+        self.assertEqual(record.state, "completed")
+        self.assertEqual(record.result_kind, "lead_proposal")
+        task = self.runtime.get_task_by_request("race-1")
+        self.assertEqual(len(self.runtime.proposals_for_task(task.task_id)), 1)
+
+    def test_amended_batch_lineage_edge_and_fresh_gate_permits(self) -> None:
+        v1 = self.put_batch("a-batch-am", "rev-batch-am", "interview", [self.brief_ref])
+        self.approve_batch(v1, "interview")
+        lineage = {**self.ref("a-batch-am", "rev-batch-am"), "role": "version_of"}
+        v2 = self.put_batch(
+            "a-batch-am",
+            "rev-batch-am2",
+            "interview",
+            [self.brief_ref],
+            parent="rev-batch-am",
+            extra_dependencies=[lineage],
+        )
+        # The old (v1) gate is stale: its target is no longer the current head.
+        with self.assertRaises(HostedLeadError):
+            self.run_lead(batch_ref=v1)
+        self.assert_no_dispatch()
+        self.assertEqual(self.transport.call_count, 0)
+        # A fresh exact gate on the amended revision permits the run; the
+        # same-artifact version_of lineage edge is not treated as a source.
+        self.approve_batch(v2, "interview")
+        self.transport.responses.append(
+            TransportResponse(status=200, body_text=_completion_body())
+        )
+        outcome = self.run_lead(batch_ref=v2)
+        self.assertEqual(outcome["status"], "completed")
+        self.assertEqual(self.transport.call_count, 1)
+
+    def test_extra_undeclared_dependency_rejected(self) -> None:
+        extra = self.put_source("a-extra", "rev-extra", _brief_envelope())
+        batch = self.put_batch(
+            "a-batch-extra",
+            "rev-batch-extra",
+            "interview",
+            [self.brief_ref],
+            extra_dependencies=[extra],
+        )
+        self.approve_batch(batch, "interview")
+        with self.assertRaises(HostedLeadError):
+            self.run_lead(batch_ref=batch)
+        self.assert_no_dispatch()
+        self.assertEqual(self.transport.call_count, 0)
+
+    def test_drain_during_post_commits_and_allows_safe_switch(self) -> None:
+        self.approve_batch(self.interview_batch, "interview")
+
+        class _DrainTransport(_FakeTransport):
+            def __init__(self, registry, token, response):
+                super().__init__([response])
+                self._registry = registry
+                self._token = token
+                self._drained = False
+
+            def __call__(self, body, api_key, *, endpoint, timeout, max_response_bytes):
+                if not self._drained:
+                    self._registry.begin_drain(self._token)
+                    self._drained = True
+                return super().__call__(
+                    body,
+                    api_key,
+                    endpoint=endpoint,
+                    timeout=timeout,
+                    max_response_bytes=max_response_bytes,
+                )
+
+        transport = _DrainTransport(
+            self.registry, self.token, TransportResponse(status=200, body_text=_completion_body())
+        )
+        outcome = self.run_lead(transport=transport)
+        self.assertEqual(outcome["status"], "completed")
+        self.assertEqual(outcome["cost_state"], "known")
+        self.assertIsNotNone(outcome["actual_model"])
+        self.assertEqual(transport.call_count, 1)
+        record = self.dispatch.get_dispatch_by_request("req-1")
+        self.assertEqual(record.state, "completed")
+        task = self.runtime.get_task_by_request("req-1")
+        self.assertEqual(len(self.runtime.proposals_for_task(task.task_id)), 1)
+
+        # A later safe switch is permitted: the drained activation releases, then
+        # re-activates, and a replay returns the stored outcome with no re-POST.
+        self.registry.release_execution(self.token)
+        new_token = self.registry.activate_execution(self.project_id).activation_token
+        spy = _FakeTransport()
+        replay = self.run_lead(transport=spy, token=new_token)
+        self.assertEqual(replay["status"], "completed")
+        self.assertEqual(spy.call_count, 0)
+        self.assertEqual(len(self.dispatch.list_dispatches()), 1)
+
+    def test_foreign_token_rejected(self) -> None:
+        self.approve_batch(self.interview_batch, "interview")
+        with self.assertRaises(HostedLeadError):
+            self.run_lead(token="act_ffffffffffffffffffffffffffffffff")
+        self.assert_no_dispatch()
+        self.assertEqual(self.transport.call_count, 0)
+
+    def test_oversized_completion_records_diagnostic(self) -> None:
+        self.approve_batch(self.interview_batch, "interview")
+        self.transport.responses.append(
+            TransportResponse(status=200, body_text=_completion_body(text="x" * 300_000))
+        )
+        outcome = self.run_lead()
+        # A completed output too large to store as a bounded proposal becomes a
+        # diagnostic with the received metadata and the settled cost preserved.
+        self.assertEqual(outcome["status"], "oversized_output")
+        self.assertIsNone(outcome["proposal_id"])
+        self.assertIsNone(outcome["proposal_record_id"])
+        self.assertIsNotNone(outcome["diagnostic_record_id"])
+        self.assertEqual(outcome["cost_state"], "known")
+        self.assertEqual(outcome["cost_amount_usd"], "0.0002")
+        self.assertEqual(outcome["actual_model"], _MODEL_ID)
+        self.assertIsNotNone(outcome["request_sha256"])
+        record = self.dispatch.get_dispatch_by_request("req-1")
+        self.assertEqual(record.state, "completed")
+        self.assertEqual(record.result_kind, "lead_oversized_output")
+        task = self.runtime.get_task_by_request("req-1")
+        proposals = self.runtime.proposals_for_task(task.task_id)
+        self.assertEqual(len(proposals), 1)
+        content = json.loads(proposals[0].canonical.decode("utf-8"))["content"]
+        self.assertEqual(content["outcome"], "oversized_output")
+        self.assertIsNone(content["proposal_text"])
+        # The persisted envelope stays bounded.
+        self.assertLessEqual(len(proposals[0].canonical), 262_144)
+        # The metadata survives a reopen (no in-memory result).
+        reopened = get_lead_outcome(self.store, "req-1")
+        self.assertEqual(reopened["status"], "oversized_output")
+        self.assertEqual(reopened["actual_model"], _MODEL_ID)
+        self.assertEqual(reopened["request_sha256"], outcome["request_sha256"])
+
+    def test_source_edit_after_send_stays_proposal_and_creates_no_approval(self) -> None:
+        self.approve_batch(self.interview_batch, "interview")
+        self.transport.responses.append(
+            TransportResponse(status=200, body_text=_completion_body())
+        )
+        self.run_lead()
+        approvals = HumanApprovalRepository(self.store)
+        before = len(approvals.list_approvals())
+        # A post-send scope edit: a new revision of the live brief input.
+        self.artifacts.import_revision(
+            artifact_id="a-brief",
+            content=_brief_envelope("edited objective"),
+            origin_locator="import:synthetic",
+            rights=_rights(self.project_id, "a-brief", "rev-brief-edit"),
+            revision_id="rev-brief-edit",
+            parent_revision_id="rev-brief",
+        )
+        after = get_lead_outcome(self.store, "req-1")
+        self.assertEqual(after["status"], "completed")
+        self.assertIsNotNone(after["proposal_id"])
+        # The runner created no authoritative approval; the outcome stays a
+        # (still non-authorizing) proposal.
+        self.assertEqual(len(approvals.list_approvals()), before)
+        task = self.runtime.get_task_by_request("req-1")
+        proposal = self.runtime.proposals_for_task(task.task_id)[0]
+        self.assertEqual(proposal.to_mapping()["kind"], "proposal")
+        for forbidden in ("authority", "approval", "authorize"):
+            self.assertNotIn(forbidden, proposal.to_mapping())
 
 
 # --------------------------------------------------------------------------- #

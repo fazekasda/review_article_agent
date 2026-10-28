@@ -175,6 +175,11 @@ _UTC_TIMESTAMP_RE = re.compile(
 RESULT_KIND_PROPOSAL = "lead_proposal"
 RESULT_KIND_REFUSED = "lead_refused"
 RESULT_KIND_PROTOCOL = "lead_protocol_error"
+RESULT_KIND_OVERSIZED = "lead_oversized_output"
+
+#: A completed response too large to store as a bounded proposal is recorded as
+#: this diagnostic outcome (metadata + cost preserved; no proposal text).
+OUTCOME_OVERSIZED = "oversized_output"
 
 #: The bounded scope of the lead task (never free-form caller text).
 _TASK_SCOPE = ("discovery.hosted_use",)
@@ -457,18 +462,27 @@ def _load_batch(store, batch_ref: object):
 
 
 def _verify_batch_sources(revision, source_refs: list[dict]) -> None:
-    """The batch revision must pin **exactly** its declared source refs.
+    """The batch revision's **source** pins must be exactly its declared refs.
 
-    A source ref that is not an exact generic artifact dependency (or a pinned
-    dependency that is not declared) is refused, so the human-approved closure
-    and the in-band manifest can never disagree.
+    A source ref that is not an exact generic artifact dependency, or a pinned
+    non-lineage dependency that is not declared, is refused, so the
+    human-approved closure and the in-band manifest can never disagree. A
+    legitimate amendment pins its own artifact's historical parent as a
+    ``version_of`` lineage edge; that lineage is **not** a source and is
+    excluded here (the generic gate snapshot already verifies it), but any other
+    extra input is still rejected.
     """
-    pinned = {(d.artifact_id, d.revision_id) for d in revision.dependencies}
+    batch_artifact_id = revision.artifact_id
+    source_edges = {
+        (d.artifact_id, d.revision_id)
+        for d in revision.dependencies
+        if not (d.role == "version_of" and d.artifact_id == batch_artifact_id)
+    }
     declared = {(r["artifact_id"], r["revision_id"]) for r in source_refs}
-    if pinned != declared:
+    if source_edges != declared:
         raise HostedLeadError(
             "batch: the declared source references are not exactly the revision's "
-            "pinned dependencies"
+            "pinned source dependencies"
         )
 
 
@@ -787,6 +801,8 @@ def _outcome_from_dispatch(dispatch_record) -> str:
             return "refused"
         if kind == RESULT_KIND_PROTOCOL:
             return "protocol_error"
+        if kind == RESULT_KIND_OVERSIZED:
+            return OUTCOME_OVERSIZED
         return "completed"
     if state == "failed":
         return "failed"
@@ -1053,12 +1069,32 @@ def _commit_result(
     """
     outcome = result.outcome
     metadata = _execution_metadata(prepared, dispatch_id, result)
-    content = _metadata_content(
-        purpose=prepared["purpose"],
-        outcome=outcome,
-        proposal_text=result.proposal_text if outcome == "completed" else None,
-        execution_metadata=metadata,
-    )
+    if outcome == "completed":
+        content = _metadata_content(
+            purpose=prepared["purpose"],
+            outcome="completed",
+            proposal_text=result.proposal_text,
+            execution_metadata=metadata,
+        )
+        if len(canonical_json(content)) > _TASK_SIZE_LIMIT:
+            # The completed output cannot be stored as a bounded proposal:
+            # record an oversized-output diagnostic instead (the received
+            # metadata and the settled cost are preserved, and no unbounded
+            # proposal text is persisted), never a partially-lost result.
+            outcome = OUTCOME_OVERSIZED
+            content = _metadata_content(
+                purpose=prepared["purpose"],
+                outcome=OUTCOME_OVERSIZED,
+                proposal_text=None,
+                execution_metadata=metadata,
+            )
+    else:
+        content = _metadata_content(
+            purpose=prepared["purpose"],
+            outcome=outcome,
+            proposal_text=None,
+            execution_metadata=metadata,
+        )
 
     with store.transaction():
         record = runtime._record_proposal_in_transaction(
@@ -1091,12 +1127,14 @@ def _commit_result(
             # definitive failure and never a retry.
             dispatch._settle_cost_in_transaction(dispatch_id, cost_state="unknown")
             dispatch._recover_in_transaction(dispatch_id)
-        else:  # refused / protocol_error
+        else:  # refused / protocol_error / oversized_output (accepted diagnostics)
             cost_state = "known" if result.cost.state == "known" else "unknown"
             amount = result.cost.amount_usd if cost_state == "known" else None
-            kind = (
-                RESULT_KIND_REFUSED if outcome == "refused" else RESULT_KIND_PROTOCOL
-            )
+            kind = {
+                "refused": RESULT_KIND_REFUSED,
+                "protocol_error": RESULT_KIND_PROTOCOL,
+                OUTCOME_OVERSIZED: RESULT_KIND_OVERSIZED,
+            }[outcome]
             dispatch._settle_cost_in_transaction(
                 dispatch_id, cost_state=cost_state, amount_usd=amount
             )
@@ -1130,9 +1168,12 @@ def execute_lead_proposal(
     ``batch``/``discovery.hosted_use.<purpose>`` gate and every pinned source's
     hosted-transfer rights and context are revalidated, a one-step lead task is
     recorded, and a ``direct_call`` dispatch is reserved **before** the single
-    POST. A completed request is returned from storage without a second POST; an
-    interrupted one recovers to ``unknown`` and is never re-sent. The returned
-    mapping carries only safe IDs/status — never the API key or source text.
+    POST. An already-recorded request is returned from storage without a second
+    POST (the new-send decision and the reserve are made under one registry write
+    guard, so two concurrent callers can never both send); an ambiguous outcome
+    retains its reserve and is never re-sent, and restart reconciliation is the
+    outer worker's job. The returned mapping carries only safe IDs/status — never
+    the API key or source text.
     """
     request_id = _require_identifier(request_id, "request_id")
     if not isinstance(api_key, str) or api_key == "":
@@ -1153,17 +1194,17 @@ def execute_lead_proposal(
         configuration=prepared["role_set"],
     )
 
-    # Replay / reconnect: a request that already exists never POSTs again.
-    existing = dispatch.get_dispatch_by_request(prepared["request_id"])
-    if existing is not None:
-        if existing.state == "submitted":
-            # A restart-orphaned submission recovers to ``unknown``; never re-sent.
-            with store.transaction():
-                dispatch._recover_in_transaction(existing.dispatch_id)
-        return _readback(store, prepared["request_id"], posted=False)
-
-    # Reserve + claim the single send, under the short local write guard.
+    # The single exclusive **new-send** decision is made inside the registry
+    # write guard, together with the reserve and the send claim. Two concurrent
+    # callers therefore can never both proceed to a POST: the loser observes the
+    # recorded dispatch here and returns its in-flight/stored state. A recorded
+    # logical request is never re-sent, and a live duplicate's remote execution
+    # is never mutated (restart reconciliation is the outer worker's job; a
+    # replay only observes).
     with registry.execution_write_guard(activation_token, store.project_id):
+        existing = dispatch.get_dispatch_by_request(prepared["request_id"])
+        if existing is not None:
+            return _readback(store, prepared["request_id"], posted=False)
         dispatch_record = dispatch.reserve_dispatch(
             task_record,
             request_id=prepared["request_id"],
@@ -1188,7 +1229,12 @@ def execute_lead_proposal(
         prepared["plan"], api_key=prepared["api_key"], transport=transport
     )
 
-    with registry.execution_write_guard(activation_token, store.project_id):
+    # Completing/reconciling already-accepted in-flight work must still commit if
+    # the owner began a drain while the request was in flight; the same
+    # token/project is required, and no new dispatch is started here.
+    with registry.execution_write_guard(
+        activation_token, store.project_id, allow_draining=True
+    ):
         return _commit_result(
             store,
             runtime=runtime,
