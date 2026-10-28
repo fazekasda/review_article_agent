@@ -127,9 +127,12 @@ from ..storage.agent_runtime import (
 from .dispatch import DispatchError, DispatchRecord, RuntimeDispatchRepository
 from .opencode import MESSAGE_ID_RE, MAX_ID_LENGTH, assert_explicit_loopback_url
 from .roles import (
+    MAX_ROLE_STEPS,
     MAX_TASK_SIZE_BYTES,
+    SCIENTIFIC_ROLES,
     AgentRoleError,
     BoundedTask,
+    ModelRef,
     RoleConfiguration,
     build_opencode_config,
 )
@@ -558,12 +561,45 @@ def _strict_object(raw: object) -> dict[str, Any]:
     return parsed
 
 
+def _validate_execution_boundary(value: object) -> None:
+    """Require the fixed, non-authorizing boundary with exact keys and real types.
+
+    A forged boundary that swaps a boolean for ``0``/``1`` or a string is refused:
+    Python ``0 == False`` and ``1 == True`` so a value comparison alone is not
+    enough — every flag must be an actual ``bool`` with the fixed value.
+    """
+    _require(
+        isinstance(value, dict) and set(value) == set(_EXECUTION_BOUNDARY),
+        "spec",
+        _MSG_SPEC,
+    )
+    for key, expected in _EXECUTION_BOUNDARY.items():
+        actual = value[key]
+        if isinstance(expected, bool):
+            _require(isinstance(actual, bool) and actual is expected, "spec", _MSG_SPEC)
+        else:
+            _require(isinstance(actual, str) and actual == expected, "spec", _MSG_SPEC)
+
+
 def _validate_spec(spec: "SessionTurnSpec") -> None:
     """Require **every** public field to agree with its canonical/message projection."""
     for name in _STR_SPEC_FIELDS:
         _require(isinstance(getattr(spec, name), str), "spec", _MSG_SPEC)
-    _require(_plain_int(spec.step_limit) and _plain_int(spec.size_limit), "spec", _MSG_SPEC)
+    # Standalone limits: real plain ints in the exact allowed ranges (never bool,
+    # float, 0, or over the bound), independent of any projection comparison.
+    _require(_plain_int(spec.step_limit), "spec", _MSG_SPEC)
+    _require(1 <= spec.step_limit <= MAX_ROLE_STEPS, "spec", _MSG_SPEC)
+    _require(_plain_int(spec.size_limit), "spec", _MSG_SPEC)
+    _require(1 <= spec.size_limit <= MAX_TASK_SIZE_BYTES, "spec", _MSG_SPEC)
     _require(isinstance(spec.fresh_context_required, bool), "spec", _MSG_SPEC)
+    # The standalone role/model fields must be a known scientific role and a valid
+    # explicit model reference with a resolved variant.
+    _require(spec.role in SCIENTIFIC_ROLES, "spec", _MSG_SPEC)
+    try:
+        model_ref = ModelRef.from_mapping(spec.model)
+    except AgentRoleError as exc:
+        raise SessionTurnValidationError("spec", _MSG_SPEC) from exc
+    _require(model_ref.variant is not None and model_ref.ref == spec.model, "spec", _MSG_SPEC)
 
     plan = _strict_object(spec.canonical)
     message = _strict_object(spec.message)
@@ -576,7 +612,8 @@ def _validate_spec(spec: "SessionTurnSpec") -> None:
         _MSG_SPEC,
     )
     _require(plan["context_history"] == "unverified", "spec", _MSG_SPEC)
-    _require(plan["execution_boundary"] == _EXECUTION_BOUNDARY, "spec", _MSG_SPEC)
+    _validate_execution_boundary(plan["execution_boundary"])
+    _require(isinstance(plan["fresh_context_required"], bool), "spec", _MSG_SPEC)
     _require(plan["fresh_context_required"] == spec.fresh_context_required, "spec", _MSG_SPEC)
     _require(spec.fresh_context_required == (spec.role == "section_critic"), "spec", _MSG_SPEC)
     _require(plan["project_id"] == spec.project_id, "spec", _MSG_SPEC)
@@ -676,9 +713,41 @@ def _validate_spec(spec: "SessionTurnSpec") -> None:
         "spec",
         _MSG_SPEC,
     )
+    # The known model/prompt version refs must cross-pin the spec's model and prompt.
+    model_slot = versions.get("model")
+    prompt_slot = versions.get("prompt")
+    _require(
+        isinstance(model_slot, dict)
+        and model_slot.get("state") == "known"
+        and isinstance(model_slot.get("ref"), dict),
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(model_slot["ref"].get("version") == spec.model, "spec", _MSG_SPEC)
+    _require(
+        isinstance(prompt_slot, dict)
+        and prompt_slot.get("state") == "known"
+        and isinstance(prompt_slot.get("ref"), dict),
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(prompt_slot["ref"].get("version") == spec.prompt_version, "spec", _MSG_SPEC)
 
     _require(set(message) == _MESSAGE_KEYS, "spec", _MSG_SPEC)
     _require(message["kind"] == "session_turn_input", "spec", _MSG_SPEC)
+    # The message's own limits must be real plain ints (never bool/float) that
+    # agree with the spec, and the serialized message must respect the size limit.
+    _require(
+        _plain_int(message["step_limit"]) and message["step_limit"] == spec.step_limit,
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(
+        _plain_int(message["size_limit"]) and message["size_limit"] == spec.size_limit,
+        "spec",
+        _MSG_SPEC,
+    )
+    _require(len(spec.message) <= spec.size_limit, "spec", _MSG_SPEC)
     for key, expected in (
         ("project_id", spec.project_id),
         ("role", spec.role),
@@ -696,6 +765,12 @@ def _validate_spec(spec: "SessionTurnSpec") -> None:
     _require(message["target"] == task["target"], "spec", _MSG_SPEC)
     _require(message["input_refs"] == task["input_refs"], "spec", _MSG_SPEC)
     _require(message["versions"] == versions, "spec", _MSG_SPEC)
+    # The application text's own canonical bytes must respect the size limit too.
+    try:
+        text_bytes = canonical_json(message["text"])
+    except (RecordValidationError, ValueError, TypeError, RecursionError, UnicodeError) as exc:
+        raise SessionTurnValidationError("spec", _MSG_SPEC) from exc
+    _require(len(text_bytes) <= spec.size_limit, "spec", _MSG_SPEC)
 
 
 def _store_project_id(store: object) -> str:

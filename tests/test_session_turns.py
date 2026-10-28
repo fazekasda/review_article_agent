@@ -46,6 +46,8 @@ from review_article_agent.runtime import service  # noqa: E402
 from review_article_agent.runtime.dispatch import RuntimeDispatchRepository  # noqa: E402
 from review_article_agent.runtime.opencode import MESSAGE_ID_RE  # noqa: E402
 from review_article_agent.runtime.roles import (  # noqa: E402
+    MAX_ROLE_STEPS,
+    MAX_TASK_SIZE_BYTES,
     BoundedTask,
     CriticConfigError,
     RoleConfiguration,
@@ -1028,6 +1030,180 @@ class SpecSelfCheckTest(SessionTurnPlanTestBase):
             with self.subTest(field=name):
                 with self.assertRaises(SessionTurnValidationError):
                     dataclasses.replace(spec, **{name: bad})
+
+
+class StrictForgeryTest(SessionTurnPlanTestBase):
+    """Forged-but-projection-consistent values must still fail the strict rules.
+
+    Each case rewrites ``canonical`` + ``message`` + the matching public fields and
+    recomputes the message digest and (where needed) the version digest, so the
+    object satisfies the projection/hash/admission checks — the refusal therefore
+    comes from a bounded strict rule (ranges/types/cross-pins), not a projection
+    mismatch.
+    """
+
+    def _spec(self):
+        return self._prepare(self._scenario())
+
+    @staticmethod
+    def _rehash(plan, message):
+        message_bytes = canonical_json(message)
+        plan = dict(plan)
+        plan["message_digest"] = hashlib.sha256(message_bytes).hexdigest()
+        return canonical_json(plan), message_bytes, plan["message_digest"]
+
+    def _assert_rejected(self, spec, plan, message, **field_updates):
+        canonical, message_bytes, digest = self._rehash(plan, message)
+        with self.assertRaises(SessionTurnValidationError) as ctx:
+            dataclasses.replace(
+                spec,
+                canonical=canonical,
+                message=message_bytes,
+                message_digest=digest,
+                **field_updates,
+            )
+        self.assertEqual(ctx.exception.code, "spec")
+        return ctx.exception
+
+    def test_out_of_range_or_boolish_limits_are_rejected(self) -> None:
+        spec = self._spec()
+
+        # A too-small size (0): message bytes cannot fit and the range is invalid.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["task"]["size_limit"] = 0
+        message["size_limit"] = 0
+        self.assertEqual(plan["task"]["size_limit"], 0)
+        self.assertEqual(message["size_limit"], 0)
+        self._assert_rejected(spec, plan, message, size_limit=0)
+
+        # Zero and over-bound step limits.
+        for step in (0, MAX_ROLE_STEPS + 1):
+            plan = spec.to_mapping()
+            message = json.loads(spec.message)
+            plan["task"]["step_limit"] = step
+            message["step_limit"] = step
+            self.assertEqual(plan["task"]["step_limit"], step)
+            self._assert_rejected(spec, plan, message, step_limit=step)
+
+        # Over-bound size limit.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["task"]["size_limit"] = MAX_TASK_SIZE_BYTES + 1
+        message["size_limit"] = MAX_TASK_SIZE_BYTES + 1
+        self._assert_rejected(
+            spec, plan, message, size_limit=MAX_TASK_SIZE_BYTES + 1
+        )
+
+    def test_message_bytes_and_float_message_limit_are_rejected(self) -> None:
+        spec = self._spec()
+
+        # Serialized message over the size limit (projections agree at 512).
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["task"]["size_limit"] = 512
+        message["size_limit"] = 512
+        self.assertGreater(len(spec.message), 512)
+        self._assert_rejected(spec, plan, message, size_limit=512)
+
+        # A float message limit ("8.0" == 8) must still be refused by type.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        message["size_limit"] = float(spec.size_limit)
+        self.assertEqual(message["size_limit"], spec.size_limit)  # 4096.0 == 4096
+        self._assert_rejected(spec, plan, message)
+
+    def test_boolish_fresh_flag_and_boundary_are_rejected(self) -> None:
+        spec = self._spec()
+
+        # ``0 == False`` would pass a value comparison; the strict bool check fails.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["fresh_context_required"] = 0
+        self.assertEqual(plan["fresh_context_required"], spec.fresh_context_required)
+        self._assert_rejected(spec, plan, message)
+
+        # A boundary flag swapped to 1 (``1 == True``) must be refused.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["execution_boundary"]["grants_admission"] = 1
+        self.assertEqual(plan["execution_boundary"]["grants_admission"], True)
+        self._assert_rejected(spec, plan, message)
+
+        # A boundary flag swapped to a string of the same shape must be refused.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["execution_boundary"]["correlation_persisted"] = "False"
+        self._assert_rejected(spec, plan, message)
+
+    def test_version_cross_pins_are_enforced_in_the_constructor(self) -> None:
+        spec = self._spec()
+
+        # Model version drift: recompute the canonical hash so only the cross-pin
+        # (and the projection-consistent session model) is left to catch it.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["versions"]["model"]["ref"]["version"] = "openrouter/other/model#high"
+        message["versions"] = plan["versions"]
+        digest = hashlib.sha256(canonical_json(plan["versions"])).hexdigest()
+        plan["dispatch"]["version_digest"] = digest
+        self.assertEqual(plan["session"]["model"], spec.model)
+        self._assert_rejected(spec, plan, message, version_digest=digest)
+
+        # Prompt version drift.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["versions"]["prompt"]["ref"]["version"] = "other.v1"
+        message["versions"] = plan["versions"]
+        digest = hashlib.sha256(canonical_json(plan["versions"])).hexdigest()
+        plan["dispatch"]["version_digest"] = digest
+        self.assertEqual(plan["task"]["prompt_version"], spec.prompt_version)
+        self._assert_rejected(spec, plan, message, version_digest=digest)
+
+        # A known slot whose ref is not an object is refused (ref kind).
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["versions"]["model"]["ref"] = "openrouter/anthropic/claude-sonnet-5-5#high"
+        message["versions"] = plan["versions"]
+        digest = hashlib.sha256(canonical_json(plan["versions"])).hexdigest()
+        plan["dispatch"]["version_digest"] = digest
+        self._assert_rejected(spec, plan, message, version_digest=digest)
+
+    def test_standalone_role_and_model_fields_are_enforced(self) -> None:
+        spec = self._spec()
+
+        # Unknown role (projections agree on the forged role).
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["role"] = "not_a_role"
+        message["role"] = "not_a_role"
+        self.assertEqual(plan["role"], "not_a_role")
+        self._assert_rejected(spec, plan, message, role="not_a_role")
+
+        # A model reference with no explicit variant is refused, even when the
+        # session projection is rewritten to match.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["session"]["model"] = "openrouter/anthropic/claude-sonnet-5-5"
+        plan["versions"]["model"]["ref"]["version"] = plan["session"]["model"]
+        message["versions"] = plan["versions"]
+        digest = hashlib.sha256(canonical_json(plan["versions"])).hexdigest()
+        plan["dispatch"]["version_digest"] = digest
+        self.assertEqual(plan["session"]["model"], plan["session"]["model"])
+        self._assert_rejected(
+            spec,
+            plan,
+            message,
+            model="openrouter/anthropic/claude-sonnet-5-5",
+            version_digest=digest,
+        )
+
+        # A malformed model reference is refused.
+        plan = spec.to_mapping()
+        message = json.loads(spec.message)
+        plan["session"]["model"] = "not-a-model-ref"
+        message["versions"] = plan["versions"]
+        self._assert_rejected(spec, plan, message, model="not-a-model-ref")
 
 
 class LocationReadOnlyPlanTest(SessionTurnPlanTestBase):
