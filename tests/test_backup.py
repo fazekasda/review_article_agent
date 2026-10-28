@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -22,6 +23,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -31,6 +33,7 @@ from review_article_agent.domain.errors import (  # noqa: E402
     StoreError,
     UnsupportedSchemaVersion,
 )
+from review_article_agent.domain.records import canonical_json  # noqa: E402
 from review_article_agent.storage import (  # noqa: E402
     ApprovalRepository,
     ArtifactRepository,
@@ -38,6 +41,7 @@ from review_article_agent.storage import (  # noqa: E402
     Registry,
 )
 from review_article_agent.storage import paths  # noqa: E402
+from review_article_agent.storage import backup as backup_mod  # noqa: E402
 from review_article_agent.storage.backup import (  # noqa: E402
     MANIFEST_FILENAME,
     SNAPSHOT_FILENAME,
@@ -170,11 +174,37 @@ class BackupTestBase(unittest.TestCase):
         manifest["database"]["byte_size"] = len(data)
         manifest_path.write_text(json.dumps(manifest))
 
-    def tamper_db(self, backup_dir: Path, *statements: str) -> None:
-        conn = sqlite3.connect(str(backup_dir / SNAPSHOT_FILENAME))
+    def tamper_db(
+        self, backup_dir: Path, *statements: str, preserve_schema: bool = False
+    ) -> None:
+        """Execute raw SQL against the snapshot.
+
+        With ``preserve_schema=True`` any *trigger* the statements drop is
+        recreated with its original definition afterwards, so a test that mutates
+        data still exercises inner digest validation rather than merely a missing
+        schema object.
+        """
+        db = str(backup_dir / SNAPSHOT_FILENAME)
+        conn = sqlite3.connect(db)
         try:
+            dropped: dict[str, str] = {}
             for statement in statements:
+                match = re.match(
+                    r"\s*DROP\s+TRIGGER\s+(?:IF\s+EXISTS\s+)?(\S+)\s*;?\s*$",
+                    statement,
+                    re.IGNORECASE,
+                )
+                if match:
+                    row = conn.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                        (match.group(1),),
+                    ).fetchone()
+                    if row and row[0]:
+                        dropped[match.group(1)] = row[0]
                 conn.execute(statement)
+            if preserve_schema:
+                for sql in dropped.values():
+                    conn.execute(sql)
             conn.commit()
         finally:
             conn.close()
@@ -488,6 +518,7 @@ class FailClosedVerificationTest(BackupTestBase):
             dest,
             "DROP TRIGGER revision_no_update",
             "UPDATE revision SET content = X'00' WHERE revision_id = 'rev-d1'",
+            preserve_schema=True,
         )
         self.rewrite_outer_db_hash(dest)
         with self.assertRaises(BackupError):
@@ -499,6 +530,7 @@ class FailClosedVerificationTest(BackupTestBase):
             dest,
             "DROP TRIGGER rights_record_no_update",
             "UPDATE rights_record SET canonical = X'7b7d'",
+            preserve_schema=True,
         )
         self.rewrite_outer_db_hash(dest)
         with self.assertRaises(BackupError):
@@ -511,6 +543,7 @@ class FailClosedVerificationTest(BackupTestBase):
             "DROP TRIGGER fixture_approval_no_update",
             "UPDATE fixture_approval SET snapshot_digest = "
             "'sha256:" + "0" * 64 + "'",
+            preserve_schema=True,
         )
         self.rewrite_outer_db_hash(dest)
         with self.assertRaises(BackupError):
@@ -530,6 +563,7 @@ class FailClosedVerificationTest(BackupTestBase):
             dest,
             "DROP TRIGGER revision_no_update",
             "UPDATE revision SET byte_size = byte_size + 1 WHERE revision_id = 'rev-d1'",
+            preserve_schema=True,
         )
         # The outer database hash is made to match the tampered file.
         self.rewrite_outer_db_hash(dest)
@@ -639,6 +673,184 @@ class FailClosedVerificationTest(BackupTestBase):
         self.assertEqual(sorted(os.listdir(dest)), [MANIFEST_FILENAME, SNAPSHOT_FILENAME])
 
 
+class RepairTrustBoundaryTest(BackupTestBase):
+    """T5-R1 focused repairs: close backup/restore trust-boundary gaps."""
+
+    def _seeded_backup(self):
+        store = self.new_store()
+        self.addCleanup(store.close)
+        seeded = self.seed(store)
+        dest = self.tmp / "backup"
+        create_backup(store, dest)
+        return store, seeded, dest
+
+    # (1) exact rights/revision structural bindings ------------------------- #
+    def test_revision_pinning_other_artifacts_rights_rejected(self) -> None:
+        store, seeded, dest = self._seeded_backup()
+        project_id = store.project_id
+        content = b"forged"
+        sha = _sha(content)
+        # A forged revision under the *finding* artifact that pins the *document*
+        # revision's rights record (a valid record for a different revision).
+        self.tamper_db(
+            dest,
+            "INSERT INTO revision (project_id, artifact_id, revision_id, "
+            "parent_revision_id, content, content_sha256, byte_size, media_type, "
+            "origin_locator, acquired_at_utc, acquired_by, provenance_method, "
+            "provenance_actor, provenance_performed_at_utc, rights_project_id, "
+            "rights_id, rights_record_revision, immutable) VALUES "
+            f"('{project_id}', '{seeded['find'].artifact_id}', 'rev-forged', NULL, "
+            f"X'{content.hex()}', '{sha}', {len(content)}, NULL, 'import:forged', "
+            f"'2026-10-27T00:00:00Z', 'import', 'import', 'forged', "
+            f"'2026-10-27T00:00:00Z', '{project_id}', 'RIGHTS-rev-d1', 1, 1)",
+        )
+        self.rewrite_outer_db_hash(dest)
+        with self.assertRaises(BackupError) as ctx:
+            verify_backup(dest)
+        self.assertIn("bind", str(ctx.exception))
+
+    def test_revision_with_non_storage_rights_rejected(self) -> None:
+        store, seeded, dest = self._seeded_backup()
+        project_id = store.project_id
+        conn = sqlite3.connect(str(dest / SNAPSHOT_FILENAME))
+        try:
+            canonical = conn.execute(
+                "SELECT canonical FROM rights_record WHERE rights_id = "
+                "'RIGHTS-rev-d1' AND record_revision = 1"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        record = json.loads(canonical.decode("utf-8"))
+        record["operations"]["storage"] = "not_allowed"
+        new_canonical = canonical_json(record)
+        self.tamper_db(
+            dest,
+            "DROP TRIGGER rights_record_no_update",
+            "UPDATE rights_record SET canonical = X'" + new_canonical.hex() + "', "
+            "content_sha256 = '" + _sha(new_canonical) + "' WHERE rights_id = "
+            "'RIGHTS-rev-d1' AND record_revision = 1",
+            preserve_schema=True,
+        )
+        self.rewrite_outer_db_hash(dest)
+        with self.assertRaises(BackupError) as ctx:
+            verify_backup(dest)
+        self.assertIn("storage", str(ctx.exception))
+
+    # (2) exact schema-object fingerprint ----------------------------------- #
+    def test_missing_immutability_trigger_rejected(self) -> None:
+        _, _, dest = self._seeded_backup()
+        self.tamper_db(dest, "DROP TRIGGER artifact_no_delete")
+        self.rewrite_outer_db_hash(dest)
+        with self.assertRaises(BackupError) as ctx:
+            verify_backup(dest)
+        self.assertIn("schema", str(ctx.exception))
+
+    def test_added_hidden_column_rejected(self) -> None:
+        _, _, dest = self._seeded_backup()
+        self.tamper_db(dest, "ALTER TABLE revision ADD COLUMN secret TEXT")
+        self.rewrite_outer_db_hash(dest)
+        with self.assertRaises(BackupError) as ctx:
+            verify_backup(dest)
+        self.assertIn("schema", str(ctx.exception))
+
+    # (3) active write transaction is rejected fast ------------------------- #
+    def test_active_transaction_rejected(self) -> None:
+        store = self.new_store()
+        self.addCleanup(store.close)
+        self.seed(store)
+        dest = self.tmp / "backup"
+        with store.transaction():
+            with self.assertRaises(BackupError):
+                create_backup(store, dest)
+        self.assertFalse(os.path.lexists(dest))
+        self.assertEqual(
+            [p.name for p in self.tmp.iterdir() if "staging" in p.name], []
+        )
+
+    # (4) corrupt staging is never published -------------------------------- #
+    def test_corrupt_staging_not_published(self) -> None:
+        store = self.new_store()
+        self.addCleanup(store.close)
+        self.seed(store)
+        dest = self.tmp / "backup"
+        original = backup_mod._snapshot_database
+
+        def corrupt(source, dest_path):
+            original(source, dest_path)
+            conn = sqlite3.connect(dest_path)
+            try:
+                conn.execute("DROP TRIGGER artifact_no_delete")
+                conn.commit()
+            finally:
+                conn.close()
+
+        with mock.patch.object(backup_mod, "_snapshot_database", corrupt):
+            with self.assertRaises(BackupError):
+                create_backup(store, dest)
+        self.assertFalse(os.path.lexists(dest))
+        self.assertEqual(
+            [p.name for p in self.tmp.iterdir() if "staging" in p.name], []
+        )
+
+    # (5) TOCTOU: source change after verify is refused -------------------- #
+    def test_restore_detects_source_change_after_verify(self) -> None:
+        store = self.new_store()
+        self.addCleanup(store.close)
+        self.seed(store)
+        dest = self.tmp / "backup"
+        create_backup(store, dest)
+        root = self.tmp / "target"
+        registry = Registry(self.tmp / "state")
+        original_copy = backup_mod.shutil.copyfile
+
+        def evil_copy(src, dst, *args, **kwargs):
+            conn = sqlite3.connect(src)
+            try:
+                conn.execute("DROP TRIGGER revision_no_update")
+                conn.execute(
+                    "UPDATE revision SET content = X'00' WHERE revision_id = 'rev-d1'"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return original_copy(src, dst, *args, **kwargs)
+
+        with mock.patch.object(backup_mod.shutil, "copyfile", evil_copy):
+            with self.assertRaises(BackupError):
+                restore_backup(dest, root, registry)
+        self.assertFalse(os.path.exists(paths.app_dir_for(str(root))))
+        self.assertEqual(registry.list_projects(), [])
+
+    # (6) malformed manifest JSON is rejected as BackupError --------------- #
+    def test_manifest_duplicate_key_rejected(self) -> None:
+        _, _, dest = self._seeded_backup()
+        path = dest / MANIFEST_FILENAME
+        text = path.read_text()
+        path.write_text(text.replace('"notice":', '"format_version": 1, "notice":', 1))
+        with self.assertRaises(BackupError):
+            verify_backup(dest)
+
+    def test_manifest_nonfinite_constant_rejected(self) -> None:
+        _, _, dest = self._seeded_backup()
+        path = dest / MANIFEST_FILENAME
+        manifest = json.loads(path.read_text())
+        path.write_text(
+            json.dumps(manifest).replace(
+                f'"artifacts": {manifest["counts"]["artifacts"]}',
+                '"artifacts": NaN',
+                1,
+            )
+        )
+        with self.assertRaises(BackupError):
+            verify_backup(dest)
+
+    def test_manifest_deep_nesting_rejected(self) -> None:
+        _, _, dest = self._seeded_backup()
+        (dest / MANIFEST_FILENAME).write_text('{"x": ' + "[" * 4000 + "]" * 4000 + "}")
+        with self.assertRaises(BackupError):
+            verify_backup(dest)
+
+
 class CorruptRejectedBeforeRestoreTest(BackupTestBase):
     def test_corrupt_backup_rejected_before_target_created(self) -> None:
         store = self.new_store()
@@ -650,6 +862,7 @@ class CorruptRejectedBeforeRestoreTest(BackupTestBase):
             dest,
             "DROP TRIGGER revision_no_update",
             "UPDATE revision SET content = X'ff' WHERE revision_id = 'rev-d1'",
+            preserve_schema=True,
         )
         self.rewrite_outer_db_hash(dest)
 

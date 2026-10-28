@@ -35,7 +35,14 @@ Mechanism: a backup is produced with SQLite's **online backup API**
 database file and its `-wal`/`-shm` sidecars are **never** copied directly, so
 committed WAL content is captured and a concurrent writer cannot produce a torn
 backup. Because immutable content is stored as a SQLite BLOB, the snapshot
-captures all data in one consistent database.
+captures all data in one consistent database. The snapshot is converted to a
+self-contained rollback-journal database; a conversion that does not take, or a
+leftover sidecar, is a hard failure rather than a silently shipped WAL.
+
+`create_backup` refuses early if the source connection has an **open write
+transaction** (an online backup started inside the caller's transaction can
+block indefinitely), and it **fully verifies the staged backup before publishing
+it**, so a corrupt source never yields a valid-looking backup at the destination.
 
 The manifest is derived **from the closed snapshot**, never from live state, so
 the digests it records describe exactly the captured bytes.
@@ -55,11 +62,12 @@ application never scans for or automatically ingests secrets; the guarantee is
 withdrawal-by-design (only allowlisted members are written), **not** a general
 credential scanner.
 
-The snapshot database contains exactly the schema-3 project tables (`meta`,
-`project`, `artifact`, `rights_record`, `revision`, `dependency`,
-`import_request`, `fixture_approval`, `fixture_approval_entry`). Any other
-("external") table, or a missing required table, is refused so unknown data is
-never accepted as valid storage.
+The snapshot database must match the schema-3 project schema **exactly**: the
+full set of tables, indices, triggers, and views — including foreign keys and the
+immutability triggers — is compared against the schema the canonical migrations
+generate in memory. Any other ("external") table, a missing or altered object, or
+a hidden added column is refused, so a forged database that merely reuses the
+right table names (and would pass `foreign_key_check`) is never accepted.
 
 All output is owner-private: the backup directory is `0o700`, and
 `manifest.json`/`snapshot.sqlite3` are `0o600`.
@@ -104,16 +112,27 @@ newer manifest/store schema) on any of:
 
 - a symlinked backup directory, member, or sidecar; an unexpected member
   (including a `-wal`/`-shm` sidecar); a non-file member;
-- an invalid/unrecognised manifest, a missing field, an unsafe or traversing
-  database filename, a newer `format_version`, or a newer/unsupported
+- an invalid/unrecognised manifest (including duplicate JSON keys, non-finite
+  constants, over-deep nesting, or invalid UTF-8 — rejected without echoing any
+  untrusted key or value), a missing field, an unsafe or traversing database
+  filename, a newer `format_version`, or a newer/unsupported
   `store_schema_version`;
 - an identity mismatch between the manifest and the snapshot; a failed
   `PRAGMA integrity_check` or non-empty `PRAGMA foreign_key_check`;
-- an unrecognised schema or an external table;
+- a snapshot schema that is not byte-for-byte the canonical schema-3 definition
+  (a missing/altered trigger or constraint, an added hidden column, or an
+  external table);
 - a **recomputed** revision/rights BLOB digest or byte size that does not match
-  the stored column, an invalid rights record, a cross-project key, or an exact
-  rights subject that does not resolve;
-- a dangling dependency or import-request reference;
+  the stored column;
+- a rights record whose canonical body does not equal its denormalized identity
+  and subject columns, that is not a fully valid rights record, or that carries a
+  cross-project key;
+- a revision that does not pin a rights record whose subject binds **this exact
+  revision** (same project, artifact, and revision), or whose pinned rights
+  record does not permit `storage` (metadata-only / pre-acquisition records never
+  authorize content bytes);
+- a dangling or cross-project dependency/import-request reference, or a revision
+  whose artifact or parent does not exist;
 - a local fixture approval that is not the non-authorizing constant, or whose
   exact snapshot (digest, entry digest/size/rights, recorded schema) does not
   verify — including valid historical `stale`/`superseded` rows, which are never
@@ -135,10 +154,13 @@ Because verification **recomputes every inner digest**, rewriting the outer
 3. **No overwrite.** An existing unregistered app-owned directory is refused
    rather than overwritten; unrelated files in the target root are preserved.
 4. **Stage, then register last.** The snapshot is copied into an owner-private
-   staging directory inside the target root, renamed atomically into the
-   app-owned directory, and only then registered. On any failure, only this
-   call's own directories are removed (rollback), leaving no half registry row
-   and no stale approvals.
+   staging directory inside the target root. The staged copy's hash and byte size
+   are re-checked against the verified snapshot digest (closing the window in
+   which the source could change between verification and copy); on a mismatch the
+   restore is refused and its staging removed. The staging directory is renamed
+   atomically into the app-owned directory, and only then registered. On any
+   failure, only this call's own directories are removed (rollback), leaving no
+   half registry row and no stale approvals.
 
 The restored project keeps the snapshot's exact `project_id`; all exact IDs and
 immutable historical approval snapshots are preserved. A new scientific identity
@@ -148,7 +170,10 @@ is never created.
 
 - Only the **current store schema (version 3)** backups are supported. A newer
   store schema is refused clearly; migrations from older schemas (`2 -> 3`) are
-  tested separately and are not part of this module.
+  tested separately and are not part of this module. A fixture approval's
+  *recorded* `storage_schema_version` is validated against the supported range
+  (`1..current`), so a historical version is preserved where supported while an
+  arbitrary/unknown version is refused.
 - `verify_backup` re-validates stored rights records and recomputes content
   digests; it is a structural/integrity check, not a scientific or rights
   decision.

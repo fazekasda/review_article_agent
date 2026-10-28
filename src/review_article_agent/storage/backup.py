@@ -86,6 +86,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from ..domain.errors import (
+    InvalidProjectId,
     ProjectNotFound,
     ProjectPathError,
     StoreError,
@@ -94,6 +95,7 @@ from ..domain.errors import (
 from ..domain.records import (
     RecordValidationError,
     canonical_json,
+    require_storage_allowed,
     validate_rights_record,
 )
 from . import paths, schema
@@ -110,26 +112,16 @@ BACKUP_FORMAT_VERSION = 1
 #: The only supported store schema version for a snapshot.
 SUPPORTED_STORE_SCHEMA_VERSION = schema.STORE_SCHEMA_VERSION
 
+#: Store schema versions whose *recorded* approval ``storage_schema_version`` is
+#: accepted (the historical version survives a restore where supported; an
+#: arbitrary/unknown version is refused). Bounded to ``1..current``.
+_SUPPORTED_RECORDED_SCHEMA_VERSIONS = frozenset(
+    range(1, SUPPORTED_STORE_SCHEMA_VERSION + 1)
+)
+
 #: Fixed allowlisted member names inside a backup directory.
 MANIFEST_FILENAME = "manifest.json"
 SNAPSHOT_FILENAME = "snapshot.sqlite3"
-
-#: The exact set of tables a schema-3 project snapshot may contain. Any other
-#: table (or a missing one) means the snapshot is not our storage and is refused,
-#: so arbitrary/external data is never accepted as valid storage.
-_ALLOWED_SNAPSHOT_TABLES = frozenset(
-    {
-        "meta",
-        "project",
-        "artifact",
-        "rights_record",
-        "revision",
-        "dependency",
-        "import_request",
-        "fixture_approval",
-        "fixture_approval_entry",
-    }
-)
 
 #: The exact keys permitted in the manifest object.
 _MANIFEST_KEYS = frozenset(
@@ -273,18 +265,51 @@ def _open_readonly(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def _user_tables(conn: sqlite3.Connection) -> set[str]:
+def _schema_objects(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
+    """Return ``{(type, name): sql}`` for every user schema object.
+
+    Covers tables, indices, triggers, and views; SQLite-internal objects
+    (``sqlite_*``, e.g. implicit indexes) are ignored.
+    """
     return {
-        row["name"]
+        (row["type"], row["name"]): row["sql"]
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' "
-            "AND name NOT LIKE 'sqlite_%'"
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
         )
     }
 
 
-def _assert_known_schema(version: int, tables: set[str]) -> None:
-    """Fail-closed schema gate for a snapshot database."""
+_CANONICAL_SCHEMA_OBJECTS: dict[tuple[str, str], str] | None = None
+
+
+def _canonical_schema_objects() -> dict[tuple[str, str], str]:
+    """Build schema 3 from the canonical migrations **in memory** and cache it.
+
+    Comparing a snapshot against the schema the migrations actually generate
+    (not merely against a set of table names) detects a forged database that
+    reuses the right names but drops a foreign key or an immutability trigger, or
+    adds a hidden column — none of which ``PRAGMA foreign_key_check`` can see.
+    """
+    global _CANONICAL_SCHEMA_OBJECTS
+    if _CANONICAL_SCHEMA_OBJECTS is None:
+        conn = sqlite3.connect(":memory:", isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            schema.migrate(
+                conn,
+                target_version=schema.STORE_SCHEMA_VERSION,
+                migrations=schema.STORE_MIGRATIONS,
+                label="project store",
+            )
+            _CANONICAL_SCHEMA_OBJECTS = _schema_objects(conn)
+        finally:
+            conn.close()
+    return _CANONICAL_SCHEMA_OBJECTS
+
+
+def _assert_known_schema(conn: sqlite3.Connection, version: int) -> None:
+    """Fail-closed schema gate: version **and** exact schema-object fingerprint."""
     if version > SUPPORTED_STORE_SCHEMA_VERSION:
         raise UnsupportedSchemaVersion(
             label="backup store snapshot",
@@ -296,18 +321,27 @@ def _assert_known_schema(version: int, tables: set[str]) -> None:
             f"the snapshot records store schema version {version}; only schema "
             f"version {SUPPORTED_STORE_SCHEMA_VERSION} backups are supported."
         )
-    unexpected = tables - _ALLOWED_SNAPSHOT_TABLES
-    if unexpected:
-        raise BackupError(
-            "the snapshot contains unexpected table(s) "
-            f"{', '.join(sorted(unexpected))}; refusing to accept unknown or "
-            "external data as valid storage."
+    actual = _schema_objects(conn)
+    expected = _canonical_schema_objects()
+    if actual != expected:
+        missing = sorted(f"{kind} {name!r}" for kind, name in expected if (kind, name) not in actual)
+        extra = sorted(f"{kind} {name!r}" for kind, name in actual if (kind, name) not in expected)
+        altered = sorted(
+            f"{kind} {name!r}"
+            for (kind, name), sql in expected.items()
+            if (kind, name) in actual and actual[(kind, name)] != sql
         )
-    missing = _ALLOWED_SNAPSHOT_TABLES - tables
-    if missing:
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if extra:
+            details.append("unexpected: " + ", ".join(extra))
+        if altered:
+            details.append("altered: " + ", ".join(altered))
         raise BackupError(
-            "the snapshot is missing required table(s) "
-            f"{', '.join(sorted(missing))}; it is not a complete snapshot."
+            "the snapshot schema does not match the canonical schema-3 "
+            "definition (" + "; ".join(details) + "); refusing a snapshot with "
+            "missing, extra, or altered schema objects."
         )
 
 
@@ -333,11 +367,13 @@ def _snapshot_database(source: sqlite3.Connection, dest_path: str) -> None:
 
     Uses :meth:`sqlite3.Connection.backup` so the destination is a
     transactionally consistent copy that includes committed WAL content; a
-    concurrent writer does not produce a torn file. The destination is a fresh
-    file (journal mode ``delete``) and is closed before it is hashed.
+    concurrent writer does not produce a torn file. The destination is converted
+    to a self-contained rollback-journal database (the online backup copies the
+    source's header, so the destination can inherit WAL), and any leftover sidecar
+    is treated as a failure rather than silently unlinked.
     """
     try:
-        dest = sqlite3.connect(dest_path)
+        dest = sqlite3.connect(dest_path, isolation_level=None)
     except sqlite3.Error as exc:
         raise BackupError(
             f"could not create a snapshot database at {dest_path!r}."
@@ -345,25 +381,31 @@ def _snapshot_database(source: sqlite3.Connection, dest_path: str) -> None:
     try:
         source.backup(dest)
         # The online backup copies page 1, including the source's ``write
-        # version`` byte, so the destination can inherit WAL mode. Force an
-        # explicit rollback-journal mode so the snapshot is a single
-        # self-contained file with no live ``-wal``/``-shm`` sidecars.
-        try:
-            dest.execute("PRAGMA journal_mode = DELETE")
-        except sqlite3.Error:  # pragma: no cover - best effort
-            pass
+        # version`` byte, so the destination can inherit WAL mode. Convert it to a
+        # single self-contained file; a conversion that does not take is a hard
+        # failure (never a silent swallow).
+        mode = dest.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+        if str(mode).lower() != "delete":
+            raise BackupError(
+                "could not convert the snapshot to a self-contained "
+                "rollback-journal database; aborting the backup."
+            )
     except sqlite3.Error as exc:
         dest.close()
         raise BackupError(
             "could not create a consistent SQLite snapshot of the live store; "
             "the backup was aborted and nothing was kept."
         ) from exc
+    except BaseException:
+        dest.close()
+        raise
     dest.close()
     for sidecar in (dest_path + "-wal", dest_path + "-shm", dest_path + "-journal"):
-        try:
-            os.unlink(sidecar)
-        except OSError:
-            pass
+        if os.path.lexists(sidecar):
+            raise BackupError(
+                f"the snapshot is not self-contained (it left {os.path.basename(sidecar)!r}); "
+                f"aborting rather than shipping an uncheckpointed WAL."
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -377,8 +419,7 @@ def _build_manifest(
     conn = _open_readonly(snapshot_path)
     try:
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        tables = _user_tables(conn)
-        _assert_known_schema(version, tables)
+        _assert_known_schema(conn, version)
 
         identity = conn.execute("SELECT project_id FROM project").fetchall()
         if len(identity) != 1 or identity[0]["project_id"] != project_id:
@@ -490,6 +531,13 @@ def create_backup(store, destination) -> dict[str, object]:
     project_id = store.project_id
     app_version = store.app_version
 
+    if getattr(source, "in_transaction", False):
+        raise BackupError(
+            "the live store connection has an open transaction; commit or roll "
+            "back before creating a backup, so the snapshot is not taken "
+            "mid-transaction (which could block)."
+        )
+
     if os.path.lexists(dest):
         raise BackupError(
             f"backup destination {dest!r} already exists; refusing to overwrite "
@@ -507,6 +555,9 @@ def create_backup(store, destination) -> dict[str, object]:
         paths.ensure_owner_private_file(snapshot_path)
         manifest = _build_manifest(snapshot_path, project_id, app_version)
         _write_manifest(os.path.join(staging, MANIFEST_FILENAME), manifest)
+        # Fully verify the staged backup before publishing it, so a corrupt
+        # source never yields a valid-looking backup at ``destination``.
+        verify_backup(staging)
         os.rename(staging, dest)
     except BaseException:
         paths.remove_dir_best_effort(staging)
@@ -547,21 +598,53 @@ def _require_int(value: object, field: str, *, positive: bool = False) -> int:
 
 
 def _reject_unknown_keys(obj: dict, allowed: frozenset, field: str) -> None:
-    extra = sorted(set(obj) - allowed)
-    if extra:
-        raise BackupError(f"{field}: unknown field(s): {', '.join(extra)}")
+    # Do not echo the key names: a malformed manifest is untrusted input.
+    if set(obj) - allowed:
+        raise BackupError(f"{field}: contains unknown field(s); refusing.")
+
+
+class _DuplicateJSONKey(ValueError):
+    """A JSON object with a duplicate key (rejected; never trust the last value)."""
+
+
+def _no_duplicate_pairs(pairs):
+    seen: set[str] = set()
+    result: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise _DuplicateJSONKey("duplicate JSON object key")
+        seen.add(key)
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(name: str):
+    raise _DuplicateJSONKey(f"non-finite JSON constant {name!r}")
+
+
+def _load_manifest_json(raw: bytes) -> object:
+    return json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=_no_duplicate_pairs,
+        parse_constant=_reject_json_constant,
+    )
 
 
 def _read_manifest(manifest_path: str) -> dict[str, object]:
-    """Read and strictly validate the manifest (never trusts its shape)."""
+    """Read and strictly validate the manifest (never trusts its shape).
+
+    Malformed JSON — duplicate keys, non-finite constants, over-deep nesting, or
+    invalid UTF-8 — is rejected as a :class:`BackupError` without echoing any
+    untrusted key or value.
+    """
     try:
         with open(manifest_path, "rb") as handle:
             raw = handle.read()
     except OSError as exc:
         raise BackupError(f"could not read the backup manifest at {manifest_path!r}.") from exc
     try:
-        manifest = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
+        manifest = _load_manifest_json(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise BackupError("the backup manifest is not valid JSON.") from exc
     if not isinstance(manifest, dict):
         raise BackupError("the backup manifest must be a JSON object.")
@@ -583,7 +666,12 @@ def _read_manifest(manifest_path: str) -> dict[str, object]:
     for key in ("project_id", "app_version", "created_at_utc", "notice"):
         if not isinstance(manifest.get(key), str):
             raise BackupError(f"manifest.{key}: must be a string")
-    paths.validate_project_id(manifest["project_id"])
+    try:
+        paths.validate_project_id(manifest["project_id"])
+    except InvalidProjectId as exc:
+        raise BackupError(
+            "the backup manifest records an invalid project id; refusing."
+        ) from exc
 
     store_schema_version = _require_int(
         manifest.get("store_schema_version"), "store_schema_version"
@@ -607,8 +695,8 @@ def _read_manifest(manifest_path: str) -> dict[str, object]:
     filename = database.get("filename")
     if filename != SNAPSHOT_FILENAME:
         raise BackupError(
-            f"manifest.database.filename: expected {SNAPSHOT_FILENAME!r} (a safe "
-            f"fixed name), got {filename!r}."
+            "manifest.database.filename: must be the fixed safe snapshot "
+            "filename; refusing."
         )
     _parse_sha256(database.get("sha256"), "manifest.database.sha256")
     _require_int(database.get("byte_size"), "manifest.database.byte_size", positive=True)
@@ -637,7 +725,7 @@ def _read_manifest(manifest_path: str) -> dict[str, object]:
         if not isinstance(approval_id, str) or not approval_id:
             raise BackupError(f"manifest.approvals[{index}].approval_id: must be a string")
         if approval_id in seen_ids:
-            raise BackupError(f"manifest.approvals: duplicate entry {approval_id!r}")
+            raise BackupError("manifest.approvals: contains duplicate approval ids; refusing.")
         seen_ids.add(approval_id)
         _parse_sha256(
             entry.get("snapshot_digest"),
@@ -652,10 +740,11 @@ def _read_manifest(manifest_path: str) -> dict[str, object]:
 
 def _verify_relations(conn: sqlite3.Connection, project_id: str, version: int) -> None:
     """Recompute + re-validate every row's inner integrity and relations."""
-    # ---- rights records: BLOB digest + full record re-validation ---------- #
+    # ---- rights records: BLOB digest + exact canonical/column bindings ---- #
     rights_rows = conn.execute(
         "SELECT * FROM rights_record ORDER BY rights_id, record_revision"
     ).fetchall()
+    rights_by_ref: dict[tuple[str, int], dict] = {}
     for row in rights_rows:
         canonical = bytes(row["canonical"])
         if _sha256_bytes(canonical) != row["content_sha256"]:
@@ -668,10 +757,6 @@ def _verify_relations(conn: sqlite3.Connection, project_id: str, version: int) -
             raise BackupError(
                 "a rights record carries a cross-project key; refusing."
             )
-        if row["subject_kind"] not in ("source_revision", "subject_artifact_ref"):
-            raise BackupError(
-                f"rights record {row['rights_id']!r} has an unrecognised subject kind."
-            )
         try:
             parsed = json.loads(canonical.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
@@ -679,29 +764,58 @@ def _verify_relations(conn: sqlite3.Connection, project_id: str, version: int) -
                 f"rights record {row['rights_id']!r} canonical bytes are not JSON."
             ) from exc
         try:
-            validate_rights_record(parsed, project_id)
+            validated = validate_rights_record(parsed, project_id)
         except RecordValidationError as exc:
             raise BackupError(
                 f"rights record {row['rights_id']!r} revision "
                 f"{row['record_revision']} is not a valid rights record."
             ) from exc
-        if row["subject_kind"] == "source_revision":
-            subject = conn.execute(
+        # The canonical record must match the denormalized SQL identity columns,
+        # so a record cannot be stored under one identity/subject and parsed as
+        # another.
+        if (
+            validated["project_id"] != row["project_id"]
+            or validated["rights_id"] != row["rights_id"]
+            or validated["record_revision"] != row["record_revision"]
+        ):
+            raise BackupError(
+                "a rights record's canonical identity does not match its stored "
+                "identity columns; refusing."
+            )
+        subject = validated["subject"]
+        if (
+            subject["kind"] != row["subject_kind"]
+            or subject["project_id"] != row["subject_project_id"]
+            or subject["artifact_id"] != row["subject_artifact_id"]
+        ):
+            raise BackupError(
+                "a rights record's canonical subject does not match its stored "
+                "subject columns; refusing."
+            )
+        if subject["kind"] == "source_revision":
+            if subject.get("revision_id") != row["subject_revision_id"]:
+                raise BackupError(
+                    "a rights record's canonical subject revision does not match "
+                    "its stored subject column; refusing."
+                )
+            exists = conn.execute(
                 "SELECT 1 AS ok FROM revision WHERE project_id = ? AND "
                 "artifact_id = ? AND revision_id = ?",
-                (
-                    project_id,
-                    row["subject_artifact_id"],
-                    row["subject_revision_id"],
-                ),
+                (project_id, subject["artifact_id"], subject["revision_id"]),
             ).fetchone()
-            if subject is None:
+            if exists is None:
                 raise BackupError(
                     f"rights record {row['rights_id']!r} names a subject revision "
                     f"that does not exist in this project."
                 )
+        elif row["subject_revision_id"] is not None:
+            raise BackupError(
+                "a rights record with a pre-acquisition subject records a "
+                "revision id; refusing."
+            )
+        rights_by_ref[(row["rights_id"], row["record_revision"])] = validated
 
-    # ---- revisions: exact BLOB digest + byte size + same-project rights --- #
+    # ---- revisions: exact BLOB digest + exact rights subject + storage ---- #
     revisions = conn.execute(
         "SELECT * FROM revision ORDER BY artifact_id, revision_id"
     ).fetchall()
@@ -719,24 +833,94 @@ def _verify_relations(conn: sqlite3.Connection, project_id: str, version: int) -
             )
         if row["project_id"] != project_id or row["rights_project_id"] != project_id:
             raise BackupError("a revision carries a cross-project key; refusing.")
-        rights = conn.execute(
-            "SELECT 1 AS ok FROM rights_record WHERE project_id = ? AND "
-            "rights_id = ? AND record_revision = ?",
-            (project_id, row["rights_id"], row["rights_record_revision"]),
-        ).fetchone()
-        if rights is None:
+        if (
+            conn.execute(
+                "SELECT 1 AS ok FROM artifact WHERE project_id = ? AND "
+                "artifact_id = ?",
+                (project_id, row["artifact_id"]),
+            ).fetchone()
+            is None
+        ):
+            raise BackupError(
+                "a revision references an artifact that does not exist in this "
+                "project; refusing."
+            )
+        if row["parent_revision_id"] is not None and (
+            conn.execute(
+                "SELECT 1 AS ok FROM revision WHERE project_id = ? AND "
+                "artifact_id = ? AND revision_id = ?",
+                (project_id, row["artifact_id"], row["parent_revision_id"]),
+            ).fetchone()
+            is None
+        ):
+            raise BackupError(
+                "a revision references a parent revision that does not exist; "
+                "refusing."
+            )
+        validated = rights_by_ref.get(
+            (row["rights_id"], row["rights_record_revision"])
+        )
+        if validated is None:
             raise BackupError(
                 f"revision {row['artifact_id']!r}/{row['revision_id']!r} pins a "
                 f"rights record that does not exist in this project."
             )
+        subject = validated["subject"]
+        if (
+            subject["kind"] != "source_revision"
+            or subject["project_id"] != project_id
+            or subject["artifact_id"] != row["artifact_id"]
+            or subject.get("revision_id") != row["revision_id"]
+        ):
+            raise BackupError(
+                f"revision {row['artifact_id']!r}/{row['revision_id']!r} pins a "
+                f"rights record whose subject does not bind this exact revision; "
+                f"refusing."
+            )
+        try:
+            require_storage_allowed(validated)
+        except RecordValidationError as exc:
+            raise BackupError(
+                f"revision {row['artifact_id']!r}/{row['revision_id']!r} pins a "
+                f"rights record that does not permit storage (or is metadata-only); "
+                f"refusing to accept it as authorizing content."
+            ) from exc
 
     # ---- dependencies + import requests: no dangling / cross-project refs - #
     for row in conn.execute("SELECT * FROM dependency").fetchall():
         if row["project_id"] != project_id or row["to_project_id"] != project_id:
             raise BackupError("a dependency carries a cross-project key; refusing.")
+        for artifact_id, revision_id in (
+            (row["from_artifact_id"], row["from_revision_id"]),
+            (row["to_artifact_id"], row["to_revision_id"]),
+        ):
+            if (
+                conn.execute(
+                    "SELECT 1 AS ok FROM revision WHERE project_id = ? AND "
+                    "artifact_id = ? AND revision_id = ?",
+                    (project_id, artifact_id, revision_id),
+                ).fetchone()
+                is None
+            ):
+                raise BackupError(
+                    "a dependency references a revision that does not exist in "
+                    "this project; refusing."
+                )
     for row in conn.execute("SELECT * FROM import_request").fetchall():
         if row["project_id"] != project_id:
             raise BackupError("an import request carries a cross-project key; refusing.")
+        if (
+            conn.execute(
+                "SELECT 1 AS ok FROM artifact WHERE project_id = ? AND "
+                "artifact_id = ?",
+                (project_id, row["artifact_id"]),
+            ).fetchone()
+            is None
+        ):
+            raise BackupError(
+                "an import request references an artifact that does not exist; "
+                "refusing."
+            )
         target = conn.execute(
             "SELECT 1 AS ok FROM revision WHERE project_id = ? AND artifact_id = ? "
             "AND revision_id = ?",
@@ -766,10 +950,20 @@ def _verify_relations(conn: sqlite3.Connection, project_id: str, version: int) -
                 f"fixture approval {row['approval_id']!r} records an authorizing/"
                 f"authenticated constant; refusing a snapshot that claims authority."
             )
-        if row["storage_schema_version"] != version:
+        if row["storage_schema_version"] not in _SUPPORTED_RECORDED_SCHEMA_VERSIONS:
             raise BackupError(
-                f"fixture approval {row['approval_id']!r} records store schema "
-                f"version {row['storage_schema_version']}, not {version}."
+                f"fixture approval {row['approval_id']!r} records an unsupported "
+                f"store schema version {row['storage_schema_version']}; refusing."
+            )
+        target = conn.execute(
+            "SELECT artifact_id FROM revision WHERE project_id = ? AND "
+            "artifact_id = ? AND revision_id = ?",
+            (project_id, row["target_artifact_id"], row["target_revision_id"]),
+        ).fetchone()
+        if target is None or target["artifact_id"] != row["target_artifact_id"]:
+            raise BackupError(
+                f"fixture approval {row['approval_id']!r} targets a revision that "
+                f"does not exist in this project; refusing."
             )
         for entry in conn.execute(
             "SELECT * FROM fixture_approval_entry WHERE project_id = ? AND "
@@ -870,7 +1064,7 @@ def verify_backup(backup_dir) -> dict[str, object]:
                 f"the snapshot records store schema version {version}, but the "
                 f"manifest claims {manifest['store_schema_version']}."
             )
-        _assert_known_schema(version, _user_tables(conn))
+        _assert_known_schema(conn, version)
 
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
@@ -972,6 +1166,7 @@ def verify_backup(backup_dir) -> dict[str, object]:
         "format_version": manifest["format_version"],
         "store_schema_version": version,
         "database_sha256": actual_sha,
+        "database_byte_size": actual_size,
         "counts": counts,
         "approvals": actual_approvals,
     }
@@ -1047,6 +1242,19 @@ def restore_backup(backup_dir, root, registry):
         paths.ensure_owner_private_dir(staging)
         dst_db = os.path.join(staging, paths.STORE_FILENAME)
         shutil.copyfile(src_db, dst_db)
+        # Close the TOCTOU window: the backup was verified earlier, but the
+        # source could change before/while it is copied. Refuse a substitution by
+        # hashing the staged copy against the verified snapshot digest.
+        copied_sha, copied_size = _sha256_file(dst_db)
+        if (
+            copied_sha != report["database_sha256"]
+            or copied_size != report["database_byte_size"]
+        ):
+            raise BackupError(
+                "the staged restore copy does not match the verified snapshot "
+                "(the source changed between verification and copy); refusing and "
+                "leaving no restored project."
+            )
         paths.ensure_owner_private_file(dst_db)
         os.rename(staging, app_dir)
         renamed = True
