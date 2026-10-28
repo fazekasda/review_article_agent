@@ -1039,6 +1039,25 @@ class MultipleUnknownReconcileTest(EngineTestBase):
             repo.mark_admitted(attempt.attempt_id, admission_id="adm-" + attempt.attempt_id)
             return job.job_id
 
+    def test_human_escalation_retains_reconciliation_activation(self) -> None:
+        job_id = self._restore_admitted(self.project.project_id, "escalate")
+        with self._repo() as repo:
+            repo.mark_ambiguous(repo.get(job_id).current_attempt_id)
+        response = self.engine.handle(_req(
+            "reconcile", project_id=self.project.project_id,
+            job_id=job_id, resolution="human_escalation",
+        ))
+        self.assertTrue(response["ok"])
+        activation = self.registry.activation()
+        self.assertEqual(activation.state, "draining")
+        self.assertEqual(activation.active_project_id, self.project.project_id)
+        with self._repo() as repo:
+            self.assertTrue(repo.get(job_id).outcome_unresolved)
+        other = self.registry.create_project(self.tmp / "other", name="Other")
+        self.assertFalse(self.engine.handle(_req(
+            "switch", project_id=other.project_id,
+        ))["ok"])
+
     def test_owner_can_reconcile_each_unknown_project_in_turn(self) -> None:
         other = self.registry.create_project(self.tmp / "b", name="B")
         job_a = self._restore_admitted(self.project.project_id, "mu-a")
@@ -1082,6 +1101,20 @@ class MultipleUnknownReconcileTest(EngineTestBase):
 
 
 class RegistryUnavailableTest(EngineTestBase):
+    def test_queued_work_cannot_dispatch_after_registry_becomes_unavailable(self) -> None:
+        response = self._submit_numeric("queued-before-failure")
+        self.assertTrue(response["ok"])
+        job_id = response["job"]["job_id"]
+        with mock.patch.object(
+            self.registry, "list_projects", side_effect=StoreError("unavailable")
+        ):
+            self.assertIsNone(self.engine.tick())
+            with self._repo() as repo:
+                self.assertEqual(repo.get(job_id).attempts_total, 0)
+        self._drain_engine()
+        with self._repo() as repo:
+            self.assertEqual(repo.get(job_id).state, "completed")
+
     def test_registry_list_failure_blocks_new_dispatch(self) -> None:
         self._activate()
         with mock.patch.object(

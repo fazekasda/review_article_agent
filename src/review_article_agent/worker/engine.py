@@ -940,7 +940,7 @@ class WorkerEngine:
         except ReviewAgentError as exc:
             raise _RequestError(ErrorCode.BAD_VALUE) from exc
         finally:
-            if acquired_token is not None:
+            if acquired_token is not None and self._quiesce_project(project_id):
                 self._release_token_quiet(acquired_token)
                 self._activation = None
                 self._draining = False
@@ -1183,6 +1183,10 @@ class WorkerEngine:
         if self._draining:
             return False
         if project_id in self._paused_projects:
+            return False
+        # A queued authorization is not permission to ignore a later recovery
+        # blocker. Re-check before every new claim/admission, not just submit.
+        if self._new_dispatch_blockers(project_id) is not None:
             return False
         return True
 
