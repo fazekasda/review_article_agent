@@ -28,6 +28,7 @@ import dataclasses
 import json
 import sys
 import unittest
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 
@@ -219,20 +220,58 @@ def forge_cost(**overrides):
     return cost
 
 
+def refs_for(qs, artifact_id, revision_prefix):
+    """Build an exact per-question ref mapping for *qs* (same project)."""
+    return {
+        q.question_id: {
+            "project_id": PROJECT,
+            "artifact_id": artifact_id,
+            "revision_id": f"{revision_prefix}_{q.question_id}",
+        }
+        for q in qs
+    }
+
+
+def bindings_for(qs):
+    """Build trusted submission-time bindings for *qs*.
+
+    A question whose descriptor cannot be derived (a forged cyclic/deep/non-finite
+    criteria) yields a sentinel digest, so the projection itself raises the typed
+    error rather than the fixture.
+    """
+    out = {}
+    for q in qs:
+        try:
+            digest = dr.question_descriptor_digest(q)
+        except Exception:
+            digest = "0" * 64
+        out[q.question_id] = dr.QuestionBinding(
+            question_id=q.question_id,
+            question_kind=getattr(q, "question_kind", jev.PREDICATE),
+            question_def_digest=digest,
+            options=tuple(getattr(q, "options", ()) or ()),
+            levels=tuple(getattr(q, "levels", ()) or ()),
+        )
+    return out
+
+
 def project(result=None, qs=None, **overrides):
+    questions_ = list(qs) if qs is not None else questions()
     params = dict(
         project_id=PROJECT,
         target=TARGET,
-        question_def_ref=QDEF_REF,
-        criteria_ref=CRIT_REF,
+        question_def_ref=refs_for(questions_, "question_def", "qd_rev"),
+        criteria_ref=refs_for(questions_, "criteria", "crit_rev"),
         dispatch_ref=DISPATCH,
         task_context=TASK_CONTEXT,
         versions=versions(),
+        bindings=bindings_for(questions_),
+        expected_request_sha256="f" * 64,
     )
     params.update(overrides)
     return dr.project_decision_records(
         result if result is not None else make_result(valid_outcomes()),
-        qs if qs is not None else questions(),
+        questions_,
         **params,
     )
 
@@ -344,16 +383,33 @@ class OutcomeRetentionTest(unittest.TestCase):
         )
         return project(result=make_result({qid: outcome}), qs=[q])[0].as_mapping()
 
-    def test_missing_answer_partial_error_retains_candidate(self):
-        mapping = self._single(
-            error_outcome("p", jev.PREDICATE, "partial_error", "missing_answer"), jev.PREDICATE, "p"
+    def test_partial_error_without_answer_denied(self):
+        # C02 §6.2 presence union: ``answer`` is present iff the outcome is
+        # ``answered`` or ``partial_error`` — a partial_error MUST carry an answer.
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            self._single(
+                error_outcome("p", jev.PREDICATE, "partial_error", "missing_answer"),
+                jev.PREDICATE,
+                "p",
+            )
+
+    def test_partial_error_retains_candidate_with_answer(self):
+        forged = jev.DecisionOutcome(
+            question_id="p",
+            question_kind=jev.PREDICATE,
+            outcome="partial_error",
+            answer=predicate_answer("0.4"),
+            per_question_error=jev.PerQuestionError(
+                question_id="p", reason="provider_error", message_redacted="static"
+            ),
+            diagnostic=jev.Diagnostic(code="c", detail_redacted="d", raised_at=RAISED_AT),
         )
+        mapping = self._single(forged, jev.PREDICATE, "p")
         self.assertEqual(mapping["outcome"], "partial_error")
-        self.assertNotIn("answer", mapping)
-        self.assertEqual(mapping["per_question_error"]["reason"], "missing_answer")
-        self.assertIn("diagnostics", mapping)
+        self.assertIn("answer", mapping)
         self.assertFalse(mapping["is_exclusion"])
         self.assertTrue(mapping["retains_candidate"])
+        self.assertFalse(mapping["grants_eligibility"])
 
     def test_refusal_and_malformed_and_unsupported_retain_candidate(self):
         cases = [
@@ -512,9 +568,14 @@ class RefsAndVersionsTest(unittest.TestCase):
             project(target=bad)
 
     def test_cross_project_criteria_ref_denied(self):
-        bad = {"project_id": "proj_B", "artifact_id": "criteria", "revision_id": "c1"}
+        refs = refs_for(questions(), "criteria", "crit_rev")
+        refs["study_design"] = {
+            "project_id": "proj_B",
+            "artifact_id": "criteria",
+            "revision_id": "c1",
+        }
         with self.assertRaises(dr.DecisionRecordBindingError):
-            project(criteria_ref=bad)
+            project(criteria_ref=refs)
 
     def test_missing_ref_key_denied(self):
         with self.assertRaises(dr.DecisionRecordBindingError):
@@ -786,9 +847,14 @@ class StaticErrorTest(unittest.TestCase):
             self.fail("bad version accepted")
 
     def test_ref_error_is_static(self):
-        bad = {"project_id": self.CANARY, "artifact_id": "x", "revision_id": "r"}
+        refs = refs_for(questions(), "question_def", "qd_rev")
+        refs["is_original_report"] = {
+            "project_id": self.CANARY,
+            "artifact_id": "x",
+            "revision_id": "r",
+        }
         try:
-            project(question_def_ref=bad)
+            project(question_def_ref=refs)
         except dr.DecisionRecordError as exc:
             self.assertNotIn(self.CANARY, str(exc))
         else:  # pragma: no cover
@@ -838,6 +904,228 @@ class MappingValidatorTest(unittest.TestCase):
         mapping["answer"]["choice"] = "not-an-option"
         with self.assertRaises(dr.DecisionRecordValidationError):
             dr.validate_decision_record_mapping(mapping)
+
+
+# --------------------------------------------------------------------------- #
+# Boundary: an untrusted mapping is bounded before any walk/thaw/freeze
+# --------------------------------------------------------------------------- #
+class BoundaryMappingTest(unittest.TestCase):
+    def test_cyclic_mapping_denied_without_recursion_error(self):
+        mapping = project()[0].as_mapping()
+        mapping["answer"] = mapping  # circular
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_deep_mapping_denied_without_recursion_error(self):
+        mapping = project()[0].as_mapping()
+        nested = "leaf"
+        for _ in range(200):
+            nested = [nested]
+        mapping["answer"] = nested
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_oversize_mapping_denied(self):
+        mapping = project()[0].as_mapping()
+        mapping["answer"] = {
+            "answer_kind": "predicate",
+            "wire_type": "noul",
+            "probability": "0" * (dr.MAX_DECISION_RECORD_BYTES + 1),
+        }
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_non_portable_mapping_denied(self):
+        mapping = project()[0].as_mapping()
+        mapping["provider"]["input_tokens"] = Decimal("1")
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_hostile_mapping_never_leaks_recursion_error(self):
+        # The canonical/size bound runs before any key walk, so a hostile Mapping
+        # whose iteration would raise is converted to a static typed error.
+        class _HostileMapping(Mapping):
+            def __getitem__(self, key):
+                raise RecursionError("hostile")
+
+            def __iter__(self):
+                raise RecursionError("hostile")
+
+            def __len__(self):
+                return 0
+
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(_HostileMapping())
+
+
+# --------------------------------------------------------------------------- #
+# Bounded numerics: a compact Decimal/int can never expand before validation
+# --------------------------------------------------------------------------- #
+class NumericBoundTest(unittest.TestCase):
+    def _single_forged(self, probability):
+        forged = answered(
+            "p",
+            jev.PREDICATE,
+            jev.Answer(answer_kind="predicate", wire_type="noul", probability=probability),
+        )
+        return project(
+            result=make_result({"p": forged}),
+            qs=[jev.QuestionDef("p", jev.PREDICATE, "i")],
+        )
+
+    def test_tiny_zero_decimal_denied(self):
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            self._single_forged(Decimal("0E-1000000"))
+
+    def test_tiny_nonzero_decimal_denied(self):
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            self._single_forged(Decimal("1e-1000000"))
+
+    def test_huge_exponent_decimal_denied(self):
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            self._single_forged(Decimal("1E+1000000"))
+
+    def test_num_to_str_does_not_expand_bounded_away_decimals(self):
+        self.assertEqual(dr._num_to_str(Decimal("0E-1000000")), Decimal("0E-1000000"))
+        self.assertEqual(dr._num_to_str(Decimal("1e-1000000")), Decimal("1e-1000000"))
+        self.assertEqual(dr._num_to_str(Decimal("0.83")), "0.83")
+
+    def test_num_to_str_guards_huge_int(self):
+        huge = 10 ** 5000
+        self.assertIs(dr._num_to_str(huge), huge)
+        self.assertEqual(dr._num_to_str(7), "7")
+
+
+# --------------------------------------------------------------------------- #
+# Per-question refs (C02 §6.2: one QuestionDef/criteria_ref per record)
+# --------------------------------------------------------------------------- #
+class PerQuestionRefTest(unittest.TestCase):
+    def test_multi_question_single_ref_denied(self):
+        with self.assertRaises(dr.DecisionRecordBindingError):
+            project(question_def_ref=QDEF_REF)
+
+    def test_multi_question_single_criteria_ref_denied(self):
+        with self.assertRaises(dr.DecisionRecordBindingError):
+            project(criteria_ref=CRIT_REF)
+
+    def test_per_question_refs_recorded(self):
+        qs = questions()
+        refs = refs_for(qs, "question_def", "qd_rev")
+        records = project(question_def_ref=refs)
+        for record in records:
+            self.assertEqual(record.as_mapping()["question_def_ref"], refs[record.question_id])
+
+    def test_per_question_refs_missing_coverage_denied(self):
+        refs = refs_for(questions(), "question_def", "qd_rev")
+        del refs["study_design"]
+        with self.assertRaises(dr.DecisionRecordBindingError):
+            project(question_def_ref=refs)
+
+    def test_per_question_refs_extra_coverage_denied(self):
+        refs = refs_for(questions(), "question_def", "qd_rev")
+        refs["undeclared"] = {"project_id": PROJECT, "artifact_id": "x", "revision_id": "r"}
+        with self.assertRaises(dr.DecisionRecordBindingError):
+            project(question_def_ref=refs)
+
+    def test_single_ref_allowed_for_single_question(self):
+        q = jev.QuestionDef("p", jev.PREDICATE, "i")
+        record = project(
+            result=make_result({"p": answered("p", jev.PREDICATE, predicate_answer())}),
+            qs=[q],
+            question_def_ref=QDEF_REF,
+            criteria_ref=CRIT_REF,
+        )[0]
+        self.assertEqual(
+            record.as_mapping()["question_def_ref"],
+            {"project_id": PROJECT, "artifact_id": "question_def", "revision_id": "qd_rev_1"},
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Bindings + request digest are required for an actual projection
+# --------------------------------------------------------------------------- #
+class BindingsRequiredTest(unittest.TestCase):
+    def test_projection_requires_bindings_and_request_digest(self):
+        base = dict(
+            project_id=PROJECT,
+            target=TARGET,
+            question_def_ref=refs_for(questions(), "question_def", "qd_rev"),
+            criteria_ref=refs_for(questions(), "criteria", "crit_rev"),
+            dispatch_ref=DISPATCH,
+            task_context=TASK_CONTEXT,
+            versions=versions(),
+        )
+        with self.assertRaises(TypeError):
+            dr.project_decision_records(make_result(valid_outcomes()), questions(), **base)
+
+
+# --------------------------------------------------------------------------- #
+# Persisted task context + re-derived decision id
+# --------------------------------------------------------------------------- #
+class TaskContextAndIdTest(unittest.TestCase):
+    def test_task_context_is_persisted(self):
+        self.assertEqual(project()[0].as_mapping()["task_context"], TASK_CONTEXT)
+
+    def test_validator_requires_task_context(self):
+        mapping = project()[0].as_mapping()
+        del mapping["task_context"]
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_validator_rejects_tampered_task_context(self):
+        mapping = project()[0].as_mapping()
+        mapping["task_context"] = "other_task"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_validator_rejects_invented_decision_id(self):
+        mapping = project()[0].as_mapping()
+        mapping["decision_id"] = "dec_" + "0" * 32
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+
+# --------------------------------------------------------------------------- #
+# Presence union / envelope type strictness
+# --------------------------------------------------------------------------- #
+class PresenceEnvelopeTest(unittest.TestCase):
+    def test_validator_rejects_empty_request_sha(self):
+        mapping = project()[0].as_mapping()
+        mapping["request_sha256"] = ""
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_validator_rejects_missing_reserve(self):
+        mapping = project()[0].as_mapping()
+        del mapping["cost"]["reserve_usd"]
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_float_calls_attempted_denied(self):
+        with self.assertRaises(dr.DecisionRecordProjectionError):
+            project(result=make_result(valid_outcomes(), calls_attempted=1.0))
+
+    def test_bool_schema_version_denied(self):
+        mapping = project()[0].as_mapping()
+        mapping["schema_version"] = True
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+
+# --------------------------------------------------------------------------- #
+# Ledger: a divergent charge for the same dispatch is a defect
+# --------------------------------------------------------------------------- #
+class LedgerConflictTest(unittest.TestCase):
+    def test_divergent_charge_same_dispatch_denied(self):
+        first = project()
+        other = project(result=make_result(valid_outcomes(), cost=make_cost(amount="0.5")))
+        self.assertEqual(first[0].dispatch_ref, other[0].dispatch_ref)
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.ledger_charges((first[0], other[0]))
+
+    def test_identical_charge_same_dispatch_counted_once(self):
+        records = project()
+        self.assertEqual(len(dr.ledger_charges(records)), 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

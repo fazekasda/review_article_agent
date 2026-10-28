@@ -172,6 +172,10 @@ _MAX_META_CHARS = 256
 
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
+#: The exact keys of a ``RefRevision`` (C01 §3.1-3.3). Used to tell a bare single
+#: ref from a per-question ``{question_id: ref}`` mapping.
+_REF_KEYS = frozenset({"project_id", "artifact_id", "revision_id"})
+
 # --------------------------------------------------------------------------- #
 # Errors (static, curated, non-reflective)
 # --------------------------------------------------------------------------- #
@@ -252,6 +256,10 @@ _M_RECORD_ROUTE = "a decision-record mapping must use the direct_call route"
 _M_RECORD_BOOL = "a decision record must retain its candidate and grant no authority"
 _M_RECORD_SIZE = "a decision record exceeds the permitted canonical size"
 _M_RECORD_DEPTH = "a decision record nests too deeply"
+_M_RECORD_SHAPE = "a decision record mapping is not a portable, bounded JSON object"
+_M_REF_SINGLE = "a single ref is accepted only for a single-question projection"
+_M_REF_COVERAGE = "the per-question refs must cover exactly the declared questions"
+_M_COST_CONFLICT = "the same dispatch is referenced with divergent cost metadata"
 
 
 # --------------------------------------------------------------------------- #
@@ -259,6 +267,25 @@ _M_RECORD_DEPTH = "a decision record nests too deeply"
 # --------------------------------------------------------------------------- #
 def _err(message: str, error: type[DecisionRecordError] = DecisionRecordValidationError):
     raise error(message)
+
+
+def _bounded_decimal_string(amount: Decimal) -> str | None:
+    """Return the exact decimal string of *amount* iff it is finite and bounded.
+
+    The finite check, the significant-digit count, and the base-10 exponent are
+    read from ``as_tuple`` **before** any formatting, so a compact input such as
+    ``Decimal("0E-1000000")`` (or ``1e-1000000``) can never expand into a
+    pathological ``"f"`` string. ``None`` means the value is refused.
+    """
+    if not amount.is_finite():
+        return None
+    _sign, digits, exponent = amount.as_tuple()
+    if len(digits) > _MAX_SIGNIFICANT_DIGITS:
+        return None
+    magnitude = exponent + len(digits) - 1 if amount != 0 else exponent
+    if abs(magnitude) > _MAX_ADJUSTED_EXPONENT:
+        return None
+    return format(amount, "f")
 
 
 def _parse_exact_decimal(value: object, *, positive: bool = False) -> str | None:
@@ -275,28 +302,28 @@ def _parse_exact_decimal(value: object, *, positive: bool = False) -> str | None
         return None
     if not amount.is_finite():
         return None
-    _sign, digits, exponent = amount.as_tuple()
-    if len(digits) > _MAX_SIGNIFICANT_DIGITS:
-        return None
-    magnitude = exponent + len(digits) - 1 if amount != 0 else exponent
-    if abs(magnitude) > _MAX_ADJUSTED_EXPONENT:
-        return None
     if amount < 0 or (positive and amount == 0):
         return None
-    return format(amount, "f")
+    return _bounded_decimal_string(amount)
 
 
 def _num_to_str(value: object) -> object:
     """Convert a Decimal/int leaf to its exact decimal string; pass others through.
 
     A ``float``/``bool``/``str``/``None`` is returned unchanged so the record
-    validator rejects it (never a float round-trip, never a silent coercion).
+    validator rejects it (never a float round-trip, never a silent coercion). A
+    Decimal or int that is out of the bounded digit/exponent/bit range is likewise
+    returned unchanged (never formatted), so a hostile value is refused by the
+    downstream string checks instead of allocating an enormous representation.
     """
     if isinstance(value, bool):
         return value
     if isinstance(value, Decimal):
-        return format(value, "f") if value.is_finite() else str(value)
+        text = _bounded_decimal_string(value)
+        return value if text is None else text
     if isinstance(value, int):
+        if value.bit_length() > _MAX_DECIMAL_INPUT_BITS:
+            return value
         return str(value)
     return value
 
@@ -420,6 +447,29 @@ def _ref(value: object, project_id: str | None = None) -> dict[str, str]:
         return validate_ref(plain, expected)
     except Exception as exc:  # RecordValidationError/TypeError/ValueError
         raise DecisionRecordBindingError(_M_BAD_REF) from exc
+
+
+def _per_question_refs(
+    value: object, questions: Sequence[jev.QuestionDef], project_id: str
+) -> dict[str, dict[str, str]]:
+    """Resolve a per-question ref mapping, or a bare single ref for one question.
+
+    C02 §6.2 gives **one** ``QuestionDef``/``criteria_ref`` per record, so a
+    multi-question projection must supply an exact ``{question_id: ref}`` mapping
+    covering every declared question. A bare single ref is accepted only when the
+    projection carries exactly one question. No ref existence is checked here (no
+    I/O): a later repository resolves each ref against the project store.
+    """
+    if isinstance(value, Mapping) and set(value) <= _REF_KEYS:
+        if len(questions) != 1:
+            _err(_M_REF_SINGLE, DecisionRecordBindingError)
+        return {questions[0].question_id: _ref(value, project_id)}
+    if isinstance(value, Mapping):
+        declared = {q.question_id for q in questions}
+        if set(value) != declared:
+            _err(_M_REF_COVERAGE, DecisionRecordBindingError)
+        return {qid: _ref(value[qid], project_id) for qid in declared}
+    _err(_M_BAD_REF, DecisionRecordBindingError)
 
 
 def _identifier(value: object) -> str:
@@ -732,6 +782,7 @@ _REQUIRED_KEYS = frozenset(
         "schema_version",
         "decision_id",
         "question_id",
+        "task_context",
         "question_def_ref",
         "criteria_ref",
         "target",
@@ -928,9 +979,10 @@ def _check_cost(cost: object) -> None:
             _err(_M_BAD_COST)
     elif amount is not None:
         _err(_M_BAD_COST)
-    reserve = cost.get("reserve_usd")
-    if reserve is not None and _parse_exact_decimal(reserve, positive=True) is None:
-        _err(_M_BAD_COST)
+    # A submitted dispatch (the only source of a projected record) is admitted
+    # only with a retained reserve (§5.6/§6.3), so the reserve is mandatory.
+    if _parse_exact_decimal(cost.get("reserve_usd"), positive=True) is None:
+        _err(_M_COST_RESERVE)
 
 
 def _check_provider(provider: object) -> None:
@@ -983,13 +1035,23 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
     """
     if not isinstance(mapping, Mapping):
         _err(_M_RECORD_KEYS)
+    # Bound the untrusted mapping *before* any structural walk/thaw/freeze: a
+    # cyclic, over-deep, over-large, or non-portable mapping must fail closed with
+    # a static typed error, never a raw RecursionError or an unbounded expansion.
+    try:
+        canonical = canonical_json(mapping)
+    except Exception as exc:  # RecordValidationError/ValueError/TypeError
+        raise DecisionRecordValidationError(_M_RECORD_SHAPE) from exc
+    if len(canonical) > MAX_DECISION_RECORD_BYTES:
+        _err(_M_RECORD_SIZE)
     for key in mapping:
         if not isinstance(key, str):
             _err(_M_RECORD_KEYS)
     keys = set(mapping)
     if keys - (_REQUIRED_KEYS | _OPTIONAL_KEYS) or _REQUIRED_KEYS - keys:
         _err(_M_RECORD_KEYS)
-    if mapping["schema_version"] != DECISION_RECORD_SCHEMA_VERSION:
+    schema_version = mapping["schema_version"]
+    if isinstance(schema_version, bool) or schema_version != DECISION_RECORD_SCHEMA_VERSION:
         _err(_M_RECORD_VERSION)
 
     decision_id = mapping["decision_id"]
@@ -1011,8 +1073,9 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
 
     if not _is_hex_digest(mapping["question_def_digest"]):
         _err(_M_BAD_HASH)
-    request_sha256 = mapping["request_sha256"]
-    if request_sha256 != "" and not _is_hex_digest(request_sha256):
+    # A projected record always comes from a submitted dispatch, whose request
+    # digest is a real non-empty SHA-256 (§8.1.1).
+    if not _is_hex_digest(mapping["request_sha256"]):
         _err(_M_BAD_HASH)
 
     if mapping["route"] != DECISION_ROUTE:
@@ -1049,6 +1112,13 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
     _check_cost(mapping["cost"])
     _check_provider(mapping["provider"])
 
+    # The record id is content-derived from the exact bound inputs; a mapping
+    # whose id was invented (or whose task context was dropped) is refused.
+    task_context = _identifier(mapping["task_context"])
+    dispatch_ref = _identifier(mapping["cost"]["dispatch_ref"])
+    if decision_id != _decision_id(project_id, dispatch_ref, task_context, question_id):
+        _err(_M_RECORD_ID)
+
     answer = mapping.get("answer")
     pqe = mapping.get("per_question_error")
     diagnostic = mapping.get("diagnostics")
@@ -1068,9 +1138,15 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
     elif outcome == "unsupported":
         _err(_M_UNSUPPORTED_KIND)
 
-    if outcome == "answered":
+    # C02 §6.2 presence union: ``answer`` is present iff the outcome is
+    # ``answered`` or ``partial_error``.
+    if outcome in ("answered", "partial_error"):
         if answer is None:
             _err(_M_ANSWER_MISSING)
+    else:
+        if answer is not None:
+            _err(_M_ANSWER_PRESENCE)
+    if outcome == "answered":
         if pqe is not None:
             _err(_M_ANSWER_PRESENCE)
     elif outcome in PER_QUESTION_ERROR_OUTCOMES:
@@ -1078,11 +1154,6 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
             _err(_M_DIAGNOSTIC_REQUIRED)
         if pqe is None:
             _err(_M_PQE_REQUIRED)
-        if outcome != "partial_error" and answer is not None:
-            _err(_M_ANSWER_PRESENCE)
-    else:  # uncertain / omitted
-        if answer is not None:
-            _err(_M_ANSWER_PRESENCE)
 
     return _thaw(mapping)
 
@@ -1107,7 +1178,9 @@ def _validate_result_envelope(result: object) -> jev.DispatchResult:
         _err(_M_BAD_MODEL, DecisionRecordProjectionError)
     if result.submitted is not True:
         _err(_M_NOT_SUBMITTED, DecisionRecordProjectionError)
-    if isinstance(result.calls_attempted, bool) or result.calls_attempted != 1:
+    if isinstance(result.calls_attempted, bool) or not isinstance(
+        result.calls_attempted, int
+    ) or result.calls_attempted != 1:
         _err(_M_BAD_RESULT, DecisionRecordProjectionError)
     return result
 
@@ -1123,9 +1196,9 @@ def project_decision_records(
     dispatch_ref: object,
     task_context: object,
     versions: object,
+    bindings: Mapping[str, QuestionBinding],
+    expected_request_sha256: str,
     consumed: Sequence[str] = (),
-    bindings: Mapping[str, QuestionBinding] | None = None,
-    expected_request_sha256: str | None = None,
 ) -> tuple[DecisionRecord, ...]:
     """Project one immutable ``DecisionRecord`` per submitted question.
 
@@ -1133,16 +1206,22 @@ def project_decision_records(
     ``questions`` are the exact definitions that were submitted. Every argument
     is revalidated; nothing is trusted merely because it is typed.
 
-    ``target``/``question_def_ref``/``criteria_ref`` are exact same-project
-    ``{project_id, artifact_id, revision_id}`` references (the immutable
-    ``QuestionDef`` revision and the immutable criteria revision are recorded by
-    reference; a later repository verifies their actual bytes). ``versions`` is
-    the trusted consumed ``VersionSet`` (real ``version``+``digest`` values,
-    never invented); ``consumed`` may additionally name ``rubric``/``parser`` as
-    consumed. ``bindings``, when given, must cover every question and match its
-    declared kind/options/levels and per-question descriptor digest.
-    ``expected_request_sha256``, when given, must equal the dispatch's recorded
-    request digest (a stale/mismatched request is refused).
+    ``target`` is the exact same-project ``{project_id, artifact_id,
+    revision_id}`` reference of the decision target. Because C02 §6.2 gives
+    **one** ``QuestionDef``/``criteria_ref`` per record, ``question_def_ref`` and
+    ``criteria_ref`` are each either a bare single ref (accepted only when exactly
+    one question is projected) or an exact ``{question_id: ref}`` mapping covering
+    every declared question; the criteria refs may explicitly share one rubric
+    revision. No ref existence is checked here (no I/O). ``versions`` is the
+    trusted consumed ``VersionSet`` (real ``version``+``digest`` values, never
+    invented); ``consumed`` may additionally name ``rubric``/``parser`` as
+    consumed.
+
+    ``bindings`` and ``expected_request_sha256`` are **required**: a projection is
+    only produced from proven submitted-question bindings (each matching the
+    declared kind/options/levels and the exact per-question descriptor digest of
+    the wire request) and the exact dispatch request digest — an unbound or
+    stale-request projection is refused.
 
     Every returned record references the **same** dispatch and its **single**
     ``CostRecord``; the charge is counted once (see :func:`ledger_charges`), never
@@ -1150,25 +1229,23 @@ def project_decision_records(
     """
     project = _identifier(project_id)
     target_ref = _ref(target, project)
-    qdef_ref = _ref(question_def_ref, project)
-    crit_ref = _ref(criteria_ref, project)
     dispatch = _identifier(dispatch_ref)
     context = _identifier(task_context)
 
     canonical_questions = _revalidate_questions(questions)
     trusted = _validate_result_envelope(result)
 
+    qdef_refs = _per_question_refs(question_def_ref, canonical_questions, project)
+    crit_refs = _per_question_refs(criteria_ref, canonical_questions, project)
+
     version_map, consumed_slots = _validate_versions(versions, consumed)
 
-    binding_map = None
-    if bindings is not None:
-        binding_map = _validate_bindings(bindings, canonical_questions)
+    binding_map = _validate_bindings(bindings, canonical_questions)
 
-    if expected_request_sha256 is not None:
-        if not _is_hex_digest(expected_request_sha256):
-            _err(_M_BAD_HASH, DecisionRecordBindingError)
-        if trusted.request_sha256 != expected_request_sha256:
-            _err(_M_STALE_REQUEST, DecisionRecordBindingError)
+    if not _is_hex_digest(expected_request_sha256):
+        _err(_M_BAD_HASH, DecisionRecordBindingError)
+    if trusted.request_sha256 != expected_request_sha256:
+        _err(_M_STALE_REQUEST, DecisionRecordBindingError)
 
     outcomes = trusted.outcomes
     if not isinstance(outcomes, Mapping):
@@ -1196,15 +1273,15 @@ def project_decision_records(
             _err(_M_OUTCOME_LITERAL)
 
         descriptor_digest = question_descriptor_digest(question)
-        if binding_map is not None:
-            _match_binding(binding_map[qid], question)
+        _match_binding(binding_map[qid], question)
 
         mapping: dict[str, Any] = {
             "schema_version": DECISION_RECORD_SCHEMA_VERSION,
             "decision_id": _decision_id(project, dispatch, context, qid),
             "question_id": qid,
-            "question_def_ref": qdef_ref,
-            "criteria_ref": crit_ref,
+            "task_context": context,
+            "question_def_ref": qdef_refs[qid],
+            "criteria_ref": crit_refs[qid],
             "target": target_ref,
             "question_kind": question.question_kind,
             "options": list(question.options),
@@ -1265,4 +1342,8 @@ def ledger_charges(records: Sequence[DecisionRecord]) -> tuple[dict[str, Any], .
         if ref not in seen:
             seen[ref] = charge
             order.append(ref)
+        elif seen[ref] != charge:
+            # The same dispatch must carry one identical CostRecord; a divergent
+            # duplicate is a defect, never silently collapsed to the first.
+            _err(_M_COST_CONFLICT)
     return tuple(seen[ref] for ref in order)
