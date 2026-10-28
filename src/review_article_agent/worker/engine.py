@@ -93,10 +93,16 @@ from __future__ import annotations
 import os
 import signal
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 
+from ..discovery.execution import (
+    DiscoveryExecutionBlockedError,
+    DiscoveryExecutionError,
+)
+from ..discovery.transport import http_get
 from ..domain.errors import ProjectConflict, ReviewAgentError
 from ..domain.records import validate_identifier
 from ..runtime.dispatch import (
@@ -107,6 +113,7 @@ from ..runtime.jobs import (
     ACTIVE_ATTEMPT_STATES,
     BudgetExceededError,
     Job,
+    JobConflictError,
     JobError,
     JobRepository,
     JobValidationError,
@@ -116,6 +123,12 @@ from ..runtime.jobs import (
 from ..storage import paths
 from ..storage.registry import Registry
 from ..storage.store import ProjectStore
+from . import discovery as discovery_jobs
+from .discovery import (
+    AttemptCounter,
+    DiscoveryJobStopped,
+    DiscoveryJobValidationError,
+)
 from .synthetic import (
     MAX_DELAY_MS,
     MAX_STEPS,
@@ -153,6 +166,7 @@ SYNTHETIC_WAITING_HUMAN_TASK = "synthetic_waiting_human"
 OPERATIONS = (
     "status",
     "submit",
+    "discovery_submit",
     "job_status",
     "job_list",
     "pause",
@@ -188,6 +202,7 @@ class ErrorCode:
     DRAINING = "draining"
     BUDGET_EXCEEDED = "budget_exceeded"
     SWITCH_BLOCKED = "switch_blocked"
+    CONFLICT = "conflict"
     INTERNAL = "internal_error"
 
 
@@ -207,6 +222,7 @@ _MESSAGES = {
     ErrorCode.DRAINING: "execution is draining; new dispatch is disabled",
     ErrorCode.BUDGET_EXCEEDED: "the cost cap would be exceeded",
     ErrorCode.SWITCH_BLOCKED: "the switch is blocked pending reconciliation",
+    ErrorCode.CONFLICT: "the request diverges from an already-recorded job",
     ErrorCode.INTERNAL: "the request could not be handled",
 }
 
@@ -226,6 +242,16 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "outcome",
             "stage",
             "reserve_usd",
+        }
+    ),
+    "discovery_submit": frozenset(
+        {
+            "version",
+            "op",
+            "project_id",
+            "request_id",
+            "mode",
+            "parameters",
         }
     ),
     "job_status": frozenset({"version", "op", "project_id", "job_id"}),
@@ -274,6 +300,7 @@ class WorkerEngine:
         *,
         registry: Registry | None = None,
         clock: Callable[[], float] | None = None,
+        discovery_transport: Callable[..., Any] | None = None,
     ) -> None:
         self._data_dir = os.path.abspath(os.fspath(data_dir))
         self._registry = registry if registry is not None else Registry(self._data_dir)
@@ -288,6 +315,18 @@ class WorkerEngine:
         self._hooks: dict[str, list[Callable[..., None]]] = {
             name: [] for name in FAULT_SEAMS
         }
+        # Discovery execution: the default low-level transport is the S1 real
+        # HTTP GET, but it is only ever invoked for an explicit discovery job
+        # (never automatically on boot). Tests inject a deterministic fake here.
+        lowlevel = http_get if discovery_transport is None else discovery_transport
+        if not callable(lowlevel):
+            raise ValueError("discovery_transport must be a callable low-level transport")
+        self._discovery_lowlevel = lowlevel
+        self._discovery_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="raa-discovery"
+        )
+        self._discovery_future: Future[Any] | None = None
+        self._discovery_job: tuple[str, str, str] | None = None
         self._adopt_activation()
 
     def _adopt_activation(self) -> None:
@@ -323,10 +362,22 @@ class WorkerEngine:
     def close(self) -> None:
         """Release any engine-owned resources.
 
-        No project store is held between calls, so this is a no-op beyond
-        dropping cached wait-reason text; it exists for a stable lifecycle API.
+        No project store is held between calls. The discovery executor is shut
+        down **without cancelling an authorized in-flight job**: a running task is
+        awaited so a worker stop *drains* it rather than aborting it (queued jobs
+        are never left in the pool — the engine keeps at most one active future,
+        started only by :meth:`tick`). Closing the CLI never reaches here; only a
+        real worker stop does.
         """
         self._wait_reasons.clear()
+        pool, self._discovery_pool = self._discovery_pool, None
+        if pool is not None:
+            try:
+                pool.shutdown(wait=True, cancel_futures=False)
+            except Exception:  # noqa: BLE001 - shutdown must never raise
+                pass
+        self._discovery_future = None
+        self._discovery_job = None
 
     # -- store access -------------------------------------------------------- #
     @contextmanager
@@ -564,9 +615,9 @@ class WorkerEngine:
                 return True
             if attempt.state in ("admitted", "running"):
                 return True
-            if (
-                attempt.state == "queued"
-                and self._checkpoint_continuity(attempt) is not None
+            if attempt.state == "queued" and (
+                self._checkpoint_continuity(attempt) is not None
+                or discovery_jobs.is_predispatch_checkpoint(attempt.checkpoint)
             ):
                 return True
         return False
@@ -791,6 +842,75 @@ class WorkerEngine:
                 self._wait_reasons[job.job_id] = "waiting_human_task"
             job = repo.get(job.job_id)
             result = {"ok": True, "job": self._job_dict(repo, job)}
+        self._maybe_release_active()
+        return result
+
+    def _op_discovery_submit(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Admit one owner-controlled discovery job (queued, not completed).
+
+        Strictly validates the mode/parameters *before* any durable write or
+        activation change, persists one immutable ``JobRepository`` job under the
+        caller request id (a divergent replay is a conflict), and acquires the
+        same global registry execution token new dispatch uses. The provider work
+        is scheduled asynchronously by :meth:`tick`; this operation returns the
+        queued admission only.
+        """
+        project_id = self._resolve_project(request)
+
+        request_id = request.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise _RequestError(ErrorCode.BAD_TYPE)
+        try:
+            validate_identifier(request_id, "request_id")
+        except ReviewAgentError as exc:
+            raise _RequestError(ErrorCode.BAD_VALUE) from exc
+
+        mode = request.get("mode")
+        if mode not in discovery_jobs.DISCOVERY_MODES:
+            raise _RequestError(ErrorCode.BAD_VALUE)
+        try:
+            parameters = discovery_jobs.validate_submission(
+                mode, request.get("parameters"), project_id
+            )
+        except DiscoveryJobValidationError as exc:
+            raise _RequestError(exc.code) from exc
+
+        # 1) Recovery blockers forbid new durable queuing (no job row created).
+        blockers = self._new_dispatch_blockers(project_id)
+        if blockers is not None:
+            return self._blocked(blockers)
+
+        # 2) Another project must not be silently drained for this submission.
+        current = self._registry.activation()
+        if current.state != "none" and current.active_project_id != project_id:
+            return self._error(ErrorCode.WRONG_PROJECT)
+        if project_id in self._paused_projects:
+            return self._error(ErrorCode.DENIED)
+        if (
+            self._draining
+            and self._activation is not None
+            and self._activation.project_id == project_id
+        ):
+            return self._error(ErrorCode.DRAINING)
+
+        # 3) Acquire/verify execution BEFORE persisting the job.
+        try:
+            self._ensure_execution(project_id)
+        except _RequestError as exc:
+            return self._error(exc.code)
+
+        # 4) Persist the (idempotent) discovery job; a divergent replay conflicts.
+        task_kind = discovery_jobs.task_kind_for_mode(mode)
+        with self.open_repository(project_id) as repo:
+            try:
+                job = repo.submit(
+                    request_id, task_kind=task_kind, parameters=parameters
+                )
+            except JobConflictError:
+                return self._error(ErrorCode.CONFLICT)
+            except JobError:
+                return self._error(ErrorCode.INVALID_STATE)
+            result = {"ok": True, "queued": True, "job": self._job_dict(repo, job)}
         self._maybe_release_active()
         return result
 
@@ -1160,6 +1280,11 @@ class WorkerEngine:
                 with self.open_store(info.project_id) as store:
                     repo = JobRepository(store)
                     for job in repo.list():
+                        if discovery_jobs.is_discovery_task_kind(job.task_kind):
+                            # Discovery attempts are reconciled explicitly by the
+                            # scheduling loop (a local-kind recover would wrongly
+                            # treat a possibly-dispatched attempt as retry-safe).
+                            continue
                         attempt_id = job.current_attempt_id
                         if attempt_id is None:
                             continue
@@ -1237,6 +1362,13 @@ class WorkerEngine:
         """
         if self._stopping:
             return 0.0
+        # A running discovery job occupies the single serial executor: poll it
+        # without blocking the control loop, and start nothing else meanwhile.
+        if self._discovery_future is not None:
+            if self._discovery_future.done():
+                self._poll_discovery_future()
+                return 0.0
+            return 0.05
         active = self._activation
         if active is None:
             return None
@@ -1259,6 +1391,347 @@ class WorkerEngine:
             return False
         return True
 
+    # -- discovery jobs ------------------------------------------------------ #
+    def _active_token(self, project_id: str) -> str | None:
+        """Return the current execution token when it authorizes ``project_id``.
+
+        Used to build the S1 executor; the S1 library revalidates the activation
+        (``active`` only) before every attempt, so a stale/absent token simply
+        blocks the job rather than dispatching under stale authority.
+        """
+        try:
+            current = self._registry.activation()
+        except ReviewAgentError:
+            return None
+        if current.state == "active" and current.active_project_id == project_id:
+            return current.activation_token
+        return None
+
+    def _poll_discovery_future(self) -> None:
+        """Clear a finished discovery future and surface (swallow) its outcome.
+
+        The task records every durable outcome itself; the future is only a
+        liveness handle, so any exception is retrieved and dropped (never a raw
+        trace, never a crash in the control thread).
+        """
+        future = self._discovery_future
+        self._discovery_future = None
+        self._discovery_job = None
+        if future is None:
+            return
+        try:
+            future.result()
+        except Exception:  # noqa: BLE001 - the task owns its error handling
+            pass
+
+    def _maybe_start_discovery(
+        self,
+        repo: JobRepository,
+        project_id: str,
+        jobs: list[Job],
+        *,
+        scheduling: bool,
+        occupied: bool,
+    ) -> bool:
+        """Claim + admit one queued discovery job and start it asynchronously.
+
+        Only starts when the serial slot is free and scheduling is allowed; the
+        durable claim/admit writes happen here (fast, local) while the provider
+        work runs on the executor's own thread with its own store connection.
+        """
+        if self._discovery_pool is None or self._discovery_future is not None:
+            return False
+        if not scheduling or occupied:
+            return False
+        if self._active_token(project_id) is None:
+            return False
+        for job in jobs:
+            if not discovery_jobs.is_discovery_task_kind(job.task_kind):
+                continue
+            if job.state != "queued":
+                continue
+            attempt = (
+                None
+                if job.current_attempt_id is None
+                else repo.attempt(job.current_attempt_id)
+            )
+            if attempt is not None:
+                if attempt.state != "queued":
+                    continue
+                if discovery_jobs.is_predispatch_checkpoint(attempt.checkpoint):
+                    continue  # a possibly-dispatched attempt is reconciled, never restarted
+            try:
+                if attempt is None:
+                    with self._write_guard(project_id, allow_draining=False):
+                        attempt = repo.begin_attempt(job.job_id, dispatch_kind="local")
+                with self._write_guard(project_id, allow_draining=False):
+                    repo.record_checkpoint(
+                        attempt.attempt_id,
+                        discovery_jobs.predispatch_checkpoint(
+                            discovery_jobs.mode_for_task_kind(job.task_kind)
+                        ),
+                    )
+            except (JobError, ReviewAgentError):
+                return False
+            try:
+                future = self._discovery_pool.submit(
+                    self._run_discovery_job,
+                    project_id,
+                    job.job_id,
+                    attempt.attempt_id,
+                )
+            except RuntimeError:  # pool already shut down
+                return False
+            self._discovery_future = future
+            self._discovery_job = (project_id, job.job_id, attempt.attempt_id)
+            return True
+        return False
+
+    def _tick_discovery(
+        self, store: Any, repo: JobRepository, project_id: str, jobs: list[Job]
+    ) -> bool:
+        """Reconcile one possibly-dispatched discovery attempt; return progress.
+
+        A standing local observation completes the same fence; an attempt that
+        *may* have dispatched but has no observation is escalated (never
+        blind-retried); a provably undispatched attempt is reopened. A fresh
+        queued attempt (never dispatched) is left to :meth:`_maybe_start_discovery`.
+        """
+        active_job = self._discovery_job[1] if self._discovery_job else None
+        for job in jobs:
+            if not discovery_jobs.is_discovery_task_kind(job.task_kind):
+                continue
+            if job.job_id == active_job:
+                continue
+            attempt_id = job.current_attempt_id
+            if attempt_id is None:
+                continue
+            attempt = repo.attempt(attempt_id)
+            if attempt is None or attempt.state in ("succeeded", "definitive_failure"):
+                continue
+            if attempt.state not in (
+                "queued",
+                "interrupted",
+                "ambiguous",
+                "admitted",
+                "running",
+            ):
+                continue
+            if attempt.state == "queued" and not discovery_jobs.is_predispatch_checkpoint(
+                attempt.checkpoint
+            ):
+                # Proven never-dispatched: wait for a schedulable start.
+                continue
+            return self._reconcile_discovery_attempt(
+                store, repo, project_id, job, attempt
+            )
+        return False
+
+    def _reconcile_discovery_attempt(
+        self, store: Any, repo: JobRepository, project_id: str, job: Job, attempt: Any
+    ) -> bool:
+        token = self._active_token(project_id)
+        observation = None
+        if token is not None:
+            observation = discovery_jobs.replay_only(
+                store, self._registry, token, job
+            )
+        if observation is not None:
+            metadata = discovery_jobs.observation_metadata(job, observation)
+            try:
+                with self._write_guard(project_id, allow_draining=True):
+                    repo.accept_result(
+                        attempt.attempt_id,
+                        result_kind="discovery_observation",
+                        result=metadata,
+                    )
+            except (JobError, ReviewAgentError):
+                return False
+            return True
+
+        predispatch = discovery_jobs.is_predispatch_checkpoint(attempt.checkpoint)
+        may_have_dispatched = predispatch or attempt.state in (
+            "admitted",
+            "running",
+            "ambiguous",
+        )
+        try:
+            if may_have_dispatched:
+                if attempt.state == "ambiguous":
+                    # Already recorded as an explicit unknown outcome: never
+                    # re-escalate (or poll) in a loop.
+                    return False
+                with self._write_guard(project_id, allow_draining=True):
+                    repo.mark_ambiguous(attempt.attempt_id)
+                    repo.escalate_to_human(job.job_id)
+                self._wait_reasons[job.job_id] = "discovery_reconciliation_required"
+            else:
+                with self._write_guard(project_id, allow_draining=True):
+                    repo.resume_proven_undispatched(attempt.attempt_id)
+        except (JobError, ReviewAgentError):
+            return False
+        return True
+
+    def _run_discovery_job(
+        self, project_id: str, job_id: str, attempt_id: str
+    ) -> None:
+        """Execute one discovery job on a worker thread with its own store.
+
+        The store location is re-resolved from the registry here (never carried
+        across the thread lifetime), and the S1 library performs the provider I/O
+        and the fenced local commit on this thread's connection.
+        """
+        try:
+            with self.open_store(project_id) as store:
+                self._run_discovery_job_inner(store, project_id, job_id, attempt_id)
+        except (ReviewAgentError, OSError):
+            # Cannot even resolve/open the store: leave the durable attempt for
+            # restart reconciliation (never a silent success).
+            return
+
+    def _run_discovery_job_inner(
+        self, store: Any, project_id: str, job_id: str, attempt_id: str
+    ) -> None:
+        repo = JobRepository(store)
+        job = repo.get(job_id)
+        if job is None or job.current_attempt_id != attempt_id:
+            return
+        attempt = repo.attempt(attempt_id)
+        if attempt is None or attempt.state != "queued":
+            return
+
+        if job.state in ("paused", "cancelled"):
+            self._discovery_fail(
+                repo, project_id, job, attempt, attempts=0, reason="stopped"
+            )
+            return
+
+        token = self._active_token(project_id)
+        if token is None:
+            self._discovery_fail(
+                repo, project_id, job, attempt, attempts=0, reason="not_active"
+            )
+            return
+
+        counter = AttemptCounter()
+        transport = discovery_jobs.guard_transport(
+            self._discovery_lowlevel,
+            stop_requested=lambda: self._discovery_stop_requested(
+                repo, project_id, job_id
+            ),
+            counter=counter,
+        )
+        try:
+            record = discovery_jobs.dispatch(
+                store, self._registry, token, job, transport
+            )
+        except DiscoveryJobStopped:
+            self._discovery_fail(
+                repo, project_id, job, attempt, attempts=counter.value, reason="stopped"
+            )
+            return
+        except DiscoveryExecutionBlockedError:
+            held = self._discovery_is_held(repo, project_id, job_id)
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=counter.value,
+                reason="blocked",
+                escalate=(counter.value > 0 or not held),
+            )
+            return
+        except DiscoveryExecutionError:
+            self._discovery_fail(
+                repo, project_id, job, attempt, attempts=counter.value, reason="refused"
+            )
+            return
+        except BaseException:  # noqa: BLE001 - fail closed, never a silent success
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=counter.value,
+                reason="indeterminate",
+            )
+            return
+
+        metadata = discovery_jobs.observation_metadata(job, record)
+        try:
+            with self._write_guard(project_id, allow_draining=True):
+                repo.accept_result(
+                    attempt_id,
+                    result_kind="discovery_observation",
+                    result=metadata,
+                )
+        except (JobError, ReviewAgentError):
+            # The S1 observation is durably recorded; a restart proves it via
+            # replay. Do not fabricate a local receipt here.
+            return
+
+    def _discovery_fail(
+        self,
+        repo: JobRepository,
+        project_id: str,
+        job: Job,
+        attempt: Any,
+        *,
+        attempts: int,
+        reason: str,
+        escalate: bool | None = None,
+    ) -> None:
+        """Record an honest, non-silent outcome for a failed discovery dispatch.
+
+        Zero real provider attempts means nothing could have been issued: the
+        attempt is reopened (its dispatch marker cleared) so it can run once the
+        obstruction is lifted. One or more attempts (or an explicit escalation)
+        is an unknown outcome: the attempt is marked ambiguous and the job is
+        escalated, never silently retried.
+        """
+        if escalate is None:
+            escalate = True
+        try:
+            if attempts == 0:
+                # Nothing could have been issued: reopen the same identity and
+                # clear the dispatch marker. Only an explicit, non-transient
+                # refusal escalates (a persistent obstruction must not loop).
+                with self._write_guard(project_id, allow_draining=True):
+                    repo.resume_proven_undispatched(attempt.attempt_id)
+                    if escalate:
+                        repo.escalate_to_human(job.job_id)
+            else:
+                with self._write_guard(project_id, allow_draining=True):
+                    repo.mark_ambiguous(attempt.attempt_id)
+                    repo.escalate_to_human(job.job_id)
+        except (JobError, ReviewAgentError):
+            pass
+        self._wait_reasons[job.job_id] = "discovery_" + reason
+
+    def _discovery_stop_requested(
+        self, repo: JobRepository, project_id: str, job_id: str
+    ) -> bool:
+        """True when a running discovery job must stop issuing attempts."""
+        if self._draining or project_id in self._paused_projects:
+            return True
+        try:
+            job = repo.get(job_id)
+        except ReviewAgentError:
+            return True
+        return job is None or job.state in ("paused", "cancelled")
+
+    def _discovery_is_held(
+        self, repo: JobRepository, project_id: str, job_id: str
+    ) -> bool:
+        if self._draining or project_id in self._paused_projects:
+            return True
+        try:
+            job = repo.get(job_id)
+        except ReviewAgentError:
+            return False
+        return job is None or job.state in ("paused", "cancelled")
+
     def _runtime_occupied(self, conn: Any, project_id: str) -> bool:
         """True when a durable runtime dispatch occupies the serial remote slot.
 
@@ -1275,8 +1748,32 @@ class WorkerEngine:
             with self.open_store(project_id) as store:
                 repo = JobRepository(store)
                 runtime_occupied = self._runtime_occupied(store.connection, project_id)
-                plan = self._plan(repo, project_id, runtime_occupied=runtime_occupied)
+                jobs = repo.list()
+                occupied = runtime_occupied or any(
+                    self._job_has_potential_remote(repo, job) for job in jobs
+                )
+                scheduling = self._scheduling_allowed(project_id)
+                # Discovery reconciliation (a standing observation completes the
+                # same fence; an unknown outcome escalates) is independent of the
+                # synthetic plan and of a held/occupied slot.
+                if self._tick_discovery(store, repo, project_id, jobs):
+                    return 0.0
+                plan = self._plan(
+                    repo,
+                    project_id,
+                    runtime_occupied=runtime_occupied,
+                    jobs=jobs,
+                    occupied=occupied,
+                )
                 if plan is None:
+                    if self._maybe_start_discovery(
+                        repo,
+                        project_id,
+                        jobs,
+                        scheduling=scheduling,
+                        occupied=occupied,
+                    ):
+                        return 0.0
                     return None
                 action, job, attempt = plan
                 if action == "claim":
@@ -1290,7 +1787,13 @@ class WorkerEngine:
             return None
 
     def _plan(
-        self, repo: JobRepository, project_id: str, *, runtime_occupied: bool = False
+        self,
+        repo: JobRepository,
+        project_id: str,
+        *,
+        runtime_occupied: bool = False,
+        jobs: list[Job] | None = None,
+        occupied: bool | None = None,
     ) -> tuple | None:
         """Pick the next action for the single serial remote executor.
 
@@ -1311,11 +1814,17 @@ class WorkerEngine:
         ``waiting_human``/``waiting_external`` are never polled (no busy loop).
         """
         scheduling = self._scheduling_allowed(project_id)
-        jobs = repo.list()
-        occupied = runtime_occupied or any(
-            self._job_has_potential_remote(repo, job) for job in jobs
-        )
+        if jobs is None:
+            jobs = repo.list()
+        if occupied is None:
+            occupied = runtime_occupied or any(
+                self._job_has_potential_remote(repo, job) for job in jobs
+            )
         for job in jobs:
+            if discovery_jobs.is_discovery_task_kind(job.task_kind):
+                # Discovery jobs have their own claim/reconcile path; never route
+                # them through the synthetic numeric backend.
+                continue
             if job.state in ("waiting_human", "waiting_external"):
                 # A waiting gate is never polled, but it still occupies the slot
                 # (tracked via ``occupied``) and blocks other dispatch.
