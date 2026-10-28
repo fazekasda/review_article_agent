@@ -17,6 +17,7 @@ Run::
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import sqlite3
@@ -50,6 +51,8 @@ from review_article_agent.storage.discovery import (  # noqa: E402
     DiscoverySearchConflictError,
     DiscoverySearchCorruptionError,
     DiscoverySearchValidationError,
+    SQLITE_INTEGER_MAX,
+    SQLITE_INTEGER_MIN,
     discovery_integrity_problems,
 )
 import test_discovery_serialization as fixtures  # noqa: E402
@@ -407,6 +410,61 @@ class AtomicityTests(DiscoveryStoreBase):
         self.assertEqual(loaded.canonical, record.canonical)
 
 
+class RepresentationBoundTests(DiscoveryStoreBase):
+    def test_total_count_at_sqlite_max_is_stored_exactly_and_reloaded(self) -> None:
+        result = dataclasses.replace(fixtures.result(), total_count=SQLITE_INTEGER_MAX)
+        record = self.repo.record_search(request_id="req_sqlite_max", result=result)
+
+        self.assertEqual(record.total_count, SQLITE_INTEGER_MAX)
+        self.assertEqual(record.result.total_count, SQLITE_INTEGER_MAX)
+        loaded = self.repo.get_search(record.run_id)
+        assert loaded is not None
+        self.assertEqual(loaded.total_count, SQLITE_INTEGER_MAX)
+        self.assertEqual(loaded.result.total_count, SQLITE_INTEGER_MAX)
+        self.assertEqual(self._row_count(), 1)
+
+    def test_total_count_above_sqlite_max_is_static_validation_and_writes_nothing(self) -> None:
+        for too_big in (SQLITE_INTEGER_MAX + 1, 2**100):
+            with self.subTest(value=too_big):
+                result = dataclasses.replace(fixtures.result(), total_count=too_big)
+                with self.assertRaises(DiscoverySearchValidationError) as caught:
+                    self.repo.record_search(request_id="req_sqlite_overflow", result=result)
+
+                message = str(caught.exception)
+                self.assertNotIn(str(too_big), message)
+                self.assertNotIn("OverflowError", message)
+                self.assertNotIn("Python int too large", message)
+                self.assertEqual(self._row_count(), 0)
+        self.assertEqual(self.repo.list_searches(), [])
+
+    def test_negative_sqlite_boundaries_are_static_and_write_nothing(self) -> None:
+        # ``SearchResult`` itself forbids a negative total count; a mutated object
+        # at the SQLite negative boundary is still refused statically without SQL.
+        for value in (SQLITE_INTEGER_MIN, SQLITE_INTEGER_MIN - 1):
+            with self.subTest(value=value):
+                mutated = fixtures.result()
+                object.__setattr__(mutated, "total_count", value)
+                with self.assertRaises(DiscoverySearchValidationError) as caught:
+                    self.repo.record_search(request_id="req_negative", result=mutated)
+                message = str(caught.exception)
+                self.assertNotIn(str(value), message)
+                self.assertNotIn("OverflowError", message)
+                self.assertEqual(self._row_count(), 0)
+
+    def test_get_search_invalid_ids_are_rejected_before_sql(self) -> None:
+        cases = ("", "bad id", "a/b", "a" * 513, "\ud800", "\udfff")
+        for bad in cases:
+            with self.subTest(value=repr(bad)):
+                with self.assertRaises(DiscoverySearchValidationError) as caught:
+                    self.repo.get_search(bad)
+                message = str(caught.exception)
+                self.assertNotIn("UnicodeEncodeError", message)
+                self.assertNotIn("utf-8", message)
+                if bad:
+                    self.assertNotIn(bad, message)
+        self.assertEqual(self._row_count(), 0)
+
+
 class CorruptionTests(DiscoveryStoreBase):
     def test_tampered_projection_is_corruption_and_replay_does_not_overwrite(self) -> None:
         result = self.pubmed_completed()
@@ -511,6 +569,10 @@ class CorruptionTests(DiscoveryStoreBase):
             self.repo.record_search(request_id="bad id with space", result=self.pubmed_completed())
         with self.assertRaises(DiscoverySearchValidationError):
             self.repo.record_search(request_id="a" * 513, result=self.pubmed_completed())
+        with self.assertRaises(DiscoverySearchValidationError) as caught:
+            self.repo.record_search(request_id="\ud800", result=self.pubmed_completed())
+        self.assertNotIn("UnicodeEncodeError", str(caught.exception))
+        self.assertNotIn("utf-8", str(caught.exception))
         self.assertEqual(self._row_count(), 0)
 
     def test_shared_integrity_sweep_is_read_only_and_detects_foreign_rows(self) -> None:

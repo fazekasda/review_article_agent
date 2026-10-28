@@ -59,6 +59,19 @@ What this module **is not** (the boundary)
   provenance and may contain the exact query, source URLs, titles, and provider
   identifiers; they are never logged or echoed in an error.
 
+Representation bounds
+---------------------
+
+SQLite ``INTEGER`` is a signed 64-bit value. Every **projected** integer column
+must therefore fit exactly in ``[-2**63, 2**63 - 1]``; values are never coerced,
+truncated, or converted to floats. The only projected value not derived from a
+Python ``len``/fixed encoding constant is the result's non-negative
+``total_count``: a value above :data:`SQLITE_INTEGER_MAX` is refused **before
+insertion** with a static :class:`DiscoverySearchValidationError` and writes no
+row. Negative totals remain invalid under the existing ``SearchResult`` contract.
+Page-level counts and any other non-projected values stay inside the canonical T1
+bytes, so this storage bound does not alter the result value contract.
+
 Every failure is a static, value-free error: a message never echoes a query,
 source, URL, title, identifier, payload byte, or digest.
 """
@@ -86,6 +99,8 @@ __all__ = [
     "DISCOVERY_SEARCH_SCHEMA_VERSION",
     "MAX_DISCOVERY_REQUEST_ID_CHARS",
     "MAX_DISCOVERY_BINDING_BYTES",
+    "SQLITE_INTEGER_MIN",
+    "SQLITE_INTEGER_MAX",
     "DiscoverySearchError",
     "DiscoverySearchValidationError",
     "DiscoverySearchConflictError",
@@ -105,6 +120,11 @@ MAX_DISCOVERY_REQUEST_ID_CHARS = 512
 #: The binding is a handful of ids/digests; a generous technical bound guards a
 #: corrupted or hostile blob without admitting an unbounded parse.
 MAX_DISCOVERY_BINDING_BYTES = 16_384
+
+#: SQLite ``INTEGER`` is a signed 64-bit value. Projected integers must fit
+#: exactly; they are never coerced, truncated, or stored as floats.
+SQLITE_INTEGER_MIN = -(2**63)
+SQLITE_INTEGER_MAX = 2**63 - 1
 
 #: The two supported concrete result types, as recorded.
 _RESULT_TYPE_SEARCH = "search_result"
@@ -166,6 +186,8 @@ _M_TIMESTAMP = "a discovery search observation timestamp is not an RFC 3339 UTC 
 _M_CANONICAL_SIZE = "a discovery search observation canonical result is outside the permitted size"
 _M_BINDING_SIZE = "a discovery search observation binding is outside the permitted size"
 _M_DIGEST_MISMATCH = "a discovery search observation digest does not match its bytes"
+_M_TOTAL_COUNT_BOUND = "the discovery search total count is not a non-negative SQLite signed 64-bit integer"
+_M_PROJECTION_BOUND = "a projected discovery search observation integer is outside the SQLite signed 64-bit integer range"
 _M_PROJECTION = "a projected discovery search observation column disagrees with its canonical result"
 _M_DIVERGENT = "a different discovery search result is already recorded for this request key"
 _M_SQL = "the discovery search observation could not be read or written safely"
@@ -185,6 +207,18 @@ def _sha256_hex(data: bytes) -> str:
 
 def _plain_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _sqlite_int_in_range(value: object) -> bool:
+    """True only for a plain integer exactly representable by SQLite ``INTEGER``."""
+    return _plain_int(value) and SQLITE_INTEGER_MIN <= value <= SQLITE_INTEGER_MAX
+
+
+def _reject_surrogates(value: str, message: str) -> None:
+    """Refuse a lone surrogate before any SQLite UTF-8 conversion can occur."""
+    for char in value:
+        if 0xD800 <= ord(char) <= 0xDFFF:
+            raise DiscoverySearchValidationError(message)
 
 
 def _require_utc_timestamp(value: object) -> str:
@@ -216,12 +250,9 @@ def _request_identifier(value: object) -> str:
         raise DiscoverySearchValidationError(_M_BAD_REQUEST_ID) from exc
     if len(normalized) > MAX_DISCOVERY_REQUEST_ID_CHARS:
         raise DiscoverySearchValidationError(_M_BAD_REQUEST_ID)
-    for char in normalized:
-        if 0xD800 <= ord(char) <= 0xDFFF:
-            # A lone surrogate is not portably encodable into the canonical
-            # identity material; refuse it as a bad key rather than leaking a
-            # JSON-serialization failure.
-            raise DiscoverySearchValidationError(_M_BAD_REQUEST_ID)
+    # A lone surrogate is not portably encodable into canonical identity material
+    # or a SQLite UTF-8 parameter; refuse it as a bad key before any SQL.
+    _reject_surrogates(normalized, _M_BAD_REQUEST_ID)
     return normalized
 
 
@@ -232,6 +263,7 @@ def _run_identifier(value: object) -> str:
         raise DiscoverySearchValidationError(_M_BAD_RUN_ID) from exc
     if len(normalized) > MAX_DISCOVERY_REQUEST_ID_CHARS or len(normalized) < 1:
         raise DiscoverySearchValidationError(_M_BAD_RUN_ID)
+    _reject_surrogates(normalized, _M_BAD_RUN_ID)
     return normalized
 
 
@@ -242,6 +274,7 @@ def _project_identifier(value: object) -> str:
         raise DiscoverySearchValidationError(_M_BAD_PROJECT) from exc
     if len(normalized) > MAX_DISCOVERY_REQUEST_ID_CHARS:
         raise DiscoverySearchValidationError(_M_BAD_PROJECT)
+    _reject_surrogates(normalized, _M_BAD_PROJECT)
     return normalized
 
 
@@ -273,6 +306,47 @@ def _canonical_result(result: object) -> bytes:
     except DiscoverySerializationError as exc:
         raise DiscoverySearchValidationError(_M_BAD_RESULT) from exc
     return canonical
+
+
+def _projected_counts(
+    result: SearchResult, canonical: bytes, binding: bytes
+) -> tuple[int | None, int, int, int, int, int]:
+    """Validate every projected integer against SQLite's exact INTEGER range.
+
+    Returns ``(total_count, page_count, record_count, attempt_count,
+    result_bytes, binding_bytes)``. A result whose top-level ``total_count`` is
+    outside SQLite's signed 64-bit range is refused rather than coerced,
+    truncated, or stored as a float. Python ``len`` values are individually
+    checked too, so no projected integer reaches the SQLite binding layer
+    unvalidated.
+    """
+    total_count = result.total_count
+    if total_count is not None and (
+        not _sqlite_int_in_range(total_count) or total_count < 0
+    ):
+        raise DiscoverySearchValidationError(_M_TOTAL_COUNT_BOUND)
+    page_count = len(result.pages)
+    record_count = len(result.records)
+    attempt_count = len(result.attempts)
+    result_bytes = len(canonical)
+    binding_bytes = len(binding)
+    for count in (
+        page_count,
+        record_count,
+        attempt_count,
+        result_bytes,
+        binding_bytes,
+    ):
+        if not _sqlite_int_in_range(count):
+            raise DiscoverySearchValidationError(_M_PROJECTION_BOUND)
+    return (
+        total_count,
+        page_count,
+        record_count,
+        attempt_count,
+        result_bytes,
+        binding_bytes,
+    )
 
 
 def _binding_canonical(
@@ -383,6 +457,14 @@ class DiscoveryRepository:
             result_sha256=result_sha256,
             result_bytes=len(canonical),
         )
+        (
+            total_count,
+            page_count,
+            record_count,
+            attempt_count,
+            result_bytes,
+            binding_bytes,
+        ) = _projected_counts(result, canonical, binding)
 
         try:
             with self._store.transaction():
@@ -403,6 +485,12 @@ class DiscoveryRepository:
                     result_sha256=result_sha256,
                     binding=binding,
                     result=result,
+                    total_count=total_count,
+                    page_count=page_count,
+                    record_count=record_count,
+                    attempt_count=attempt_count,
+                    result_bytes=result_bytes,
+                    binding_bytes=binding_bytes,
                 )
                 row = self._run_row(run_id)
                 if row is None:  # pragma: no cover - just inserted in this transaction
@@ -410,6 +498,11 @@ class DiscoveryRepository:
                 return self._validate_row(row)
         except DiscoverySearchError:
             raise
+        except OverflowError as exc:
+            # Defence in depth: no caller value may surface a raw sqlite-binding
+            # overflow. The explicit projected bounds above should make this
+            # unreachable, but a refusal is still fail-closed and value-free.
+            raise DiscoverySearchValidationError(_M_PROJECTION_BOUND) from exc
         except sqlite3.Error as exc:
             # Never echo SQL text: it could name a column but never a value.
             raise DiscoverySearchError(_M_SQL) from exc
@@ -426,6 +519,12 @@ class DiscoveryRepository:
         result_sha256: str,
         binding: bytes,
         result: SearchResult,
+        total_count: int | None,
+        page_count: int,
+        record_count: int,
+        attempt_count: int,
+        result_bytes: int,
+        binding_bytes: int,
     ) -> None:
         binding_sha256 = _sha256_hex(binding)
         self._conn().execute(
@@ -448,17 +547,17 @@ class DiscoveryRepository:
                 result.started_at,
                 result.completed_at,
                 result.stop_reason,
-                result.total_count,
+                total_count,
                 1 if result.complete else 0,
                 result.failure,
-                len(result.pages),
-                len(result.records),
-                len(result.attempts),
+                page_count,
+                record_count,
+                attempt_count,
                 result_sha256,
-                len(canonical),
+                result_bytes,
                 bytes(canonical),
                 binding_sha256,
-                len(binding),
+                binding_bytes,
                 bytes(binding),
             ),
         )
@@ -540,7 +639,7 @@ class DiscoveryRepository:
         if row["run_id"] != expected_run_id:
             raise DiscoverySearchCorruptionError(_M_BAD_ROW)
         for column in _COUNT_COLUMNS:
-            if not _plain_int(row[column]):
+            if not _sqlite_int_in_range(row[column]):
                 raise DiscoverySearchCorruptionError(_M_BAD_ROW)
         if row["schema_version"] != DISCOVERY_SEARCH_SCHEMA_VERSION:
             raise DiscoverySearchCorruptionError(_M_BAD_ROW)
@@ -549,7 +648,7 @@ class DiscoveryRepository:
         if row["page_count"] < 0 or row["record_count"] < 0 or row["attempt_count"] < 0:
             raise DiscoverySearchCorruptionError(_M_BAD_ROW)
         if row["total_count"] is not None and (
-            not _plain_int(row["total_count"]) or row["total_count"] < 0
+            not _sqlite_int_in_range(row["total_count"]) or row["total_count"] < 0
         ):
             raise DiscoverySearchCorruptionError(_M_BAD_ROW)
         try:
@@ -587,6 +686,14 @@ class DiscoveryRepository:
                 raise DiscoverySearchCorruptionError(_M_PROJECTION)
         except DiscoverySerializationError as exc:
             raise DiscoverySearchCorruptionError(_M_BAD_ROW) from exc
+        if result.total_count is not None and (
+            not _sqlite_int_in_range(result.total_count)
+            or result.total_count < 0
+        ):
+            # A canonical payload can carry an arbitrary Python integer under the
+            # T1 contract, but this store's projected ``total_count`` column
+            # cannot represent it. Such a row is corrupt for this representation.
+            raise DiscoverySearchCorruptionError(_M_TOTAL_COUNT_BOUND)
 
         expected_type = _result_type(result)
         expected_binding = _binding_canonical(
