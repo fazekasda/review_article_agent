@@ -60,7 +60,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 
 from ..domain.errors import StoreError
 from ..domain.records import canonical_json, validate_identifier
@@ -268,6 +268,19 @@ def _exact_decimal(
     if strictly_positive and amount == 0:
         raise JobValidationError(f"{field}: must be greater than zero")
     return format(amount, "f")
+
+
+def _add_exact(left: Decimal, right: Decimal) -> Decimal:
+    """Add bounded decimal amounts without the process context rounding cents.
+
+    Include every fractional position and a carry digit. This also covers
+    subtraction (a negative right operand) and accumulated project totals.
+    """
+    lowest = min(left.as_tuple().exponent, right.as_tuple().exponent)
+    highest = max(left.adjusted(), right.adjusted(), 0)
+    with localcontext() as context:
+        context.prec = max(1, highest - lowest + 2)
+        return left + right
 
 
 def _fingerprint(payload: object) -> str:
@@ -1111,7 +1124,10 @@ class JobRepository:
         ).fetchone()
         if row is None:
             return DEFAULT_PROJECT_CAP_USD, DEFAULT_STAGE_CAP_USD
-        return row["project_cap_usd"], row["stage_cap_usd"]
+        return (
+            _exact_decimal(row["project_cap_usd"], "stored project cap", strictly_positive=True),
+            _exact_decimal(row["stage_cap_usd"], "stored stage cap", strictly_positive=True),
+        )
 
     def budget_usage(self, *, stage: str | None = None) -> BudgetUsage:
         """Exact-decimal budget usage (reserves count until settled)."""
@@ -1124,7 +1140,7 @@ class JobRepository:
                 project_reserved_usd=project_reserved,
                 stage_reserved_usd=None,
                 project_remaining_usd=format(
-                    Decimal(project_cap) - Decimal(project_reserved), "f"
+                    _add_exact(Decimal(project_cap), Decimal(project_reserved).copy_negate()), "f"
                 ),
                 stage_remaining_usd=None,
             )
@@ -1136,10 +1152,10 @@ class JobRepository:
             project_reserved_usd=project_reserved,
             stage_reserved_usd=stage_reserved,
             project_remaining_usd=format(
-                Decimal(project_cap) - Decimal(project_reserved), "f"
+                _add_exact(Decimal(project_cap), Decimal(project_reserved).copy_negate()), "f"
             ),
             stage_remaining_usd=format(
-                Decimal(stage_cap) - Decimal(stage_reserved), "f"
+                _add_exact(Decimal(stage_cap), Decimal(stage_reserved).copy_negate()), "f"
             ),
         )
 
@@ -1303,7 +1319,7 @@ class JobRepository:
                     row["cost_amount"], "stored cost amount"
                 )
                 counted = max(counted, actual)
-            total += counted
+            total = _add_exact(total, counted)
         return format(total, "f")
 
     def _check_caps_and_reserve(
@@ -1313,13 +1329,13 @@ class JobRepository:
         project_reserved = Decimal(self._reserved_total())
         stage_reserved = Decimal(self._reserved_total(stage=stage))
         want = Decimal(amount)
-        if project_reserved + want > Decimal(project_cap):
+        if _add_exact(project_reserved, want) > Decimal(project_cap):
             raise BudgetExceededError(
                 f"reserving {amount} would exceed the project cap {project_cap} "
                 f"(already reserved {format(project_reserved, 'f')}); "
                 f"refusing to dispatch."
             )
-        if stage_reserved + want > Decimal(stage_cap):
+        if _add_exact(stage_reserved, want) > Decimal(stage_cap):
             raise BudgetExceededError(
                 f"reserving {amount} would exceed the stage cap {stage_cap} for "
                 f"stage {stage!r} (already reserved {format(stage_reserved, 'f')}); "

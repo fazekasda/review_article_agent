@@ -17,7 +17,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -258,6 +258,29 @@ class RetryTest(JobTestBase):
 
 
 class BudgetTest(JobTestBase):
+    def test_accounting_does_not_inherit_process_decimal_precision(self) -> None:
+        self.jobs.set_budget_policy(project_cap_usd="25", stage_cap_usd="25")
+        with localcontext() as context:
+            context.prec = 2
+            first = self.jobs.submit("precise", task_kind="probe")
+            self._external(first, reserve="24.99")
+            usage = self.jobs.budget_usage(stage="s1")
+            self.assertEqual(usage.project_reserved_usd, "24.99")
+            self.assertEqual(usage.project_remaining_usd, "0.01")
+            second = self.jobs.submit("over", task_kind="probe")
+            with self.assertRaises(BudgetExceededError):
+                self._external(second, reserve="0.02")
+
+    def test_exhausted_large_cap_cannot_round_away_small_reserve(self) -> None:
+        cap = "1000000000000000000000000"
+        self.jobs.set_budget_policy(project_cap_usd=cap, stage_cap_usd=cap)
+        first = self.jobs.submit("large", task_kind="probe")
+        self._external(first, reserve=cap)
+        second = self.jobs.submit("small", task_kind="probe")
+        with self.assertRaises(BudgetExceededError):
+            self._external(second, reserve="0.000000000000000000000001")
+        self.assertEqual(self.jobs.budget_usage(stage="s1").stage_remaining_usd, "0")
+
     def _external(self, job, *, reserve, stage="s1"):
         return self.jobs.begin_attempt(
             job.job_id,
