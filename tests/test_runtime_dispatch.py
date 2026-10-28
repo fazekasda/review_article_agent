@@ -28,7 +28,13 @@ These tests cover the additive ``runtime/dispatch.py`` layer and store schema 6:
 * database-level identity immutability and a reusable read-only integrity sweep
   that detects foreign/dangling/orphan/corrupt rows and malformed linked tasks;
 * a fail-closed exposure read (missing operational row, malformed cost state or
-  amount raises instead of silently counting the bare reserve);
+  amount raises instead of silently counting the bare reserve; a schema-6 store
+  missing a ledger table raises rather than reporting zero);
+* monotonic **legacy** settlement shared with the runtime ledger (a known overrun
+  cannot be erased by a later unknown/not_incurred/lower settlement, and both cap
+  directions stay closed) and an exact admission replay that compares the ref too;
+* database-level ``UNIQUE(project_id, task_id)`` (at most one logical dispatch per
+  task);
 * static, curated error messages that never echo raw ids/values;
 * a schema 5 -> 6 upgrade that leaves old artifacts, tasks, and jobs unchanged.
 
@@ -65,6 +71,7 @@ from review_article_agent.runtime.dispatch import (  # noqa: E402
 )
 from review_article_agent.runtime.jobs import (  # noqa: E402
     BudgetExceededError,
+    JobConflictError,
     JobRepository,
 )
 from review_article_agent.runtime.roles import (  # noqa: E402
@@ -794,6 +801,91 @@ class SharedCapsTest(DispatchTestBase):
         self.assertEqual(len(self.dispatch.list_dispatches()), 1)
 
 
+class LegacySettlementSharedCapTest(DispatchTestBase):
+    """The legacy synthetic ledger cannot erase a known overrun on settlement.
+
+    R1 correctly separated routes, but the reciprocal helper counted the *current*
+    legacy amount, so a later weaker legacy settlement discarded the known actual
+    and shrank the exposure shared with every runtime route. These regressions pin
+    the conservative, monotonic legacy settlement and both cap directions.
+    """
+
+    def _legacy_overrun(self):
+        job = self.jobs.submit("legacy", task_kind="synthetic_numeric")
+        attempt = self.jobs.begin_attempt(
+            job.job_id,
+            dispatch_kind="external_synthetic",
+            stage="s",
+            reserve_usd="0.1",
+        )
+        self.jobs.settle_cost(attempt.attempt_id, cost_state="known", amount_usd="2")
+        return job, attempt
+
+    def test_known_overrun_cannot_be_erased_by_unknown_or_not_incurred(self) -> None:
+        _job, attempt = self._legacy_overrun()
+        # The known actual overran the 0.10 reserve and counts at 2.00.
+        self.assertEqual(
+            Decimal(self.dispatch.budget_usage().project_reserved_usd), Decimal("2")
+        )
+        # A later unknown/not_incurred settlement must be refused, not applied.
+        with self.assertRaises(JobConflictError):
+            self.jobs.settle_cost(attempt.attempt_id, cost_state="unknown")
+        with self.assertRaises(JobConflictError):
+            self.jobs.settle_cost(attempt.attempt_id, cost_state="not_incurred")
+        # The shared exposure still counts the known overrun, both scopes.
+        self.assertEqual(
+            Decimal(self.dispatch.budget_usage().project_reserved_usd), Decimal("2")
+        )
+        self.assertEqual(
+            Decimal(self.dispatch.budget_usage(stage="s").stage_reserved_usd),
+            Decimal("2"),
+        )
+        stored = self.jobs.attempt(attempt.attempt_id)
+        self.assertEqual((stored.cost_state, stored.cost_amount_usd), ("known", "2"))
+
+    def test_known_overrun_cannot_be_lowered_but_higher_is_allowed(self) -> None:
+        _job, attempt = self._legacy_overrun()
+        with self.assertRaises(JobConflictError):
+            self.jobs.settle_cost(
+                attempt.attempt_id, cost_state="known", amount_usd="1"
+            )
+        with self.assertRaises(JobConflictError):
+            self.jobs.settle_cost(
+                attempt.attempt_id, cost_state="estimated", amount_usd="1.99"
+            )
+        settled = self.jobs.settle_cost(
+            attempt.attempt_id, cost_state="known", amount_usd="3"
+        )
+        self.assertEqual(settled.cost_amount_usd, "3")
+        self.assertEqual(
+            Decimal(self.dispatch.budget_usage().project_reserved_usd), Decimal("3")
+        )
+
+    def test_project_and_stage_caps_stay_closed_after_refused_downgrade(self) -> None:
+        self.jobs.set_budget_policy(project_cap_usd="25", stage_cap_usd="25")
+        _job, _attempt = self._legacy_overrun()
+        # A refused downgrade must not reopen the shared caps in either direction:
+        # a new runtime reserve in the same stage cannot reopen the stage cap...
+        with self.assertRaises(BudgetExceededError):
+            self.reserve(request_id="rt-same-stage", stage="s", reserve_usd="24")
+        # ...nor can a runtime reserve in a different stage reopen the project cap.
+        with self.assertRaises(BudgetExceededError):
+            self.reserve(request_id="rt-other-stage", stage="s2", reserve_usd="24")
+        # The reciprocal direction (a synthetic reserve) also stays closed.
+        job2 = self.jobs.submit("legacy-2", task_kind="synthetic_numeric")
+        with self.assertRaises(BudgetExceededError):
+            self.jobs.begin_attempt(
+                job2.job_id,
+                dispatch_kind="external_synthetic",
+                stage="s",
+                reserve_usd="24",
+            )
+        # The known overrun is still counted and unchanged.
+        self.assertEqual(
+            Decimal(self.dispatch.budget_usage().project_reserved_usd), Decimal("2")
+        )
+
+
 class ImmutableAndIntegrityTest(DispatchTestBase):
     def test_identity_row_is_immutable(self) -> None:
         record = self.reserve()
@@ -1012,6 +1104,107 @@ class CostExposureFailClosedTest(DispatchTestBase):
             conn.execute("PRAGMA ignore_check_constraints = OFF")
         with self.assertRaises(DispatchCorruptionError):
             runtime_reserve_exposure(conn, self.pid)
+
+
+class MissingLedgerTableFailClosedTest(DispatchTestBase):
+    """A schema-6 store missing a ledger table must not report zero exposure."""
+
+    def test_missing_identity_and_operational_tables_fail_closed(self) -> None:
+        conn = self.store.connection
+        conn.execute("DROP TABLE runtime_dispatch_state")
+        conn.execute("DROP TABLE runtime_dispatch")
+        self.assertEqual(
+            int(conn.execute("PRAGMA user_version").fetchone()[0]), 6
+        )
+        with self.assertRaises(DispatchCorruptionError) as ctx:
+            runtime_reserve_exposure(conn, self.pid)
+        # Typed and static: the denial never echoes the project id.
+        self.assertNotIn(self.pid, str(ctx.exception))
+
+    def test_missing_operational_table_fails_closed(self) -> None:
+        self.reserve(reserve_usd="0.10")
+        conn = self.store.connection
+        conn.execute("DROP TABLE runtime_dispatch_state")
+        with self.assertRaises(DispatchCorruptionError):
+            runtime_reserve_exposure(conn, self.pid)
+
+    def test_pre_ledger_schema_has_zero_runtime_exposure(self) -> None:
+        root = str(self.tmp / "p3")
+        paths.ensure_owner_private_dir(paths.app_dir_for(root))
+        conn = schema.open_connection(paths.store_path_for(root))
+        try:
+            schema.migrate(
+                conn,
+                target_version=3,
+                migrations=schema.STORE_MIGRATIONS,
+                label="project store",
+            )
+            self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 3)
+            # A genuine pre-ledger store has no runtime ledger to count.
+            self.assertEqual(
+                runtime_reserve_exposure(conn, paths.new_project_id()), Decimal("0")
+            )
+        finally:
+            conn.close()
+
+
+class SingleDispatchPerTaskDatabaseTest(DispatchTestBase):
+    def test_database_refuses_second_dispatch_for_same_task(self) -> None:
+        first = self.reserve(request_id="call-1")
+        conn = self.store.connection
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO runtime_dispatch "
+                "(project_id, dispatch_id, request_id, task_id, task_fingerprint, "
+                " route, accounting_bucket, stage, input_digest, version_digest, "
+                " reserve_usd, bound_evidence_digest, created_at_utc) "
+                "VALUES (?, 'disp_second', 'call-2', ?, ?, 'direct_call', "
+                " 'direct_call', 's2', ?, ?, '0.20', ?, '2026-01-01T00:00:00+00:00')",
+                (
+                    self.pid,
+                    first.task_id,
+                    first.task_fingerprint,
+                    _DIG_A,
+                    _DIG_B,
+                    _DIG_C,
+                ),
+            )
+        self.assertEqual(len(self.dispatch.list_dispatches()), 1)
+
+
+class AdmissionReplayTest(DispatchTestBase):
+    def test_admission_ref_must_match_on_exact_replay(self) -> None:
+        record = self.reserve(route="opencode_session")
+        self.dispatch.mark_submitted(record.dispatch_id)
+        admitted = self.dispatch.mark_admitted(
+            record.dispatch_id, admission_id="adm-1", admission_ref="ext-1"
+        )
+        self.assertEqual(admitted.admission_ref, "ext-1")
+        replay = self.dispatch.mark_admitted(
+            record.dispatch_id, admission_id="adm-1", admission_ref="ext-1"
+        )
+        self.assertEqual((replay.admission_id, replay.admission_ref), ("adm-1", "ext-1"))
+        # A divergent ref (same id) must not silently reuse the recorded ref.
+        with self.assertRaises(DispatchConflictError):
+            self.dispatch.mark_admitted(
+                record.dispatch_id, admission_id="adm-1", admission_ref="ext-2"
+            )
+        # A missing ref must not silently accept the established one either.
+        with self.assertRaises(DispatchConflictError):
+            self.dispatch.mark_admitted(record.dispatch_id, admission_id="adm-1")
+        self.assertEqual(
+            self.dispatch.get_dispatch(record.dispatch_id).admission_ref, "ext-1"
+        )
+
+    def test_divergent_admission_id_is_refused(self) -> None:
+        record = self.reserve(route="opencode_session")
+        self.dispatch.mark_submitted(record.dispatch_id)
+        self.dispatch.mark_admitted(record.dispatch_id, admission_id="adm-1")
+        with self.assertRaises(DispatchConflictError):
+            self.dispatch.mark_admitted(record.dispatch_id, admission_id="adm-2")
+        self.assertEqual(
+            self.dispatch.get_dispatch(record.dispatch_id).admission_id, "adm-1"
+        )
 
 
 class StaticMessageTest(DispatchTestBase):

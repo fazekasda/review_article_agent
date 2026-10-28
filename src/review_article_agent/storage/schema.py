@@ -705,7 +705,9 @@ def _store_v6(conn: sqlite3.Connection) -> None:
     * **Logical-call identity is explicit and idempotent.** ``dispatch_id`` is
       derived from ``(project_id, request_id)`` and ``UNIQUE(project_id,
       request_id)`` makes a repeated reserve with the same key return the same one
-      row, so a reserve can never double-count.
+      row, so a reserve can never double-count. ``UNIQUE(project_id, task_id)``
+      additionally makes "at most one logical dispatch per task" (initial scope,
+      no retries) a database invariant rather than only a repository check.
     * **Route/bucket separation.** ``CHECK ((route = 'direct_call') =
       (accounting_bucket = 'direct_call'))`` makes a ``direct_call`` cost
       un-aggregatable into OpenCode session statistics (C02 §6.3).
@@ -747,6 +749,10 @@ def _store_v6(conn: sqlite3.Connection) -> None:
             created_at_utc        TEXT NOT NULL,
             PRIMARY KEY (project_id, dispatch_id),
             UNIQUE (project_id, request_id),
+            -- Initial scope permits at most one logical dispatch per task (no
+            -- retries); enforced here as well as in the repository so the
+            -- database itself cannot hold a second dispatch for the same task.
+            UNIQUE (project_id, task_id),
             CHECK ((route = 'direct_call') = (accounting_bucket = 'direct_call')),
             FOREIGN KEY (project_id, task_id)
                 REFERENCES runtime_bounded_task (project_id, task_id)

@@ -295,6 +295,23 @@ def _add_exact(left: Decimal, right: Decimal) -> Decimal:
         return left + right
 
 
+def _counted_exposure(
+    reserve_usd: str, cost_state: str, amount_usd: str | None
+) -> Decimal:
+    """The conservative exposure one reserve contributes (C02 §5.6).
+
+    The immutable reserve is always counted, and a ``known``/``estimated`` amount
+    that overran it is counted instead, so an overrun is never under-counted.
+    ``unknown``/``not_incurred`` costs contribute no separate amount (their reserve
+    bound is retained). Shared with the runtime dispatch ledger so both route
+    settlements use the same conservative arithmetic.
+    """
+    counted = Decimal(reserve_usd)
+    if cost_state in _COST_STATES_WITH_AMOUNT and amount_usd is not None:
+        counted = max(counted, Decimal(amount_usd))
+    return counted
+
+
 def _fingerprint(payload: object) -> str:
     return hashlib.sha256(canonical_json(payload)).hexdigest()
 
@@ -1247,6 +1264,14 @@ class JobRepository:
         (C02 §5.6). The reported/estimated amount is recorded on the attempt; an
         ``unknown`` cost records **no** amount (never zero), and ``not_incurred``
         records no amount either. Requires the current attempt.
+
+        Settlement is **monotonic** (the same rule the runtime dispatch ledger
+        applies): an established amount can never be discarded
+        (``known``/``estimated`` -> ``unknown``/``not_incurred``) or lowered, and
+        the counted exposure can never shrink. A weaker replay raises
+        :class:`JobConflictError` and changes nothing, so a known/estimated overrun
+        is never erased by a later ``unknown``/``not_incurred``/lower settlement
+        (C02 §5.6/§6.3).
         """
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         _require_enum(cost_state, COST_STATES, "cost_state")
@@ -1275,6 +1300,9 @@ class JobRepository:
                 raise JobStateError(
                     f"attempt {attempt_id!r} has no budget reserve to settle."
                 )
+            self._assert_cost_settlement_monotonic(
+                attempt, reserve["amount_usd"], cost_state, recorded
+            )
             reserve_state = (
                 "retained" if cost_state in ("unknown", "estimated") else "settled"
             )
@@ -1289,6 +1317,44 @@ class JobRepository:
                 (cost_state, recorded, self.project_id, attempt_id),
             )
         return self._require_attempt(attempt_id)
+
+    def _assert_cost_settlement_monotonic(
+        self,
+        attempt: Attempt,
+        reserve_usd: str,
+        new_state: str,
+        new_amount: str | None,
+    ) -> None:
+        """Refuse a settlement that would weaken or lower an established cost.
+
+        Mirrors :meth:`RuntimeDispatchRepository.settle_cost`: an incurred/unknown
+        cost can never become ``not_incurred``, an established amount can never be
+        discarded or reduced, and the counted exposure can never shrink. A refused
+        settlement changes nothing, so an overrun is never erased (C02 §5.6/§6.3).
+        """
+        if new_state == "not_incurred" and attempt.cost_state != "not_incurred":
+            raise JobConflictError(
+                "an incurred or unknown cost cannot be re-declared as not incurred; "
+                "refusing to release the reserve."
+            )
+        if attempt.cost_amount_usd is not None:
+            if new_amount is None:
+                raise JobConflictError(
+                    "an established cost amount cannot be discarded; refusing a "
+                    "cost downgrade."
+                )
+            if Decimal(new_amount) < Decimal(attempt.cost_amount_usd):
+                raise JobConflictError(
+                    "an established cost amount cannot be reduced; refusing a cost "
+                    "downgrade."
+                )
+        if _counted_exposure(reserve_usd, new_state, new_amount) < _counted_exposure(
+            reserve_usd, attempt.cost_state, attempt.cost_amount_usd
+        ):
+            raise JobConflictError(
+                "a cost settlement cannot reduce the attempt's counted exposure; "
+                "refusing the downgrade."
+            )
 
     # -- internal ------------------------------------------------------------ #
     def _job_row(self, job_id: str) -> sqlite3.Row | None:

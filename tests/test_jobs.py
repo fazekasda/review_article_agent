@@ -455,6 +455,78 @@ class BudgetTest(JobTestBase):
             )
 
 
+class CostSettlementMonotonicTest(JobTestBase):
+    """A settled cost can never be discarded or lowered (C02 §5.6/§6.3)."""
+
+    def _external_known_overrun(self):
+        job = self.jobs.submit("legacy", task_kind="synthetic_numeric")
+        attempt = self.jobs.begin_attempt(
+            job.job_id,
+            dispatch_kind="external_synthetic",
+            stage="s",
+            reserve_usd="0.1",
+        )
+        self.jobs.settle_cost(attempt.attempt_id, cost_state="known", amount_usd="2")
+        return job, attempt
+
+    def test_known_overrun_cannot_be_erased_by_unknown_or_not_incurred(self) -> None:
+        _job, attempt = self._external_known_overrun()
+        self.assertEqual(self.jobs.budget_usage(stage="s").stage_reserved_usd, "2")
+        with self.assertRaises(JobConflictError):
+            self.jobs.settle_cost(attempt.attempt_id, cost_state="unknown")
+        with self.assertRaises(JobConflictError):
+            self.jobs.settle_cost(attempt.attempt_id, cost_state="not_incurred")
+        # The refused downgrades changed nothing: the overrun still counts.
+        stored = self.jobs.attempt(attempt.attempt_id)
+        self.assertEqual(stored.cost_state, "known")
+        self.assertEqual(stored.cost_amount_usd, "2")
+        self.assertEqual(self.jobs.budget_usage(stage="s").stage_reserved_usd, "2")
+
+    def test_known_overrun_cannot_be_lowered_but_higher_is_allowed(self) -> None:
+        _job, attempt = self._external_known_overrun()
+        with self.assertRaises(JobConflictError):
+            self.jobs.settle_cost(
+                attempt.attempt_id, cost_state="known", amount_usd="1"
+            )
+        with self.assertRaises(JobConflictError):
+            self.jobs.settle_cost(
+                attempt.attempt_id, cost_state="estimated", amount_usd="1.99"
+            )
+        settled = self.jobs.settle_cost(
+            attempt.attempt_id, cost_state="known", amount_usd="3"
+        )
+        self.assertEqual(settled.cost_amount_usd, "3")
+        self.assertEqual(self.jobs.budget_usage(stage="s").stage_reserved_usd, "3")
+
+    def test_unknown_cannot_become_not_incurred(self) -> None:
+        job = self.jobs.submit("legacy", task_kind="synthetic_numeric")
+        attempt = self.jobs.begin_attempt(
+            job.job_id,
+            dispatch_kind="external_synthetic",
+            stage="s",
+            reserve_usd="0.1",
+        )
+        self.jobs.settle_cost(attempt.attempt_id, cost_state="unknown")
+        with self.assertRaises(JobConflictError):
+            self.jobs.settle_cost(attempt.attempt_id, cost_state="not_incurred")
+        self.assertEqual(self.jobs.budget_usage(stage="s").stage_reserved_usd, "0.1")
+
+    def test_settled_cost_survives_restart_without_reset(self) -> None:
+        _job, attempt = self._external_known_overrun()
+        self.reopen()
+        stored = self.jobs.attempt(attempt.attempt_id)
+        self.assertEqual(stored.cost_state, "known")
+        self.assertEqual(stored.cost_amount_usd, "2")
+        self.assertEqual(self.jobs.budget_usage(stage="s").stage_reserved_usd, "2")
+        # Recovery retains the settled cost and never resets it to not_incurred.
+        outcome = self.jobs.recover(attempt.attempt_id)
+        self.assertEqual(outcome.disposition, "reconciliation_required")
+        recovered = self.jobs.attempt(attempt.attempt_id)
+        self.assertEqual(recovered.cost_state, "known")
+        self.assertEqual(recovered.cost_amount_usd, "2")
+        self.assertEqual(self.jobs.budget_usage(stage="s").stage_reserved_usd, "2")
+
+
 class RepairRegressionTest(JobTestBase):
     def test_external_missing_receipt_recovery_is_unresolved(self) -> None:
         # An external attempt with no local admission receipt must NOT be treated

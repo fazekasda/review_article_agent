@@ -117,6 +117,7 @@ from .jobs import (
     JobValidationError,
     _add_exact,
     _bounded_decimal_amount,
+    _counted_exposure,
     _exact_decimal,
 )
 
@@ -427,20 +428,15 @@ def _table_present(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
-def _counted_exposure(
-    reserve_usd: str, cost_state: str, amount_usd: str | None
-) -> Decimal:
-    """The conservative exposure one dispatch contributes (C02 §5.6).
+def _user_version(conn: sqlite3.Connection) -> int:
+    """The store's ``PRAGMA user_version`` (the runtime ledger's schema version)."""
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
-    The immutable reserve is always counted, and a ``known``/``estimated`` amount
-    that overran it is counted instead, so an overrun is never under-counted.
-    ``unknown``/``not_incurred`` costs contribute no separate amount (their reserve
-    bound is retained).
-    """
-    counted = Decimal(reserve_usd)
-    if cost_state in _COST_STATES_WITH_AMOUNT and amount_usd is not None:
-        counted = max(counted, Decimal(amount_usd))
-    return counted
+
+#: The store schema version that introduces the runtime dispatch ledger. A store
+#: **at or above** this version must carry both ledger tables; only a genuinely
+#: older store (``< 6``) may legitimately have no runtime ledger to count.
+RUNTIME_LEDGER_SCHEMA_VERSION = 6
 
 
 def runtime_reserve_exposure(
@@ -462,11 +458,25 @@ def runtime_reserve_exposure(
     is **not** silently counted at its bare reserve — the whole read raises
     :class:`DispatchCorruptionError` instead (a malformed ledger must never
     under-count exposure). Every stored amount is re-validated as a bounded exact
-    decimal. A store that predates the runtime ledger (no ``runtime_dispatch``
-    table) contributes nothing.
+    decimal. Only a store that genuinely **predates** the runtime ledger (a schema
+    ``< 6``, so no ``runtime_dispatch``/``runtime_dispatch_state`` table was ever
+    created) contributes nothing; a schema ``>= 6`` store that is missing either
+    ledger table is corrupt and raises :class:`DispatchCorruptionError` rather than
+    quietly reporting zero exposure (C02 §5.6).
     """
-    if not _table_present(conn, "runtime_dispatch"):
+    if _user_version(conn) < RUNTIME_LEDGER_SCHEMA_VERSION:
+        # A genuine pre-ledger store: no runtime dispatch table was ever created.
         return Decimal("0")
+    if not _table_present(conn, "runtime_dispatch"):
+        raise DispatchCorruptionError(
+            "runtime dispatch ledger: the identity table is missing from a store "
+            "that should carry it; refusing to report zero exposure."
+        )
+    if not _table_present(conn, "runtime_dispatch_state"):
+        raise DispatchCorruptionError(
+            "runtime dispatch ledger: the operational state table is missing from a "
+            "store that should carry it; refusing to report zero exposure."
+        )
     sql = (
         "SELECT d.reserve_usd, s.cost_state, s.cost_amount_usd "
         "FROM runtime_dispatch d "
@@ -827,8 +837,10 @@ class RuntimeDispatchRepository:
 
         The direct route has no proven durable/idempotent admission, so this is
         refused for a ``direct_call`` dispatch (and the database trigger refuses
-        such a row outright). Admission is **not** completion. Idempotent for the
-        same ``admission_id``.
+        such a row outright). Admission is **not** completion. An **exact** replay
+        (the same ``admission_id`` **and** the same ``admission_ref``) is
+        idempotent; a divergent replay raises :class:`DispatchConflictError` instead
+        of silently reusing the recorded ref.
         """
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         admission_id = validate_identifier(admission_id, "admission_id")
@@ -841,8 +853,18 @@ class RuntimeDispatchRepository:
                     "a direct_call dispatch has no durable admission; refusing to "
                     "claim an idempotent external admission."
                 )
-            if record.state == "admitted" and record.admission_id == admission_id:
-                return record
+            if record.state == "admitted":
+                # An exact replay (same id **and** same ref) is idempotent; a
+                # divergent replay must never silently reuse the recorded ref.
+                if (
+                    record.admission_id == admission_id
+                    and record.admission_ref == admission_ref
+                ):
+                    return record
+                raise DispatchConflictError(
+                    "the dispatch already recorded a different admission; refusing "
+                    "a divergent admission replay."
+                )
             if record.state != "submitted":
                 raise DispatchStateError(
                     "only a submitted dispatch may record an admission; refusing to "
