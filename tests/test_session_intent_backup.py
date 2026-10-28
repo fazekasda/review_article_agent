@@ -492,14 +492,18 @@ class DynamicHookTest(SessionIntentBackupBase):
             minimums[:6], [4, 5, 6, 7, 8, backup_mod._DECISION_RESULT_SCHEMA_VERSION]
         )
         self.assertEqual(minimums[-1], schema.STORE_SCHEMA_VERSION)
-        self.assertEqual(
-            backup_mod._SESSION_INTENT_SCHEMA_VERSION, schema.STORE_SCHEMA_VERSION
-        )
+        self.assertEqual(backup_mod._SESSION_INTENT_SCHEMA_VERSION, 10)
         self.assertIn(backup_mod._SESSION_INTENT_SCHEMA_VERSION, minimums)
         validators = [validator for _, validator in backup_mod._SCHEMA_VALIDATORS]
         self.assertTrue(all(callable(validator) for validator in validators))
         self.assertEqual(len(validators), len(set(validators)))
-        self.assertIs(validators[-1], backup_mod._verify_session_intent_relations)
+        self.assertIs(
+            validators[minimums.index(backup_mod._SESSION_INTENT_SCHEMA_VERSION)],
+            backup_mod._verify_session_intent_relations,
+        )
+        # A later additive checkpoint appends its hook without moving schema-10.
+        self.assertIs(validators[-1], backup_mod._verify_discovery_relations)
+        self.assertGreater(minimums[-1], backup_mod._SESSION_INTENT_SCHEMA_VERSION)
         # The pre-existing schema-4..9 entries are untouched.
         self.assertEqual(
             validators[:6],

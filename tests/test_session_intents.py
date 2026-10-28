@@ -677,8 +677,8 @@ class MigrationTest(SessionIntentTestBase):
 
     def test_schema_version_is_current_and_additive(self) -> None:
         self.assertEqual(schema.STORE_SCHEMA_VERSION, max(schema.STORE_MIGRATIONS))
-        self.assertEqual(schema.STORE_SCHEMA_VERSION, 10)
-        self.assertEqual(set(schema.STORE_MIGRATIONS), set(range(1, 11)))
+        self.assertGreaterEqual(schema.STORE_SCHEMA_VERSION, 10)
+        self.assertTrue(set(range(1, 11)).issubset(set(schema.STORE_MIGRATIONS)))
 
 
 if __name__ == "__main__":  # pragma: no cover

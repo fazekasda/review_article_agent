@@ -43,11 +43,13 @@ Step 04 is **complete as a restricted runtime**: its full local verification pas
 at `c1f927b` (**2,105 tests, no skips**; see the
 [Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)).
 Step 05 (reproducible discovery and corpus freeze) is **partial — metadata adapter
-foundation**: a bounded, stdlib-only public-metadata transport and two provider
-adapters exist as a **library** only (see the
-[Step 05 handoff](docs/implementation/handoffs/05-discovery.md) and the
-[discovery API/limits](docs/discovery.md)); no workflow, persistence, approval
-gate, or corpus freeze is built, and the step is **not** complete.
+foundation plus inert durable search observations**: a bounded, stdlib-only
+public-metadata transport and two provider adapters exist as a **library**, and an
+added lossless codec/schema-11 repository can durably replay exact provider
+observations (see the [Step 05 handoff](docs/implementation/handoffs/05-discovery.md)
+and the [discovery API/limits](docs/discovery.md)). There is still no workflow,
+approval/search-plan gate, scientific candidate deduplication or cross-run
+ingestion, coverage reporting, or corpus freeze; the step is **not** complete.
 
 ## Getting started (local core only)
 
@@ -86,7 +88,7 @@ surface in [CLI contract §10](docs/cli.md); the runtime safety contract is in
 [Worker runtime safety contract](docs/worker.md), with the completion evidence in
 the [Step 03 handoff](docs/implementation/handoffs/03-durable-worker.md).
 
-### Discovery metadata adapters (Step 05, partial)
+### Discovery metadata adapters and inert observations (Step 05, partial)
 
 A bounded, stdlib-only **library** foundation for public literature metadata now
 exists under `src/review_article_agent/discovery/`: a fixed-allowlist HTTPS GET
@@ -110,13 +112,27 @@ europepmc = EuropePMCClient(transport)      # positional transport argument
 # epmc_result = europepmc.search("EXT_ID:31452104 AND SRC:MED")
 ```
 
-This is **not** a workflow: there is **no** CLI, worker scheduling, approval gate,
-or persistence (the storage schema remains **10**), and metadata is an **untrusted
-observation** — no accepted context, eligibility, scientific identity, or corpus
-freeze. Each `search()` invocation **repeats** the provider observations; it is
-**not** idempotent persisted candidate ingestion. The exact API, defaults, and
-maximum limits are in the [discovery API/limits](docs/discovery.md), and the
-criterion-by-criterion status is in the
+An added slice stores exact observations in the additive schema-11
+`discovery_search_run` table through
+`review_article_agent.storage.discovery.DiscoveryRepository`. Given a trusted
+caller's `request_id` and an already-returned `SearchResult`,
+`record_search(*, request_id=..., result=...)` writes one immutable row;
+`get_search(run_id)` and `list_searches()` reconstruct it exactly, and an identical
+request-key replay returns the historical row and timestamp. A divergent result is
+a static conflict; different request keys stay separate observations even for an
+identical payload (this is **not** scientific deduplication). The repository
+performs **no** network call, so `search()` itself still repeats provider
+observations and is **not** idempotent candidate ingestion.
+
+This is **not** a workflow: there is **no** discovery CLI, worker scheduling,
+search-plan/approval gate, candidate deduplication or cross-run scientific
+candidate ingestion, citation expansion, coverage report, corpus freeze, or cost
+reporting, and metadata is an **untrusted observation** — no accepted context,
+eligibility, or scientific identity. Its private bytes may contain exact queries,
+source URLs, titles, and identifiers; hashes detect corruption, not authenticity,
+and it is not a secret scanner. The exact API, defaults, and maximum limits are in
+the [discovery API/limits](docs/discovery.md), and the criterion-by-criterion
+status is in the
 [Step 05 handoff](docs/implementation/handoffs/05-discovery.md).
 
 ## Planning documents
@@ -129,8 +145,8 @@ criterion-by-criterion status is in the
 - [Step 02 handoff (complete, local foundation)](docs/implementation/handoffs/02-project-foundation.md)
 - [Step 03 handoff (complete, synthetic detached worker)](docs/implementation/handoffs/03-durable-worker.md)
 - [Step 04 handoff (complete, restricted runtime)](docs/implementation/handoffs/04-agent-runtime.md)
-- [Step 05 handoff (partial, metadata adapter foundation)](docs/implementation/handoffs/05-discovery.md)
-- [Discovery metadata adapters API and limits (Step 05, partial)](docs/discovery.md)
+- [Step 05 handoff (partial, adapters plus durable observations)](docs/implementation/handoffs/05-discovery.md)
+- [Discovery adapters, codec, and observation API/limits (Step 05, partial)](docs/discovery.md)
 - [Step 02 CLI contract](docs/cli.md)
 - [Step 02 storage contract](docs/storage.md)
 - [Step 03 worker runtime safety contract](docs/worker.md)
@@ -155,8 +171,10 @@ model, provider, or scientific approval, and step 04 is a **restricted** runtime
 whose only model transport is a loopback fixture — no scientific autonomous
 workflow, production paid generation, hosted transfer, scientific feature, or
 scientific validation is implemented or claimed. Step 05 is **partial — metadata
-adapter foundation**: a bounded public-metadata transport and two provider adapters
-exist as a **library** only (see the
-[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); no workflow,
-persistence, approval gate, corpus freeze, or scientific feature is implemented or
-claimed, and the step is **not** complete.
+adapter foundation plus inert durable observations**: a bounded public-metadata
+transport, two provider adapters, and a lossless schema-11 observation repository
+exist as **libraries** (see the
+[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); no discovery
+workflow, approval/search-plan gate, scientific candidate dedup/ingestion,
+citation expansion, coverage, corpus freeze, cost reporting, or scientific feature
+is implemented or claimed, and the step is **not** complete.

@@ -1,16 +1,19 @@
-# Discovery metadata adapters (Step 05, partial)
+# Discovery metadata adapters and durable observations (Step 05, partial)
 
-**Status: partial — metadata adapter foundation.** This document describes the
-**first partial slice** of [Step 05](implementation/05-discovery.md): a bounded,
-stdlib-only public-metadata transport and two provider adapters. It is a
-**library foundation**, not a workflow. The whole of Step 05 remains
-**unchecked/partial**; see the
+**Status: partial — metadata adapter foundation plus an added durable
+search-observation slice.** This document describes two **partial library
+slices** of [Step 05](implementation/05-discovery.md): (1) a bounded, stdlib-only
+public-metadata transport and two provider adapters, and (2) a lossless versioned
+codec and an inert, project-local, durable observation repository. Neither is a
+workflow. The whole of Step 05 remains **unchecked/partial**; see the
 [Step 05 handoff](implementation/handoffs/05-discovery.md) for the
 criterion-by-criterion status.
 
-Nothing here is scientific context, eligibility, an approval, or a corpus freeze.
-Every value is an **untrusted provider observation**. No accepted context, no
-scientific identity, and no candidate repository exist yet.
+Nothing here is scientific context, eligibility, approval, scientific identity,
+deduplication, coverage, or a corpus freeze. Every value is an **untrusted
+provider observation**. No accepted context, no scientific candidate repository,
+and no candidate deduplication exist yet. A recorded observation is private,
+inert provenance only.
 
 ## What exists
 
@@ -20,6 +23,8 @@ scientific identity, and no candidate repository exist yet.
 | `review_article_agent.discovery.records` | Frozen value contracts: `MetadataRecord`, `SearchPage`, `SearchResult`. |
 | `review_article_agent.discovery.pubmed` | PubMed ESearch + EFetch metadata adapter (`PubMedClient`). |
 | `review_article_agent.discovery.europepmc` | Europe PMC cursor-paginated metadata adapter (`EuropePMCClient`). |
+| `review_article_agent.discovery.serialization` | Versioned, strict, lossless canonical codec for `SearchResult`/`PubMedSearchResult` (`encode_search_result`, `decode_search_result`). |
+| `review_article_agent.storage.discovery` | Inert, immutable project-local search-observation repository (`DiscoveryRepository`) over additive store schema 11. |
 
 ## Example (placeholder — not executed by docs or tests)
 
@@ -44,6 +49,23 @@ europepmc = EuropePMCClient(transport)      # positional transport argument
 A caller that issues real requests must **serialize** them — rate pacing is
 **per-instance** and the transport is **not thread-safe**, so sharing one instance
 preserves spacing only for sequential calls — see *Behaviour notes*.
+
+The durable observation surface is separate from transport. The following is a
+**placeholder** and is **not** executed by the docs or tests (it also assumes an
+already-open `ProjectStore`, and `search()` would perform network I/O):
+
+```python
+from review_article_agent.storage.discovery import DiscoveryRepository
+
+# Placeholder only — never executed by docs or tests:
+# repo = DiscoveryRepository(open_store)
+# record = repo.record_search(request_id="search-2026-10-28-a", result=pubmed_result)
+# same = repo.record_search(request_id="search-2026-10-28-a", result=pubmed_result)
+# rows = repo.list_searches()
+```
+
+`record_search` stores an **observation**; it does not approve, deduplicate,
+rank, expand citations, report coverage, or freeze anything.
 
 ## API reference
 
@@ -250,6 +272,105 @@ EuropePMCClient.search(query: str, page_size: int = 100,
   full attempt provenance; reaching `max_pages` while a cursor is still offered
   yields `page_limit` and is never complete.
 
+## Durable search observations (added partial slice)
+
+### `discovery.serialization` — codec version 1
+
+```python
+SEARCH_RESULT_FORMAT = "review_article_agent.discovery.search_result"
+SEARCH_RESULT_FORMAT_VERSION = 1
+MAX_SEARCH_RESULT_BYTES = 536_870_912        # 512 MiB
+
+encode_search_result(result: SearchResult) -> bytes
+decode_search_result(data: bytes) -> SearchResult
+```
+
+- Emits **canonical** (sorted-key, compact, UTF-8) JSON with envelope keys
+  exactly `format`, `format_version`, `result_type`, `result`; `result_type` is
+  `search_result` or `pubmed_search_result`.
+- Decodes only the exact base `SearchResult` or `PubMedSearchResult` and rebuilds
+  it through the real dataclass constructors, so page/source/query agreement,
+  flattened aggregates, identifier shapes, `complete` semantics, and
+  failure/stop consistency are enforced rather than trusted.
+- **Lossless:** exact query/source strings, UTC timestamps, URLs, counts, page
+  order, overlapping and duplicate records, missing (`None`) identifiers,
+  explicit failures/stop reasons, every attempt, PubMed `query_translation`, and
+  the `int`/`float` distinction of `retry_after_seconds` survive.
+- **Strict:** invalid UTF-8, malformed or over-deep JSON, duplicate object keys,
+  non-finite/overflowing numbers (including `1e999`), unknown or missing fields
+  at every level, unknown format/version/type, wrong JSON types (including
+  `bool` for `int`), lone Unicode surrogates, and value-contract violations are
+  refused. Messages are static and never echo payload text.
+- **512 MiB technical cap:** checked before decode parsing and after encode. A
+  larger payload is an explicit refusal, never silent truncation; it is a
+  resource bound, not a scientific threshold or completeness claim. Because
+  aggregate `records`/`attempts` are retained alongside the page arrays,
+  duplicated aggregate content counts toward the same cap.
+
+### `storage.discovery` — `DiscoveryRepository` (store schema 11)
+
+```python
+DiscoveryRepository(store)                        # bound to one ProjectStore
+repo.project_id                                   # actual store project id
+
+repo.record_search(*, request_id: str, result: SearchResult) -> DiscoverySearchRecord
+repo.get_search(run_id: str) -> DiscoverySearchRecord | None
+repo.list_searches() -> list[DiscoverySearchRecord]   # insertion order
+repo.verify_all_integrity() -> list[str]              # empty = intact
+discovery_integrity_problems(conn, project_id) -> list[str]   # read-only backup hook
+```
+
+`DiscoverySearchRecord` fields: `project_id`, `run_id`, `request_id`,
+`schema_version` (observation representation, currently `1`), `recorded_at_utc`,
+`result_type`, `source`, `query`, `started_at`, `completed_at`, `stop_reason`,
+`total_count`, `complete`, `failure`, `page_count`, `record_count`,
+`attempt_count`, `result_sha256`, `result_bytes`, `canonical`,
+`binding_sha256`, `binding_bytes`, `binding`, `result`.
+
+- Schema migration 11 adds only the immutable `discovery_search_run` table
+  (`PRIMARY KEY (project_id, run_id)`, `UNIQUE (project_id, request_id)`, project
+  FK, abort-on-UPDATE/DELETE triggers). Earlier migrations are unchanged.
+- `run_id` is deterministic and project-local:
+  `"dsr_" + sha256(canonical_json([project_id, request_id]))[:32]`; the caller
+  supplies only the bounded opaque `request_id` (≤512 characters).
+- The exact canonical codec bytes, their SHA-256/size, and a canonical binding
+  (project/run/request/recorded time/type/digest/size) are stored. Projected
+  source/query/time/count/failure columns are re-derived from the decoded bytes on
+  every read; a tampered projection, digest, binding, timestamp, non-canonical
+  blob, or foreign-project row is `DiscoverySearchCorruptionError`.
+- `total_count` must be a non-negative signed 64-bit SQLite integer; a larger
+  value is refused before insertion with no row. Other projected counts are range
+  checked too. Values are never truncated or coerced.
+- Errors are static and value-free: `DiscoverySearchValidationError`,
+  `DiscoverySearchConflictError`, `DiscoverySearchCorruptionError` (all under
+  `DiscoverySearchError(StoreError)`).
+
+**Replay semantics.** An identical request-key + canonical-result replay returns
+the exact historical row, including its original `recorded_at_utc`, also after a
+reopen. A changed result under the same key is a static conflict and never
+overwrites. Different request keys are separate observations even for identical
+payloads — this is **not** scientific deduplication. A fresh `search()` is **not**
+replay: it re-issues provider requests; only `record_search` with the same key
+replays stored bytes.
+
+**Preserved source observations.** PubMed title/year/DOI/PMCID and
+`query_translation`, Europe PMC native `source:id` identity, requested URLs and
+timestamps, missing IDs, overlaps/duplicates in page order, and partial failures
+with earlier successful pages are all retained exactly. No merge, map, score, or
+drop occurs.
+
+`verify_backup`/`restore_backup` share the same schema-11 read-only integrity
+sweep; a schema-10 legacy snapshot is still supported and is upgraded by the
+ordinary store open. Older software refuses a newer schema, so back up before
+upgrading; there is no downgrade path. Restore proves storage integrity only.
+
+**Boundaries.** The repository performs no network, provider, transport, CLI,
+worker, approval, or model call and makes no scientific decision. It is not
+accepted context, eligibility, scientific identity, candidate deduplication,
+citation expansion, coverage, corpus freeze, or cost reporting. Its private bytes
+may contain exact queries, source URLs, titles, and provider identifiers; hashes
+detect corruption, **not** authenticity, and this is **not** a secret scanner.
+
 ## Behaviour notes (limits to keep in mind)
 
 - **Socket timeout is inactivity, not a deadline.** `timeout` bounds connection
@@ -262,13 +383,17 @@ EuropePMCClient.search(query: str, page_size: int = 100,
   spacing only for **sequential** calls; concurrent threads or processes are
   **not** coordinated. A caller must **serialize** its `search()`/`get()` calls
   (even when sharing one transport) to respect a provider's request rate.
-- **No scientific deduplication.** Overlapping provider pages stay visible; the
-  adapters never deduplicate scientific candidates. There is **no** cross-run or
-  cross-provider candidate repository.
+- **No scientific deduplication / no candidate repository.** Overlapping provider
+  pages stay visible; neither the adapters nor the observation repository
+  deduplicate scientific candidates. There is **no** cross-run or cross-provider
+  candidate repository. The schema-11 table is an observation store keyed by a
+  caller request id: different request keys remain separate even with identical
+  payload, and a replay returns an observation rather than merging candidates.
 - **Each invocation repeats provider observations.** `search()` is **not**
   idempotent persisted candidate ingestion: calling it again re-issues the
-  requests and returns fresh observations. Nothing is persisted; the returned
-  `SearchResult` lives **in memory** only.
+  requests and returns fresh observations. `search()` itself persists nothing; a
+  trusted caller may pass its returned value to `record_search`, which durably
+  records that exact observation. Request-key replay does not rerun the provider.
 - **No hidden cap.** A page/record budget or the provider's own window is always
   an explicit `stop_reason` (`page_limit`/`failure`), never reported as complete
   retrieval.
