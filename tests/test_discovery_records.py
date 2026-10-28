@@ -27,6 +27,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from review_article_agent.discovery import records  # noqa: E402
+from review_article_agent.discovery import transport  # noqa: E402
 from review_article_agent.discovery.records import (  # noqa: E402
     DiscoveryRecordError,
     MetadataRecord,
@@ -277,6 +278,134 @@ class SearchResultTests(unittest.TestCase):
         )
         with self.assertRaises(dataclasses.FrozenInstanceError):
             result.complete = False  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# SearchResult consistency (repair 3)
+# --------------------------------------------------------------------------- #
+def _page(**overrides) -> SearchPage:
+    kwargs = dict(
+        source=records.SOURCE_PUBMED,
+        query="q",
+        requested_url="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?term=q",
+        retrieved_at="2026-10-28T00:00:00+00:00",
+        page_index=0,
+        records=(record(source_id="1", pmid="1"),),
+        complete=True,
+        stop_reason="completed",
+    )
+    kwargs.update(overrides)
+    return SearchPage(**kwargs)
+
+
+def _attempt(attempt_no: int = 1) -> transport.AttemptRecord:
+    return transport.AttemptRecord(
+        attempt_no=attempt_no,
+        requested_url="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?term=q",
+        requested_at="2026-10-28T00:00:00+00:00",
+        completed_at="2026-10-28T00:00:01+00:00",
+        status=200,
+        body_bytes=2,
+        body_sha256="ab" * 32,
+        outcome="ok",
+    )
+
+
+class SearchResultConsistencyTests(unittest.TestCase):
+    def _assemble(self, pages, *, source=records.SOURCE_PUBMED, query="q",
+                  stop_reason="completed", failure=None):
+        return SearchResult.from_pages(
+            source=source,
+            query=query,
+            pages=pages,
+            started_at="2026-10-28T00:00:00+00:00",
+            completed_at="2026-10-28T00:00:02+00:00",
+            stop_reason=stop_reason,
+            failure=failure,
+        )
+
+    def test_rejects_foreign_page_source(self):
+        with self.assertRaises(DiscoveryRecordError):
+            self._assemble((_page(),), source=records.SOURCE_EUROPEPMC)
+
+    def test_rejects_foreign_page_query(self):
+        with self.assertRaises(DiscoveryRecordError):
+            self._assemble((_page(),), query="other")
+
+    def test_completed_rejects_failed_page(self):
+        failed = _page(complete=False, stop_reason="failure", failure="http_status")
+        with self.assertRaises(DiscoveryRecordError):
+            self._assemble((failed,), stop_reason="completed")
+
+    def test_page_records_must_match_page_source(self):
+        with self.assertRaises(DiscoveryRecordError):
+            _page(records=(MetadataRecord(source=records.SOURCE_EUROPEPMC),))
+
+    def test_failure_stop_reason_requires_reason(self):
+        with self.assertRaises(DiscoveryRecordError):
+            SearchResult(
+                source=records.SOURCE_PUBMED,
+                query="q",
+                pages=(),
+                records=(),
+                started_at="2026-10-28T00:00:00+00:00",
+                completed_at="2026-10-28T00:00:02+00:00",
+                stop_reason="failure",
+                failure=None,
+            )
+
+    def test_page_limit_allows_incremental_complete_pages(self):
+        result = self._assemble((_page(),), stop_reason="page_limit")
+        self.assertFalse(result.complete)
+        self.assertTrue(all(page.complete for page in result.pages))
+
+    def test_failure_result_is_incomplete_and_keeps_reason(self):
+        failed = _page(complete=False, stop_reason="failure", failure="http_status")
+        result = self._assemble((failed,), stop_reason="failure", failure="http_status")
+        self.assertFalse(result.complete)
+        self.assertEqual(result.failure, "http_status")
+
+
+# --------------------------------------------------------------------------- #
+# Attempt provenance through pages/results (repair 4)
+# --------------------------------------------------------------------------- #
+class AttemptProvenanceTests(unittest.TestCase):
+    def test_search_page_attempts_default_and_validation(self):
+        page = _page()
+        self.assertEqual(page.attempts, ())
+        attempt = _attempt()
+        page2 = _page(attempts=(attempt,))
+        self.assertEqual(page2.attempts, (attempt,))
+        with self.assertRaises(DiscoveryRecordError):
+            _page(attempts=[attempt])  # list, not tuple
+        with self.assertRaises(DiscoveryRecordError):
+            _page(attempts=("not an attempt",))
+
+    def test_search_result_aggregates_page_attempts(self):
+        attempt = _attempt()
+        result = SearchResult.from_pages(
+            source=records.SOURCE_PUBMED,
+            query="q",
+            pages=(_page(attempts=(attempt,)),),
+            started_at="2026-10-28T00:00:00+00:00",
+            completed_at="2026-10-28T00:00:02+00:00",
+            stop_reason="completed",
+        )
+        self.assertEqual(result.attempts, (attempt,))
+
+    def test_search_result_attempts_must_match_pages(self):
+        with self.assertRaises(DiscoveryRecordError):
+            SearchResult(
+                source=records.SOURCE_PUBMED,
+                query="q",
+                pages=(),
+                records=(),
+                started_at="2026-10-28T00:00:00+00:00",
+                completed_at="2026-10-28T00:00:02+00:00",
+                stop_reason="completed",
+                complete=True,
+                attempts=(_attempt(),),
+            )
 
 
 if __name__ == "__main__":

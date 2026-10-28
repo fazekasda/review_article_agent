@@ -63,9 +63,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping as _AbcMapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 from ..domain.errors import ReviewAgentError
@@ -154,6 +156,13 @@ MAX_ATTEMPTS = 5
 DEFAULT_RETRY_DELAY_SECONDS = 1.0
 MIN_RETRY_DELAY_SECONDS = 0.0
 MAX_RETRY_DELAY_SECONDS = 60.0
+
+#: Conservative finite stand-in for a ``Retry-After`` value too large to
+#: represent as a float (e.g. a 400-digit integer). It always exceeds any
+#: permitted ``max_retry_delay`` (which is itself bounded by
+#: :data:`MAX_RETRY_DELAY_SECONDS`), so such a value yields an explicit
+#: ``retry_after_exceeds_bound`` failure instead of an ``OverflowError``.
+_RETRY_AFTER_OVERFLOW = MAX_RETRY_DELAY_SECONDS + 1.0
 
 #: Per-instance minimum spacing between consecutive requests (NCBI's public,
 #: unauthenticated limit is ~3 requests/second, so the default is ~0.34s).
@@ -393,10 +402,26 @@ class TransportResponse:
     def __post_init__(self) -> None:
         if isinstance(self.status, bool) or not isinstance(self.status, int):
             raise DiscoveryValidationError("transport status must be an integer")
+        if self.status < 100 or self.status > 599:
+            raise DiscoveryValidationError("transport status is outside the HTTP range")
         if not isinstance(self.body, (bytes, bytearray)):
             raise DiscoveryValidationError("transport body must be bytes")
         if not isinstance(self.truncated, bool):
             raise DiscoveryValidationError("transport truncated flag must be a bool")
+        if not isinstance(self.headers, _AbcMapping):
+            raise DiscoveryValidationError("transport headers must be a mapping")
+        copied_headers: dict[str, str] = {}
+        for key, value in self.headers.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise DiscoveryValidationError(
+                    "transport headers must map strings to strings"
+                )
+            copied_headers[key] = value
+        # Defensive immutability: copy the body bytes and freeze the header
+        # mapping so a caller mutating the original bytearray/dict cannot drift
+        # a response that a later classification step reads.
+        object.__setattr__(self, "body", bytes(self.body))
+        object.__setattr__(self, "headers", MappingProxyType(copied_headers))
 
 
 def http_get(
@@ -404,14 +429,31 @@ def http_get(
 ) -> TransportResponse:
     """One bounded GET. Never retries; raises :class:`TransportNetworkError`.
 
+    The URL is re-validated against the fixed allowlist (and its query checked
+    for credential-looking parameters) and the timeout/size options are bounded
+    **before** any socket is opened, so a disallowed URL or a malformed option
+    raises with zero opener calls even when this function is called directly.
     Redirects are refused and proxies are disabled. At most
     ``max_response_bytes + 1`` bytes are read; a larger body is flagged
     ``truncated`` rather than silently returned. A 4xx/5xx is returned as a
     :class:`TransportResponse` carrying its (bounded) body for the caller to
     classify; a network-level failure raises.
     """
+    validated_url = build_request_url(url)
+    timeout = _require_finite_float(
+        timeout,
+        "timeout",
+        minimum=MIN_TIMEOUT_SECONDS,
+        maximum=MAX_TIMEOUT_SECONDS,
+    )
+    max_response_bytes = _require_bounded_int(
+        max_response_bytes,
+        "max_response_bytes",
+        minimum=MIN_RESPONSE_BYTES,
+        maximum=MAX_RESPONSE_BYTES,
+    )
     request = urllib.request.Request(
-        url,
+        validated_url,
         method="GET",
         headers={
             "Accept": "application/json, application/xml;q=0.9, text/xml;q=0.8",
@@ -559,7 +601,12 @@ def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
     """Parse a ``Retry-After`` header (integer seconds or an HTTP-date).
 
     Returns a non-negative number of seconds, or ``None`` when absent or
-    unparseable (the caller then falls back to its own retry delay).
+    unparseable (the caller then falls back to its own retry delay). A value
+    too large to represent as a finite float (e.g. a 400-digit integer) is
+    returned as the conservative finite sentinel :data:`_RETRY_AFTER_OVERFLOW`,
+    which always exceeds any permitted bound and therefore yields an explicit
+    ``retry_after_exceeds_bound`` failure rather than an ``OverflowError`` or a
+    silently ignored delay.
     """
     raw: str | None = None
     for key, value in headers.items():
@@ -576,17 +623,28 @@ def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
     except ValueError:
         try:
             when = parsedate_to_datetime(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         if when is None:
             return None
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
-        delta = (when - datetime.now(timezone.utc)).total_seconds()
+        try:
+            delta = (when - datetime.now(timezone.utc)).total_seconds()
+        except (OverflowError, ValueError):  # pragma: no cover - defensive
+            return _RETRY_AFTER_OVERFLOW
+        if not math.isfinite(delta):
+            return _RETRY_AFTER_OVERFLOW
         return max(0.0, delta)
     if seconds < 0:
         return None
-    return float(seconds)
+    try:
+        value = float(seconds)
+    except (OverflowError, ValueError):
+        return _RETRY_AFTER_OVERFLOW
+    if not math.isfinite(value):
+        return _RETRY_AFTER_OVERFLOW
+    return value
 
 
 class DiscoveryTransport:
@@ -771,7 +829,7 @@ class DiscoveryTransport:
             status = response.status
             body = bytes(response.body)
             digest = hashlib.sha256(body).hexdigest() if body else None
-            if response.truncated:
+            if response.truncated or len(body) > self._max_response_bytes:
                 attempts.append(
                     AttemptRecord(
                         attempt_no=attempt_no,

@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from ..domain.errors import ReviewAgentError
+from .transport import AttemptRecord
 
 __all__ = [
     "SOURCE_PUBMED",
@@ -220,6 +221,7 @@ class SearchPage:
     complete: bool = False
     stop_reason: str | None = None
     failure: str | None = None
+    attempts: tuple[AttemptRecord, ...] = ()
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.source, "source")
@@ -235,6 +237,17 @@ class SearchPage:
         for record in self.records:
             if not isinstance(record, MetadataRecord):
                 raise DiscoveryRecordError("records: must contain MetadataRecord values")
+            if record.source != self.source:
+                raise DiscoveryRecordError(
+                    "records: every record source must match the page source"
+                )
+        if not isinstance(self.attempts, tuple):
+            raise DiscoveryRecordError("attempts: must be a tuple")
+        for attempt in self.attempts:
+            if not isinstance(attempt, AttemptRecord):
+                raise DiscoveryRecordError(
+                    "attempts: must contain AttemptRecord values"
+                )
         if self.page_size is not None:
             if isinstance(self.page_size, bool) or not isinstance(self.page_size, int):
                 raise DiscoveryRecordError("page_size: must be an integer or None")
@@ -249,6 +262,14 @@ class SearchPage:
         _require_optional_reason(self.failure, "failure", FAILURE_REASONS)
         if self.failure is not None and self.complete:
             raise DiscoveryRecordError("a failed page must not be complete")
+        if self.failure is not None and self.stop_reason != "failure":
+            raise DiscoveryRecordError(
+                "a failed page must carry stop_reason 'failure'"
+            )
+        if self.stop_reason == "failure" and self.failure is None:
+            raise DiscoveryRecordError(
+                "stop_reason 'failure' requires a failure reason"
+            )
 
     def has_identifier_coverage(self) -> bool:
         """True when every record on the page carries at least one identifier."""
@@ -262,9 +283,13 @@ class SearchPage:
 class SearchResult:
     """The immutable aggregate of a bounded search over one or more pages.
 
-    ``complete`` is ``True`` **iff** ``stop_reason == "completed"`` and there is
-    no ``failure``. A budget or page limit therefore can never be ``complete``.
-    ``records`` is exactly the concatenation of the pages' records (enforced).
+    ``complete`` is ``True`` **iff** ``stop_reason == "completed"``, there is no
+    ``failure``, and **every** page is itself complete (a fully retrieved,
+    untruncated provider page). A budget or page limit therefore can never be
+    ``complete``, and a failed/capped page can never be counted complete.
+    ``records`` is exactly the concatenation of the pages' records and
+    ``attempts`` exactly the concatenation of the pages' attempts (both enforced).
+    Every page must share this result's ``source`` and ``query``.
     """
 
     source: str
@@ -277,6 +302,7 @@ class SearchResult:
     total_count: int | None = None
     complete: bool = False
     failure: str | None = None
+    attempts: tuple[AttemptRecord, ...] = ()
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.source, "source")
@@ -288,6 +314,14 @@ class SearchResult:
         for page in self.pages:
             if not isinstance(page, SearchPage):
                 raise DiscoveryRecordError("pages: must contain SearchPage values")
+            if page.source != self.source:
+                raise DiscoveryRecordError(
+                    "pages: every page source must match the result source"
+                )
+            if page.query != self.query:
+                raise DiscoveryRecordError(
+                    "pages: every page query must match the result query"
+                )
         if not isinstance(self.records, tuple):
             raise DiscoveryRecordError("records: must be a tuple")
         for record in self.records:
@@ -297,6 +331,20 @@ class SearchResult:
         if flattened != self.records:
             raise DiscoveryRecordError(
                 "records: must equal the concatenation of the page records"
+            )
+        if not isinstance(self.attempts, tuple):
+            raise DiscoveryRecordError("attempts: must be a tuple")
+        for attempt in self.attempts:
+            if not isinstance(attempt, AttemptRecord):
+                raise DiscoveryRecordError(
+                    "attempts: must contain AttemptRecord values"
+                )
+        flattened_attempts = tuple(
+            attempt for page in self.pages for attempt in page.attempts
+        )
+        if flattened_attempts != self.attempts:
+            raise DiscoveryRecordError(
+                "attempts: must equal the concatenation of the page attempts"
             )
         _require_optional_count(self.total_count, "total_count")
         if not isinstance(self.complete, bool):
@@ -312,6 +360,16 @@ class SearchResult:
             raise DiscoveryRecordError(
                 "a failed search must carry stop_reason 'failure'"
             )
+        if self.stop_reason == "failure" and self.failure is None:
+            raise DiscoveryRecordError(
+                "stop_reason 'failure' requires a failure reason"
+            )
+        if self.complete:
+            for page in self.pages:
+                if not page.complete or page.failure is not None:
+                    raise DiscoveryRecordError(
+                        "a complete search requires every page to be complete"
+                    )
 
     @classmethod
     def from_pages(
@@ -326,14 +384,19 @@ class SearchResult:
         total_count: int | None = None,
         failure: str | None = None,
     ) -> "SearchResult":
-        """Assemble a result from pages, deriving ``records`` and ``complete``.
+        """Assemble a result from pages, deriving records/attempts/``complete``.
 
         This is the preferred constructor: it flattens the page records and
-        derives ``complete`` from ``stop_reason``/``failure`` so a budget or page
-        limit can never be reported complete by accident.
+        attempts and derives ``complete`` from ``stop_reason``/``failure`` so a
+        budget or page limit can never be reported complete by accident. A page
+        whose source/query differs from the result, or a failed page under a
+        ``completed`` stop reason, is refused by ``__post_init__``.
         """
         page_tuple = tuple(pages)
         records = tuple(record for page in page_tuple for record in page.records)
+        attempts = tuple(
+            attempt for page in page_tuple for attempt in page.attempts
+        )
         complete = stop_reason == "completed" and failure is None
         return cls(
             source=source,
@@ -346,4 +409,5 @@ class SearchResult:
             total_count=total_count,
             complete=complete,
             failure=failure,
+            attempts=attempts,
         )

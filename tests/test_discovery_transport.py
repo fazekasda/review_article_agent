@@ -428,5 +428,124 @@ class NetworkSafetyTests(unittest.TestCase):
         self.assertEqual(captured["timeout"], 5.0)
 
 
+# --------------------------------------------------------------------------- #
+# http_get boundary enforcement (repair 1)
+# --------------------------------------------------------------------------- #
+class HttpGetBoundaryTests(unittest.TestCase):
+    def test_http_get_rejects_before_opening_a_socket(self):
+        bad_cases = [
+            (
+                dict(url="https://evil.example.com/x", timeout=5.0, max_response_bytes=1024),
+                transport.DiscoveryEndpointError,
+            ),
+            (
+                dict(url="http://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                     timeout=5.0, max_response_bytes=1024),
+                transport.DiscoveryEndpointError,
+            ),
+            (
+                dict(url=ESEARCH + "?api_key=leak", timeout=5.0, max_response_bytes=1024),
+                transport.DiscoveryValidationError,
+            ),
+            (
+                dict(url=ESEARCH, timeout=True, max_response_bytes=1024),
+                transport.DiscoveryValidationError,
+            ),
+            (
+                dict(url=ESEARCH, timeout=float("nan"), max_response_bytes=1024),
+                transport.DiscoveryValidationError,
+            ),
+            (
+                dict(url=ESEARCH, timeout=1e9, max_response_bytes=1024),
+                transport.DiscoveryValidationError,
+            ),
+            (
+                dict(url=ESEARCH, timeout=5.0, max_response_bytes=True),
+                transport.DiscoveryValidationError,
+            ),
+            (
+                dict(url=ESEARCH, timeout=5.0, max_response_bytes=1),
+                transport.DiscoveryValidationError,
+            ),
+        ]
+        with mock.patch.object(transport, "_http_opener") as opener_mock:
+            for kwargs, exc in bad_cases:
+                with self.subTest(kwargs=kwargs):
+                    with self.assertRaises(exc):
+                        transport.http_get(**kwargs)
+            opener_mock.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Retry-After overflow (repair 2)
+# --------------------------------------------------------------------------- #
+class RetryAfterOverflowTests(unittest.TestCase):
+    def test_parse_retry_after_huge_and_malformed(self):
+        huge = transport._parse_retry_after({"retry-after": "9" * 400})
+        self.assertIsNotNone(huge)
+        self.assertGreater(huge, transport.MAX_RETRY_DELAY_SECONDS)
+        self.assertEqual(transport._parse_retry_after({"retry-after": "3"}), 3.0)
+        self.assertIsNone(transport._parse_retry_after({"retry-after": "not a date"}))
+        self.assertIsNone(transport._parse_retry_after({"retry-after": "-5"}))
+        self.assertIsNone(transport._parse_retry_after({}))
+
+    def test_huge_retry_after_is_a_bounded_failure(self):
+        client, fake, sleep, _ = make_client(
+            [response(429, headers={"Retry-After": "9" * 400})],
+            retry_delay=1.0,
+            max_retry_delay=5.0,
+        )
+        result = client.get(ESEARCH, {"term": "x"})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure, "retry_after_exceeds_bound")
+        self.assertEqual(result.attempt_count, 1)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(sleep.calls, [])
+        # Provenance stays finite and valid (never an OverflowError/inf).
+        self.assertGreater(
+            result.attempts[0].retry_after_seconds, transport.MAX_RETRY_DELAY_SECONDS
+        )
+
+
+# --------------------------------------------------------------------------- #
+# TransportResponse immutability / cap enforcement (repair 5)
+# --------------------------------------------------------------------------- #
+class TransportResponseTests(unittest.TestCase):
+    def test_copies_body_and_freezes_headers(self):
+        body = bytearray(b"abc")
+        headers = {"Retry-After": "2"}
+        resp = transport.TransportResponse(status=200, body=body, headers=headers)
+        body.append(0x21)
+        headers["Retry-After"] = "999"
+        self.assertIsInstance(resp.body, bytes)
+        self.assertEqual(resp.body, b"abc")
+        self.assertEqual(resp.headers["Retry-After"], "2")
+        with self.assertRaises(TypeError):
+            resp.headers["x"] = "y"  # type: ignore[index]
+
+    def test_rejects_bad_status_headers_and_body(self):
+        for status in (True, 99, 600, "200"):
+            with self.subTest(status=status):
+                with self.assertRaises(transport.DiscoveryValidationError):
+                    transport.TransportResponse(status=status)
+        with self.assertRaises(transport.DiscoveryValidationError):
+            transport.TransportResponse(status=200, headers={"a": 1})
+        with self.assertRaises(transport.DiscoveryValidationError):
+            transport.TransportResponse(status=200, headers=[("a", "b")])
+        with self.assertRaises(transport.DiscoveryValidationError):
+            transport.TransportResponse(status=200, body="not bytes")
+
+    def test_get_enforces_cap_even_without_truncated_flag(self):
+        big = b"x" * (transport.MIN_RESPONSE_BYTES + 10)
+        client, _, _, _ = make_client(
+            [response(200, big)], max_response_bytes=transport.MIN_RESPONSE_BYTES
+        )
+        result = client.get(ESEARCH, {"term": "x"})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure, "response_too_large")
+        self.assertEqual(result.body, b"")
+        self.assertEqual(result.attempts[0].outcome, "too_large")
+
+
 if __name__ == "__main__":
     unittest.main()
