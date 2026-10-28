@@ -270,6 +270,18 @@ def _exact_decimal(
     return format(amount, "f")
 
 
+def validate_reserve_usd(value: object) -> str:
+    """Validate and canonicalise a dispatch reserve: an exact, strictly positive
+    decimal within the bounded magnitude/significant-digit caps.
+
+    Public wrapper around :func:`_exact_decimal` so the worker engine can reject
+    an out-of-bounds reserve (a huge exponent, zero, a negative, or a float/bool)
+    **before** persisting any durable job, instead of leaving a job stuck queued.
+    Raises :class:`JobValidationError`.
+    """
+    return _exact_decimal(value, "reserve_usd", strictly_positive=True)
+
+
 def _add_exact(left: Decimal, right: Decimal) -> Decimal:
     """Add bounded decimal amounts without the process context rounding cents.
 
@@ -1491,4 +1503,5 @@ __all__ = [
     "STARTABLE_JOB_STATES",
     "StaleFenceError",
     "TERMINAL_JOB_STATES",
+    "validate_reserve_usd",
 ]

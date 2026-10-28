@@ -40,7 +40,7 @@ if str(SRC) not in sys.path:
 
 from review_article_agent.runtime.ipc import WorkerIPCClient, WorkerIPCServer  # noqa: E402
 from review_article_agent.runtime.jobs import JobStateError  # noqa: E402
-from review_article_agent.storage import Registry  # noqa: E402
+from review_article_agent.storage import Registry, paths  # noqa: E402
 from review_article_agent.worker.engine import (  # noqa: E402
     APP_NAME,
     PROTOCOL_VERSION,
@@ -48,6 +48,7 @@ from review_article_agent.worker.engine import (  # noqa: E402
     SYNTHETIC_WAITING_HUMAN_TASK,
     WorkerEngine,
 )
+from review_article_agent.worker.synthetic import SyntheticBackend  # noqa: E402
 
 
 def _req(op: str, **kw: object) -> dict:
@@ -103,6 +104,62 @@ class EngineTestBase(unittest.TestCase):
         engine = WorkerEngine(str(self.data_dir))
         self.addCleanup(engine.close)
         return engine
+
+    def _drive(self, engine: WorkerEngine, max_ticks: int = 200) -> None:
+        for _ in range(max_ticks):
+            hint = engine.tick()
+            if hint is None:
+                return
+            if hint > 0:
+                time.sleep(min(hint, 0.02))
+        self.fail("engine did not settle within the tick budget")
+
+    @staticmethod
+    def _params(steps: int = 7, delay_ms: int = 0, outcome: str = "complete",
+                stage: str = "s", reserve: str = "0.10") -> dict:
+        return {
+            "steps": steps,
+            "delay_ms": delay_ms,
+            "outcome": outcome,
+            "stage": stage,
+            "reserve_usd": reserve,
+        }
+
+    def _simulate_dispatch(self, *, request_id: str, admitted: bool, **params: object) -> tuple[str, str]:
+        """Persist a crash-like attempt state directly in the store.
+
+        Returns ``(job_id, attempt_id)``. With ``admitted=True`` the provider
+        journal is written (admission happened) but no local receipt is recorded
+        — simulating a crash between external admission and the local commit.
+        With ``admitted=False`` only the continuity checkpoint is persisted —
+        simulating a crash just before dispatch.
+        """
+        self.registry.activate_execution(self.project.project_id)
+        with self._repo() as repo:
+            job = repo.submit(
+                request_id, task_kind=SYNTHETIC_NUMERIC_TASK,
+                parameters=self._params(**params),
+            )
+            attempt = repo.begin_attempt(
+                job.job_id, dispatch_kind="external_synthetic",
+                stage="s", reserve_usd=str(params.get("reserve", "0.10")),
+            )
+            continuity = SyntheticBackend(str(self.data_dir)).initialize()
+            repo.record_checkpoint(
+                attempt.attempt_id,
+                {"continuity_id": continuity, "phase": "predispatch"},
+            )
+            if admitted:
+                SyntheticBackend(
+                    str(self.data_dir), expected_continuity_id=continuity
+                ).admit(
+                    attempt.attempt_id,
+                    self.project.project_id,
+                    steps=int(params.get("steps", 7)),
+                    delay_ms=int(params.get("delay_ms", 0)),
+                    outcome=str(params.get("outcome", "complete")),
+                )
+            return job.job_id, attempt.attempt_id
 
 
 class ValidationTest(EngineTestBase):
@@ -549,6 +606,218 @@ class SwitchTest(EngineTestBase):
         self.assertEqual(switched["code"], "switch_blocked")
 
 
+def _submit_to(engine, project_id, request_id, **params):
+    return engine.handle(
+        _req(
+            "submit",
+            project_id=project_id,
+            request_id=request_id,
+            task_kind=SYNTHETIC_NUMERIC_TASK,
+            steps=params.get("steps", 1),
+            delay_ms=params.get("delay_ms", 0),
+            outcome=params.get("outcome", "complete"),
+            stage=params.get("stage", "s"),
+            reserve_usd=params.get("reserve", "0.10"),
+        )
+    )
+
+
+class CrashRecoveryTest(EngineTestBase):
+    """Restart recovery from durable state (Step 03 AC2/AC3; C02 §8.3)."""
+
+    def test_restart_before_dispatch_completes_same_attempt(self) -> None:
+        job_id, attempt_id = self._simulate_dispatch(
+            request_id="crash-predispatch", admitted=False, steps=9
+        )
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        self._drive(engine)
+
+        with self._repo() as repo:
+            job = repo.get(job_id)
+            accepted = repo.accepted_result(job_id)
+            attempts = repo.attempts(job_id)
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(job.current_attempt_id, attempt_id)  # same identity
+        self.assertEqual(len(attempts), 1)  # no new attempt minted
+        self.assertIsNotNone(accepted)
+        # Exactly one provider dispatch row, now terminal.
+        result = SyntheticBackend(str(self.data_dir)).lookup(
+            attempt_id, self.project.project_id
+        )
+        self.assertEqual(result.status, "completed")
+
+    def test_restart_after_admission_before_receipt_same_identity(self) -> None:
+        job_id, attempt_id = self._simulate_dispatch(
+            request_id="crash-postadmit", admitted=True, steps=5
+        )
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        self._drive(engine)
+
+        with self._repo() as repo:
+            job = repo.get(job_id)
+            accepted = repo.accepted_result(job_id)
+            attempts = repo.attempts(job_id)
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(job.current_attempt_id, attempt_id)
+        self.assertEqual([a.attempt_id for a in attempts], [attempt_id])
+        self.assertIsNotNone(accepted)
+
+    def test_restart_failed_remote_resolves_nonbilling(self) -> None:
+        job_id, attempt_id = self._simulate_dispatch(
+            request_id="crash-fail", admitted=True, outcome="failure"
+        )
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        self._drive(engine)
+
+        with self._repo() as repo:
+            job = repo.get(job_id)
+            attempt = repo.attempt(attempt_id)
+            accepted = repo.accepted_result(job_id)
+        self.assertEqual(job.state, "failed")  # explicit, non-billing terminal
+        self.assertFalse(job.outcome_unresolved)
+        self.assertEqual(attempt.state, "definitive_failure")
+        self.assertIsNone(accepted)
+
+    def test_restart_paused_known_terminal_accept_preserves_held(self) -> None:
+        job_id, attempt_id = self._simulate_dispatch(
+            request_id="crash-paused", admitted=True, steps=3
+        )
+        with self._repo() as repo:
+            repo.mark_admitted(attempt_id, admission_id="adm-" + attempt_id)
+            repo.pause(job_id)
+
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        self._drive(engine)
+
+        with self._repo() as repo:
+            job = repo.get(job_id)
+            accepted = repo.accepted_result(job_id)
+        self.assertEqual(job.state, "paused")  # held state preserved
+        self.assertIsNotNone(accepted)
+
+    def test_restart_cancelled_known_terminal_accept_preserves_held(self) -> None:
+        job_id, attempt_id = self._simulate_dispatch(
+            request_id="crash-cancelled", admitted=True, steps=3
+        )
+        with self._repo() as repo:
+            repo.mark_admitted(attempt_id, admission_id="adm-" + attempt_id)
+            repo.cancel(job_id)
+
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        self._drive(engine)
+
+        with self._repo() as repo:
+            job = repo.get(job_id)
+            accepted = repo.accepted_result(job_id)
+        self.assertEqual(job.state, "cancelled")
+        self.assertIsNotNone(accepted)
+
+
+class RestoredArbitrationTest(EngineTestBase):
+    """Restored/unactivated remote state blocks new execution (C02 §8.5)."""
+
+    def _restore_admitted(self, project_id: str, request_id: str) -> str:
+        with self.engine.open_repository(project_id) as repo:
+            job = repo.submit(
+                request_id, task_kind=SYNTHETIC_NUMERIC_TASK,
+                parameters=self._params(),
+            )
+            attempt = repo.begin_attempt(
+                job.job_id, dispatch_kind="external_synthetic",
+                stage="s", reserve_usd="0.10",
+            )
+            repo.mark_admitted(attempt.attempt_id, admission_id="adm-" + attempt.attempt_id)
+            return job.job_id
+
+    def test_restored_unactivated_unknown_receives_arbitration_and_blocks(self) -> None:
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        self._restore_admitted(self.project.project_id, "restored-1")
+        self.assertEqual(self.registry.activation().state, "none")
+
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        # The sole pending-remote project receives arbitration so it can reconcile.
+        self.assertEqual(
+            self.registry.activation().active_project_id, self.project.project_id
+        )
+        # Submitting to, and switching to, another project is refused.
+        self.assertFalse(_submit_to(engine, other.project_id, "b-1")["ok"])
+        switched = engine.handle(_req("switch", project_id=other.project_id))
+        self.assertFalse(switched["ok"])
+
+    def test_two_restored_unknown_blocked_visible(self) -> None:
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        self._restore_admitted(self.project.project_id, "restored-a")
+        self._restore_admitted(other.project_id, "restored-b")
+
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        # Two pending projects: no automatic adoption.
+        self.assertEqual(self.registry.activation().state, "none")
+        status = engine.handle(_req("status"))
+        self.assertEqual(
+            set(status["recovery_projects"]),
+            {self.project.project_id, other.project_id},
+        )
+        self.assertFalse(
+            _submit_to(engine, self.project.project_id, "x-1")["ok"]
+        )
+        self.assertFalse(
+            engine.handle(_req("switch", project_id=other.project_id))["ok"]
+        )
+
+    def test_unreadable_store_blocks_new_dispatch(self) -> None:
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        # Corrupt B's store so it cannot be read (fail closed).
+        info = self.registry.get(other.project_id)
+        with open(paths.store_path_for(info.root_path), "wb") as handle:
+            handle.write(b"this is not a sqlite database")
+
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        status = engine.handle(_req("status"))
+        self.assertIn(other.project_id, status["unreadable_projects"])
+        # A new dispatch for the healthy project is still refused.
+        self.assertFalse(
+            _submit_to(engine, self.project.project_id, "u-1")["ok"]
+        )
+
+
+class SubmitValidationTest(EngineTestBase):
+    def test_invalid_reserve_rejected_without_durable_job(self) -> None:
+        cases = [
+            ("1e999999", "bad_value"),
+            ("0", "bad_value"),
+            ("-1", "bad_value"),
+            (True, "bad_type"),
+            (1.0, "bad_type"),
+        ]
+        for index, (bad, code) in enumerate(cases):
+            res = self.engine.handle(
+                _req(
+                    "submit",
+                    project_id=self.project.project_id,
+                    request_id=f"bad-reserve-{index}",
+                    task_kind=SYNTHETIC_NUMERIC_TASK,
+                    steps=1,
+                    delay_ms=0,
+                    outcome="complete",
+                    stage="s",
+                    reserve_usd=bad,
+                )
+            )
+            self.assertFalse(res["ok"], f"{bad!r} should be rejected")
+            self.assertEqual(res["code"], code, f"{bad!r}")
+        # No durable job was created for any invalid request.
+        with self._repo() as repo:
+            self.assertEqual(repo.list(), [])
+
+
 class DetachedEntrypointTest(EngineTestBase):
     def test_detached_worker_start_status_stop(self) -> None:
         self.registry.activate_execution(self.project.project_id)
@@ -749,6 +1018,90 @@ class DetachedEntrypointTest(EngineTestBase):
         stop = client.request(_req("stop"))
         self.assertTrue(stop["stopping"])
         first.wait(timeout=10)
+
+    def test_before_dispatch_sigkill_completes_same_attempt(self) -> None:
+        """AC2: a worker SIGKILLed before dispatch recovers and completes the
+        SAME attempt (one accepted result) on a fresh worker."""
+        self.registry.activate_execution(self.project.project_id)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join([str(SRC), env.get("PYTHONPATH", "")])
+        env["RAA_WORKER_TEST_PAUSE_AT"] = "before_dispatch"
+        first = self._spawn(env)
+        client = WorkerIPCClient(str(self.data_dir), io_timeout=5.0)
+        self._wait_ready(client)
+        sub = client.request(
+            _req(
+                "submit",
+                project_id=self.project.project_id,
+                request_id="kill-predispatch",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                steps=4,
+                delay_ms=0,
+                outcome="complete",
+                stage="s",
+                reserve_usd="0.10",
+            )
+        )
+        self.assertTrue(sub["ok"])
+        job_id = sub["job"]["job_id"]
+        # Wait until the worker is stopped at the before_dispatch seam.
+        self.assertTrue(
+            self._wait_for_state(first.pid, "T"),
+            "worker never reached the before_dispatch gate",
+        )
+        first.kill()
+        first.wait(timeout=10)
+
+        # A fresh worker owns the lock and reconciles the same attempt.
+        env2 = dict(env)
+        env2.pop("RAA_WORKER_TEST_PAUSE_AT", None)
+        second = self._spawn(env2)
+        client2 = WorkerIPCClient(str(self.data_dir), io_timeout=5.0)
+        self._wait_ready(client2)
+        deadline = time.monotonic() + 15.0
+        final = None
+        while time.monotonic() < deadline:
+            final = client2.request(
+                _req("job_status", project_id=self.project.project_id, job_id=job_id)
+            )
+            if final["job"]["state"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(final["job"]["state"], "completed")
+        self.assertEqual(final["job"]["attempts_total"], 1)
+        self.assertIsNotNone(final["job"]["accepted_result"])
+        stop = client2.request(_req("stop"))
+        self.assertTrue(stop["stopping"])
+        second.wait(timeout=10)
+
+    def _spawn(self, env: dict[str, str]) -> subprocess.Popen:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "review_article_agent.worker", "--data-dir", str(self.data_dir)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(proc.kill)
+        self.addCleanup(self._close_proc, proc)
+        return proc
+
+    def _wait_ready(self, client: WorkerIPCClient) -> None:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                client.request(_req("status"))
+                return
+            except Exception:
+                time.sleep(0.05)
+        self.fail("worker did not become ready")
+
+    def _wait_for_state(self, pid: int, want: str) -> bool:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if self._proc_state(pid) == want:
+                return True
+            time.sleep(0.05)
+        return False
 
     @staticmethod
     def _attempt_id(repo, job_id: str) -> str:
