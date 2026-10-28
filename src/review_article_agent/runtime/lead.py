@@ -573,8 +573,29 @@ class LeadConfig:
         return cls(**_normalize_config(mapping))
 
     def to_mapping(self) -> dict:
-        """Return a fresh mapping of the (already validated) config fields."""
-        return {key: getattr(self, key) for key in _CONFIG_KEYS}
+        """Return a fresh, **JSON-portable** mapping of the config fields.
+
+        Prices are emitted as exact decimal **strings** (never :class:`Decimal`),
+        so the mapping survives :func:`canonical_json`/``json.dumps`` storage. It
+        round-trips: ``LeadConfig.from_mapping(config.to_mapping()) == config``,
+        with the same exact price values.
+        """
+        return {
+            "model_id": self.model_id,
+            "upstream_provider": self.upstream_provider,
+            "max_output_tokens": self.max_output_tokens,
+            "context_tokens": self.context_tokens,
+            "input_price_per_million": _exact_decimal_string(
+                self.input_price_per_million
+            ),
+            "output_price_per_million": _exact_decimal_string(
+                self.output_price_per_million
+            ),
+            "pricing_ref": self.pricing_ref,
+            "instructions_revision": self.instructions_revision,
+            "timeout_seconds": self.timeout_seconds,
+            "max_response_bytes": self.max_response_bytes,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -899,6 +920,19 @@ def _safe_status(response: object) -> int | None:
     return status
 
 
+def _utf8_len(text: str) -> int:
+    """Byte length of *text* as UTF-8 (the size that bound applies to).
+
+    A Python ``str`` length counts code points, not bytes: a multibyte body can
+    be far larger than its ``len()``. On the impossible lone-surrogate case the
+    result is conservatively reported as over the ceiling, never under.
+    """
+    try:
+        return len(text.encode("utf-8"))
+    except UnicodeError:  # pragma: no cover - a lone surrogate is never valid JSON
+        return MAX_RESPONSE_BYTES + 1
+
+
 # --------------------------------------------------------------------------- #
 # Transport (single POST; no redirect, no proxy)
 # --------------------------------------------------------------------------- #
@@ -940,14 +974,23 @@ def post_chat(
     *,
     endpoint: str = ENDPOINT,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    max_response_bytes: int = MAX_RESPONSE_BYTES,
 ) -> TransportResponse:
     """One POST attempt. Never retries; raises :class:`LeadTransportError` on a
-    network failure (an ambiguous, possibly-billed outcome)."""
+    network failure (an ambiguous, possibly-billed outcome).
+
+    Reads at most ``max_response_bytes + 1`` bytes, so the caller's **configured**
+    cap bounds the read (not a global constant); the single extra byte only flags
+    truncation.
+    """
     if endpoint != ENDPOINT:
         raise LeadEndpointError("dispatch is restricted to the documented endpoint")
     if not isinstance(api_key, str) or not api_key:
         raise LeadCredentialError("a non-empty credential is required")
     timeout = _require_timeout(timeout)
+    limit = _require_bounded_int(
+        max_response_bytes, "max_response_bytes", MIN_RESPONSE_BYTES, MAX_RESPONSE_BYTES
+    )
     request = urllib.request.Request(
         endpoint,
         data=body,
@@ -961,15 +1004,15 @@ def post_chat(
     opener = _http_opener()
     try:
         with opener.open(request, timeout=timeout) as response:
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-            truncated = len(raw) > MAX_RESPONSE_BYTES
-            text = raw[:MAX_RESPONSE_BYTES].decode("utf-8", "replace")
+            raw = response.read(limit + 1)
+            truncated = len(raw) > limit
+            text = raw[:limit].decode("utf-8", "replace")
             return TransportResponse(int(response.status), text, truncated)
     except urllib.error.HTTPError as exc:
         try:
-            raw = exc.read(MAX_RESPONSE_BYTES + 1)
-            truncated = len(raw) > MAX_RESPONSE_BYTES
-            text = raw[:MAX_RESPONSE_BYTES].decode("utf-8", "replace")
+            raw = exc.read(limit + 1)
+            truncated = len(raw) > limit
+            text = raw[:limit].decode("utf-8", "replace")
         except Exception:  # pragma: no cover - defensive
             text, truncated = "", False
         return TransportResponse(int(exc.code), text, truncated)
@@ -1255,7 +1298,7 @@ def _finish_lead(plan: LeadPlan, response: object) -> LeadResult:
             code="response_too_large",
             message="response body exceeded the permitted size",
         )
-    if len(response.body_text) > plan.max_response_bytes:
+    if _utf8_len(response.body_text) > plan.max_response_bytes:
         return _result(
             plan, outcome="protocol_error", http_status=status,
             cost=_unknown_cost(plan.reserve_usd), submitted=True,
@@ -1332,6 +1375,11 @@ def execute_lead(
     result is returned so a possibly-billed call is never reported
     ``not_incurred``. A server-reported cost is an exact decimal string; an
     absent one is explicit ``unknown`` with the reserve retained.
+    The transport protocol is ``transport(body, api_key, *, endpoint, timeout,
+    max_response_bytes) -> TransportResponse`` (the default is :func:`post_chat`,
+    which bounds its read at ``max_response_bytes + 1``). An injected transport
+    must accept ``max_response_bytes`` so the plan's configured response cap, not
+    a global constant, bounds the read.
     """
     plan = _revalidate_plan(plan)
     if not isinstance(api_key, str) or not api_key:
@@ -1339,7 +1387,13 @@ def execute_lead(
     send = post_chat if transport is None else transport
     body = bytes(plan.request_body)
     try:
-        response = send(body, api_key, endpoint=plan.endpoint, timeout=plan.timeout_seconds)
+        response = send(
+            body,
+            api_key,
+            endpoint=plan.endpoint,
+            timeout=plan.timeout_seconds,
+            max_response_bytes=plan.max_response_bytes,
+        )
     except Exception:  # noqa: BLE001 - a submitted call must not escape as no-call
         return _result(
             plan, outcome="unknown", http_status=None,

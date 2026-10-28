@@ -39,6 +39,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from review_article_agent.runtime import lead  # noqa: E402
+from review_article_agent.domain.records import canonical_json  # noqa: E402
 
 API_KEY = "sk-or-v1-supersecret-should-never-appear"
 CANARY = "PRIVATE_SOURCE_TEXT_CANARY"
@@ -97,16 +98,26 @@ def valid_body(**overrides):
 
 
 class FakeTransport:
-    """Records every call; returns a canned response or raises."""
+    """Records every call; returns a canned response or raises.
+
+    Implements the documented transport protocol, including the configured
+    ``max_response_bytes`` cap passed by :func:`execute_lead`.
+    """
 
     def __init__(self, response=None, raises=None):
         self.response = response
         self.raises = raises
         self.calls = []
 
-    def __call__(self, body, api_key, *, endpoint, timeout):
+    def __call__(self, body, api_key, *, endpoint, timeout, max_response_bytes):
         self.calls.append(
-            {"body": body, "api_key": api_key, "endpoint": endpoint, "timeout": timeout}
+            {
+                "body": body,
+                "api_key": api_key,
+                "endpoint": endpoint,
+                "timeout": timeout,
+                "max_response_bytes": max_response_bytes,
+            }
         )
         if self.raises is not None:
             raise self.raises
@@ -711,6 +722,146 @@ class InstalledPackageTests(unittest.TestCase):
 
     def test_endpoint_is_the_documented_one(self):
         self.assertEqual(lead.ENDPOINT, "https://openrouter.ai/api/v1/chat/completions")
+
+
+# --------------------------------------------------------------------------- #
+# Focused repair (M1-R1): UTF-8 byte cap, bounded real read, portable config
+# --------------------------------------------------------------------------- #
+class RepairR1Tests(unittest.TestCase):
+    def test_multibyte_body_over_utf8_cap_is_protocol_error(self):
+        # 100 code points, 400 UTF-8 bytes: the code-point length is under the
+        # cap while the UTF-8 byte length is over it.
+        content = "\U0001f9ea" * 100
+        body = {
+            "model": MODEL,
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": content},
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.00002037},
+        }
+        text = json.dumps(body, ensure_ascii=False)
+        char_len = len(text)
+        byte_len = len(text.encode("utf-8"))
+        self.assertGreater(byte_len, char_len)
+        cap = char_len  # old (str-length) check would NOT flag this body
+        self.assertLessEqual(char_len, cap)
+        self.assertGreater(byte_len, cap)
+        result = run(
+            FakeTransport(lead.TransportResponse(200, text)), max_response_bytes=cap
+        )
+        self.assertEqual(result.outcome, "protocol_error")
+        self.assertIsNone(result.proposal_text)
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+        self.assertNotEqual(result.cost.state, "not_incurred")
+
+    def test_utf8_cap_helper_counts_bytes_not_code_points(self):
+        text = "\U0001f9ea"
+        self.assertEqual(lead._utf8_len(text), 4)
+        self.assertEqual(lead._utf8_len("ascii"), 5)
+
+    def test_real_transport_reads_at_configured_cap(self):
+        recorded = {}
+
+        class _FakeResponse:
+            status = 200
+
+            def __init__(self, data):
+                self._data = data
+
+            def read(self, n):
+                recorded["n"] = n
+                return self._data[:n]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class _FakeOpener:
+            def open(self, request, timeout=None):
+                recorded["timeout"] = timeout
+                return _FakeResponse(b"x" * 500)
+
+        with mock.patch.object(lead, "_http_opener", return_value=_FakeOpener()):
+            response = lead.post_chat(
+                b"{}",
+                API_KEY,
+                endpoint=lead.ENDPOINT,
+                timeout=1.0,
+                max_response_bytes=375,
+            )
+        self.assertEqual(recorded["n"], 376)
+        self.assertTrue(response.truncated)
+        self.assertEqual(len(response.body_text), 375)
+
+    def test_real_transport_default_cap_is_global(self):
+        recorded = {}
+
+        class _FakeResponse:
+            status = 200
+
+            def read(self, n):
+                recorded["n"] = n
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class _FakeOpener:
+            def open(self, request, timeout=None):
+                return _FakeResponse()
+
+        with mock.patch.object(lead, "_http_opener", return_value=_FakeOpener()):
+            lead.post_chat(b"{}", API_KEY, endpoint=lead.ENDPOINT, timeout=1.0)
+        self.assertEqual(recorded["n"], lead.MAX_RESPONSE_BYTES + 1)
+
+    def test_execute_passes_configured_cap_to_transport(self):
+        transport = FakeTransport(resp(200, valid_body()))
+        run(transport, max_response_bytes=1234)
+        self.assertEqual(transport.calls[0]["max_response_bytes"], 1234)
+
+    def test_configured_cap_is_checked_before_parsing(self):
+        # A body whose byte length exceeds the cap is refused even though it is
+        # valid JSON with a valid reported cost (nothing is parsed/trusted).
+        text = json.dumps(valid_body(), ensure_ascii=False)
+        cap = len(text) - 1
+        result = run(FakeTransport(lead.TransportResponse(200, text)),
+                     max_response_bytes=cap)
+        self.assertEqual(result.outcome, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_config_to_mapping_is_json_portable_and_roundtrips(self):
+        config = cfg()
+        mapping = config.to_mapping()
+        # JSON-portable: no Decimal anywhere, json.dumps and canonical_json work.
+        self.assertTrue(all(not isinstance(v, Decimal) for v in mapping.values()))
+        self.assertIsInstance(mapping["input_price_per_million"], str)
+        self.assertEqual(mapping["input_price_per_million"], "0.10")
+        blob = canonical_json(mapping)
+        reloaded = json.loads(json.dumps(mapping, ensure_ascii=False))
+        rebuilt = lead.LeadConfig.from_mapping(reloaded)
+        self.assertEqual(rebuilt, config)
+        self.assertEqual(
+            rebuilt.input_price_per_million, config.input_price_per_million
+        )
+        self.assertEqual(
+            rebuilt.output_price_per_million, config.output_price_per_million
+        )
+        self.assertEqual(canonical_json(rebuilt.to_mapping()), blob)
+
+    def test_plan_still_uses_portable_config_roundtrip(self):
+        the_plan = plan()
+        self.assertEqual(the_plan.config.input_price_per_million, Decimal("0.10"))
+        self.assertEqual(lead.LeadConfig.from_mapping(the_plan.config.to_mapping()), the_plan.config)
 
 
 if __name__ == "__main__":
