@@ -327,6 +327,10 @@ _M_DIGEST = "a decision-result digest is not a lowercase hex SHA-256 digest"
 _M_DECIMAL = "a decision-result amount is not an exact bounded decimal"
 _M_CONSUMED = "the recorded consumed version slots do not match the intent"
 _M_CALL_STATUS = "the recorded per-question call-status audit contradicts the set status"
+_M_CONTRADICTION = (
+    "the supplied dispatch result contradicts the recorded intent, status, or cost "
+    "relation; nothing was written"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -1082,6 +1086,11 @@ class DecisionResultRepository:
         recorded refs; the canonical C02 records are projected with the intent's
         own versions/consumed slots; and the full set **and** every per-question
         row are written in a single transaction, so no partial set is ever visible.
+        The complete set/question/intent/status/cost cross-validation runs **inside
+        that same transaction** (the just-inserted rows are revalidated with the
+        shared read validators before the commit), so a result that contradicts its
+        intent/status relation is refused with a static typed error and the whole
+        1+N set rolls back rather than committing a corrupt observation.
 
         This is an **inert observation**: it never advances the dispatch state
         machine and never records an unknown cost as ``0``. An identical replay
@@ -1134,9 +1143,17 @@ class DecisionResultRepository:
             if dispatch.state not in _ACCEPTABLE_STATES:
                 raise DecisionResultStateError(_M_STATE)
             self._insert_observation(built)
-        stored = self.get_result(dispatch_id)
-        assert stored is not None  # just committed
-        return stored
+            # The final full cross-validation must finish INSIDE this transaction:
+            # revalidate the just-inserted set + question rows with the same shared
+            # read validators so a contradictory envelope/intent/status/cost relation
+            # rolls back the entire 1+N set instead of committing a corrupt record.
+            row = self._set_row(dispatch_id)
+            if row is None:  # pragma: no cover - just inserted
+                raise DecisionResultCorruptionError(_M_PARTIAL_SET)
+            try:
+                return self._validate_set_row(row)
+            except DecisionResultCorruptionError as exc:
+                raise DecisionResultValidationError(_M_CONTRADICTION) from exc
 
     # -- reads --------------------------------------------------------------- #
     def get_result(self, dispatch_id: str) -> DecisionResultObservation | None:

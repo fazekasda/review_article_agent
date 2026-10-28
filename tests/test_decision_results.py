@@ -1239,6 +1239,107 @@ class RepairRegressionTest(ResultTestBase):
         dispatch = self.dispatch.get_dispatch(obs.dispatch_id)
         self.assertIn(dispatch.state, ("submitted", "unknown"))
 
+    # -- T5g-R2: full cross-validation must finish before the commit --------- #
+    def _result_row_counts(self):
+        conn = self.store.connection
+        return tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("decision_result_set", "decision_result_question")
+        )
+
+    def test_exact_contradiction_refused_zero_writes_then_recovers(self) -> None:
+        # The exact T5g-R2 repro: a whole-call failure envelope that still carries
+        # valid typed answers (an answered-outcome/status contradiction).
+        self.submit()
+        forged = dataclasses.replace(
+            self.valid_result(),
+            status="protocol_error",
+            actual_model=None,
+            provider=None,
+            response_id=None,
+            usage=None,
+            diagnostic=jev.Diagnostic(
+                code="protocol_error",
+                detail_redacted="protocol failed",
+                raised_at="2026-10-28T00:00:00+00:00",
+            ),
+        )
+        with self.assertRaises(DecisionResultValidationError):
+            self.record(forged)
+        self.assertEqual(self._result_row_counts(), (0, 0))
+        self.assertEqual(self.results.verify_all_integrity(), [])
+        # The refused call left nothing behind, so a valid call can now record.
+        obs = self.record(self.valid_result())
+        self.assertEqual(obs.question_count, len(_SPECS))
+        self.assertEqual(self.results.verify_all_integrity(), [])
+
+    def test_whole_call_failure_with_answered_outcomes_refused(self) -> None:
+        self.submit()
+        base = self.valid_result()
+        forged = dataclasses.replace(
+            base,
+            status="transport_error",
+            http_status=None,
+            actual_model=None,
+            provider=None,
+            response_id=None,
+            usage=None,
+            cost=jev.CostRecord(
+                state="unknown", reserve_usd="0.25", reserve_retained=True
+            ),
+            diagnostic=jev.Diagnostic(
+                code="transport_error",
+                detail_redacted="the request did not complete",
+                raised_at="2026-10-28T00:00:00+00:00",
+            ),
+        )
+        with self.assertRaises(DecisionResultValidationError):
+            self.record(forged)
+        self.assertEqual(self._result_row_counts(), (0, 0))
+        self.assertEqual(self.record(base).question_count, len(_SPECS))
+
+    def test_injected_final_crossvalidation_failure_rolls_back_whole_set(self) -> None:
+        # Fault seam: force the shared final cross-validator to fail once, after the
+        # 1+N rows have been inserted inside the transaction.
+        self.submit()
+        original = DecisionResultRepository._assert_question_set
+        state = {"n": 0}
+
+        def failing(self, mapping, dispatch, intent):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise DecisionResultCorruptionError(
+                    "injected final cross-validation failure"
+                )
+            return original(self, mapping, dispatch, intent)
+
+        DecisionResultRepository._assert_question_set = failing
+        try:
+            with self.assertRaises(DecisionResultValidationError):
+                self.record(self.valid_result())
+        finally:
+            DecisionResultRepository._assert_question_set = original
+        self.assertEqual(self._result_row_counts(), (0, 0))
+        self.assertEqual(self.results.verify_all_integrity(), [])
+        obs = self.record(self.valid_result())
+        self.assertEqual(obs.question_count, len(_SPECS))
+
+    def test_whole_call_failure_per_question_status_mismatch_refused(self) -> None:
+        self.submit()
+        obs = self.record(self.dispatch_result(_CannedTransport(500, "")))
+        self._drop_immutability_triggers()
+
+        def mutate(record):
+            # A self-consistent record whose call-status/diagnostic code differ from
+            # the retained whole-call failure status.
+            record["call_status"] = "transport_error"
+            record["diagnostics"]["code"] = "transport_error"
+
+        self._rewrite_record_and_set(obs.dispatch_id, "is_original_report", mutate)
+        self._assert_all_read_paths_corrupt(
+            obs.dispatch_id, task_id=self.task.task_id
+        )
+
 
 class MigrationTest(ResultTestBase):
     def test_schema8_to_9_preserves_intent_and_rows(self) -> None:
