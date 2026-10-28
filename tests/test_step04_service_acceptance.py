@@ -43,16 +43,17 @@ Real, but bounded and explicitly scoped: creating a *pre-existing* saved
 evaluation is ``deny`` the public permission API cannot establish such a grant
 (``POST`` returns ``effect=deny`` so no request exists; ``reply always`` is
 ``404 PermissionNotFoundError``; the saved list stays empty). This suite
-therefore uses a **test-only, temporary** configuration bootstrap: it saves the
-owned config's exact bytes and private mode, temporarily makes exactly one
-synthetic ``read`` resource ``ask`` (dropping *only* the rules/policies that
-would otherwise match it, so every other action/resource stays denied), reloads
-the service through its documented ``POST /api/location/reload`` endpoint,
-drives one real ``always`` reply through the public permission API to create a
-durable saved grant, then restores the exact original bytes + mode and reloads
-**before** any teardown. It never reads or writes OpenCode's private permission
-database. The temporary widening is bounded to one synthetic resource, performs
-no model/tool action, and is fully reverted. See
+therefore uses a **test-only, temporary, additive** configuration bootstrap: it
+saves the owned config's exact bytes and private mode, appends only an
+exact-resource ``ask`` (and the matching exact ``tool.use`` policy override) for
+one synthetic ``read`` resource — removing nothing — reloads the service through
+its documented ``POST /api/location/reload`` endpoint, proves every other control
+action/resource is still ``deny``, drives one real ``always`` reply through the
+public permission API to create a durable saved grant, then restores the exact
+original bytes + mode and proves the service converged back to ``deny`` **before**
+any teardown. It never reads or writes OpenCode's private permission database.
+The temporary widening is bounded to one synthetic resource, performs no
+model/tool action, and is fully reverted. See
 ``test_real_saved_always_grant_cannot_override_configured_deny``, which also
 proves the app human-approval rejection of that exact real saved entry.
 
@@ -370,6 +371,20 @@ def _bounded_task(project_id: str = "prj_accept", role: str = "writer") -> Bound
 #: permission API. It is a path (never a repository file), and no read is run.
 SAVED_GRANT_PROBE_RESOURCE = "/tmp/raa-saved-grant-probe-read"
 
+#: Actions/resources that must stay **denied** while only the probe resource is
+#: ``ask``. Proves the bootstrap is additive/narrow and never widens a read of a
+#: different resource, a dangerous tool action, or an unknown action.
+SAVED_GRANT_DENIED_CONTROLS: tuple[tuple[str, str], ...] = (
+    ("read", "/etc/hosts"),
+    ("read", SAVED_GRANT_PROBE_RESOURCE + "-other"),
+    ("edit", "/etc/hosts"),
+    ("glob", "**/*.py"),
+    ("grep", "publishable-secret"),
+    ("shell", "/bin/sh -c true"),
+    ("webfetch", "https://example.com/paper"),
+    ("frobnicate", "synthetic-unknown-action"),
+)
+
 #: The C02 named gate kinds a saved generic tool permission must never satisfy.
 SCIENTIFIC_GATE_KINDS: tuple[str, ...] = ("pilot", "outline", "exclusion_set")
 
@@ -381,32 +396,33 @@ _APPROVAL_OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
 
 
 def _saved_grant_bootstrap_config(raw_bytes: bytes, resource: str) -> bytes:
-    """A **test-only** configuration that keeps every deny but makes ``read`` ask.
+    """A **test-only**, purely *additive* config that makes only ``read <resource>`` ask.
 
-    The real V2 resolution is deny-overrides-anything: a matching deny rule, or a
-    matching ``tool.use`` policy (whose plugin turns a match into a deny hook),
-    would defeat an ``ask``. So this bootstrap drops *only* the rules that match
-    ``read <resource>`` — the catch-all ``*/*`` deny, the ``read/*`` deny, the
-    matching ``tool.use`` policy, and each agent's catch-all deny — and appends
-    one explicit ``ask`` for the exact synthetic resource. Every other
-    action/resource stays denied. The caller restores the exact original bytes
+    The real V2 resolution is last-matching-rule wins, and the real policy plugin
+    additionally turns a matching ``tool.use`` policy into a deny. The unmodified
+    generated config already denies ``*/*`` and ``read/*`` (and every other
+    action). This bootstrap therefore **removes nothing**; it only:
+
+    * appends one explicit ``{"action": "read", "resource": <resource>, "effect":
+      "ask"}`` to each agent's permissions — the last matching rule for that exact
+      resource; and
+    * appends ``{"action": "tool.use", "resource": "read:<resource>", "effect":
+      "allow"}`` to ``policies`` so the policy plugin's exact-resource veto is
+      neutralized for the probe alone.
+
+    Everything else keeps the original denies, so a read of any *other* resource,
+    every dangerous tool action, and an unknown action stay denied (asserted by
+    ``SAVED_GRANT_DENIED_CONTROLS``). The caller restores the exact original bytes
     and mode and reloads before teardown.
     """
     document = json.loads(raw_bytes)
-    kept = [
-        rule
-        for rule in document["permissions"]
-        if not (rule.get("action") in ("*", "read") and rule.get("resource") == "*")
-    ]
-    ask = kept + [{"action": "read", "resource": resource, "effect": "ask"}]
-    document["permissions"] = ask
-    document["policies"] = [
-        rule
-        for rule in document["policies"]
-        if not (rule.get("action") == "tool.use" and rule.get("resource") in ("*", "read:*"))
-    ]
     for agent in document.get("agents", {}).values():
-        agent["permissions"] = list(ask)
+        agent["permissions"] = list(agent["permissions"]) + [
+            {"action": "read", "resource": resource, "effect": "ask"}
+        ]
+    document["policies"] = list(document["policies"]) + [
+        {"action": "tool.use", "resource": f"read:{resource}", "effect": "allow"}
+    ]
     return json.dumps(document).encode("utf-8")
 
 
@@ -442,6 +458,33 @@ def _reload_until(client, url, password, directory, *, resource: str, want: str)
         if last.get("effect") == want:
             return session, body
     raise AssertionError(f"permission evaluation never reached effect={want!r}: {last!r}")
+
+
+def _restore_owned_config(
+    config_file: Path, original: bytes, original_mode: int
+) -> None:
+    """Restore the owned config's exact bytes + private mode, then verify it on disk.
+
+    Raises :class:`AssertionError` when the on-disk bytes or mode do not match the
+    saved original, so a failed restore is always surfaced rather than leaving a
+    widened permission configuration behind.
+    """
+    config_file.write_bytes(original)
+    os.chmod(config_file, original_mode)
+    on_disk = config_file.read_bytes()
+    mode = stat.S_IMODE(config_file.stat().st_mode)
+    if on_disk != original or mode != original_mode:
+        raise AssertionError(
+            "the owned config was not restored to its exact original bytes + mode"
+        )
+
+
+def _restore_config_and_converge(
+    client, url, password, directory, config_file, original, original_mode, *, resource
+):
+    """Restore the owned config and prove the running service converged back to deny."""
+    _restore_owned_config(config_file, original, original_mode)
+    _reload_until(client, url, password, directory, resource=resource, want="deny")
 
 
 def _rights(project_id: str, artifact_id: str, revision_id: str) -> dict:
@@ -1139,18 +1182,20 @@ class RealServiceAcceptanceTests(unittest.TestCase):
         """A **real** saved ``always`` grant never overrides the configured deny.
 
         The public permission API alone cannot create a saved grant while every
-        evaluation is ``deny``, so this test uses a **bounded, fully reverted**
-        test-only configuration bootstrap: it saves the owned config's exact bytes
-        and private mode, temporarily makes exactly one synthetic ``read``
-        resource ``ask`` (every other action/resource stays denied), reloads
-        through the documented public endpoint, drives one real ``always`` reply
-        through the public permission API to create a **durable** saved grant,
-        then restores the exact original bytes + mode and reloads **before** any
-        teardown. It then proves the configured deny wins for the same
-        action/resource in the same project, that the saved grant persists, and
-        that the application's named-gate approval repository refuses that exact
-        saved entry as a capability (writing zero rows). It never touches
-        OpenCode's private permission database and performs no model/tool action.
+        evaluation is ``deny``, so this test uses a **bounded, additive, fully
+        reverted** test-only configuration bootstrap: it saves the owned config's
+        exact bytes and private mode, appends only an exact-resource ``ask`` for
+        one synthetic ``read`` resource (removing nothing), reloads through the
+        documented public endpoint, proves every other control action/resource is
+        still denied, drives one real ``always`` reply through the public
+        permission API to create a **durable** saved grant, then restores the
+        exact original bytes + mode and proves the service converged back to
+        ``deny`` **before** teardown. It then proves the configured deny wins for
+        the same action/resource in the same project, that the saved grant
+        persists, and that the application's named-gate approval repository
+        refuses that exact real saved entry as a capability (writing zero rows).
+        It never touches OpenCode's private permission database and performs no
+        model/tool action.
         """
         resource = SAVED_GRANT_PROBE_RESOURCE
         # Capture the validated connection and the owned location BEFORE the change
@@ -1165,85 +1210,96 @@ class RealServiceAcceptanceTests(unittest.TestCase):
         client = OpenCodeV2Client(
             url, auth="basic", username=service.SERVICE_USERNAME, password=password, timeout=60
         )
-        restored = False
-        try:
-            # (1) Bounded test-only bootstrap: exactly `read <resource>` -> ask.
-            config_file.write_bytes(_saved_grant_bootstrap_config(original, resource))
-            os.chmod(config_file, 0o600)
-            session, bootstrap = _reload_until(
-                client, url, password, loc.directory, resource=resource, want="ask"
+        # Registered BEFORE the mutation: whatever happens, the owned config is
+        # restored to its exact bytes + mode and the service converges back to
+        # deny (a failure here surfaces; it is never silently swallowed).
+        self.addCleanup(
+            _restore_config_and_converge,
+            client, url, password, loc.directory, config_file, original, original_mode,
+            resource=resource,
+        )
+
+        # (1) Bounded additive bootstrap: exactly `read <resource>` -> ask.
+        config_file.write_bytes(_saved_grant_bootstrap_config(original, resource))
+        os.chmod(config_file, 0o600)
+        session, bootstrap = _reload_until(
+            client, url, password, loc.directory, resource=resource, want="ask"
+        )
+
+        # The manager refuses the drifted config until it is restored: the
+        # fingerprint is never spoofed and validation is never weakened.
+        with self.assertRaises(service.ServiceOwnershipError):
+            self.manager.connection()
+
+        # (1b) The bootstrap is narrow: every other action/resource is still
+        #      denied (a wider read, a dangerous tool action, an unknown action).
+        session_id = session["id"]
+        for action, control_resource in SAVED_GRANT_DENIED_CONTROLS:
+            code, control = _raw(
+                "POST", url, f"/api/session/{session_id}/permission", password,
+                {"action": action, "resources": [control_resource]},
+            )
+            self.assertEqual(code, 200, (action, control_resource, control))
+            self.assertEqual(
+                control["data"]["effect"], "deny", (action, control_resource, control)
             )
 
-            # The manager refuses the drifted config until it is restored: the
-            # fingerprint is never spoofed and validation is never weakened.
-            with self.assertRaises(service.ServiceOwnershipError):
-                self.manager.connection()
+        # (2) One real human 'always' reply through the public API creates a
+        #     durable, project-scoped saved grant.
+        request_id = bootstrap["data"]["id"]
+        project_id = session["projectID"]
+        code, pending = _raw(
+            "GET", url, f"/api/session/{session_id}/permission", password
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(
+            any(item.get("id") == request_id for item in pending["data"]), pending
+        )
+        code = _post_status(
+            url,
+            f"/api/session/{session_id}/permission/{request_id}/reply",
+            password, {"decision": "always"},
+        )
+        self.assertEqual(code, 204)
+        code, saved = _raw(
+            "GET", url, f"/api/permission/saved?projectID={project_id}", password
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(len(saved["data"]), 1, saved)
+        row = saved["data"][0]
+        self.assertTrue(str(row["id"]).startswith("psv_"), row)
+        self.assertEqual(row["projectID"], project_id)
+        self.assertEqual(row["action"], "read")
+        self.assertEqual(row["resource"], resource)
+        # The exact public saved-row object (all keys), never a projected subset.
+        saved_entry = dict(row)
 
-            # (2) One real human 'always' reply through the public API creates a
-            #     durable, project-scoped saved grant.
-            request_id = bootstrap["data"]["id"]
-            session_id = session["id"]
-            project_id = session["projectID"]
-            code, pending = _raw(
-                "GET", url, f"/api/session/{session_id}/permission", password
-            )
-            self.assertEqual(code, 200)
-            self.assertTrue(
-                any(item.get("id") == request_id for item in pending["data"]), pending
-            )
-            code = _post_status(
-                url,
-                f"/api/session/{session_id}/permission/{request_id}/reply",
-                password, {"decision": "always"},
-            )
-            self.assertEqual(code, 204)
-            code, saved = _raw(
-                "GET", url, f"/api/permission/saved?projectID={project_id}", password
-            )
-            self.assertEqual(code, 200)
-            self.assertEqual(len(saved["data"]), 1, saved)
-            row = saved["data"][0]
-            self.assertTrue(str(row["id"]).startswith("psv_"), row)
-            self.assertEqual(row["projectID"], project_id)
-            self.assertEqual(row["action"], "read")
-            self.assertEqual(row["resource"], resource)
-            saved_entry = {
-                key: row[key] for key in ("id", "projectID", "action", "resource")
-            }
+        # (3) Restore the EXACT original bytes + private mode, then prove the
+        #     running service converged back to deny.
+        _restore_config_and_converge(
+            client, url, password, loc.directory, config_file, original, original_mode,
+            resource=resource,
+        )
 
-            # (3) Restore the EXACT original bytes + private mode, then reload.
-            config_file.write_bytes(original)
-            os.chmod(config_file, original_mode)
-            restored = True
-            _, after = _reload_until(
-                client, url, password, loc.directory, resource=resource, want="deny"
-            )
+        # The configured deny wins despite the durable REAL saved grant (a fresh
+        # session in the same project, so no per-session state can explain it).
+        _, after = _permission_eval(client, url, password, loc.directory, resource)
+        self.assertEqual(after["data"]["effect"], "deny")
+        self.assertNotEqual(after["data"]["id"], request_id)
+        code, saved_after = _raw(
+            "GET", url, f"/api/permission/saved?projectID={project_id}", password
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(saved_after["data"], saved["data"], "the saved grant must persist")
+        code, pending_after = _raw(
+            "GET", url,
+            f"/api/permission/request?location[directory]={loc.directory}", password,
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(pending_after["data"], [], "no pending request may remain")
 
-            # The configured deny wins despite the durable REAL saved grant.
-            self.assertEqual(after["data"]["effect"], "deny")
-            self.assertNotEqual(after["data"]["id"], request_id)
-            code, saved_after = _raw(
-                "GET", url, f"/api/permission/saved?projectID={project_id}", password
-            )
-            self.assertEqual(code, 200)
-            self.assertEqual(saved_after["data"], saved["data"], "the saved grant must persist")
-            code, pending_after = _raw(
-                "GET", url,
-                f"/api/permission/request?location[directory]={loc.directory}", password,
-            )
-            self.assertEqual(code, 200)
-            self.assertEqual(pending_after["data"], [], "no pending request may remain")
-
-            # (4) The app human-approval boundary refuses that exact saved entry.
-            self._assert_saved_entry_is_not_an_approval(saved_entry)
-        finally:
-            if not restored:
-                config_file.write_bytes(original)
-                os.chmod(config_file, original_mode)
-            # Best-effort reload so the owned service is never left drifted; the
-            # manager's own validation still governs every later operation.
-            with contextlib.suppress(Exception):
-                _post_status(url, "/api/location/reload", password)
+        # (4) The app human-approval boundary refuses that exact saved entry.
+        self._assert_saved_entry_is_not_an_approval(saved_entry)
 
     @staticmethod
     def _approval_table_counts(store) -> dict:
