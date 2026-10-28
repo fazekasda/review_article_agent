@@ -18,13 +18,16 @@ scientific workflow, and it makes **no** scientific or completeness claim.
 criterion, or policy was weakened.
 
 > **Evidence distinction.** The coordinator's **177 discovery tests passed at
-> `de179b4`** (with `compileall`/`git diff --check` clean). That is the slice's
-> targeted run. The broader **historical** checkpoints (core baseline `049a9c6`
-> 1890 tests; a shared-only head `0c856cc1957`; retained spike runs Python 79 /
-> live-Jev mocked 51 / integration mocks 7 / TypeScript 58 + `tsc`; scripts 20;
-> doc checks 29) are **older heads, not one latest combined run**. The full
-> coordinator combined final run is **pending** and, if recorded, will live
-> outside these docs. **No final suite count or SHA is invented here.**
+> `de179b4`** (with `compileall`/`git diff --check` clean) — the slice's targeted
+> run. The coordinator's **full frozen combined run** at the same code HEAD
+> `de179b4` (log `/tmp/opencode/step05-combined-all-checks.log`) then **passed**:
+> see §5 for the exact commands and counts (**2,282 tests total**). That run is at
+> the **code HEAD `de179b4`, before this documentation update**, not at this
+> handoff's own (docs-only) commit; **no latest full-suite claim is made at the
+> docs commit**. The older checkpoints (core baseline `049a9c6` 1890 tests;
+> shared-only `0c856cc` 1957 tests; retained spike runs Python 79 / live-Jev mocked
+> 51 / integration mocks 7 / TypeScript 58 + `tsc`; scripts 20; doc checks 29) are
+> **historical heads**, superseded by the combined run above.
 
 ## 1. Scope, base revisions, and authority used
 
@@ -119,15 +122,31 @@ Environment: **Python 3.14.4** actually used; `requires-python = ">=3.11"` is
 | `python3 -m unittest discover -s scripts -p 'test_*.py'` | **20 OK** |
 | `git diff --check` | clean |
 
-Coordinator evidence (recorded, not re-run here): **177 discovery tests passed at
-`de179b4`**, with `compileall`/`diff` clean. Historical checkpoints (older heads,
-not one combined run): core baseline `049a9c6` **1890 tests pass**; shared-only
-head `0c856cc1957` core pass; retained spike baseline Python **79** / live-Jev
-mocked **51** / integration mocks **7** / TypeScript **58 + `tsc`**; scripts
-**20**; doc checks **29**. **No final combined suite count or SHA is claimed.**
+Coordinator evidence — **full frozen combined run at code HEAD `de179b4`** (log
+`/tmp/opencode/step05-combined-all-checks.log`), **ALL LOCAL CHECKS PASSED**:
 
-**Not run / not claimed:** the full coordinator combined final run (pending);
-Python 3.11; any adapter live smoke; any paid model call; any hosted transfer.
+| Check | Result |
+| --- | --- |
+| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` | **2067 OK**, no skips |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **20 OK** |
+| `python3 scripts/check_contract_docs.py --self-test` | **29 checks** |
+| `python3 -m unittest discover -s spikes/runtime/python -p 'test_*.py'` | **79 OK** |
+| `python3 -m unittest discover -s spikes/runtime/live-jev -p 'test_*.py'` | **51 OK** |
+| `python3 -m unittest discover -s spikes/runtime/integration -p 'test_*.py'` | **7 OK** |
+| `npm --prefix spikes/runtime/typescript test` | **58 OK** |
+| `(cd spikes/runtime/typescript && npx tsc --noEmit)` | pass |
+| `python3 -m compileall -q src tests` | pass |
+| `git diff --check` | pass |
+
+**Total 2,282 tests.** Existing SQLite/subprocess/unclosed-file `ResourceWarning`s
+remain (disclosed, not failures). This run is at the **code HEAD `de179b4`**, i.e.
+**before** this documentation update, **not** at this handoff's own docs commit;
+the coordinator will prove the product source/tests are identical and run the final
+docs checks after cherry-pick. **No latest full-suite claim is made at the docs
+commit.**
+
+**Not run / not claimed:** Python 3.11; any adapter live smoke; any paid model call;
+any hosted transfer.
 
 **CI:** the repository has **0 configured GitHub workflows** and a prior PR with
 an **empty rollup**; **no CI-green claim** is made.

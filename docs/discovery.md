@@ -41,9 +41,9 @@ europepmc = EuropePMCClient(transport)      # positional transport argument
 # epmc_result = europepmc.search("EXT_ID:31452104 AND SRC:MED")
 ```
 
-A caller that issues real requests must **serialize** them (or share one
-transport) because rate pacing is **per-instance**, not process-global — see
-*Behaviour notes*.
+A caller that issues real requests must **serialize** them — rate pacing is
+**per-instance** and the transport is **not thread-safe**, so sharing one instance
+preserves spacing only for sequential calls — see *Behaviour notes*.
 
 ## API reference
 
@@ -90,15 +90,21 @@ DiscoveryTransport.get(url: str, params: object = None) -> RetrievalResult
   is refused.
 - **No redirects, no proxies.** Every 3xx is refused; the opener registers an
   empty `ProxyHandler`, so `HTTP_PROXY`/`HTTPS_PROXY`/`no_proxy` are never used.
-- **Retries** apply only to `RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}`.
-  Any other non-200 is a **permanent** failure (never retried).
+- **Retries.** A retryable HTTP status (`RETRYABLE_STATUSES = {408, 429, 500, 502,
+  503, 504}`) **and** a network/HTTP-protocol error (a broken connection, a
+  timeout, or a malformed status line, surfaced as `network_error`) are retried up
+  to `max_attempts`. Any **other** non-200 HTTP status is a **static permanent**
+  failure and is **never** retried.
 - **Body bound.** At most `max_response_bytes + 1` bytes are read; a larger body
   is an explicit `response_too_large` failure, never a silent truncation.
-- **`Retry-After`** is parsed from integer seconds or an HTTP-date. A value too
-  large to represent (more than 18 significant digits, or beyond the permitted
-  delay) yields the conservative sentinel `MAX_RETRY_DELAY_SECONDS + 1.0` and an
-  explicit `retry_after_exceeds_bound` failure — the **sentinel is not the exact
-  magnitude**; the raw header is never retained.
+- **`Retry-After`** is parsed from integer seconds or an HTTP-date. Only a value
+  that is **unrepresentable** or has **more than 18 significant digits** is
+  replaced by the conservative sentinel `MAX_RETRY_DELAY_SECONDS + 1.0` (`61.0`)
+  and reported as an explicit `retry_after_exceeds_bound` failure. An ordinary
+  value that merely **exceeds the permitted bound** is recorded at its **actual
+  magnitude** (e.g. `120` seconds when `max_retry_delay` is `60`) and is likewise
+  an explicit `retry_after_exceeds_bound` failure — the sentinel is **not** the
+  exact magnitude; the raw header is never retained.
 - **Provenance.** Every attempt (success or failure) is an immutable
   `AttemptRecord(attempt_no, requested_url, requested_at, completed_at, status,
   body_bytes, body_sha256, outcome, retry_after_seconds=None)` with
@@ -190,9 +196,11 @@ PubMedClient.search(query: object, page_size: object = None,
   unexpected child) is an explicit `malformed_response`, **not** a silently
   dropped entry.
 - A normal NCBI EFetch reply's plain **external** `<!DOCTYPE ... PUBLIC ...>` is
-  **accepted without fetching** it (stdlib `ElementTree` never resolves the
-  external DTD). An **internal** DTD subset, any `<!ENTITY>` declaration, or a
-  DOCTYPE naming a non-http(s) scheme is refused.
+  **accepted without fetching** it: stdlib `ElementTree` never fetches **any**
+  external DTD, regardless of scheme. An **internal** DTD subset and any
+  `<!ENTITY>` declaration are refused, and a DOCTYPE naming a **known unsafe**
+  scheme (`file`, `data`, `ftp`, `gopher`, `jar`, `php`, `expect`, `netdoc`,
+  `ldap`, `dict`, `smb`) is refused by an explicit check.
 - Every page keeps the exact ESearch **and** EFetch `AttemptRecord`s, the exact
   transmitted query, the ESearch requested URL, and UTC timestamps.
   `PubMedSearchResult.query_translation` retains the provider's first-page
@@ -248,10 +256,12 @@ EuropePMCClient.search(query: str, page_size: int = 100,
   and read *inactivity*; a peer that dribbles bytes just under it can keep one
   attempt alive far longer than `timeout` seconds. The byte cap bounds memory but
   is not a total-deadline guarantee.
-- **Rate pacing is per-instance, not process-global.** `rate_spacing` is tracked
-  on each `DiscoveryTransport` instance. Two instances (or two processes) do not
-  coordinate. A future caller that must respect a provider's request rate has to
-  **serialize** its requests or **share** one transport instance.
+- **Rate pacing is per-instance and the transport is not thread-safe.**
+  `rate_spacing` is tracked on each `DiscoveryTransport` instance, and two
+  instances (or two processes) do not coordinate. A shared instance preserves
+  spacing only for **sequential** calls; concurrent threads or processes are
+  **not** coordinated. A caller must **serialize** its `search()`/`get()` calls
+  (even when sharing one transport) to respect a provider's request rate.
 - **No scientific deduplication.** Overlapping provider pages stay visible; the
   adapters never deduplicate scientific candidates. There is **no** cross-run or
   cross-provider candidate repository.
