@@ -70,9 +70,14 @@ What this module **is not** (the boundary)
   result / fail a definitive pre-billing rejection / recover an ambiguous outcome
   to ``unknown``). It is still **not** a transport: it performs no network call and
   mints no new identity, and it claims nothing about remote quiescence.
-* It stores **no** credential, endpoint secret, raw peer text, or source bytes:
-  only opaque ids, exact-decimal amounts, redacted diagnostics, and SHA-256
-  digests (spec lines 62-63; ``docs/storage.md``).
+* It serializes **no** credential, endpoint secret, or opaque authority, and it
+  makes no network call; but it is **not** a secret scanner and makes **no**
+  "never contains source" promise. Its private canonical bytes carry bounded
+  caller/provider-derived text — the provider envelope, a score ``legend``, and the
+  declared ``options``/``levels``, alongside opaque ids, exact-decimal amounts,
+  redacted diagnostics, and SHA-256 digests (spec lines 62-63; ``docs/storage.md``).
+  A caller that places a secret into submitted request state or referenced source
+  content places it in the private archive; never do so.
 
 Every failure is a static, value-free :class:`DecisionResultError`: a message never
 echoes caller text, source bytes, a credential, a model identifier, a ref, or a
