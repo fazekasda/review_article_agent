@@ -1032,6 +1032,57 @@ class MappingValidatorTest(unittest.TestCase):
         with self.assertRaises(dr.DecisionRecordValidationError):
             dr.validate_decision_record_mapping(mapping)
 
+    def _call_failure_mapping(self):
+        # A canonical ``omitted`` record synthesized from a whole-call failure: the
+        # global diagnostic and the call status, with no per-question error.
+        mapping = self._omitted_mapping()
+        del mapping["per_question_error"]
+        mapping["diagnostics"] = {
+            "code": "transport_error",
+            "detail_redacted": "static detail",
+            "raised_at": RAISED_AT,
+        }
+        mapping["call_status"] = "transport_error"
+        return mapping
+
+    def test_call_status_consistent_relation_accepted(self):
+        mapping = self._call_failure_mapping()
+        self.assertEqual(dr.validate_decision_record_mapping(mapping), mapping)
+
+    def test_call_status_non_failed_value_denied(self):
+        mapping = self._call_failure_mapping()
+        mapping["call_status"] = "completed"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_call_status_on_answered_denied(self):
+        mapping = project()[0].as_mapping()  # answered
+        mapping["call_status"] = "transport_error"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_call_status_code_mismatch_denied(self):
+        mapping = self._call_failure_mapping()
+        mapping["diagnostics"]["code"] = "api_error"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_call_status_with_per_question_error_denied(self):
+        mapping = self._call_failure_mapping()
+        mapping["per_question_error"] = {
+            "question_id": "is_original_report",
+            "reason": "provider_error",
+            "message_redacted": "static",
+        }
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
+    def test_call_status_with_adapter_outcome_denied(self):
+        mapping = self._call_failure_mapping()
+        mapping["adapter_outcome"] = "partial_error"
+        with self.assertRaises(dr.DecisionRecordValidationError):
+            dr.validate_decision_record_mapping(mapping)
+
     def test_returns_no_list_alias(self):
         # The validator promises a fresh plain copy; every list descendant
         # (options/levels/consumed_versions) must be copied, not aliased.

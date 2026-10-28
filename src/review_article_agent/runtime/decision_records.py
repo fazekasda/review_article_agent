@@ -66,6 +66,14 @@ What this module **is not** (the boundary)
   source literal in the optional ``adapter_outcome`` audit field. It invents no
   answer and asserts no scientific uncertainty; every other literal, and every
   answerless ``partial_error`` with a foreign/malformed/missing error, is refused.
+* It **retains whole-call failures**: when the real submitted dispatch failed at
+  the envelope/transport/API level (§8.1.1 ``transport_error``/``api_error``/
+  ``protocol_error``), the adapter returns no per-question answer — only a single
+  global ``Diagnostic``. The projection preserves every requested **supported**
+  question as a canonical ``omitted`` decision carrying that existing diagnostic
+  (and the call status in the optional ``call_status`` audit field); a ``box``
+  question keeps its own ``unsupported`` outcome. A ``completed`` envelope is
+  never admitted with a missing outcome.
 * It performs **no** ledger aggregation: the same ``CostRecord`` (one dispatch)
   is referenced by every question's record; the charge is counted **once** per
   dispatch, never summed per question.
@@ -117,6 +125,7 @@ __all__ = [
     "PER_QUESTION_ERROR_OUTCOMES",
     "ANSWERLESS_PARTIAL_ERROR_REASONS",
     "NORMALIZED_ADAPTER_OUTCOME",
+    "FAILED_SUBMITTED_STATUSES",
     "JEV_CONSUMED_SLOTS",
     "OPTIONAL_CONSUMED_SLOTS",
     "MAX_DECISION_RECORD_BYTES",
@@ -173,6 +182,17 @@ ANSWERLESS_PARTIAL_ERROR_REASONS = ("missing_answer", "provider_error")
 #: outcome (``partial_error`` -> ``omitted``), preserved in the optional
 #: ``adapter_outcome`` audit field.
 NORMALIZED_ADAPTER_OUTCOME = "partial_error"
+
+#: Whole-call ``DispatchResult`` statuses of a **submitted** attempt that failed
+#: before any per-question outcome could be validated (§8.1.1). The adapter
+#: retains a single global ``Diagnostic`` and no per-question answer for these; the
+#: projection preserves every requested **supported** question as a canonical
+#: ``omitted`` decision carrying that existing diagnostic (never an invented
+#: answer or per-question error), and the call status in the optional
+#: ``call_status`` audit field. A ``box`` question keeps its own ``unsupported``
+#: outcome. A ``completed`` (successful) envelope is never admitted with a missing
+#: outcome.
+FAILED_SUBMITTED_STATUSES = ("transport_error", "api_error", "protocol_error")
 
 #: Version slots every Jev/typed-decision stage consumes (§6.1).
 JEV_CONSUMED_SLOTS = ("model", "prompt", "adapter")
@@ -294,6 +314,11 @@ _M_PARTIAL_ERROR_NO_ANSWER = (
 _M_REASON_REQUIRED = (
     "an uncertain or omitted decision must retain a diagnostic or per-question error"
 )
+_M_BAD_STATUS = "the dispatch result status is not a documented dispatch status"
+_M_GLOBAL_DIAGNOSTIC = (
+    "a failed submitted dispatch must carry its retained global diagnostic"
+)
+_M_CALL_STATUS = "the call-status audit field is inconsistent with the record"
 
 
 # --------------------------------------------------------------------------- #
@@ -875,7 +900,7 @@ _REQUIRED_KEYS = frozenset(
     }
 )
 _OPTIONAL_KEYS = frozenset(
-    {"answer", "per_question_error", "diagnostics", "adapter_outcome"}
+    {"answer", "per_question_error", "diagnostics", "adapter_outcome", "call_status"}
 )
 
 
@@ -1201,6 +1226,7 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
     pqe = mapping.get("per_question_error")
     diagnostic = mapping.get("diagnostics")
     adapter_outcome = mapping.get("adapter_outcome")
+    call_status = mapping.get("call_status")
 
     if answer is not None:
         if kind == "box":
@@ -1226,6 +1252,20 @@ def validate_decision_record_mapping(mapping: object) -> dict[str, Any]:
             _err(_M_OUTCOME_LITERAL)
         if outcome != "omitted" or adapter_outcome != NORMALIZED_ADAPTER_OUTCOME:
             _err(_M_ADAPTER_OUTCOME)
+
+    # The optional ``call_status`` audit field preserves the whole-call dispatch
+    # status of a submitted envelope that failed before any per-question outcome
+    # was validated. Its relation is strict and exact: it names one of the failed
+    # submitted statuses, it appears only on the synthesized ``omitted`` record
+    # (never alongside a per-question error or a normalized adapter outcome), and
+    # it must match the retained global diagnostic's code.
+    if call_status is not None:
+        if call_status not in FAILED_SUBMITTED_STATUSES:
+            _err(_M_CALL_STATUS)
+        if outcome != "omitted" or adapter_outcome is not None or pqe is not None:
+            _err(_M_CALL_STATUS)
+        if diagnostic is None or diagnostic.get("code") != call_status:
+            _err(_M_CALL_STATUS)
 
     # C02 §6.2 presence union: ``answer`` is present iff the outcome is
     # ``answered`` or ``partial_error``.
@@ -1273,6 +1313,8 @@ def _validate_result_envelope(result: object) -> jev.DispatchResult:
         _err(_M_BAD_MODEL, DecisionRecordProjectionError)
     if result.submitted is not True:
         _err(_M_NOT_SUBMITTED, DecisionRecordProjectionError)
+    if result.status not in jev.DISPATCH_STATUSES:
+        _err(_M_BAD_STATUS, DecisionRecordProjectionError)
     if isinstance(result.calls_attempted, bool) or not isinstance(
         result.calls_attempted, int
     ) or result.calls_attempted != 1:
@@ -1321,6 +1363,13 @@ def project_decision_records(
     Every returned record references the **same** dispatch and its **single**
     ``CostRecord``; the charge is counted once (see :func:`ledger_charges`), never
     summed per question.
+
+    A **whole-call** submitted failure (``transport_error``/``api_error``/
+    ``protocol_error``) carries no per-question outcome, only the result's global
+    ``Diagnostic``; each requested supported question is then preserved as a
+    canonical ``omitted`` record carrying that diagnostic and the ``call_status``
+    audit field. A ``completed`` envelope must carry a typed outcome for every
+    declared question — missing evidence is refused.
     """
     project = _identifier(project_id)
     target_ref = _ref(target, project)
@@ -1348,8 +1397,27 @@ def project_decision_records(
     declared = {q.question_id for q in canonical_questions}
     if set(outcomes) - declared:
         _err(_M_UNKNOWN_OUTCOME, DecisionRecordProjectionError)
-    if declared - set(outcomes):
-        _err(_M_MISSING_OUTCOME, DecisionRecordProjectionError)
+
+    # A whole-call failure (a submitted attempt that failed at the
+    # envelope/transport/API level) retains only a global diagnostic and no
+    # per-question answer. Only such an envelope may be missing a typed outcome for
+    # a supported question, and only then is each one preserved as canonical
+    # ``omitted`` carrying that existing diagnostic. A completed (successful)
+    # envelope must still carry a typed outcome for every declared question.
+    call_failure = trusted.status in FAILED_SUBMITTED_STATUSES
+    missing = declared - set(outcomes)
+    if missing:
+        if not call_failure:
+            _err(_M_MISSING_OUTCOME, DecisionRecordProjectionError)
+        if not isinstance(trusted.diagnostic, jev.Diagnostic):
+            _err(_M_GLOBAL_DIAGNOSTIC, DecisionRecordProjectionError)
+        # A failed envelope still records every box question as ``unsupported``; a
+        # missing box outcome is malformed evidence, never silently synthesized.
+        box_ids = {
+            q.question_id for q in canonical_questions if q.question_kind == jev.BOX
+        }
+        if missing & box_ids:
+            _err(_M_MISSING_OUTCOME, DecisionRecordProjectionError)
 
     cost = _project_cost(trusted, dispatch)
     provider = _project_provider(trusted)
@@ -1357,24 +1425,8 @@ def project_decision_records(
     records: list[DecisionRecord] = []
     for question in canonical_questions:
         qid = question.question_id
-        outcome = outcomes[qid]
-        if not isinstance(outcome, jev.DecisionOutcome):
-            _err(_M_BAD_OUTCOME)
-        if outcome.question_id != qid:
-            _err(_M_OUTCOME_ID)
-        if outcome.question_kind != question.question_kind:
-            _err(_M_OUTCOME_KIND)
-        if outcome.outcome not in jev.OUTCOMES:
-            _err(_M_OUTCOME_LITERAL)
-
         descriptor_digest = question_descriptor_digest(question)
         _match_binding(binding_map[qid], question)
-
-        # Reconcile the typed adapter outcome to its canonical literal. Only an
-        # answerless adapter ``partial_error`` with a genuine missing-answer /
-        # provider-error reason becomes canonical ``omitted``; nothing is
-        # invented, and the retained error/diagnostic are projected verbatim.
-        canonical_outcome, adapter_outcome = _normalize_outcome(outcome, qid)
 
         mapping: dict[str, Any] = {
             "schema_version": DECISION_RECORD_SCHEMA_VERSION,
@@ -1388,7 +1440,6 @@ def project_decision_records(
             "options": list(question.options),
             "levels": list(question.levels),
             "question_def_digest": descriptor_digest,
-            "outcome": canonical_outcome,
             "versions": version_map,
             "consumed_versions": list(consumed_slots),
             "route": DECISION_ROUTE,
@@ -1399,22 +1450,48 @@ def project_decision_records(
             "retains_candidate": True,
             "grants_eligibility": False,
         }
-        if adapter_outcome is not None:
-            mapping["adapter_outcome"] = adapter_outcome
-        if outcome.answer is not None:
-            if not isinstance(outcome.answer, jev.Answer):
+
+        if qid not in outcomes:
+            # Whole-call failure: no per-question outcome was validated. Preserve
+            # the requested supported question as canonical ``omitted`` carrying the
+            # EXISTING global diagnostic and the call status; invent no answer and
+            # no per-question error, and never a scientific negative.
+            mapping["outcome"] = "omitted"
+            mapping["diagnostics"] = _project_diagnostic(trusted.diagnostic)
+            mapping["call_status"] = trusted.status
+        else:
+            outcome = outcomes[qid]
+            if not isinstance(outcome, jev.DecisionOutcome):
                 _err(_M_BAD_OUTCOME)
-            mapping["answer"] = _project_answer(outcome.answer)
-        if outcome.per_question_error is not None:
-            if not isinstance(outcome.per_question_error, jev.PerQuestionError):
-                _err(_M_BAD_OUTCOME)
-            mapping["per_question_error"] = _project_per_question_error(
-                outcome.per_question_error
-            )
-        if outcome.diagnostic is not None:
-            if not isinstance(outcome.diagnostic, jev.Diagnostic):
-                _err(_M_BAD_OUTCOME)
-            mapping["diagnostics"] = _project_diagnostic(outcome.diagnostic)
+            if outcome.question_id != qid:
+                _err(_M_OUTCOME_ID)
+            if outcome.question_kind != question.question_kind:
+                _err(_M_OUTCOME_KIND)
+            if outcome.outcome not in jev.OUTCOMES:
+                _err(_M_OUTCOME_LITERAL)
+
+            # Reconcile the typed adapter outcome to its canonical literal. Only an
+            # answerless adapter ``partial_error`` with a genuine missing-answer /
+            # provider-error reason becomes canonical ``omitted``; nothing is
+            # invented, and the retained error/diagnostic are projected verbatim.
+            canonical_outcome, adapter_outcome = _normalize_outcome(outcome, qid)
+            mapping["outcome"] = canonical_outcome
+            if adapter_outcome is not None:
+                mapping["adapter_outcome"] = adapter_outcome
+            if outcome.answer is not None:
+                if not isinstance(outcome.answer, jev.Answer):
+                    _err(_M_BAD_OUTCOME)
+                mapping["answer"] = _project_answer(outcome.answer)
+            if outcome.per_question_error is not None:
+                if not isinstance(outcome.per_question_error, jev.PerQuestionError):
+                    _err(_M_BAD_OUTCOME)
+                mapping["per_question_error"] = _project_per_question_error(
+                    outcome.per_question_error
+                )
+            if outcome.diagnostic is not None:
+                if not isinstance(outcome.diagnostic, jev.Diagnostic):
+                    _err(_M_BAD_OUTCOME)
+                mapping["diagnostics"] = _project_diagnostic(outcome.diagnostic)
 
         normalized = validate_decision_record_mapping(mapping)
 

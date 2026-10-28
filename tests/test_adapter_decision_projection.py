@@ -29,6 +29,7 @@ No network, no credential, no paid call, no store. Run:
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from decimal import Decimal
@@ -99,6 +100,19 @@ def payload(answers, **overrides):
     }
     body.update(overrides)
     return body
+
+
+def wire_body(body_answers, **overrides):
+    """A JSON wire body (real transport text) with a numeric provider cost."""
+    body = {
+        "id": "gen-dec-1",
+        "model": "typesafe/jev-1.14-20261014",
+        "provider": "TypeSafe",
+        "answers": body_answers,
+        "usage": {"input_tokens": 485, "output_tokens": 76, "cost": 0.00002037},
+    }
+    body.update(overrides)
+    return json.dumps(body)
 
 
 def versions():
@@ -183,6 +197,26 @@ def project(validated, qs):
         versions=versions(),
         bindings=bindings_for(qs),
         expected_request_sha256=REQUEST_SHA256,
+    )
+
+
+def project_result(result, qs, *, expected_request_sha256=None):
+    """Project an already-built (real) ``DispatchResult`` for *qs*."""
+    return dr.project_decision_records(
+        result,
+        qs,
+        project_id=PROJECT,
+        target=TARGET,
+        question_def_ref=refs_for(qs, "question_def", "qd_rev"),
+        criteria_ref=refs_for(qs, "criteria", "crit_rev"),
+        dispatch_ref=DISPATCH,
+        task_context=TASK_CONTEXT,
+        versions=versions(),
+        bindings=bindings_for(qs),
+        expected_request_sha256=(
+            result.request_sha256 if expected_request_sha256 is None
+            else expected_request_sha256
+        ),
     )
 
 
@@ -360,6 +394,268 @@ class StrictMappingStillRefusedTest(unittest.TestCase):
         mapping["adapter_outcome"] = "refusal"
         with self.assertRaises(dr.DecisionRecordValidationError):
             dr.validate_decision_record_mapping(mapping)
+
+
+# --------------------------------------------------------------------------- #
+# Whole-call submitted failures (real plan + injected local transport)
+# --------------------------------------------------------------------------- #
+API_KEY = "sk-test-not-a-real-key"
+STATE = {"fixture": "synthetic-spike-fixture-not-a-real-paper", "passage": "..."}
+
+
+def plan_questions():
+    return [predicate("is_original_report"), choice("study_design"), box("box_q")]
+
+
+class _RaisingTransport:
+    def __init__(self, exc):
+        self.exc = exc
+        self.calls = 0
+
+    def __call__(self, body, api_key, *, endpoint, timeout):
+        self.calls += 1
+        raise self.exc
+
+
+class _CannedTransport:
+    def __init__(self, status, body_text=""):
+        self.response = jev.TransportResponse(status, body_text)
+        self.calls = 0
+
+    def __call__(self, body, api_key, *, endpoint, timeout):
+        self.calls += 1
+        return self.response
+
+
+def run_dispatch(qs, transport):
+    plan = jev.plan_dispatch(qs, STATE, reserve_usd="0.25")
+    return jev.dispatch_plan(plan, api_key=API_KEY, transport=transport)
+
+
+class WholeCallFailureProjectionTest(unittest.TestCase):
+    """Every requested supported question is retained on a whole-call failure."""
+
+    def _assert_failed_envelope(self, result, qs, status, cost_state):
+        self.assertEqual(result.status, status)
+        self.assertTrue(result.submitted)
+        self.assertEqual(result.calls_attempted, 1)
+        self.assertEqual(result.cost.state, cost_state)
+        # The adapter retained only the global diagnostic and the box outcome.
+        self.assertIsNotNone(result.diagnostic)
+        self.assertEqual(set(result.outcomes), {"box_q"})
+
+        records = project_result(result, qs)
+        mapping = by_id(records)
+        self.assertEqual(set(mapping), {q.question_id for q in qs})
+
+        for q in qs:
+            record = mapping[q.question_id]
+            assert_inert(self, record)
+            if q.question_kind == jev.BOX:
+                # The existing BOX ``unsupported`` outcome is untouched.
+                self.assertEqual(record["outcome"], "unsupported")
+                self.assertNotIn("call_status", record)
+                continue
+            # A supported question with no validated outcome -> canonical omitted
+            # carrying the EXISTING global diagnostic and the call status.
+            self.assertEqual(record["outcome"], "omitted")
+            self.assertEqual(record["call_status"], status)
+            self.assertNotIn("answer", record)
+            self.assertNotIn("per_question_error", record)
+            self.assertNotIn("adapter_outcome", record)
+            self.assertEqual(record["diagnostics"], dr._project_diagnostic(result.diagnostic))
+            self.assertEqual(record["diagnostics"]["code"], status)
+            self.assertEqual(dr.validate_decision_record_mapping(record), record)
+
+        # One charge per dispatch; an unresolved cost is never zero.
+        charges = dr.ledger_charges(records)
+        self.assertEqual(len(charges), 1)
+        self.assertEqual(charges[0]["dispatch_ref"], DISPATCH)
+        self.assertEqual(charges[0]["state"], cost_state)
+        if cost_state in ("unknown", "not_incurred"):
+            # An unresolved / not-billed cost carries no amount (never a silent 0).
+            self.assertNotIn("amount_usd", charges[0])
+        return mapping
+
+    def test_raised_timeout_transport_error_unknown_reserve_retained(self):
+        qs = plan_questions()
+        transport = _RaisingTransport(TimeoutError("simulated timeout"))
+        result = run_dispatch(qs, transport)
+        self.assertEqual(transport.calls, 1)  # exactly one POST; no blind retry
+        self.assertEqual(result.cost.reserve_usd, "0.25")
+        self.assertIsNone(result.cost.amount_usd)
+        self.assertTrue(result.cost.reserve_retained)
+        self._assert_failed_envelope(result, qs, "transport_error", "unknown")
+
+    def test_http_401_definitive_api_error_not_incurred(self):
+        qs = plan_questions()
+        transport = _CannedTransport(401, "")
+        result = run_dispatch(qs, transport)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(result.cost.state, "not_incurred")
+        self.assertIsNone(result.cost.amount_usd)
+        self._assert_failed_envelope(result, qs, "api_error", "not_incurred")
+
+    def test_http_429_ambiguous_api_error_unknown(self):
+        qs = plan_questions()
+        transport = _CannedTransport(429, "")
+        result = run_dispatch(qs, transport)
+        self.assertEqual(transport.calls, 1)
+        self.assertTrue(result.cost.reserve_retained)
+        self._assert_failed_envelope(result, qs, "api_error", "unknown")
+
+    def test_http_500_ambiguous_api_error_unknown(self):
+        qs = plan_questions()
+        transport = _CannedTransport(500, "")
+        result = run_dispatch(qs, transport)
+        self._assert_failed_envelope(result, qs, "api_error", "unknown")
+
+    def test_malformed_json_protocol_error(self):
+        qs = plan_questions()
+        transport = _CannedTransport(200, "{not json")
+        result = run_dispatch(qs, transport)
+        self.assertEqual(result.status, "protocol_error")
+        self._assert_failed_envelope(result, qs, "protocol_error", "unknown")
+
+    def test_malformed_envelope_protocol_error_vs_valid_partial_answers(self):
+        # A 200 whose envelope is malformed (answers not an object) is a whole-call
+        # protocol failure: every supported question is retained as omitted.
+        qs = plan_questions()
+        malformed = valid_answers()
+        transport = _CannedTransport(200, wire_body(malformed, answers="not-an-object"))
+        result = run_dispatch(qs, transport)
+        self.assertEqual(result.status, "protocol_error")
+        self._assert_failed_envelope(result, qs, "protocol_error", "known")
+
+        # A 200 whose envelope is valid but carries only a partial set of answers is
+        # a completed call: the missing answer is the T5d per-question failure
+        # (canonical omitted via adapter_outcome), NOT a whole-call failure.
+        qs2 = [predicate("is_original_report"), predicate("missing_q")]
+        partial = {"is_original_report": {"type": "noul", "noul": 0.97}}
+        transport2 = _CannedTransport(200, wire_body(partial))
+        result2 = run_dispatch(qs2, transport2)
+        self.assertEqual(result2.status, "completed")
+        mapping = by_id(project_result(result2, qs2))
+        self.assertEqual(mapping["missing_q"]["outcome"], "omitted")
+        self.assertEqual(mapping["missing_q"]["adapter_outcome"], "partial_error")
+        self.assertNotIn("call_status", mapping["missing_q"])
+        self.assertEqual(mapping["is_original_report"]["outcome"], "answered")
+
+
+# --------------------------------------------------------------------------- #
+# Missing evidence is still refused (no silent synthesis)
+# --------------------------------------------------------------------------- #
+class MissingEvidenceRefusedTest(unittest.TestCase):
+    def test_completed_envelope_missing_outcome_refused(self):
+        # A completed envelope with a missing supported outcome (no validated call
+        # failure) must still be refused.
+        qs = [predicate("is_original_report"), predicate("missing_q")]
+        box_only = {
+            "box_q": jev.DecisionOutcome(
+                question_id="box_q",
+                question_kind=jev.BOX,
+                outcome="unsupported",
+                per_question_error=jev.PerQuestionError(
+                    question_id="box_q",
+                    reason="unsupported_question_kind",
+                    message_redacted="static",
+                ),
+                diagnostic=jev.Diagnostic(
+                    code="unsupported_question_kind", detail_redacted="static", raised_at=RAISED_AT
+                ),
+            )
+        }
+        result = jev.DispatchResult(
+            status="completed",
+            calls_attempted=1,
+            submitted=True,
+            attempt_no=1,
+            idempotent_admission_proven=False,
+            no_automatic_retry=True,
+            endpoint=jev.ENDPOINT,
+            model=jev.MODEL,
+            actual_model="typesafe/jev-1.14-20261014",
+            provider="TypeSafe",
+            response_id="gen-dec-1",
+            usage=jev.Usage(1, 1),
+            cost=jev.CostRecord(state="known", amount_usd="0.0001", reserve_usd="0.25"),
+            outcomes=box_only,
+            http_status=200,
+            request_bytes=256,
+            request_sha256=REQUEST_SHA256,
+            cost_upper_bound_usd="0.0001",
+            reserve_usd="0.25",
+        )
+        with self.assertRaises(dr.DecisionRecordProjectionError):
+            project_result(result, qs)
+
+    def test_unsubmitted_blocked_refused(self):
+        # A blocked (unsubmitted) dispatch never reached the network: it has no
+        # meaning as a decision and is refused.
+        qs = plan_questions()
+        result = jev.execute(
+            qs, STATE, api_key=None, reserve_usd="0.25", authorized=False
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertFalse(result.submitted)
+        with self.assertRaises(dr.DecisionRecordProjectionError):
+            project_result(result, qs)
+
+    def test_failed_envelope_without_global_diagnostic_refused(self):
+        # A failed submitted envelope that dropped its global diagnostic is
+        # malformed evidence and refused (never a silent reasonless omitted).
+        qs = [predicate("is_original_report")]
+        result = jev.DispatchResult(
+            status="transport_error",
+            calls_attempted=1,
+            submitted=True,
+            attempt_no=1,
+            idempotent_admission_proven=False,
+            no_automatic_retry=True,
+            endpoint=jev.ENDPOINT,
+            model=jev.MODEL,
+            actual_model=None,
+            provider=None,
+            response_id=None,
+            usage=None,
+            cost=jev.CostRecord(state="unknown", reserve_usd="0.25", reserve_retained=True),
+            outcomes={},
+            http_status=None,
+            request_bytes=256,
+            request_sha256=REQUEST_SHA256,
+            cost_upper_bound_usd="0.0001",
+            reserve_usd="0.25",
+            diagnostic=None,
+        )
+        with self.assertRaises(dr.DecisionRecordProjectionError):
+            project_result(result, qs)
+
+    def test_unknown_status_refused(self):
+        qs = [predicate("is_original_report")]
+        result = jev.DispatchResult(
+            status="not_a_status",
+            calls_attempted=1,
+            submitted=True,
+            attempt_no=1,
+            idempotent_admission_proven=False,
+            no_automatic_retry=True,
+            endpoint=jev.ENDPOINT,
+            model=jev.MODEL,
+            actual_model=None,
+            provider=None,
+            response_id=None,
+            usage=None,
+            cost=jev.CostRecord(state="unknown", reserve_usd="0.25", reserve_retained=True),
+            outcomes={},
+            http_status=None,
+            request_bytes=256,
+            request_sha256=REQUEST_SHA256,
+            cost_upper_bound_usd="0.0001",
+            reserve_usd="0.25",
+            diagnostic=jev.Diagnostic(code="x", detail_redacted="y", raised_at=RAISED_AT),
+        )
+        with self.assertRaises(dr.DecisionRecordProjectionError):
+            project_result(result, qs)
 
 
 if __name__ == "__main__":  # pragma: no cover
