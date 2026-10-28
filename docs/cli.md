@@ -605,8 +605,11 @@ lifecycle status (`active`/`stale`/`superseded`/`invalidated`) and returns retai
 historical rows. `satisfies_named_gate` is the only satisfaction claim and is `true`
 only for an `active` + `approved` exact named-gate instance. `gate status`/`gate
 list` expose curated computed `reasons` and `superseded_by`, but **not** the stored
-rationale text; `rationale` is bound into the digest and stored but never echoed by
-any gate command. `gate list` fails the whole read closed as `storage` if a stored
+rationale text in their machine-readable JSON. The caller's `rationale` is bound
+into the snapshot digest and stored, and it is displayed on the owner's
+**controlling terminal** as part of the bound action the owner confirms; it is
+never echoed in a command's machine-readable `stdout`/`stderr` JSON summary or
+error. `gate list` fails the whole read closed as `storage` if a stored
 row is corrupt rather than silently skipping it; `gate status` reports a corrupt
 approval as `invalidated`. `gate status` for an unknown approval id is a
 `validation` error.
@@ -641,7 +644,7 @@ $ review-article-agent --data-dir "$DD" gate confirm \
     --timeout-seconds 120 --project <PROJECT_ID>
 # The owner types the displayed challenge on the controlling terminal (/dev/tty);
 # piped stdin and a --yes/actor/imported-approval flag cannot confirm.
-$ review-article-agent --data-dir "$DD" gate status --approval-id apv_… --project <PROJECT_ID>
+$ review-article-agent --data-dir "$DD" gate status --approval-id <APPROVAL_ID> --project <PROJECT_ID>
 $ review-article-agent --data-dir "$DD" gate list --project <PROJECT_ID>
 ```
 

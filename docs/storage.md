@@ -200,9 +200,12 @@ newer manifest/store schema) on any of:
   operational state row is re-validated read-only: the route/accounting-bucket
   identity, canonical input/version/evidence digests, the exact-decimal reserve and
   settled cost, state/result/cost consistency, and the linked task. An `unknown`
-  (ambiguous) dispatch must keep its reserve and must not record a cost amount of
-  `0` or a fresh retry; a legitimate historical unresolved row is preserved rather
-  than "repaired".
+  (ambiguous) remote dispatch keeps its reserve and is never re-declared resolved
+  or automatically retried; a legitimate historical unresolved row is preserved
+  rather than "repaired". Remote state and settled cost are independent: an
+  unresolved dispatch may legitimately carry a `known`/`estimated` settled amount,
+  and when the actual cost is itself unknown it stays `unknown` with **no** amount
+  recorded (never `0`).
 - **schema 7 and above** — every durable human-approval row is re-validated
   read-only: the recomputed canonical snapshot digest and structure, projected
   columns, every entry pin, and the out-of-band owner-auth binding. Legitimate
@@ -254,8 +257,11 @@ snapshot keeps its runtime mappings; a **schema-6** snapshot keeps its dispatch
 identity/state and cost ledger; and a **schema-7** snapshot keeps its owner-auth
 evidence and human approvals. A schema-7 snapshot's `stale`/`superseded` approval
 history is preserved and remains structurally valid. A schema-6/7 `unknown`
-dispatch keeps its reserve and its `unknown` cost state — it is never turned into
-`0` and never retried automatically.
+dispatch keeps its reserve and is never re-declared resolved or automatically
+retried. Its remote *state* and its settled *cost* are separate: an unresolved
+dispatch may carry a `known`/`estimated` amount, and a genuinely unknown cost
+stays `unknown` with no amount (never `0`). A recorded cost is bookkeeping only
+and never proves the remote operation has quiesced.
 
 The durable runtime surface in Step 04 is still partial: real provider sessions,
 Jev runners, and result persistence are **not yet implemented**, so no
@@ -290,11 +296,15 @@ module. A restore never fabricates a scientific or model approval.
   auth capability or challenge is ever serialized, and importing an approval or
   actor value cannot mint authority. A historical `stale`/`superseded` row is
   honest history and is never rejected as corrupt.
-- A **schema-6** `unknown` dispatch is deliberately conservative: its reserve stays
-  recorded, its cost state stays `unknown` (never `0`), and no fresh automatic retry
-  is created. The immutable dispatch identity row and the mutable operational state
-  row are distinct: only the operational row changes, as an explicit state
-  transition.
+- A **schema-6** dispatch separates unresolved remote *state* from settled *cost*.
+  An `unknown`/ambiguous remote state keeps its reserve and is never re-declared
+  resolved or automatically retried, but the cost ledger is independent: such a
+  dispatch may legitimately carry a `known`/`estimated` settled amount. When the
+  actual cost is genuinely unknown it stays `unknown` with **no** amount recorded
+  (never `0`). A recorded `known`/`estimated` cost is conservative bookkeeping and
+  never proves that the remote operation has quiesced. The immutable dispatch
+  identity row and the mutable operational state row are distinct: only the
+  operational row changes, as an explicit state transition.
 - `verify_backup` re-validates stored rights records and recomputes content
   digests; from schema 4 upward it additionally re-validates the durable
   job/attempt/result/budget rows, from schema 5 upward the runtime mappings, from
