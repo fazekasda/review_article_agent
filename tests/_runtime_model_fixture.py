@@ -40,6 +40,15 @@ Every request is appended as one bounded JSON line to ``RAA_FIXTURE_LOG`` (when
 set), which is how a test proves a real turn reached the transport and inspects
 the **tool set the real service offered the model**. No credential is read,
 written, or logged; the synthetic reply contains no secret.
+
+Arrival is observable *before* the synthetic reply: the log line (with
+``"kind": "chat.request"``) is written and flushed **before** any
+``DELAY_MS`` sleep, so a test can boundedly wait for the exact prompt to reach
+the model transport and then act while the turn is still live.
+
+A readiness failure is reported on stdout as ``{"event": "fixture-error", ...}``
+and exits non-zero, so a parent that bounds its startup read gets a typed
+failure instead of blocking forever on a silent child.
 """
 
 from __future__ import annotations
@@ -66,6 +75,9 @@ MODELS = tuple(
 )
 REPLY_PREFIX = os.environ.get("RAA_FIXTURE_REPLY_PREFIX", "fixture-synthetic:")
 PROMPT_LOG_LIMIT = 400
+#: Upper bound (bytes) on one request body; a larger body is refused, so the
+#: fixture can never be made to buffer an unbounded payload.
+MAX_REQUEST_BYTES = 1_048_576
 
 _DELAY_RE = re.compile(r"DELAY_MS=(\d+)")
 _TOOLCALL_RE = re.compile(r"TOOLCALL=([A-Za-z0-9_.:-]+)")
@@ -159,6 +171,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": {"message": "no route", "type": "invalid_request_error"}})
             return
         length = int(self.headers.get("Content-Length", "0") or "0")
+        if length < 0 or length > MAX_REQUEST_BYTES:
+            self._json(
+                413,
+                {"error": {"message": "request body too large", "type": "invalid_request_error"}},
+            )
+            return
         try:
             body = json.loads(self.rfile.read(length) if length else b"{}")
         except json.JSONDecodeError:
@@ -169,8 +187,11 @@ class _Handler(BaseHTTPRequestHandler):
         text = _last_user_text(body.get("messages"))
         delay = _delay_ms(text)
         toolcall = _toolcall_name(text)
+        # Logged (and flushed, one line per file open) *before* any delay, so the
+        # arrival is observable while the turn is still live.
         _log(
             {
+                "kind": "chat.request",
                 "ts": time.time(),
                 "model": model,
                 "stream": bool(body.get("stream")),
@@ -281,7 +302,18 @@ class _Server(ThreadingHTTPServer):
 
 def main() -> int:
     port = int(os.environ.get("RAA_FIXTURE_PORT", "0"))
-    server = _Server((HOST, port), _Handler)
+    try:
+        server = _Server((HOST, port), _Handler)
+    except OSError as exc:
+        # A typed readiness failure on stdout (never a silent child), so the
+        # parent's bounded startup read fails fast with a typed error.
+        print(
+            json.dumps(
+                {"event": "fixture-error", "error": "bind", "detail": exc.__class__.__name__}
+            ),
+            flush=True,
+        )
+        return 2
     actual = server.server_address[1]
     print(
         json.dumps({"event": "fixture-listening", "host": HOST, "port": actual, "models": list(MODELS)}),
