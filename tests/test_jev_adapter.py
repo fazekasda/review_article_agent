@@ -1,0 +1,854 @@
+"""Offline regression tests for the production Jev typed-decision adapter.
+
+Covers ``src/review_article_agent/runtime/jev.py`` against the acceptance
+criteria of task T3:
+
+* valid predicate/choice/score primitives are normalized to canonical kinds;
+* per-question missing/refused/error/malformed answers are retained with
+  diagnostics while the other valid answers survive — never an exclusion;
+* an invalid plan/endpoint/authorization makes **zero** dispatch calls;
+* post-dispatch ambiguous failures keep the reserve ``unknown`` (never ``0``);
+  a malformed 200 is never reported ``not_incurred``;
+* provider cost is an exact decimal string (no float round-trip), including 0;
+* the endpoint/redirect/proxy/key guards and exact-decimal bounds all fail
+  closed;
+* exactly one dispatch is attempted and nothing is ever retried.
+
+No network, no credential, no paid call: the transport is always a local fixture.
+Run:
+
+    PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_jev_adapter.py'
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import sys
+import unittest
+import urllib.error
+import urllib.request
+from decimal import Decimal
+from pathlib import Path
+from unittest import mock
+
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from review_article_agent.runtime import jev  # noqa: E402
+
+API_KEY = "sk-or-v1-supersecret-should-never-appear"
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures
+# --------------------------------------------------------------------------- #
+def questions():
+    return [
+        jev.QuestionDef("is_original_report", jev.PREDICATE, "Is it original?"),
+        jev.QuestionDef(
+            "study_design",
+            jev.CHOICE,
+            "Which design?",
+            options=("randomised", "observational", "other"),
+        ),
+        jev.QuestionDef(
+            "confidence_level",
+            jev.SCORE,
+            "How confident?",
+            levels=("low", "moderate", "high"),
+        ),
+    ]
+
+
+STATE = {"fixture": "synthetic-spike-fixture-not-a-real-paper", "passage": "..."}
+
+
+def valid_answers():
+    return {
+        "is_original_report": {"type": "noul", "noul": 0.97},
+        "study_design": {
+            "type": "choice",
+            "choice": "randomised",
+            "confidence": 0.81,
+            "probabilities": {"randomised": 0.9, "observational": 0.1, "other": 0.0},
+        },
+        "confidence_level": {
+            "type": "score",
+            "score": 1.2,
+            "confidence": 0.66,
+            "probabilities": {"0": 0.1, "1": 0.6, "2": 0.3},
+            "legend": {"0": "low", "1": "moderate", "2": "high"},
+        },
+    }
+
+
+def valid_payload(**overrides):
+    payload = {
+        "id": "gen-dec-test",
+        "model": "typesafe/jev-1.14-20261014",
+        "provider": "TypeSafe",
+        "answers": valid_answers(),
+        "usage": {"input_tokens": 485, "output_tokens": 76, "cost": 0.00002037},
+    }
+    payload.update(overrides)
+    return payload
+
+
+class FakeTransport:
+    """Records every call; returns a canned response or raises."""
+
+    def __init__(self, response=None, raises=None):
+        self.response = response
+        self.raises = raises
+        self.calls = []
+
+    def __call__(self, body, api_key, *, endpoint, timeout):
+        self.calls.append(
+            {"body": body, "api_key": api_key, "endpoint": endpoint, "timeout": timeout}
+        )
+        if self.raises is not None:
+            raise self.raises
+        return self.response
+
+
+def resp(status, obj):
+    body = obj if isinstance(obj, str) else json.dumps(obj)
+    return jev.TransportResponse(status, body)
+
+
+def run(transport, *, qs=None, state=None, **kwargs):
+    params = dict(
+        api_key=API_KEY,
+        reserve_usd="0.25",
+        authorized=True,
+        transport=transport,
+    )
+    params.update(kwargs)
+    return jev.execute(qs or questions(), state if state is not None else STATE, **params)
+
+
+# --------------------------------------------------------------------------- #
+# Question definitions
+# --------------------------------------------------------------------------- #
+class QuestionDefTests(unittest.TestCase):
+    def test_predicate_needs_no_options_or_levels(self):
+        q = jev.QuestionDef("p", jev.PREDICATE, "i")
+        self.assertEqual(q.wire_type(), "noul")
+
+    def test_choice_requires_options(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.QuestionDef("c", jev.CHOICE, "i")
+        with self.assertRaises(jev.JevValidationError):
+            jev.QuestionDef("c", jev.CHOICE, "i", options=("a",), levels=("x",))
+
+    def test_score_requires_levels(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.QuestionDef("s", jev.SCORE, "i")
+
+    def test_duplicate_options_rejected(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.QuestionDef("c", jev.CHOICE, "i", options=("a", "a"))
+
+    def test_unknown_kind_rejected(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.QuestionDef("k", "nope", "i")
+
+    def test_box_is_representable_but_unsupported(self):
+        q = jev.QuestionDef("z", jev.BOX, "unsupported")
+        with self.assertRaises(jev.JevValidationError):
+            q.wire_type()
+
+    def test_bad_question_id_rejected(self):
+        for bad in ("", "has space", "../x", "a/b"):
+            with self.assertRaises(jev.JevValidationError):
+                jev.QuestionDef(bad, jev.PREDICATE, "i")
+
+    def test_criteria_shape_enforced(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.QuestionDef(
+                "c", jev.CHOICE, "i", options=("a", "b"), criteria={"a": "x"}
+            )
+        q = jev.QuestionDef(
+            "c", jev.CHOICE, "i", options=("a", "b"), criteria={"a": "x", "b": "y"}
+        )
+        self.assertEqual(q.wire_criteria(), {"a": "x", "b": "y"})
+
+
+# --------------------------------------------------------------------------- #
+# Request building
+# --------------------------------------------------------------------------- #
+class BuildRequestTests(unittest.TestCase):
+    def test_predicate_serializes_to_noul(self):
+        request = jev.build_request(questions(), STATE)
+        self.assertEqual(request["questions"]["is_original_report"]["type"], "noul")
+        self.assertEqual(request["questions"]["study_design"]["type"], "choice")
+        self.assertEqual(request["questions"]["confidence_level"]["type"], "score")
+        self.assertEqual(request["model"], jev.MODEL)
+        self.assertEqual(
+            request["questions"]["study_design"]["criteria"],
+            {"randomised": "randomised", "observational": "observational", "other": "other"},
+        )
+        self.assertEqual(
+            request["questions"]["confidence_level"]["criteria"],
+            ["low", "moderate", "high"],
+        )
+
+    def test_server_cap_optional_and_exact(self):
+        with_cap = jev.build_request(questions(), STATE, max_request_cost_usd="0.25")
+        without = jev.build_request(questions(), STATE)
+        self.assertEqual(with_cap["provider"]["max_price"]["request"], "0.25")
+        self.assertNotIn("provider", without)
+
+    def test_box_question_omitted_from_wire(self):
+        request = jev.build_request(
+            [jev.QuestionDef("z", jev.BOX, "x"), questions()[0]], STATE
+        )
+        self.assertNotIn("z", request["questions"])
+        self.assertIn("is_original_report", request["questions"])
+
+    def test_only_box_questions_refused(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.build_request([jev.QuestionDef("z", jev.BOX, "x")], STATE)
+
+    def test_non_json_state_refused(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.build_request(questions(), {"bad": float("nan")})
+
+
+# --------------------------------------------------------------------------- #
+# Planning: reserve before dispatch
+# --------------------------------------------------------------------------- #
+class PlanningTests(unittest.TestCase):
+    def test_plan_returns_reserve_and_bound(self):
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        self.assertEqual(plan.reserve_usd, "0.25")
+        expected = Decimal(plan.request_bytes) * Decimal("0.042") / Decimal(1_000_000)
+        self.assertEqual(Decimal(plan.cost_upper_bound_usd), expected)
+        self.assertLessEqual(Decimal(plan.cost_upper_bound_usd), Decimal("0.25"))
+        self.assertEqual(plan.pricing_version, jev.PRICING_VERSION)
+        self.assertEqual(plan.endpoint, jev.ENDPOINT)
+        self.assertEqual(
+            plan.request["provider"]["max_price"]["request"], plan.reserve_usd
+        )
+        self.assertEqual(len(plan.request_sha256), 64)
+
+    def test_plan_is_deterministic(self):
+        a = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        b = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        self.assertEqual(a.request_sha256, b.request_sha256)
+        self.assertEqual(a.request_bytes, b.request_bytes)
+
+    def test_reserve_must_be_positive(self):
+        for bad in ("0", "-1", "0.0", 0, -0.5, "abc", float("inf"), True):
+            with self.assertRaises(jev.JevValidationError):
+                jev.plan_dispatch(questions(), STATE, reserve_usd=bad)
+
+    def test_reserve_bounds_rejected(self):
+        for bad in ("1e999999", "0e-999999", "1e25"):
+            with self.assertRaises(jev.JevValidationError):
+                jev.plan_dispatch(questions(), STATE, reserve_usd=bad)
+
+    def test_over_budget_refused(self):
+        with self.assertRaises(jev.JevBudgetError):
+            jev.plan_dispatch(questions(), STATE, reserve_usd="1e-12")
+
+    def test_oversize_request_refused(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.plan_dispatch(
+                questions(), STATE, reserve_usd="0.25", max_request_bytes=10
+            )
+
+    def test_plan_restricted_to_documented_endpoint(self):
+        with self.assertRaises(jev.JevEndpointError):
+            jev.plan_dispatch(
+                questions(), STATE, reserve_usd="0.25", endpoint="https://evil.example/x"
+            )
+
+    def test_no_server_cap_when_disabled(self):
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25", server_cap=False)
+        self.assertNotIn("provider", plan.request)
+        self.assertIsNone(plan.server_cap_usd)
+
+    def test_unsupported_question_ids_recorded(self):
+        plan = jev.plan_dispatch(
+            [questions()[0], jev.QuestionDef("z", jev.BOX, "x")],
+            STATE,
+            reserve_usd="0.25",
+        )
+        self.assertEqual(plan.unsupported_question_ids, ("z",))
+        self.assertEqual(plan.supported_question_ids, ("is_original_report",))
+
+    def test_cost_bound_helper_is_exact(self):
+        bound = jev.estimate_cost_bound(1000)
+        self.assertEqual(bound["cost_upper_bound_usd"], "0.000042")
+        self.assertEqual(bound["input_tokens_upper_bound"], 1000)
+
+
+# --------------------------------------------------------------------------- #
+# Valid primitives
+# --------------------------------------------------------------------------- #
+class ValidPrimitivesTests(unittest.TestCase):
+    def test_three_primitives_answered(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.calls_attempted, 1)
+        self.assertEqual(set(result.outcomes), {
+            "is_original_report", "study_design", "confidence_level"
+        })
+        self.assertTrue(all(o.outcome == "answered" for o in result.outcomes.values()))
+        pred = result.outcomes["is_original_report"].answer
+        self.assertEqual(pred.answer_kind, "predicate")
+        self.assertEqual(pred.wire_type, "noul")
+        self.assertEqual(pred.probability, Decimal("0.97"))
+        choice = result.outcomes["study_design"].answer
+        self.assertEqual(choice.choice, "randomised")
+        self.assertEqual(choice.confidence, Decimal("0.81"))
+        score = result.outcomes["confidence_level"].answer
+        self.assertEqual(score.score, Decimal("1.2"))
+        self.assertEqual(score.legend, {"0": "low", "1": "moderate", "2": "high"})
+
+    def test_completed_cost_carries_reserve_and_bucket(self):
+        result = run(FakeTransport(resp(200, valid_payload())))
+        self.assertEqual(result.cost.reserve_usd, "0.25")
+        self.assertEqual(result.reserve_usd, "0.25")
+        self.assertEqual(result.cost.accounting_bucket, "direct_call")
+        self.assertEqual(result.cost.route, "direct_call")
+
+    def test_actual_model_provider_usage(self):
+        result = run(FakeTransport(resp(200, valid_payload())))
+        self.assertEqual(result.actual_model, "typesafe/jev-1.14-20261014")
+        self.assertEqual(result.provider, "TypeSafe")
+        self.assertEqual(result.response_id, "gen-dec-test")
+        self.assertEqual(result.usage.input_tokens, 485)
+        self.assertEqual(result.usage.output_tokens, 76)
+
+    def test_raw_probability_not_thresholded(self):
+        payload = valid_payload()
+        payload["answers"]["is_original_report"] = {"type": "noul", "noul": 0.5}
+        result = run(FakeTransport(resp(200, payload)))
+        answer = result.outcomes["is_original_report"].answer
+        self.assertEqual(answer.probability, Decimal("0.5"))
+        self.assertNotIsInstance(answer.probability, bool)
+
+    def test_raw_probability_zero_and_one_preserved(self):
+        for value in (0, 1):
+            payload = valid_payload()
+            payload["answers"]["is_original_report"] = {"type": "noul", "noul": value}
+            result = run(FakeTransport(resp(200, payload)))
+            self.assertEqual(
+                result.outcomes["is_original_report"].answer.probability,
+                Decimal(value),
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Per-question failures (never exclusions)
+# --------------------------------------------------------------------------- #
+class PerQuestionFailureTests(unittest.TestCase):
+    def _outcomes(self, payload):
+        transport = FakeTransport(resp(200, payload))
+        result = run(transport)
+        return result, result.outcomes
+
+    def test_missing_answer_is_per_question(self):
+        payload = valid_payload()
+        del payload["answers"]["study_design"]
+        result, outcomes = self._outcomes(payload)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(outcomes["study_design"].outcome, "partial_error")
+        self.assertEqual(
+            outcomes["study_design"].per_question_error.reason, "missing_answer"
+        )
+        # the other answers survive
+        self.assertEqual(outcomes["is_original_report"].outcome, "answered")
+        self.assertEqual(outcomes["confidence_level"].outcome, "answered")
+
+    def test_refused_answer_is_refusal(self):
+        payload = valid_payload()
+        payload["answers"]["study_design"] = {"type": "error", "reason": "refused"}
+        _, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["study_design"].outcome, "refusal")
+        self.assertIsNotNone(outcomes["study_design"].diagnostic)
+
+    def test_provider_error_answer_retained(self):
+        payload = valid_payload()
+        payload["answers"]["study_design"] = {
+            "type": "error",
+            "reason": "provider_error",
+            "message": "model busy",
+        }
+        _, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["study_design"].outcome, "partial_error")
+        self.assertEqual(
+            outcomes["study_design"].per_question_error.reason, "provider_error"
+        )
+
+    def test_choice_outside_options_is_malformed_not_protocol(self):
+        payload = valid_payload()
+        payload["answers"]["study_design"] = {"type": "choice", "choice": "meta"}
+        result, outcomes = self._outcomes(payload)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(outcomes["study_design"].outcome, "malformed")
+        self.assertEqual(
+            outcomes["study_design"].per_question_error.reason, "malformed_answer"
+        )
+        # other answers survive
+        self.assertEqual(outcomes["is_original_report"].outcome, "answered")
+
+    def test_score_outside_levels_is_malformed(self):
+        payload = valid_payload()
+        payload["answers"]["confidence_level"] = {"type": "score", "score": 7.0}
+        _, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["confidence_level"].outcome, "malformed")
+
+    def test_type_mismatch_is_malformed(self):
+        payload = valid_payload()
+        payload["answers"]["study_design"] = {"type": "noul", "noul": 0.4}
+        _, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["study_design"].outcome, "malformed")
+
+    def test_non_object_answer_is_malformed(self):
+        payload = valid_payload()
+        payload["answers"]["study_design"] = "randomised"
+        _, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["study_design"].outcome, "malformed")
+
+    def test_out_of_range_probability_is_malformed(self):
+        payload = valid_payload()
+        payload["answers"]["is_original_report"] = {"type": "noul", "noul": 1.4}
+        _, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["is_original_report"].outcome, "malformed")
+
+    def test_bool_probability_is_malformed(self):
+        payload = valid_payload()
+        payload["answers"]["is_original_report"] = {"type": "noul", "noul": True}
+        _, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["is_original_report"].outcome, "malformed")
+
+    def test_undeclared_probability_key_is_malformed(self):
+        payload = valid_payload()
+        payload["answers"]["study_design"]["probabilities"] = {"randomised": 0.5, "x": 0.5}
+        _, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["study_design"].outcome, "malformed")
+
+    def test_box_question_is_unsupported(self):
+        qs = questions() + [jev.QuestionDef("z_box", jev.BOX, "unsupported")]
+        payload = valid_payload()
+        result, outcomes = self._outcomes_with(payload, qs)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(outcomes["z_box"].outcome, "unsupported")
+        self.assertEqual(
+            outcomes["z_box"].per_question_error.reason, "unsupported_question_kind"
+        )
+
+    def _outcomes_with(self, payload, qs):
+        transport = FakeTransport(resp(200, payload))
+        result = run(transport, qs=qs)
+        return result, result.outcomes
+
+    def test_never_an_exclusion(self):
+        payload = valid_payload()
+        payload["answers"]["study_design"] = {"type": "error", "reason": "refused"}
+        del payload["answers"]["is_original_report"]
+        payload["answers"]["confidence_level"] = {"type": "score", "score": 99}
+        result, outcomes = self._outcomes(payload)
+        for outcome in outcomes.values():
+            self.assertFalse(outcome.is_exclusion())
+        self.assertNotIn("exclusion", json.dumps(
+            {k: o.outcome for k, o in outcomes.items()}
+        ).lower())
+
+
+# --------------------------------------------------------------------------- #
+# Envelope protocol errors
+# --------------------------------------------------------------------------- #
+class EnvelopeProtocolTests(unittest.TestCase):
+    def _run(self, payload):
+        return run(FakeTransport(resp(200, payload)))
+
+    def test_non_object_payload(self):
+        self.assertEqual(self._run(["not", "an", "object"]).status, "protocol_error")
+
+    def test_answers_not_a_map(self):
+        self.assertEqual(self._run({"model": "m", "answers": [], "usage": {}}).status, "protocol_error")
+
+    def test_missing_answers_key(self):
+        self.assertEqual(self._run({"model": "m", "usage": {"input_tokens": 1, "output_tokens": 1}}).status, "protocol_error")
+
+    def test_missing_usage(self):
+        payload = valid_payload()
+        del payload["usage"]
+        self.assertEqual(self._run(payload).status, "protocol_error")
+
+    def test_bad_usage_tokens(self):
+        payload = valid_payload()
+        payload["usage"]["input_tokens"] = -3
+        self.assertEqual(self._run(payload).status, "protocol_error")
+
+    def test_undeclared_question_name(self):
+        payload = valid_payload()
+        payload["answers"]["unexpected"] = {"type": "noul", "noul": 0.5}
+        self.assertEqual(self._run(payload).status, "protocol_error")
+
+    def test_missing_model(self):
+        payload = valid_payload()
+        del payload["model"]
+        self.assertEqual(self._run(payload).status, "protocol_error")
+
+    def test_empty_answers_is_all_missing_not_protocol(self):
+        payload = valid_payload()
+        payload["answers"] = {}
+        result = self._run(payload)
+        self.assertEqual(result.status, "completed")
+        self.assertTrue(all(o.outcome == "partial_error" for o in result.outcomes.values()))
+
+    def test_protocol_error_never_not_incurred(self):
+        payload = valid_payload()
+        payload["answers"] = ["nope"]
+        payload["usage"].pop("cost", None)
+        result = self._run(payload)
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.calls_attempted, 1)
+        self.assertNotEqual(result.cost.state, "not_incurred")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_invalid_json_body(self):
+        result = run(FakeTransport(resp(200, "<html>nope</html>")))
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_non_finite_json_rejected(self):
+        body = '{"model":"m","answers":{"q":{"type":"noul","noul":NaN}},"usage":{"input_tokens":1,"output_tokens":1}}'
+        result = run(
+            FakeTransport(resp(200, body)),
+            qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
+        )
+        self.assertEqual(result.status, "protocol_error")
+
+
+# --------------------------------------------------------------------------- #
+# Post-dispatch cost accounting
+# --------------------------------------------------------------------------- #
+class PostDispatchCostTests(unittest.TestCase):
+    def test_ambiguous_500_retains_reserve_unknown(self):
+        result = run(FakeTransport(resp(500, {"error": {"code": 500, "message": "boom"}})))
+        self.assertEqual(result.status, "api_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+        self.assertIsNone(result.cost.amount_usd)
+
+    def test_ambiguous_429_retains_reserve_unknown(self):
+        result = run(FakeTransport(resp(429, {"error": {"code": 429, "message": "slow"}})))
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_definitive_400_not_incurred(self):
+        result = run(FakeTransport(resp(400, {"error": {"code": 400, "message": "bad"}})))
+        self.assertEqual(result.status, "api_error")
+        self.assertEqual(result.cost.state, "not_incurred")
+        self.assertFalse(result.cost.reserve_retained)
+        self.assertIsNone(result.cost.amount_usd)
+
+    def test_transport_error_unknown_retained(self):
+        transport = FakeTransport(raises=jev.JevTransportError("dropped"))
+        result = run(transport)
+        self.assertEqual(result.status, "transport_error")
+        self.assertEqual(result.calls_attempted, 1)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_unexpected_transport_exception_still_unknown(self):
+        transport = FakeTransport(raises=RuntimeError("kaboom"))
+        result = run(transport)
+        self.assertEqual(result.status, "transport_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_malformed_200_with_valid_cost_is_known(self):
+        payload = valid_payload()  # carries cost 0.00002037
+        payload["answers"] = ["not", "a", "map"]
+        result = run(FakeTransport(resp(200, payload)))
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "known")
+        self.assertEqual(result.cost.amount_usd, "0.00002037")
+        self.assertFalse(result.cost.reserve_retained)
+
+    def test_malformed_200_without_cost_stays_unknown(self):
+        payload = valid_payload()
+        payload["answers"] = ["not", "a", "map"]
+        payload["usage"].pop("cost", None)
+        result = run(FakeTransport(resp(200, payload)))
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_oversize_response_is_protocol_error(self):
+        result = run(
+            FakeTransport(jev.TransportResponse(200, "x" * 50, truncated=True))
+        )
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_completed_without_cost_is_unknown_retained(self):
+        payload = valid_payload()
+        payload["usage"] = {"input_tokens": 10, "output_tokens": 2}
+        result = run(FakeTransport(resp(200, payload)))
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+        self.assertIsNone(result.cost.amount_usd)
+
+
+# --------------------------------------------------------------------------- #
+# Exact decimal cost
+# --------------------------------------------------------------------------- #
+class ExactCostTests(unittest.TestCase):
+    def _cost(self, raw):
+        body = (
+            '{"model":"m","answers":{"q":{"type":"noul","noul":0.5}},'
+            '"usage":{"input_tokens":1,"output_tokens":1,"cost":%s}}' % raw
+        )
+        result = run(
+            FakeTransport(resp(200, body)),
+            qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
+        )
+        return result
+
+    def test_provider_precision_preserved(self):
+        result = self._cost("0.00002037")
+        self.assertEqual(result.cost.amount_usd, "0.00002037")
+        self.assertIsInstance(result.cost.amount_usd, str)
+
+    def test_zero_cost_is_known_not_unknown(self):
+        result = self._cost("0")
+        self.assertEqual(result.cost.state, "known")
+        self.assertEqual(result.cost.amount_usd, "0")
+        self.assertEqual(Decimal(result.cost.amount_usd), Decimal(0))
+        self.assertFalse(result.cost.reserve_retained)
+
+    def test_small_precision_preserved(self):
+        self.assertEqual(self._cost("0.000000016").cost.amount_usd, "0.000000016")
+
+    def test_no_float_roundtrip(self):
+        # A value that would lose precision as an IEEE-754 float.
+        result = self._cost("0.1")
+        self.assertEqual(result.cost.amount_usd, "0.1")
+
+    def test_invalid_cost_string_is_protocol_error(self):
+        self.assertEqual(self._cost('"0.01"').status, "protocol_error")
+
+    def test_bool_cost_is_protocol_error(self):
+        self.assertEqual(self._cost("true").status, "protocol_error")
+
+    def test_negative_cost_is_protocol_error(self):
+        self.assertEqual(self._cost("-1").status, "protocol_error")
+
+    def test_exponent_bounds_rejected(self):
+        result = self._cost("1e999")
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+
+
+# --------------------------------------------------------------------------- #
+# Endpoint / redirect / proxy / key guards
+# --------------------------------------------------------------------------- #
+class GuardTests(unittest.TestCase):
+    def test_execute_blocks_other_endpoint_with_zero_calls(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, endpoint="https://evil.example/collect")
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.calls_attempted, 0)
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(result.cost.state, "not_incurred")
+
+    def test_execute_blocks_trailing_slash_endpoint(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, endpoint=jev.ENDPOINT + "/")
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(transport.calls, [])
+
+    def test_execute_blocks_unauthorized_with_zero_calls(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, authorized=False)
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.calls_attempted, 0)
+        self.assertEqual(transport.calls, [])
+
+    def test_execute_blocks_missing_key_with_zero_calls(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, api_key="")
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(transport.calls, [])
+
+    def test_execute_blocks_invalid_plan_with_zero_calls(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, reserve_usd="0")
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.calls_attempted, 0)
+        self.assertEqual(transport.calls, [])
+
+    def test_execute_box_only_is_blocked_with_unsupported_outcome(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, qs=[jev.QuestionDef("z", jev.BOX, "x")])
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.calls_attempted, 0)
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(result.outcomes["z"].outcome, "unsupported")
+        self.assertIsNotNone(result.outcomes["z"].diagnostic)
+        self.assertIsNone(result.outcomes["z"].answer)
+
+    def test_execute_blocks_over_budget_with_zero_calls(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, reserve_usd="1e-12")
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(result.cost.state, "not_incurred")
+
+    def test_post_decisions_refuses_other_endpoint(self):
+        with self.assertRaises(jev.JevEndpointError):
+            jev.post_decisions(b"{}", API_KEY, endpoint="https://evil.example/x")
+
+    def test_post_decisions_requires_key(self):
+        with self.assertRaises(jev.JevCredentialError):
+            jev.post_decisions(b"{}", "", endpoint=jev.ENDPOINT)
+
+    def test_redirect_is_refused(self):
+        opener = jev._http_opener()
+        handler = next(h for h in opener.handlers if isinstance(h, jev._NoRedirect))
+
+        class _Req:
+            full_url = jev.ENDPOINT
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            handler.http_error_302(_Req(), io.BytesIO(b""), 302, "Found", {})
+        self.assertEqual(ctx.exception.code, 302)
+        ctx.exception.close()
+
+    def test_proxy_handler_suppressed_even_when_environment_configured(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HTTP_PROXY": "http://evil:8080", "HTTPS_PROXY": "http://evil:8080"},
+        ):
+            with mock.patch.object(
+                urllib.request, "getproxies", return_value={"http": "http://evil:8080"}
+            ):
+                opener = jev._http_opener()
+        self.assertFalse(
+            any(isinstance(h, urllib.request.ProxyHandler) for h in opener.handlers)
+        )
+        self.assertTrue(any(isinstance(h, jev._NoRedirect) for h in opener.handlers))
+
+    def test_key_never_in_body_or_result(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport)
+        sent = transport.calls[0]["body"].decode("utf-8")
+        self.assertNotIn(API_KEY, sent)
+        self.assertNotIn(API_KEY, json.dumps(result.__dict__, default=str))
+
+    def test_provider_error_text_redacted_in_diagnostic(self):
+        body = json.dumps(
+            {"error": {"code": 400, "message": f"bad key {API_KEY} from sk-or-v1-leak"}}
+        )
+        result = run(FakeTransport(resp(400, body)))
+        detail = result.diagnostic.detail_redacted
+        self.assertNotIn(API_KEY, detail)
+        self.assertNotIn("sk-or-", detail)
+        self.assertIn("[REDACTED]", detail)
+
+    def test_redact_peer_text(self):
+        out = jev.redact_peer_text("failed sk-or-v1-abc123 with Bearer sk-or-v1-xyz\nnext")
+        self.assertNotIn("sk-or-", out)
+        self.assertNotIn("\n", out)
+
+    def test_transport_error_message_is_static(self):
+        transport = FakeTransport(raises=jev.JevTransportError("inner"))
+        result = run(transport)
+        self.assertNotIn("inner", result.diagnostic.detail_redacted)
+
+
+# --------------------------------------------------------------------------- #
+# No blind retry
+# --------------------------------------------------------------------------- #
+class NoRetryTests(unittest.TestCase):
+    def test_single_dispatch_constant(self):
+        self.assertEqual(jev.MAX_DISPATCH_ATTEMPTS, 1)
+
+    def test_completed_calls_once(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(result.calls_attempted, 1)
+        self.assertTrue(result.no_automatic_retry)
+        self.assertFalse(result.idempotent_admission_proven)
+
+    def test_transport_error_calls_once(self):
+        transport = FakeTransport(raises=jev.JevTransportError("dropped"))
+        run(transport)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_api_error_calls_once(self):
+        transport = FakeTransport(resp(503, {"error": {"code": 503, "message": "x"}}))
+        run(transport)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_attempt_no_echoed(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, attempt_no=3)
+        self.assertEqual(result.attempt_no, 3)
+        self.assertFalse(result.idempotent_admission_proven)
+
+
+# --------------------------------------------------------------------------- #
+# CostRecord invariants
+# --------------------------------------------------------------------------- #
+class CostRecordTests(unittest.TestCase):
+    def test_unknown_requires_no_amount(self):
+        record = jev.CostRecord(state="unknown", reserve_usd="0.25", reserve_retained=True)
+        self.assertIsNone(record.amount_usd)
+        self.assertEqual(record.route, "direct_call")
+        self.assertEqual(record.accounting_bucket, "direct_call")
+
+    def test_known_requires_amount(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="known")
+
+    def test_not_incurred_rejects_amount(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="not_incurred", amount_usd="0.1")
+
+    def test_unknown_rejects_zero_amount(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="unknown", amount_usd="0")
+
+    def test_bad_state_rejected(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="bogus")
+
+    def test_bucket_mismatch_rejected(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="unknown", accounting_bucket="session_statistics")
+
+
+# --------------------------------------------------------------------------- #
+# Installed-package shape
+# --------------------------------------------------------------------------- #
+class InstalledPackageTests(unittest.TestCase):
+    def test_module_is_a_package_submodule(self):
+        self.assertEqual(jev.__name__, "review_article_agent.runtime.jev")
+
+    def test_no_spike_dependency(self):
+        self.assertFalse(hasattr(jev, "live_jev"))
+        self.assertFalse(hasattr(jev, "default_questions"))
+        self.assertFalse(hasattr(jev, "main"))
+
+
+if __name__ == "__main__":
+    unittest.main()
