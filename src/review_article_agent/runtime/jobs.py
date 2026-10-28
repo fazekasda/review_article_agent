@@ -47,7 +47,9 @@ What it guarantees
 * **Reserve before dispatch.** A synthetic external dispatch must record an
   exact-decimal reserve first; the project cap (default **USD 25**) and stage cap
   (default **USD 10**) refuse any reservation that would exceed them, and an
-  ``unknown`` cost **retains** its reserve (C02 §5.6/§6.3).
+  ``unknown`` cost **retains** its reserve. A ``known``/``estimated`` actual that
+  overruns its reserve is counted at the larger amount, so "everything counts"
+  against the cap (C02 §5.6/§6.3).
 """
 
 from __future__ import annotations
@@ -132,11 +134,18 @@ _COST_STATES_WITH_AMOUNT = frozenset({"known", "estimated"})
 _SCHEDULING_HELD_STATES = frozenset({"paused", "cancelled"})
 
 #: Bounds on an accepted exact decimal, so a hostile value such as
-#: ``'1e999999999'`` is rejected cleanly instead of format-expanding into a
-#: multi-megabyte string. ``adjusted`` is the base-10 position of the most
-#: significant digit.
+#: ``'1e999999999'`` (or ``'0e-999999999'``) is rejected cleanly instead of
+#: format-expanding into a multi-megabyte string. ``adjusted`` is the base-10
+#: position of the most significant digit.
 _MAX_ADJUSTED_EXPONENT = 24
 _MAX_SIGNIFICANT_DIGITS = 40
+_MAX_DECIMAL_INPUT_LEN = 128
+_MAX_DECIMAL_INPUT_BITS = 256
+
+#: Job states from which a new attempt may start. Waiting gates
+#: (``waiting_human``/``waiting_external``), ``reconciliation_required``, and
+#: the terminal/held states must not be auto-bypassed by a fresh attempt.
+STARTABLE_JOB_STATES = frozenset({"queued", "failed", "interrupted"})
 
 #: Key under which a checkpoint carries a computed-but-uncommitted local result.
 _LOCAL_RESULT_KEY = "local_result"
@@ -200,38 +209,62 @@ def _require_enum(value: object, allowed: tuple[str, ...], field: str) -> str:
     return value  # type: ignore[return-value]
 
 
-def _exact_decimal(
-    value: object, field: str, *, strictly_positive: bool = False
-) -> str:
-    """Return the canonical exact-decimal string for ``value`` (fail closed).
+def _bounded_decimal_amount(value: object, field: str) -> Decimal:
+    """Parse and bound one exact decimal, returning its :class:`Decimal`.
 
-    Rejects ``float``/``bool`` (never an inexact binary amount), non-finite
-    values, and negatives; optionally requires strictly positive. The amount's
-    magnitude and precision are bounded so an adversarial exponent such as
-    ``'1e999999999'`` cannot force a huge expansion; error messages never echo
-    the offending value.
+    Fail-closed bounds applied **before** any formatting/expansion: a bounded
+    input length (strings), a bounded integer width, bounded significant digits,
+    and — critically — a bounded base-10 exponent *even for zero*, so
+    ``'0e-999999999'`` cannot expand into a billion-character string. Rejects
+    ``float``/``bool`` (never an inexact binary amount), non-finite values, and
+    negatives. Error messages never echo the offending value.
     """
     if isinstance(value, bool) or isinstance(value, float):
         raise JobValidationError(
             f"{field}: must be an exact decimal string, not a float or bool"
         )
-    if not isinstance(value, (str, int, Decimal)):
+    if isinstance(value, str):
+        if len(value) > _MAX_DECIMAL_INPUT_LEN:
+            raise JobValidationError(f"{field}: decimal string is too long")
+        try:
+            amount = Decimal(value)
+        except (InvalidOperation, ValueError) as exc:
+            raise JobValidationError(f"{field}: is not a valid decimal amount") from exc
+    elif isinstance(value, int):
+        if value.bit_length() > _MAX_DECIMAL_INPUT_BITS:
+            raise JobValidationError(f"{field}: integer is out of the permitted range")
+        amount = Decimal(value)
+    elif isinstance(value, Decimal):
+        amount = value
+    else:
         raise JobValidationError(
             f"{field}: must be an exact decimal string (got {type(value).__name__})"
         )
-    try:
-        amount = Decimal(value)
-    except (InvalidOperation, ValueError) as exc:
-        raise JobValidationError(f"{field}: is not a valid decimal amount") from exc
     if not amount.is_finite():
         raise JobValidationError(f"{field}: must be a finite decimal amount")
     _sign, digits, exponent = amount.as_tuple()
     if len(digits) > _MAX_SIGNIFICANT_DIGITS:
         raise JobValidationError(f"{field}: has too many significant digits")
-    if amount != 0 and abs(exponent + len(digits) - 1) > _MAX_ADJUSTED_EXPONENT:
+    # ``adjusted`` is the position of the most significant digit for a non-zero
+    # value; for zero the raw exponent governs how far ``format(..., 'f')`` would
+    # pad, so bound it directly.
+    magnitude = exponent + len(digits) - 1 if amount != 0 else exponent
+    if abs(magnitude) > _MAX_ADJUSTED_EXPONENT:
         raise JobValidationError(f"{field}: magnitude is out of the permitted range")
     if amount < 0:
         raise JobValidationError(f"{field}: must not be negative")
+    return amount
+
+
+def _exact_decimal(
+    value: object, field: str, *, strictly_positive: bool = False
+) -> str:
+    """Return the canonical exact-decimal string for ``value`` (fail closed).
+
+    See :func:`_bounded_decimal_amount` for the bounds; optionally requires a
+    strictly positive amount.
+    """
+    amount = _bounded_decimal_amount(value, field)
     if strictly_positive and amount == 0:
         raise JobValidationError(f"{field}: must be greater than zero")
     return format(amount, "f")
@@ -569,6 +602,15 @@ class JobRepository:
                     retry_authorized_by, "retry_authorized_by"
                 )
                 retries_used += 1
+
+            # A job parked at a waiting gate or awaiting reconciliation must not
+            # be auto-bypassed by a fresh attempt; only queued/failed/interrupted
+            # jobs may start. (An ambiguous/admitted prior already raised above.)
+            if job.state not in STARTABLE_JOB_STATES:
+                raise JobStateError(
+                    f"job {job_id!r} is {job.state!r}; only "
+                    f"{sorted(STARTABLE_JOB_STATES)} jobs may start a new attempt."
+                )
 
             fence = job.current_fence + 1
             attempt_no = job.attempts_total + 1
@@ -1113,9 +1155,11 @@ class JobRepository:
         The reserve row is **never reduced**: the original upper bound stays
         counted for ``known``/``estimated``/``unknown`` (conservative usage), so a
         later estimate/known transition can never silently shrink a held reserve.
-        The reported/estimated amount is recorded on the attempt; an ``unknown``
-        cost records **no** amount (never zero), and ``not_incurred`` records no
-        amount either. Requires the current attempt.
+        A ``known``/``estimated`` amount that **exceeds** the reserve is counted at
+        the larger actual, so an overrun is never under-counted against the cap
+        (C02 §5.6). The reported/estimated amount is recorded on the attempt; an
+        ``unknown`` cost records **no** amount (never zero), and ``not_incurred``
+        records no amount either. Requires the current attempt.
         """
         attempt_id = validate_identifier(attempt_id, "attempt_id")
         _require_enum(cost_state, COST_STATES, "cost_state")
@@ -1227,20 +1271,39 @@ class JobRepository:
         )
 
     def _reserved_total(self, *, stage: str | None = None) -> str:
-        if stage is None:
-            rows = self._conn().execute(
-                "SELECT amount_usd FROM job_budget_reserve WHERE project_id = ?",
-                (self.project_id,),
-            ).fetchall()
-        else:
-            rows = self._conn().execute(
-                "SELECT amount_usd FROM job_budget_reserve "
-                "WHERE project_id = ? AND stage = ?",
-                (self.project_id, stage),
-            ).fetchall()
+        """Return the counted, conservative cost exposure for the project/stage.
+
+        Each reserve contributes ``max(original reserve, reported actual)``:
+        the immutable upper bound is always counted, and a **known/estimated**
+        amount that overran it is counted instead (so an overrun is never
+        under-counted against the cap, C02 §5.6). ``unknown``/``not_incurred``
+        attempts contribute no separate amount (their reserve bound is retained).
+        Every stored value is re-validated as a bounded exact decimal, so a
+        malformed stored value fails closed rather than mis-summing.
+        """
+        join = (
+            "SELECT r.amount_usd AS reserve_amount, a.cost_amount_usd AS cost_amount "
+            "FROM job_budget_reserve r "
+            "LEFT JOIN job_attempt a ON a.project_id = r.project_id "
+            "AND a.attempt_id = r.attempt_id "
+            "WHERE r.project_id = ?"
+        )
+        params: list[object] = [self.project_id]
+        if stage is not None:
+            join += " AND r.stage = ?"
+            params.append(stage)
+        rows = self._conn().execute(join, params).fetchall()
         total = Decimal("0")
         for row in rows:
-            total += Decimal(row["amount_usd"])
+            counted = _bounded_decimal_amount(
+                row["reserve_amount"], "stored budget reserve"
+            )
+            if row["cost_amount"] is not None:
+                actual = _bounded_decimal_amount(
+                    row["cost_amount"], "stored cost amount"
+                )
+                counted = max(counted, actual)
+            total += counted
         return format(total, "f")
 
     def _check_caps_and_reserve(
@@ -1360,6 +1423,7 @@ __all__ = [
     "RECONCILIATION_RESOLUTIONS",
     "RecoveryOutcome",
     "RetryLimitExceeded",
+    "STARTABLE_JOB_STATES",
     "StaleFenceError",
     "TERMINAL_JOB_STATES",
 ]

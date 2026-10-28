@@ -17,6 +17,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -353,6 +354,70 @@ class BudgetTest(JobTestBase):
                 attempt.attempt_id, cost_state="unknown", amount_usd="1"
             )
 
+    def test_zero_exponent_huge_rejected(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        for bad in ("0e-999999999", "0e+999999999"):
+            with self.assertRaises(JobValidationError):
+                self._external(job, reserve=bad)  # type: ignore[arg-type]
+        # A settlement amount is bounded the same way.
+        attempt = self._external(job, reserve="1")
+        with self.assertRaises(JobValidationError):
+            self.jobs.settle_cost(
+                attempt.attempt_id, cost_state="known", amount_usd="0e-999999999"
+            )
+
+    def test_long_decimal_input_bounded(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        with self.assertRaises(JobValidationError):
+            self._external(job, reserve="9" * 500)
+        with self.assertRaises(JobValidationError):
+            self.jobs.set_budget_policy(project_cap_usd="1" * 500, stage_cap_usd="10")
+
+    def test_known_overrun_counts_against_cap(self) -> None:
+        self.jobs.set_budget_policy(project_cap_usd="1", stage_cap_usd="1")
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self._external(job, reserve="0.10")
+        self.assertEqual(
+            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "0.10"
+        )
+        self.jobs.settle_cost(attempt.attempt_id, cost_state="known", amount_usd="2")
+        # The known actual overran the reserve; it counts at the larger amount.
+        self.assertGreaterEqual(
+            Decimal(self.jobs.budget_usage(stage="s1").stage_reserved_usd),
+            Decimal("2"),
+        )
+        self.assertEqual(
+            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "2"
+        )
+        job2 = self.jobs.submit("req-2", task_kind="probe")
+        with self.assertRaises(BudgetExceededError):
+            self._external(job2, reserve="0.01")
+
+    def test_estimated_overrun_not_undercounted(self) -> None:
+        self.jobs.set_budget_policy(project_cap_usd="1", stage_cap_usd="1")
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self._external(job, reserve="0.10")
+        self.jobs.settle_cost(
+            attempt.attempt_id, cost_state="estimated", amount_usd="2"
+        )
+        self.assertEqual(
+            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "2"
+        )
+        job2 = self.jobs.submit("req-2", task_kind="probe")
+        with self.assertRaises(BudgetExceededError):
+            self._external(job2, reserve="0.01")
+
+    def test_known_under_reserve_retains_bound(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        attempt = self._external(job, reserve="1")
+        self.jobs.settle_cost(
+            attempt.attempt_id, cost_state="known", amount_usd="0.01"
+        )
+        # Conservative: the original bound is retained, not shrunk to the actual.
+        self.assertEqual(
+            self.jobs.budget_usage(stage="s1").stage_reserved_usd, "1"
+        )
+
     def test_external_dispatch_requires_reserve_and_stage(self) -> None:
         job = self.jobs.submit("req-1", task_kind="probe")
         with self.assertRaises(JobValidationError):
@@ -552,6 +617,26 @@ class ConcurrencyTest(JobTestBase):
         self.assertEqual(
             self.jobs.budget_usage(stage="s1").stage_reserved_usd, "0.10"
         )
+
+
+class WaitingGateTest(JobTestBase):
+    def test_waiting_human_blocks_new_attempt(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        self.jobs.escalate_to_human(job.job_id)
+        self.assertEqual(self.jobs.get(job.job_id).state, "waiting_human")
+        with self.assertRaises(JobStateError):
+            self.jobs.begin_attempt(
+                job.job_id, dispatch_kind="local", retry_authorized_by="owner"
+            )
+
+    def test_waiting_external_blocks_new_attempt(self) -> None:
+        job = self.jobs.submit("req-1", task_kind="probe")
+        self.jobs.mark_waiting_external(job.job_id)
+        self.assertEqual(self.jobs.get(job.job_id).state, "waiting_external")
+        with self.assertRaises(JobStateError):
+            self.jobs.begin_attempt(
+                job.job_id, dispatch_kind="local", retry_authorized_by="owner"
+            )
 
 
 class MigrationTest(JobTestBase):
