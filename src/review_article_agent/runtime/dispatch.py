@@ -128,6 +128,7 @@ __all__ = [
     "DISPATCH_ROUTES",
     "DISPATCH_STATES",
     "ROUTE_BUCKET",
+    "RUNTIME_REMOTE_STATES",
     "DispatchConflictError",
     "DispatchCorruptionError",
     "DispatchError",
@@ -137,6 +138,7 @@ __all__ = [
     "DispatchValidationError",
     "RuntimeDispatchRepository",
     "runtime_dispatch_integrity_problems",
+    "runtime_dispatch_remote_state",
     "runtime_reserve_exposure",
 ]
 
@@ -173,6 +175,14 @@ _COST_STATES_WITH_AMOUNT = frozenset({"known", "estimated"})
 #: result can only follow a recorded submission (``submitted``), an opencode
 #: admission (``admitted``), or a restart-orphaned submission (``unknown``).
 _ACCEPTABLE_STATES = frozenset({"submitted", "admitted", "unknown"})
+
+#: Dispatch states that mean remote work **may still be executing**: the outcome
+#: is not yet known, so the project still occupies the single serial remote slot
+#: and keeps its execution arbitration (C02 §8.3/§8.5). ``reserved`` is *not*
+#: here: a reserve is recorded **before** any I/O (ordered
+#: ``mark_submitted``-before-I/O), so by ordering it cannot have been issued.
+#: ``completed``/``failed`` are terminal and are likewise not remote.
+RUNTIME_REMOTE_STATES = ("submitted", "admitted", "unknown")
 
 #: A recorded dispatch row grants **no** authority and performs **no** network or
 #: transport I/O; it is a durable ledger entry only (authorization/rights are a
@@ -1382,3 +1392,49 @@ def runtime_dispatch_integrity_problems(
     """
     repo = RuntimeDispatchRepository(_ReadOnlyDispatchStoreView(conn, project_id))
     return repo.verify_all_integrity()
+
+
+def runtime_dispatch_remote_state(
+    conn: sqlite3.Connection, project_id: str
+) -> str:
+    """Classify a project's durable runtime dispatches as ``remote``/``none``/``unreadable``.
+
+    A read-only, fail-closed view of the runtime dispatch ledger for the worker's
+    global arbitration and single serial remote slot (C02 §8.3/§8.5):
+
+    * ``"remote"`` — at least one dispatch is in an outstanding state
+      (:data:`RUNTIME_REMOTE_STATES`): its remote outcome is not yet known, so the
+      project may still have remote work executing. This holds **regardless** of
+      the settled cost state and regardless of whether any linked synthetic job is
+      held.
+    * ``"none"`` — every dispatch is terminal (``completed``/``failed``) or merely
+      ``reserved`` (recorded before any I/O, so by ordering it cannot have been
+      issued).
+    * ``"unreadable"`` — the ledger cannot be **proven** intact: a missing
+      ``runtime_dispatch``/``runtime_dispatch_state`` table on a store that should
+      carry it, or any malformed/corrupt/foreign/dangling row (see
+      :func:`runtime_dispatch_integrity_problems`), or any read error. It fails
+      closed: the caller must treat it as potential remote work, never as safe.
+
+    The connection is never written to; no identity is minted, no retry issued,
+    and no reserve released.
+    """
+    try:
+        if runtime_dispatch_integrity_problems(conn, project_id):
+            return "unreadable"
+        records = RuntimeDispatchRepository(
+            _ReadOnlyDispatchStoreView(conn, project_id)
+        ).list_dispatches()
+    except (
+        DispatchError,
+        sqlite3.Error,
+        ValueError,
+        TypeError,
+        KeyError,
+        UnicodeError,
+    ):
+        return "unreadable"
+    for record in records:
+        if record.state in RUNTIME_REMOTE_STATES:
+            return "remote"
+    return "none"

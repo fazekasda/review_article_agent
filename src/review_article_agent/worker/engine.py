@@ -99,6 +99,10 @@ from typing import Any, Callable, Iterator
 
 from ..domain.errors import ProjectConflict, ReviewAgentError
 from ..domain.records import validate_identifier
+from ..runtime.dispatch import (
+    RuntimeDispatchRepository,
+    runtime_dispatch_remote_state,
+)
 from ..runtime.jobs import (
     ACTIVE_ATTEMPT_STATES,
     BudgetExceededError,
@@ -326,21 +330,34 @@ class WorkerEngine:
 
     # -- store access -------------------------------------------------------- #
     @contextmanager
-    def open_repository(self, project_id: str) -> Iterator[JobRepository]:
-        """Yield a repository for ``project_id``, closing it on exit.
+    def open_store(self, project_id: str) -> Iterator[ProjectStore]:
+        """Yield a :class:`ProjectStore` for ``project_id``, closing it on exit.
 
         The store location is re-resolved from the registry on every open, so a
         relocated inactive project is always read at its current location and no
         connection outlives the call. This is the only path by which the engine
-        touches a project store.
+        touches a project store; both the synthetic job repository and the
+        runtime dispatch ledger are built over the same handle. A store is always
+        resolved **before** any registry write guard (registry locks are not
+        reentrant).
         """
         info = self._registry.get(project_id)  # validates id + registration
         app_dir = paths.app_dir_for(info.root_path)
         store = ProjectStore.open_at(app_dir, expected_project_id=project_id)
         try:
-            yield JobRepository(store)
+            yield store
         finally:
             store.close()
+
+    @contextmanager
+    def open_repository(self, project_id: str) -> Iterator[JobRepository]:
+        """Yield a synthetic :class:`JobRepository` for ``project_id``.
+
+        Thin wrapper over :meth:`open_store` for callers that only need the
+        synthetic job/attempt layer.
+        """
+        with self.open_store(project_id) as store:
+            yield JobRepository(store)
 
     @contextmanager
     def _write_guard(self, project_id: str, *, allow_draining: bool) -> Iterator[None]:
@@ -557,11 +574,25 @@ class WorkerEngine:
     def _remote_state(self, project_id: str) -> str:
         """Classify a project's potential remote work: ``remote``/``none``/``unreadable``.
 
-        Fail closed: an unreadable store is ``unreadable`` and is treated as
-        remote by callers rather than silently as safe.
+        Both layers count: the synthetic job/attempt layer **and** the durable
+        runtime dispatch ledger (C02 §8.3/§8.5). A runtime dispatch that is
+        ``submitted``/``admitted``/``unknown`` still occupies the single serial
+        remote slot and pins the project's arbitration even when its cost is
+        settled or the project holds no schedulable synthetic job.
+
+        Fail closed: an unreadable store — or a runtime ledger that cannot be
+        proven intact — is ``unreadable`` and is treated as remote by callers
+        rather than silently as safe. The runtime ledger is classified first, so
+        corruption is never masked by an otherwise-clean synthetic scan.
         """
         try:
-            with self.open_repository(project_id) as repo:
+            with self.open_store(project_id) as store:
+                runtime_state = runtime_dispatch_remote_state(
+                    store.connection, project_id
+                )
+                if runtime_state != "none":
+                    return runtime_state
+                repo = JobRepository(store)
                 for job in repo.list():
                     if self._job_has_potential_remote(repo, job):
                         return "remote"
@@ -1102,20 +1133,23 @@ class WorkerEngine:
 
     # -- reconciliation / startup -------------------------------------------- #
     def reconcile_startup(self) -> None:
-        """Reconcile recorded attempts across **all** registered project stores.
+        """Reconcile recorded attempts and runtime dispatches across **all** stores.
 
         Must run only after the worker owns its singleton lock (see
         ``worker/__main__``): it opens each project store, recovers any active
-        attempt to an explicit state (never a silent success), and closes the
-        handle so no inactive connection is cached. A store that cannot be read
-        is **never** silently skipped as safe: it is reported as an unreadable
-        recovery blocker (visible via ``status``) that forbids new dispatch.
+        synthetic attempt to an explicit state (never a silent success), recovers
+        any outstanding runtime dispatch (``submitted`` -> ``unknown``, once),
+        and closes the handle so no inactive connection is cached. A store that
+        cannot be read is **never** silently skipped as safe: it is reported as an
+        unreadable recovery blocker (visible via ``status``) that forbids new
+        dispatch.
 
         After recovery, if no execution activation is held and exactly one
-        project still has unresolved remote work, that project is adopted (made
-        the execution-active project) so the engine can reconcile it. Multiple
-        pending projects, or any unreadable store, leave execution unacquired and
-        all new dispatch/switch blocked pending an explicit owner decision.
+        project still has unresolved remote work (synthetic or runtime), that
+        project is adopted (made the execution-active project) so the engine can
+        reconcile it. Multiple pending projects, or any unreadable store, leave
+        execution unacquired and all new dispatch/switch blocked pending an
+        explicit owner decision.
         """
         try:
             projects = self._registry.list_projects()
@@ -1123,7 +1157,8 @@ class WorkerEngine:
             return
         for info in projects:
             try:
-                with self.open_repository(info.project_id) as repo:
+                with self.open_store(info.project_id) as store:
+                    repo = JobRepository(store)
                     for job in repo.list():
                         attempt_id = job.current_attempt_id
                         if attempt_id is None:
@@ -1136,9 +1171,43 @@ class WorkerEngine:
                                 repo.recover(attempt_id)
                             except JobError:
                                 continue
+                    self._recover_runtime_dispatches(store)
             except (ReviewAgentError, OSError):
                 continue
         self._auto_adopt_recovery()
+
+    @staticmethod
+    def _recover_runtime_dispatches(store: ProjectStore) -> None:
+        """Recover outstanding runtime dispatches after a restart, exactly once.
+
+        Mirrors the synthetic attempt recovery: this is a durable restart
+        reconciliation, so it mints **no** new identity, issues **no** retry, and
+        releases **no** reserve. Only an outstanding ``submitted`` dispatch
+        transitions (to ``unknown``) via the ledger's own
+        :meth:`RuntimeDispatchRepository.recover`; an ``opencode_session``
+        ``admitted`` dispatch is retained unchanged for same-identity
+        reconciliation, and ``reserved``/``unknown``/terminal states are left
+        untouched. A corrupt ledger fails closed (no write) rather than being
+        partially recovered.
+
+        The store handle is already resolved by the caller and no registry guard
+        is taken here (the startup scan runs under the worker's singleton lock,
+        matching the synthetic recovery path); no registry call is made.
+        """
+        try:
+            if (
+                runtime_dispatch_remote_state(store.connection, store.project_id)
+                == "unreadable"
+            ):
+                # A ledger that cannot be proven intact is never partially
+                # recovered: fail closed and leave it for the owner/backup path.
+                return
+            runtime = RuntimeDispatchRepository(store)
+            for record in runtime.list_dispatches():
+                if record.state == "submitted":
+                    runtime.recover(record.dispatch_id)
+        except ReviewAgentError:
+            return
 
     def _auto_adopt_recovery(self) -> None:
         """Adopt the sole pending-remote project so it can be reconciled."""
@@ -1190,10 +1259,23 @@ class WorkerEngine:
             return False
         return True
 
+    def _runtime_occupied(self, conn: Any, project_id: str) -> bool:
+        """True when a durable runtime dispatch occupies the serial remote slot.
+
+        A ``remote`` ledger (an outstanding ``submitted``/``admitted``/``unknown``
+        dispatch) or an ``unreadable`` ledger both count — fail closed: new
+        synthetic dispatch must not start while the remote outcome is unknown or
+        the ledger cannot be proven safe. A ``reserved``/terminal ledger is not
+        occupying (recorded before any I/O, or already finished).
+        """
+        return runtime_dispatch_remote_state(conn, project_id) != "none"
+
     def _tick_project(self, project_id: str) -> float | None:
         try:
-            with self.open_repository(project_id) as repo:
-                plan = self._plan(repo, project_id)
+            with self.open_store(project_id) as store:
+                repo = JobRepository(store)
+                runtime_occupied = self._runtime_occupied(store.connection, project_id)
+                plan = self._plan(repo, project_id, runtime_occupied=runtime_occupied)
                 if plan is None:
                     return None
                 action, job, attempt = plan
@@ -1207,25 +1289,32 @@ class WorkerEngine:
         except (ReviewAgentError, OSError):
             return None
 
-    def _plan(self, repo: JobRepository, project_id: str) -> tuple | None:
+    def _plan(
+        self, repo: JobRepository, project_id: str, *, runtime_occupied: bool = False
+    ) -> tuple | None:
         """Pick the next action for the single serial remote executor.
 
-        One project executes at most one synthetic dispatch at a time. If ANY
-        job currently occupies the serial slot (attempt-level unresolved, an
-        admitted/running attempt, a ``waiting_external`` gate, or a queued
-        attempt that still carries a continuity checkpoint), then **no** new
-        ``claim``/``admit`` is returned for any other job: authorized new jobs may
-        be queued but are not dispatched until the occupying remote is quiesced or
-        given an explicit human disposition.
+        One project executes at most one dispatch at a time — synthetic **or**
+        runtime. If ANY job currently occupies the serial slot (attempt-level
+        unresolved, an admitted/running attempt, a ``waiting_external`` gate, or a
+        queued attempt that still carries a continuity checkpoint) **or** a
+        durable runtime dispatch is outstanding (``submitted``/``admitted``/
+        ``unknown``, or an unreadable ledger), then **no** new ``claim``/``admit``
+        is returned for any other job: authorized new jobs may be queued but are
+        not dispatched until the occupying remote is quiesced or given an explicit
+        human disposition.
 
         Reconciliation (``lookup``/``reconcile``) of an already-admitted or
         interrupted attempt is returned independently of the job's held state
-        (paused/cancelled included). ``waiting_human``/``waiting_external`` are
-        never polled (no busy loop).
+        (paused/cancelled included) **and** independently of a runtime occupancy:
+        finishing work the engine had already accepted is always allowed.
+        ``waiting_human``/``waiting_external`` are never polled (no busy loop).
         """
         scheduling = self._scheduling_allowed(project_id)
         jobs = repo.list()
-        occupied = any(self._job_has_potential_remote(repo, job) for job in jobs)
+        occupied = runtime_occupied or any(
+            self._job_has_potential_remote(repo, job) for job in jobs
+        )
         for job in jobs:
             if job.state in ("waiting_human", "waiting_external"):
                 # A waiting gate is never polled, but it still occupies the slot
