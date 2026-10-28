@@ -4,17 +4,31 @@
 owner-authenticated control socket for ``<ABS>`` and runs the engine loop until
 an owner issues ``{"version": 1, "op": "stop"}``.
 
+**Ordering is safety-critical.** The engine object may be *constructed* (it only
+reads the registry/backend paths), but **no recovery or scheduling state is
+mutated until this process owns the IPC singleton lock** — otherwise a second
+worker whose lock acquisition fails could still interrupt the first worker's
+live attempts.
+
 The worker is a local, stdlib-only process. It makes no real model, network, or
-scientific call; every task is a bounded synthetic numeric task.
+scientific call; every task is a bounded synthetic numeric task. All failures
+are reported as a static, curated line on stderr (never a raw exception or any
+request payload).
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 
 from ..runtime.ipc import WorkerIPCServer
 from .engine import WorkerEngine
+
+#: Static, curated process-failure messages (never reflect an exception/payload).
+_START_FAILED = "worker failed to start"
+_RUNTIME_FAILED = "worker stopped unexpectedly"
+_BAD_OPTION = "worker: invalid --poll-timeout (must be a finite number > 0)"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -57,20 +71,38 @@ def _serve(engine: WorkerEngine, server: WorkerIPCServer, poll_timeout: float) -
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    engine = WorkerEngine(args.data_dir)
-    server = WorkerIPCServer(args.data_dir, engine.handle)
+    # A non-finite / non-positive poll interval would busy-loop or block.
+    if not math.isfinite(args.poll_timeout) or args.poll_timeout <= 0:
+        print(_BAD_OPTION, file=sys.stderr)
+        return 2
+
     try:
-        engine.reconcile_startup()
+        engine = WorkerEngine(args.data_dir)
+        server = WorkerIPCServer(args.data_dir, engine.handle)
+    except Exception:
+        print(_START_FAILED, file=sys.stderr)
+        return 1
+
+    # 1) Own the singleton lock BEFORE any recovery/scheduling mutation.
+    try:
         server.start()
-    except Exception as exc:  # curated, no traceback to the caller
-        print(f"worker failed to start: {exc}", file=sys.stderr)
+    except Exception:
+        print(_START_FAILED, file=sys.stderr)
         engine.close()
         return 1
+
     try:
+        # 2) Only now reconcile recorded attempts and begin serving.
+        engine.reconcile_startup()
         _serve(engine, server, args.poll_timeout)
+    except Exception:
+        print(_RUNTIME_FAILED, file=sys.stderr)
+        return 1
     finally:
-        server.close()
-        engine.close()
+        try:
+            server.close()
+        finally:
+            engine.close()
     return 0
 
 

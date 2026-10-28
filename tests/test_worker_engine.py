@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -92,6 +93,17 @@ class EngineTestBase(unittest.TestCase):
         params.update(kw)
         return self.engine.handle(_req("submit", project_id=self.project.project_id, **params))
 
+    @contextmanager
+    def _repo(self, project_id: str | None = None):
+        pid = project_id or self.project.project_id
+        with self.engine.open_repository(pid) as repo:
+            yield repo
+
+    def _new_engine(self) -> WorkerEngine:
+        engine = WorkerEngine(str(self.data_dir))
+        self.addCleanup(engine.close)
+        return engine
+
 
 class ValidationTest(EngineTestBase):
     def test_status_and_unknown_op_and_version(self) -> None:
@@ -129,10 +141,32 @@ class ValidationTest(EngineTestBase):
         self.assertIn(res["code"], {"bad_value", "missing_key"})
         self.assertTrue(res["message"])
 
-    def test_submit_before_activation_is_denied(self) -> None:
-        res = self._submit_numeric("r0")
+    def test_submit_without_active_project_id_is_denied(self) -> None:
+        # With no activation and no project_id, the engine cannot know the
+        # project, so it reports not_activated.
+        res = self.engine.handle(
+            _req(
+                "submit",
+                request_id="r0",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                steps=1,
+                delay_ms=0,
+                outcome="complete",
+                stage="s",
+                reserve_usd="0.1",
+            )
+        )
         self.assertFalse(res["ok"])
         self.assertEqual(res["code"], "not_activated")
+
+    def test_submit_with_explicit_project_acquires_idle_activation(self) -> None:
+        # An explicit owner submit may acquire a free activation (no other
+        # project holds it and none has outstanding remote work).
+        res = self._submit_numeric("acquire-1")
+        self.assertTrue(res["ok"])
+        self.assertEqual(
+            self.registry.activation().active_project_id, self.project.project_id
+        )
 
     def test_submit_for_other_project_is_rejected(self) -> None:
         other = self.registry.create_project(self.tmp / "b", name="B")
@@ -183,8 +217,8 @@ class NumericCompletionTest(EngineTestBase):
         self.assertIsNotNone(job["accepted_result"])
         self.assertEqual(job["accepted_result"]["result_kind"], "synthetic_numeric")
         # exactly one accepted result row.
-        repo = self.engine._repo_for(self.project.project_id)
-        self.assertEqual(len(repo.attempts(job_id)), 1)
+        with self._repo() as repo:
+            self.assertEqual(len(repo.attempts(job_id)), 1)
 
     def test_idempotent_resubmit_does_not_create_second_job(self) -> None:
         self._activate()
@@ -212,8 +246,8 @@ class AmbiguousTest(EngineTestBase):
         self.assertTrue(job["outcome_unresolved"])
         self.assertEqual(job["attempts_total"], 1)
         # No new identity: still exactly one attempt.
-        repo = self.engine._repo_for(self.project.project_id)
-        self.assertEqual(len(repo.attempts(job_id)), 1)
+        with self._repo() as repo:
+            self.assertEqual(len(repo.attempts(job_id)), 1)
 
     def test_failed_outcome_is_explicit_and_terminal(self) -> None:
         self._activate()
@@ -245,8 +279,8 @@ class PauseAndBudgetTest(EngineTestBase):
 
     def test_budget_cap_stops_dispatch_with_visible_reason(self) -> None:
         self._activate()
-        repo = self.engine._repo_for(self.project.project_id)
-        repo.set_budget_policy(project_cap_usd="0.05", stage_cap_usd="0.05")
+        with self._repo() as repo:
+            repo.set_budget_policy(project_cap_usd="0.05", stage_cap_usd="0.05")
         submitted = self._submit_numeric("b-1", reserve_usd="0.10")
         job_id = submitted["job"]["job_id"]
         self._drain_engine()
@@ -258,6 +292,54 @@ class PauseAndBudgetTest(EngineTestBase):
         self.assertEqual(job["state"], "waiting_human")
         self.assertEqual(job["wait_reason"], "budget_exceeded")
         self.assertNotEqual(job["state"], "completed")
+
+    def test_pause_after_admission_reconciles_one_result_while_held(self) -> None:
+        self._activate()
+        submitted = self._submit_numeric("pr-1", delay_ms=150)
+        job_id = submitted["job"]["job_id"]
+        self.engine.tick()  # claim
+        self.engine.tick()  # admit
+        with self._repo() as repo:
+            self.assertEqual(repo.get(job_id).state, "admitted")
+        # Pause while the remote is in flight (arbitration must be retained).
+        paused = self.engine.handle(_req("pause", project_id=self.project.project_id))
+        self.assertTrue(paused["ok"])
+        with self._repo() as repo:
+            self.assertEqual(repo.get(job_id).state, "paused")
+        self.assertEqual(
+            self.registry.activation().active_project_id, self.project.project_id
+        )
+        # The paused project still reconciles the in-flight remote to one result,
+        # preserving the held state.
+        self._drain_engine()
+        res = self.engine.handle(
+            _req("job_status", project_id=self.project.project_id, job_id=job_id)
+        )
+        job = res["job"]
+        self.assertEqual(job["state"], "paused")
+        self.assertIsNotNone(job["accepted_result"])
+        with self._repo() as repo:
+            self.assertEqual(len(repo.attempts(job_id)), 1)
+
+    def test_drain_after_admission_reconciles_one_result_while_held(self) -> None:
+        self._activate()
+        submitted = self._submit_numeric("dr-1", delay_ms=150)
+        job_id = submitted["job"]["job_id"]
+        self.engine.tick()  # claim
+        self.engine.tick()  # admit
+        drained = self.engine.handle(_req("drain", project_id=self.project.project_id))
+        self.assertTrue(drained["ok"])
+        self.assertEqual(drained["state"], "draining")
+        # Under drain, the in-flight remote still finishes to one result.
+        self._drain_engine()
+        res = self.engine.handle(
+            _req("job_status", project_id=self.project.project_id, job_id=job_id)
+        )
+        job = res["job"]
+        self.assertEqual(job["state"], "paused")
+        self.assertIsNotNone(job["accepted_result"])
+        with self._repo() as repo:
+            self.assertEqual(len(repo.attempts(job_id)), 1)
 
 
 class NoBusyLoopTest(EngineTestBase):
@@ -281,59 +363,97 @@ class NoBusyLoopTest(EngineTestBase):
         self._activate()
         self.assertIsNone(self.engine.tick())
 
+    def test_ambiguous_unknown_returns_none_not_busy_loop(self) -> None:
+        self._activate()
+        submitted = self._submit_numeric("u-1", outcome="ambiguous", delay_ms=0)
+        job_id = submitted["job"]["job_id"]
+        for _ in range(6):
+            if self.engine.tick() is None:
+                break
+        res = self.engine.handle(
+            _req("job_status", project_id=self.project.project_id, job_id=job_id)
+        )
+        self.assertEqual(res["job"]["state"], "waiting_human")
+        # An unknown/ambiguous outcome must not be polled in a busy loop.
+        self.assertIsNone(self.engine.tick())
+        self.assertIsNone(self.engine.tick())
+
+    def test_waiting_human_without_external_releases_activation(self) -> None:
+        self._activate()
+        submitted = self.engine.handle(
+            _req(
+                "submit",
+                project_id=self.project.project_id,
+                request_id="wh-rel",
+                task_kind=SYNTHETIC_WAITING_HUMAN_TASK,
+            )
+        )
+        self.assertTrue(submitted["ok"])
+        self.assertEqual(submitted["job"]["state"], "waiting_human")
+        # No remote work is pending, so arbitration is released for another project.
+        self.assertEqual(self.registry.activation().state, "none")
+
 
 class SameAttemptResumeTest(EngineTestBase):
     def test_resume_refuses_after_admission_but_reopens_proven_undispatched(self) -> None:
         self._activate()
-        repo = self.engine._repo_for(self.project.project_id)
+        with self._repo() as repo:
+            # (a) An attempt that was admitted may never be reopened same-identity.
+            job_a = repo.submit(
+                "resume-admitted",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                parameters={"stage": "s", "reserve_usd": "0.1"},
+            )
+            att_a = repo.begin_attempt(
+                job_a.job_id,
+                dispatch_kind="external_synthetic",
+                stage="s",
+                reserve_usd="0.1",
+            )
+            repo.mark_admitted(att_a.attempt_id, admission_id="adm-" + att_a.attempt_id)
+            repo.recover(att_a.attempt_id)
+            with self.assertRaises(JobStateError):
+                repo.resume_proven_undispatched(att_a.attempt_id)
 
-        # (a) An attempt that was admitted may never be reopened same-identity.
-        job_a = repo.submit(
-            "resume-admitted",
-            task_kind=SYNTHETIC_NUMERIC_TASK,
-            parameters={"stage": "s", "reserve_usd": "0.1"},
-        )
-        att_a = repo.begin_attempt(
-            job_a.job_id, dispatch_kind="external_synthetic", stage="s", reserve_usd="0.1"
-        )
-        repo.mark_admitted(att_a.attempt_id, admission_id="adm-" + att_a.attempt_id)
-        repo.recover(att_a.attempt_id)
-        with self.assertRaises(JobStateError):
-            repo.resume_proven_undispatched(att_a.attempt_id)
-
-        # (b) A proven-undispatched interrupted attempt reopens the SAME identity.
-        job_b = repo.submit(
-            "resume-undispatched",
-            task_kind=SYNTHETIC_NUMERIC_TASK,
-            parameters={"stage": "s", "reserve_usd": "0.1"},
-        )
-        att_b = repo.begin_attempt(
-            job_b.job_id, dispatch_kind="external_synthetic", stage="s", reserve_usd="0.1"
-        )
-        repo.recover(att_b.attempt_id)
-        reopened = repo.resume_proven_undispatched(att_b.attempt_id)
-        self.assertEqual(reopened.attempt_id, att_b.attempt_id)
-        self.assertEqual(reopened.fence, att_b.fence)
-        self.assertEqual(reopened.state, "queued")
-        self.assertFalse(repo.get(job_b.job_id).outcome_unresolved)
+            # (b) A proven-undispatched interrupted attempt reopens SAME identity.
+            job_b = repo.submit(
+                "resume-undispatched",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                parameters={"stage": "s", "reserve_usd": "0.1"},
+            )
+            att_b = repo.begin_attempt(
+                job_b.job_id,
+                dispatch_kind="external_synthetic",
+                stage="s",
+                reserve_usd="0.1",
+            )
+            repo.recover(att_b.attempt_id)
+            reopened = repo.resume_proven_undispatched(att_b.attempt_id)
+            self.assertEqual(reopened.attempt_id, att_b.attempt_id)
+            self.assertEqual(reopened.fence, att_b.fence)
+            self.assertEqual(reopened.state, "queued")
+            self.assertFalse(repo.get(job_b.job_id).outcome_unresolved)
 
     def test_resume_preserves_pause(self) -> None:
         self._activate()
-        repo = self.engine._repo_for(self.project.project_id)
-        job = repo.submit(
-            "resume-paused",
-            task_kind=SYNTHETIC_NUMERIC_TASK,
-            parameters={"stage": "s", "reserve_usd": "0.1"},
-        )
-        att = repo.begin_attempt(
-            job.job_id, dispatch_kind="external_synthetic", stage="s", reserve_usd="0.1"
-        )
-        repo.recover(att.attempt_id)
-        repo.pause(job.job_id)
-        reopened = repo.resume_proven_undispatched(att.attempt_id)
-        self.assertEqual(reopened.state, "queued")
-        # The explicit pause is preserved (never silently undone).
-        self.assertEqual(repo.get(job.job_id).state, "paused")
+        with self._repo() as repo:
+            job = repo.submit(
+                "resume-paused",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                parameters={"stage": "s", "reserve_usd": "0.1"},
+            )
+            att = repo.begin_attempt(
+                job.job_id,
+                dispatch_kind="external_synthetic",
+                stage="s",
+                reserve_usd="0.1",
+            )
+            repo.recover(att.attempt_id)
+            repo.pause(job.job_id)
+            reopened = repo.resume_proven_undispatched(att.attempt_id)
+            self.assertEqual(reopened.state, "queued")
+            # The explicit pause is preserved (never silently undone).
+            self.assertEqual(repo.get(job.job_id).state, "paused")
 
 
 class SwitchTest(EngineTestBase):
@@ -363,9 +483,70 @@ class SwitchTest(EngineTestBase):
             self.registry.activation().active_project_id, other.project_id
         )
         # The old project's result stayed in its own store.
-        old_repo = self.engine._repo_for(self.project.project_id)
-        accepted = old_repo.accepted_result(job_id)
+        with self._repo() as old_repo:
+            accepted = old_repo.accepted_result(job_id)
         self.assertIsNotNone(accepted)
+
+    def test_switch_persists_pause_across_engine_restart(self) -> None:
+        self._activate()
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        # A job admitted but not yet completed keeps a remote in flight, so the
+        # switch is blocked — but it must persist a durable pause first.
+        submitted = self._submit_numeric("sw-persist", delay_ms=60000)
+        job_id = submitted["job"]["job_id"]
+        self.engine.tick()  # claim
+        self.engine.tick()  # admit
+        blocked = self.engine.handle(_req("switch", project_id=other.project_id))
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["code"], "switch_blocked")
+
+        # A brand-new engine over the same store sees the job paused durably.
+        engine2 = self._new_engine()
+        res = engine2.handle(
+            _req("job_status", project_id=self.project.project_id, job_id=job_id)
+        )
+        self.assertEqual(res["job"]["state"], "paused")
+        with self._repo() as repo:
+            self.assertEqual(repo.get(job_id).state, "paused")
+
+    def test_owner_reconcile_wrong_active_is_refused(self) -> None:
+        self._activate()
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        # Write directly into B a job to reconcile, then try to reconcile it
+        # while A holds execution.
+        with self._repo(other.project_id) as repo_b:
+            job_b = repo_b.submit(
+                "rb-1",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                parameters={"stage": "s", "reserve_usd": "0.1"},
+            )
+        res = self.engine.handle(
+            _req(
+                "reconcile",
+                project_id=other.project_id,
+                job_id=job_b.job_id,
+                resolution="human_escalation",
+            )
+        )
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["code"], "wrong_project")
+
+    def test_cancel_ambiguity_blocks_other_project(self) -> None:
+        self._activate()
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        submitted = self._submit_numeric("cx-1", outcome="ambiguous")
+        job_id = submitted["job"]["job_id"]
+        self._drain_engine()
+        # Cancel the unresolved job; the ambiguity must survive cancellation and
+        # still pin arbitration.
+        cancelled = self.engine.handle(
+            _req("cancel", project_id=self.project.project_id, job_id=job_id)
+        )
+        self.assertTrue(cancelled["ok"])
+        self.assertTrue(cancelled["job"]["outcome_unresolved"])
+        switched = self.engine.handle(_req("switch", project_id=other.project_id))
+        self.assertFalse(switched["ok"])
+        self.assertEqual(switched["code"], "switch_blocked")
 
 
 class DetachedEntrypointTest(EngineTestBase):
@@ -426,10 +607,13 @@ class DetachedEntrypointTest(EngineTestBase):
             time.sleep(0.05)
         self.assertEqual(final["job"]["state"], "completed")
 
-        # stop replies before the owned worker exits.
+        # stop replies before the owned worker exits (with launcher identity).
         stop = client.request(_req("stop"))
         self.assertTrue(stop["ok"])
         self.assertTrue(stop["stopping"])
+        self.assertEqual(stop["app"], APP_NAME)
+        self.assertEqual(stop["protocol_version"], PROTOCOL_VERSION)
+        self.assertEqual(stop["pid"], proc.pid)
         proc.wait(timeout=10)
         self.assertEqual(proc.returncode, 0)
 
@@ -489,18 +673,88 @@ class DetachedEntrypointTest(EngineTestBase):
 
         # A fresh engine over the same store reconciles: the attempt is explicit,
         # never a silent success.
-        engine2 = WorkerEngine(str(self.data_dir))
-        self.addCleanup(engine2.close)
+        engine2 = self._new_engine()
         engine2.reconcile_startup()
-        repo = engine2._repo_for(self.project.project_id)
-        job = repo.get(job_id)
-        accepted = repo.accepted_result(job_id)
+        with self._repo() as repo:
+            job = repo.get(job_id)
+            accepted = repo.accepted_result(job_id)
         self.assertIsNone(accepted)
         self.assertIn(
             job.state,
             {"reconciliation_required", "interrupted", "admitted", "running", "queued"},
         )
         self.assertNotEqual(job.state, "completed")
+
+    def test_duplicate_entrypoint_start_does_not_recover_running_job(self) -> None:
+        """A second worker on the same data_dir must fail its lock WITHOUT
+        touching the first worker's live attempt (lock before recovery)."""
+        self.registry.activate_execution(self.project.project_id)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join([str(SRC), env.get("PYTHONPATH", "")])
+        first = subprocess.Popen(
+            [sys.executable, "-m", "review_article_agent.worker", "--data-dir", str(self.data_dir)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(first.kill)
+        self.addCleanup(self._close_proc, first)
+        client = WorkerIPCClient(str(self.data_dir), io_timeout=5.0)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                client.request(_req("status"))
+                break
+            except Exception:
+                time.sleep(0.05)
+        # Admit a long-running numeric job, then confirm it is in-flight.
+        sub = client.request(
+            _req(
+                "submit",
+                project_id=self.project.project_id,
+                request_id="dup-run-1",
+                task_kind=SYNTHETIC_NUMERIC_TASK,
+                steps=3,
+                delay_ms=60000,
+                outcome="complete",
+                stage="s",
+                reserve_usd="0.10",
+            )
+        )
+        job_id = sub["job"]["job_id"]
+        deadline = time.monotonic() + 10.0
+        state = None
+        while time.monotonic() < deadline:
+            res = client.request(
+                _req("job_status", project_id=self.project.project_id, job_id=job_id)
+            )
+            state = res["job"]["state"]
+            if state in ("admitted", "running"):
+                break
+            time.sleep(0.05)
+        self.assertIn(state, {"admitted", "running"})
+
+        # A second worker must fail to acquire the singleton lock and exit.
+        second = subprocess.run(
+            [sys.executable, "-m", "review_article_agent.worker", "--data-dir", str(self.data_dir)],
+            env=env,
+            capture_output=True,
+            timeout=15,
+        )
+        self.assertNotEqual(second.returncode, 0)
+        # It must NOT have recovered the first worker's live attempt.
+        with self._repo() as repo:
+            self.assertEqual(repo.attempt(self._attempt_id(repo, job_id)).state, "admitted")
+
+        stop = client.request(_req("stop"))
+        self.assertTrue(stop["stopping"])
+        first.wait(timeout=10)
+
+    @staticmethod
+    def _attempt_id(repo, job_id: str) -> str:
+        job = repo.get(job_id)
+        assert job is not None and job.current_attempt_id is not None
+        return job.current_attempt_id
 
     @staticmethod
     def _proc_state(pid: int) -> str | None:

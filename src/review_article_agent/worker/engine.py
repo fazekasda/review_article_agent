@@ -17,14 +17,40 @@ A **pure-Python, stdlib-only** engine that:
   layer enforces singleton + owner authentication);
 * answers a **strict, versioned, whitelisted** request protocol (see
   :data:`PROTOCOL_VERSION` and :data:`OPERATIONS`);
-* executes **at most one synthetic dispatch at a time** (and never more than the
-  approved ``max 2`` concurrent external calls) for the single execution-active
-  project;
+* executes **at most one synthetic dispatch at a time** for the single
+  execution-active project;
 * keeps the single execution activation token-fenced, guarding every claim and
-  every accepted write, and never nesting a registry call inside a registry lock;
+  every accepted write, and **never nests a registry call inside a registry
+  lock**;
 * never trusts a caller-supplied ``uid``/``actor`` field — the IPC layer supplies
   the kernel-verified peer out of band;
-* performs restart reconciliation and a safe, quiesce-before-switch drain.
+* reconciles restart state and performs a safe, quiesce-before-switch drain.
+
+Scheduling vs reconciliation
+-----------------------------
+
+Scheduling (starting **new** external work: a claim or a dispatch admission) and
+reconciliation (finishing **existing** work: a lookup, an accepted local result,
+or a definitive failure) are deliberately separate:
+
+* new dispatch requires an *execution-eligible* project: activation held, not
+  draining, not owner-paused, and not budget-blocked;
+* reconciliation of an already-admitted attempt continues under an
+  ``allow_draining`` write guard while the project is draining or paused, and
+  preserves the held (paused/cancelled) scheduling state.
+
+An ambiguous/unknown outcome escalates to ``waiting_human`` and is **never** polled
+in a busy loop. An execution-active project with no remote work and no schedulable
+work **releases** its activation so another project can execute.
+
+Store lifetime
+--------------
+
+Inactive project stores are **never cached**: a repository handle is opened,
+used, and closed per request and per startup scan. The location is re-resolved
+from the registry on every access, so a user relocate of an inactive project is
+always picked up (and an open handle never outlives the activation it was opened
+for).
 
 What it deliberately is **not**
 -------------------------------
@@ -67,11 +93,12 @@ from __future__ import annotations
 import os
 import signal
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
-from ..domain.errors import ReviewAgentError
+from ..domain.errors import ProjectConflict, ReviewAgentError
 from ..domain.records import validate_identifier
 from ..runtime.jobs import (
     ACTIVE_ATTEMPT_STATES,
@@ -79,7 +106,6 @@ from ..runtime.jobs import (
     Job,
     JobError,
     JobRepository,
-    JobStateError,
     StaleFenceError,
 )
 from ..storage import paths
@@ -108,7 +134,7 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 # Protocol constants
 # --------------------------------------------------------------------------- #
-#: Application name reported by ``status`` (and matched by the launcher).
+#: Application name reported by ``status`` and ``stop`` (and matched by the launcher).
 APP_NAME = "review_article_agent.worker"
 
 #: Control protocol version. The only version this engine accepts.
@@ -234,8 +260,8 @@ class WorkerEngine:
 
     The engine is single-threaded by design: :meth:`handle` and :meth:`tick`
     are both called from the one control-loop thread, so no job state is shared
-    across threads. Tests drive it directly (in-process) or through the UDS
-    control transport.
+    across threads. Inactive project stores are never cached: each request and
+    each startup scan opens, uses, and closes its own repository handle.
     """
 
     def __init__(
@@ -253,8 +279,6 @@ class WorkerEngine:
         self._draining = False
         self._stopping = False
         self._paused_projects: set[str] = set()
-        self._repos: dict[str, JobRepository] = {}
-        self._stores: dict[str, ProjectStore] = {}
         self._wait_reasons: dict[str, str] = {}
         self._hooks: dict[str, list[Callable[..., None]]] = {
             name: [] for name in FAULT_SEAMS
@@ -265,7 +289,8 @@ class WorkerEngine:
         """Adopt an activation already held in the registry at startup.
 
         A detached worker started while a project is execution-active must pick
-        up that same activation (no new grant, no new token).
+        up that same activation (no new grant, no new token). This is a
+        read-only registry observation; it never mutates scheduling state.
         """
         try:
             activation = self._registry.activation()
@@ -291,13 +316,49 @@ class WorkerEngine:
         return self._stopping
 
     def close(self) -> None:
-        for store in self._stores.values():
-            try:
-                store.close()
-            except Exception:  # pragma: no cover - defensive
-                pass
-        self._stores.clear()
-        self._repos.clear()
+        """Release any engine-owned resources.
+
+        No project store is held between calls, so this is a no-op beyond
+        dropping cached wait-reason text; it exists for a stable lifecycle API.
+        """
+        self._wait_reasons.clear()
+
+    # -- store access -------------------------------------------------------- #
+    @contextmanager
+    def open_repository(self, project_id: str) -> Iterator[JobRepository]:
+        """Yield a repository for ``project_id``, closing it on exit.
+
+        The store location is re-resolved from the registry on every open, so a
+        relocated inactive project is always read at its current location and no
+        connection outlives the call. This is the only path by which the engine
+        touches a project store.
+        """
+        info = self._registry.get(project_id)  # validates id + registration
+        app_dir = paths.app_dir_for(info.root_path)
+        store = ProjectStore.open_at(app_dir, expected_project_id=project_id)
+        try:
+            yield JobRepository(store)
+        finally:
+            store.close()
+
+    @contextmanager
+    def _write_guard(self, project_id: str, *, allow_draining: bool) -> Iterator[None]:
+        """Authorize a local write under the registry's execution token.
+
+        Resolves the activation from the registry (never a nested registry call),
+        refuses a project that is not the execution-active one, and holds the
+        registry lock only across the local commit.
+        """
+        current = self._registry.activation()
+        if current.state == "none" or current.active_project_id != project_id:
+            raise ProjectConflict(
+                f"project {project_id!r} is not the execution-active project; "
+                f"refusing to authorize a write."
+            )
+        with self._registry.execution_write_guard(
+            current.activation_token, project_id, allow_draining=allow_draining
+        ):
+            yield
 
     # -- fault hooks --------------------------------------------------------- #
     def add_fault_hook(self, seam: str, hook: Callable[..., None]) -> None:
@@ -363,22 +424,12 @@ class WorkerEngine:
     def _resolve_project(self, request: dict[str, Any]) -> str:
         project_id = request.get("project_id")
         if project_id is None:
-            return self._require_active().project_id
-        if not isinstance(project_id, str):
-            raise _RequestError(ErrorCode.BAD_TYPE)
+            if self._activation is None:
+                raise _RequestError(ErrorCode.NOT_ACTIVATED)
+            return self._activation.project_id
+        if not isinstance(project_id, str) or not project_id:
+            raise _RequestError(ErrorCode.BAD_VALUE)
         return project_id
-
-    def _repo_for(self, project_id: str) -> JobRepository:
-        repo = self._repos.get(project_id)
-        if repo is not None:
-            return repo
-        info = self._registry.get(project_id)  # validates the id + registration
-        app_dir = paths.app_dir_for(info.root_path)
-        store = ProjectStore.open_at(app_dir, expected_project_id=project_id)
-        repo = JobRepository(store)
-        self._stores[project_id] = store
-        self._repos[project_id] = repo
-        return repo
 
     @staticmethod
     def _checkpoint_continuity(attempt: Any) -> str | None:
@@ -413,6 +464,121 @@ class WorkerEngine:
             }
         return data
 
+    # -- activation acquisition / release ------------------------------------ #
+    def _ensure_execution(self, project_id: str) -> _ActiveExecution:
+        """Return the execution activation for ``project_id``, acquiring if free.
+
+        Acquiring is allowed only when no activation is held and no *other*
+        project still has remote work outstanding (a recovery blocker). If a
+        different project holds execution, this is refused — the engine never
+        implicitly drains another project.
+        """
+        try:
+            self._registry.get(project_id)
+        except ReviewAgentError as exc:
+            raise _RequestError(ErrorCode.BAD_VALUE) from exc
+        current = self._registry.activation()
+        if current.state != "none":
+            if current.active_project_id != project_id:
+                raise _RequestError(ErrorCode.WRONG_PROJECT)
+            self._activation = _ActiveExecution(
+                project_id, current.activation_token
+            )
+            self._draining = current.state == "draining"
+            return self._activation
+        if current.active_project_id is not None:
+            # ``none`` state must carry no project; anything else is corruption.
+            raise _RequestError(ErrorCode.INTERNAL)
+        if self._has_remote_elsewhere(project_id):
+            raise _RequestError(ErrorCode.SWITCH_BLOCKED)
+        activated = self._registry.activate_execution(project_id)
+        self._activation = _ActiveExecution(project_id, activated.activation_token)
+        self._draining = False
+        return self._activation
+
+    def _release(self, project_id: str) -> None:
+        active = self._activation
+        if active is None or active.project_id != project_id:
+            return
+        try:
+            self._registry.release_execution(active.token)
+        except ReviewAgentError:
+            # Confirm whether the registry already recorded a release.
+            try:
+                if self._registry.activation().state == "none":
+                    self._activation = None
+                    self._draining = False
+            except ReviewAgentError:
+                pass
+            return
+        self._activation = None
+        self._draining = False
+
+    def _maybe_release_active(self) -> None:
+        """Release execution when the active project has nothing left to do.
+
+        A waiting-human/paused project with no potential remote work (and no
+        schedulable job) releases its arbitration so another project may execute.
+        An unknown/unresolved remote outcome is **never** auto-released.
+        """
+        active = self._activation
+        if active is None:
+            return
+        project_id = active.project_id
+        if self._has_remote(project_id) or self._has_schedulable(project_id):
+            return
+        self._release(project_id)
+
+    # -- project-work predicates --------------------------------------------- #
+    def _has_remote(self, project_id: str) -> bool:
+        """True if any job carries potential remote work (pins arbitration)."""
+        try:
+            with self.open_repository(project_id) as repo:
+                for job in repo.list():
+                    if job.outcome_unresolved:
+                        return True
+                    if job.state == "waiting_external":
+                        return True
+                    for attempt in repo.attempts(job.job_id):
+                        if attempt.state in ACTIVE_ATTEMPT_STATES:
+                            return True
+        except (ReviewAgentError, OSError):
+            # Unreadable store: fail closed (treat as still doing work).
+            return True
+        return False
+
+    def _has_schedulable(self, project_id: str) -> bool:
+        """True if any job still needs scheduling (so we do not release early)."""
+        try:
+            with self.open_repository(project_id) as repo:
+                for job in repo.list():
+                    if job.state in ("queued", "admitted", "running", "interrupted"):
+                        return True
+        except (ReviewAgentError, OSError):
+            return True
+        return False
+
+    def _has_remote_elsewhere(self, project_id: str) -> bool:
+        try:
+            projects = self._registry.list_projects()
+        except ReviewAgentError:
+            return True
+        for info in projects:
+            if info.project_id == project_id:
+                continue
+            if self._has_remote(info.project_id):
+                return True
+        return False
+
+    def _quiesce_project(self, project_id: str) -> bool:
+        """Return ``True`` when ``project_id`` has no potential remote work.
+
+        Every job is checked, including cancelled/failed ones: an unresolved bit,
+        a ``waiting_external`` gate, or **any** attempt in an active state means
+        remote work may still be executing and pins arbitration (C02 §8.5).
+        """
+        return not self._has_remote(project_id)
+
     # -- operations ---------------------------------------------------------- #
     def _op_status(self, request: dict[str, Any]) -> dict[str, Any]:
         activation = self._registry.activation()
@@ -436,14 +602,7 @@ class WorkerEngine:
         }
 
     def _op_submit(self, request: dict[str, Any]) -> dict[str, Any]:
-        active = self._require_active()
         project_id = self._resolve_project(request)
-        if project_id != active.project_id:
-            return self._error(ErrorCode.WRONG_PROJECT)
-        if project_id in self._paused_projects:
-            return self._error(ErrorCode.DENIED)
-        if self._draining:
-            return self._error(ErrorCode.DRAINING)
 
         request_id = request.get("request_id")
         if not isinstance(request_id, str) or not request_id:
@@ -452,42 +611,78 @@ class WorkerEngine:
         if task_kind not in (SYNTHETIC_NUMERIC_TASK, SYNTHETIC_WAITING_HUMAN_TASK):
             raise _RequestError(ErrorCode.BAD_VALUE)
 
-        repo = self._repo_for(project_id)
+        # Validate the dispatch inputs before any durable or activation change.
+        parameters: dict[str, Any] = {}
+        if task_kind == SYNTHETIC_NUMERIC_TASK:
+            steps = self._bounded_int(request, "steps", MIN_STEPS, MAX_STEPS)
+            delay_ms = self._bounded_int(request, "delay_ms", MIN_DELAY_MS, MAX_DELAY_MS)
+            outcome = request.get("outcome")
+            if outcome not in ("complete", "failure", "ambiguous"):
+                raise _RequestError(ErrorCode.BAD_VALUE)
+            stage = request.get("stage")
+            if not isinstance(stage, str) or not stage:
+                raise _RequestError(ErrorCode.BAD_VALUE)
+            try:
+                validate_identifier(stage, "stage")
+            except ReviewAgentError as exc:
+                raise _RequestError(ErrorCode.BAD_VALUE) from exc
+            reserve_usd = request.get("reserve_usd")
+            self._validate_reserve(reserve_usd)
+            parameters = {
+                "steps": steps,
+                "delay_ms": delay_ms,
+                "outcome": outcome,
+                "stage": stage,
+                "reserve_usd": reserve_usd,
+            }
 
-        if task_kind == SYNTHETIC_WAITING_HUMAN_TASK:
-            job = repo.submit(request_id, task_kind=task_kind, parameters={})
-            repo.escalate_to_human(job.job_id)
-            self._wait_reasons[job.job_id] = "waiting_human_task"
-            return {"ok": True, "job": self._job_dict(repo, repo.get(job.job_id))}
+        # Another project must not be silently drained for this submit.
+        current = self._registry.activation()
+        if current.state != "none" and current.active_project_id != project_id:
+            return self._error(ErrorCode.WRONG_PROJECT)
+        # Do not create new durable work while this project is held.
+        if project_id in self._paused_projects:
+            return self._error(ErrorCode.DENIED)
+        if (
+            self._draining
+            and self._activation is not None
+            and self._activation.project_id == project_id
+        ):
+            return self._error(ErrorCode.DRAINING)
 
-        # synthetic numeric dispatch: bounded numeric params only.
-        steps = self._bounded_int(request, "steps", MIN_STEPS, MAX_STEPS)
-        delay_ms = self._bounded_int(request, "delay_ms", MIN_DELAY_MS, MAX_DELAY_MS)
-        outcome = request.get("outcome")
-        if outcome not in ("complete", "failure", "ambiguous"):
-            raise _RequestError(ErrorCode.BAD_VALUE)
-        stage = request.get("stage")
-        if not isinstance(stage, str) or not stage:
-            raise _RequestError(ErrorCode.BAD_VALUE)
-        try:
-            validate_identifier(stage, "stage")
-        except ReviewAgentError as exc:
-            raise _RequestError(ErrorCode.BAD_VALUE) from exc
-        reserve_usd = request.get("reserve_usd")
-        self._validate_reserve(reserve_usd)
+        with self.open_repository(project_id) as repo:
+            try:
+                job = repo.submit(
+                    request_id, task_kind=task_kind, parameters=parameters
+                )
+            except JobError:
+                return self._error(ErrorCode.INVALID_STATE)
 
-        parameters = {
-            "steps": steps,
-            "delay_ms": delay_ms,
-            "outcome": outcome,
-            "stage": stage,
-            "reserve_usd": reserve_usd,
-        }
-        try:
-            job = repo.submit(request_id, task_kind=task_kind, parameters=parameters)
-        except JobError:
-            return self._error(ErrorCode.INVALID_STATE)
-        return {"ok": True, "job": self._job_dict(repo, job)}
+            terminal = job.state in ("completed", "failed")
+            if task_kind == SYNTHETIC_WAITING_HUMAN_TASK and not terminal:
+                # A waiting-human gate is a durable, non-authorizing stop; never
+                # reopen a completed/cancelled job (idempotent replay).
+                if job.state not in ("waiting_human", "paused"):
+                    try:
+                        repo.escalate_to_human(job.job_id)
+                    except JobError:
+                        pass
+                self._wait_reasons[job.job_id] = "waiting_human_task"
+            job = repo.get(job.job_id)
+
+        if not terminal:
+            try:
+                self._ensure_execution(project_id)
+            except _RequestError as exc:
+                return self._error(exc.code)
+            if project_id in self._paused_projects:
+                return self._error(ErrorCode.DENIED)
+            if self._draining:
+                return self._error(ErrorCode.DRAINING)
+        with self.open_repository(project_id) as repo:
+            result = {"ok": True, "job": self._job_dict(repo, repo.get(job.job_id))}
+        self._maybe_release_active()
+        return result
 
     def _op_job_status(self, request: dict[str, Any]) -> dict[str, Any]:
         project_id = self._resolve_project(request)
@@ -495,68 +690,103 @@ class WorkerEngine:
         if not isinstance(job_id, str) or not job_id:
             raise _RequestError(ErrorCode.BAD_VALUE)
         try:
-            repo = self._repo_for(project_id)
-        except ReviewAgentError:
-            raise _RequestError(ErrorCode.BAD_VALUE)
-        job = repo.get(job_id)
-        if job is None:
-            return self._error(ErrorCode.NO_SUCH_JOB)
-        return {"ok": True, "job": self._job_dict(repo, job)}
+            with self.open_repository(project_id) as repo:
+                job = repo.get(job_id)
+                if job is None:
+                    return self._error(ErrorCode.NO_SUCH_JOB)
+                return {"ok": True, "job": self._job_dict(repo, job)}
+        except ReviewAgentError as exc:
+            raise _RequestError(ErrorCode.BAD_VALUE) from exc
 
     def _op_job_list(self, request: dict[str, Any]) -> dict[str, Any]:
         project_id = self._resolve_project(request)
         try:
-            repo = self._repo_for(project_id)
-        except ReviewAgentError:
-            raise _RequestError(ErrorCode.BAD_VALUE)
-        jobs = [self._job_dict(repo, job) for job in repo.list()]
+            with self.open_repository(project_id) as repo:
+                jobs = [self._job_dict(repo, job) for job in repo.list()]
+        except ReviewAgentError as exc:
+            raise _RequestError(ErrorCode.BAD_VALUE) from exc
         return {"ok": True, "project_id": project_id, "jobs": jobs}
 
-    def _control_job(self, request: dict[str, Any], op: str) -> dict[str, Any]:
-        project_id = self._resolve_project(request)
-        job_id = request.get("job_id")
-        repo = self._repo_for(project_id)
-        if job_id is None:
-            # Project-scoped: apply to every non-terminal job of the project.
-            changed = []
-            for job in repo.list():
-                if job.state in ("completed", "failed", "cancelled"):
-                    continue
-                changed.append(self._apply_control(repo, job.job_id, op))
-            if op == "pause":
-                self._paused_projects.add(project_id)
-            elif op == "resume":
-                self._paused_projects.discard(project_id)
-            return {"ok": True, "project_id": project_id, "jobs": changed}
-        if not isinstance(job_id, str) or not job_id:
-            raise _RequestError(ErrorCode.BAD_VALUE)
-        job = repo.get(job_id)
-        if job is None:
-            return self._error(ErrorCode.NO_SUCH_JOB)
-        return {"ok": True, "job": self._apply_control(repo, job_id, op)}
-
-    def _apply_control(self, repo: JobRepository, job_id: str, op: str) -> dict[str, Any]:
-        try:
-            if op == "pause":
-                job = repo.pause(job_id)
-            elif op == "resume":
-                job = repo.resume(job_id)
-            else:
-                job = repo.cancel(job_id)
-        except JobError:
-            job = repo.get(job_id)
-            if job is None:
-                raise _RequestError(ErrorCode.NO_SUCH_JOB)
-        return self._job_dict(repo, job)
-
     def _op_pause(self, request: dict[str, Any]) -> dict[str, Any]:
-        return self._control_job(request, "pause")
+        return self._control(request, "pause")
 
     def _op_resume(self, request: dict[str, Any]) -> dict[str, Any]:
-        return self._control_job(request, "resume")
+        return self._control(request, "resume")
 
     def _op_cancel(self, request: dict[str, Any]) -> dict[str, Any]:
-        return self._control_job(request, "cancel")
+        return self._control(request, "cancel")
+
+    def _control(self, request: dict[str, Any], op: str) -> dict[str, Any]:
+        project_id = self._resolve_project(request)
+        job_id = request.get("job_id")
+        if op == "resume":
+            # Resume explicitly (re-)acquires execution, but never steals it from
+            # another project.
+            try:
+                self._ensure_execution(project_id)
+            except _RequestError as exc:
+                return self._error(exc.code)
+        try:
+            with self.open_repository(project_id) as repo:
+                if job_id is None:
+                    if op == "pause":
+                        self._pause_project_jobs(repo)
+                        self._paused_projects.add(project_id)
+                    elif op == "resume":
+                        self._resume_project_jobs(repo)
+                        self._paused_projects.discard(project_id)
+                    else:
+                        for job in repo.list():
+                            if job.state in ("completed", "failed", "cancelled"):
+                                continue
+                            try:
+                                repo.cancel(job.job_id)
+                            except JobError:
+                                pass
+                    changed = [self._job_dict(repo, job) for job in repo.list()]
+                    result: dict[str, Any] = {
+                        "ok": True,
+                        "project_id": project_id,
+                        "jobs": changed,
+                    }
+                else:
+                    if not isinstance(job_id, str) or not job_id:
+                        raise _RequestError(ErrorCode.BAD_VALUE)
+                    if repo.get(job_id) is None:
+                        return self._error(ErrorCode.NO_SUCH_JOB)
+                    try:
+                        if op == "pause":
+                            repo.pause(job_id)
+                        elif op == "resume":
+                            repo.resume(job_id)
+                        else:
+                            repo.cancel(job_id)
+                    except JobError:
+                        return self._error(ErrorCode.INVALID_STATE)
+                    result = {"ok": True, "job": self._job_dict(repo, repo.get(job_id))}
+        except ReviewAgentError as exc:
+            raise _RequestError(ErrorCode.BAD_VALUE) from exc
+        self._maybe_release_active()
+        return result
+
+    @staticmethod
+    def _pause_project_jobs(repo: JobRepository) -> None:
+        for job in repo.list():
+            if job.state in ("completed", "failed", "cancelled"):
+                continue
+            try:
+                repo.pause(job.job_id)
+            except JobError:
+                pass
+
+    @staticmethod
+    def _resume_project_jobs(repo: JobRepository) -> None:
+        for job in repo.list():
+            if job.state == "paused":
+                try:
+                    repo.resume(job.job_id)
+                except JobError:
+                    pass
 
     def _op_reconcile(self, request: dict[str, Any]) -> dict[str, Any]:
         project_id = self._resolve_project(request)
@@ -571,27 +801,52 @@ class WorkerEngine:
             "keep_unresolved",
         ):
             raise _RequestError(ErrorCode.BAD_VALUE)
-        repo = self._repo_for(project_id)
-        if repo.get(job_id) is None:
-            return self._error(ErrorCode.NO_SUCH_JOB)
+
+        # An explicit owner reconcile is an authorized write for the active
+        # project only: another executing project must never be crossed.
+        current = self._registry.activation()
+        if current.state == "none":
+            return self._error(ErrorCode.NOT_ACTIVATED)
+        if current.active_project_id != project_id:
+            return self._error(ErrorCode.WRONG_PROJECT)
+
         try:
-            job = repo.reconcile(
-                job_id,
-                resolution=resolution,
-                result_kind=request.get("result_kind"),
-                result=request.get("result"),
-            )
-        except JobError:
-            return self._error(ErrorCode.INVALID_STATE)
-        return {"ok": True, "job": self._job_dict(repo, job)}
+            with self.open_repository(project_id) as repo:
+                if repo.get(job_id) is None:
+                    return self._error(ErrorCode.NO_SUCH_JOB)
+                try:
+                    with self._write_guard(project_id, allow_draining=True):
+                        job = repo.reconcile(
+                            job_id,
+                            resolution=resolution,
+                            result_kind=request.get("result_kind"),
+                            result=request.get("result"),
+                        )
+                except JobError:
+                    return self._error(ErrorCode.INVALID_STATE)
+                except ReviewAgentError:
+                    return self._error(ErrorCode.WRONG_PROJECT)
+                result = {"ok": True, "job": self._job_dict(repo, job)}
+        except ReviewAgentError as exc:
+            raise _RequestError(ErrorCode.BAD_VALUE) from exc
+        self._maybe_release_active()
+        return result
 
     def _op_drain(self, request: dict[str, Any]) -> dict[str, Any]:
-        active = self._require_active()
         project_id = self._resolve_project(request)
-        if project_id != active.project_id:
+        current = self._registry.activation()
+        if current.state == "none":
+            return self._error(ErrorCode.NOT_ACTIVATED)
+        if current.active_project_id != project_id:
             return self._error(ErrorCode.WRONG_PROJECT)
+        # Persist a durable pause on the old project's non-terminal jobs so a
+        # restart/switch cannot silently unpause them.
+        with self.open_repository(project_id) as repo:
+            self._pause_project_jobs(repo)
+        self._registry.begin_drain(current.activation_token)
+        self._activation = _ActiveExecution(project_id, current.activation_token)
         self._draining = True
-        self._registry.begin_drain(active.token)
+        self._paused_projects.add(project_id)
         return {"ok": True, "state": "draining", "project_id": project_id}
 
     def _op_switch(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -599,30 +854,41 @@ class WorkerEngine:
         if not isinstance(project_id, str) or not project_id:
             raise _RequestError(ErrorCode.BAD_VALUE)
         try:
-            info = self._registry.get(project_id)  # validate registration
-        except ReviewAgentError:
-            raise _RequestError(ErrorCode.BAD_VALUE)
+            self._registry.get(project_id)  # validate registration
+        except ReviewAgentError as exc:
+            raise _RequestError(ErrorCode.BAD_VALUE) from exc
 
         current = self._registry.activation()
         if current.state == "none":
             activated = self._registry.activate_execution(project_id)
             self._activation = _ActiveExecution(project_id, activated.activation_token)
+            self._draining = False
             return {"ok": True, "switched": True, "active_project_id": project_id}
 
         if current.active_project_id == project_id:
             self._activation = _ActiveExecution(project_id, current.activation_token)
+            self._draining = current.state == "draining"
             return {"ok": True, "switched": True, "active_project_id": project_id}
 
-        # Safe switch: drain the old project, reconcile/quiesce its in-flight
-        # work, and only then release + activate the new one.
+        # Safe switch: persist a durable pause, drain, reconcile/quiesce the old
+        # project's remote work, then release + activate the new one.
         old_pid = current.active_project_id
         token = current.activation_token
+        with self.open_repository(old_pid) as repo:
+            self._pause_project_jobs(repo)
         self._registry.begin_drain(token)
+        self._activation = _ActiveExecution(old_pid, token)
         self._draining = True
         self._paused_projects.add(old_pid)
+
+        for _ in range(32):
+            if self._quiesce_project(old_pid):
+                break
+            hint = self._tick_project(old_pid)
+            if hint is None or hint > 0:
+                break
+
         if not self._quiesce_project(old_pid):
-            # Unknown / still-executing remote work pins arbitration: the switch
-            # is blocked pending reconciliation (C02 §8.5).
             return {
                 "ok": False,
                 "code": ErrorCode.SWITCH_BLOCKED,
@@ -637,41 +903,23 @@ class WorkerEngine:
 
     def _op_stop(self, request: dict[str, Any]) -> dict[str, Any]:
         self._stopping = True
-        return {"ok": True, "stopping": True}
+        return {
+            "ok": True,
+            "app": APP_NAME,
+            "protocol_version": PROTOCOL_VERSION,
+            "pid": os.getpid(),
+            "stopping": True,
+        }
 
-    # -- reconciliation / quiescence ----------------------------------------- #
-    def _quiesce_project(self, project_id: str) -> bool:
-        """Return ``True`` when ``project_id`` has no potential remote work.
-
-        Every **active** attempt state (not only ``outcome_unresolved``) is
-        treated as potential remote work, plus an unresolved bit or a
-        ``waiting_external`` gate. ``waiting_human``/``paused`` with no active
-        attempt hold no remote work and may release execution resources.
-        """
-        try:
-            repo = self._repo_for(project_id)
-        except ReviewAgentError:
-            # A store we cannot read is treated as not quiescent (fail closed).
-            return False
-        for job in repo.list():
-            if job.state in ("completed", "failed", "cancelled"):
-                continue
-            if job.outcome_unresolved:
-                return False
-            if job.state == "waiting_external":
-                return False
-            for attempt in repo.attempts(job.job_id):
-                if attempt.state in ACTIVE_ATTEMPT_STATES:
-                    return False
-        return True
-
+    # -- reconciliation / startup -------------------------------------------- #
     def reconcile_startup(self) -> None:
         """Reconcile recorded attempts across **all** registered project stores.
 
-        Includes restored jobs that have no registry activation and no provider
-        journal record: an active attempt is always moved to an explicit
-        recovered state (never a silent success). A store that cannot be read is
-        skipped; it is reconciled again on a later run.
+        Must run only after the worker owns its singleton lock (see
+        ``worker/__main__``): it opens each project store, recovers any active
+        attempt to an explicit state (never a silent success), and closes the
+        handle so no inactive connection is cached. A store that cannot be read
+        is skipped; it is reconciled again on a later run.
         """
         try:
             projects = self._registry.list_projects()
@@ -679,21 +927,21 @@ class WorkerEngine:
             return
         for info in projects:
             try:
-                repo = self._repo_for(info.project_id)
+                with self.open_repository(info.project_id) as repo:
+                    for job in repo.list():
+                        attempt_id = job.current_attempt_id
+                        if attempt_id is None:
+                            continue
+                        attempt = repo.attempt(attempt_id)
+                        if attempt is None:
+                            continue
+                        if attempt.state in ACTIVE_ATTEMPT_STATES:
+                            try:
+                                repo.recover(attempt_id)
+                            except JobError:
+                                continue
             except (ReviewAgentError, OSError):
                 continue
-            for job in repo.list():
-                attempt_id = job.current_attempt_id
-                if attempt_id is None:
-                    continue
-                attempt = repo.attempt(attempt_id)
-                if attempt is None:
-                    continue
-                if attempt.state in ACTIVE_ATTEMPT_STATES:
-                    try:
-                        repo.recover(attempt_id)
-                    except JobError:
-                        continue
 
     # -- scheduling ---------------------------------------------------------- #
     def tick(self) -> float | None:
@@ -701,70 +949,81 @@ class WorkerEngine:
 
         Returns ``0.0`` when it made progress (call again promptly), a positive
         number of seconds to wait before the next poll, or ``None`` when there is
-        no pending work at all (the caller should block indefinitely). It never
-        busy-loops: a waiting-human / paused / reconciliation-required job yields
-        ``None``.
+        no pending work (the caller should block indefinitely). It never
+        busy-loops: an ambiguous/unknown outcome becomes ``waiting_human`` and
+        yields ``None`` until an owner request or a known backend deadline.
         """
         if self._stopping:
             return 0.0
         active = self._activation
-        if active is None or self._draining:
+        if active is None:
             return None
-        project_id = active.project_id
+        hint = self._tick_project(active.project_id)
+        # Release arbitration once the active project has nothing left to do.
+        self._maybe_release_active()
+        return hint
+
+    def _scheduling_allowed(self, project_id: str) -> bool:
+        active = self._activation
+        if active is None or active.project_id != project_id:
+            return False
+        if self._draining:
+            return False
         if project_id in self._paused_projects:
-            return None
+            return False
+        return True
+
+    def _tick_project(self, project_id: str) -> float | None:
         try:
-            repo = self._repo_for(project_id)
+            with self.open_repository(project_id) as repo:
+                plan = self._plan(repo, project_id)
+                if plan is None:
+                    return None
+                action, job, attempt = plan
+                if action == "claim":
+                    return self._do_claim(repo, project_id, job)
+                if action == "admit":
+                    return self._do_admit(repo, project_id, job, attempt)
+                if action == "lookup":
+                    return self._do_lookup(repo, project_id, job, attempt)
+                return self._do_reconcile(repo, project_id, job, attempt)
         except (ReviewAgentError, OSError):
             return None
-        plan = self._plan(repo)
-        if plan is None:
-            return None
-        action = plan[0]
-        if action == "claim":
-            return self._do_claim(repo, project_id, plan[1])
-        if action == "admit":
-            return self._do_admit(repo, project_id, plan[1], plan[2])
-        if action == "lookup":
-            return self._do_lookup(repo, project_id, plan[1], plan[2])
-        return self._do_reconcile(repo, project_id, plan[1], plan[2])
 
-    def _plan(self, repo: JobRepository) -> tuple | None:
+    def _plan(self, repo: JobRepository, project_id: str) -> tuple | None:
+        """Pick the next action, separating scheduling from reconciliation.
+
+        New dispatch (``claim``/``admit``) is returned only when scheduling is
+        allowed. Reconciliation (``lookup``/``reconcile``) of an already-admitted
+        attempt is returned even while draining/paused/cancelled, so remote work
+        still finishes under an ``allow_draining`` guard.
+        """
+        scheduling = self._scheduling_allowed(project_id)
         for job in repo.list():
-            if job.state in (
-                "completed",
-                "failed",
-                "cancelled",
-                "paused",
-                "waiting_human",
-                "waiting_external",
-            ):
+            if job.state in ("waiting_human", "waiting_external"):
+                # A waiting gate is never polled (no busy loop).
                 continue
             attempt = (
                 None
                 if job.current_attempt_id is None
                 else repo.attempt(job.current_attempt_id)
             )
-            if job.state in ("reconciliation_required", "interrupted"):
-                if attempt is not None:
-                    return ("reconcile", job, attempt)
-                continue
-            if job.state == "queued":
-                if attempt is None:
-                    return ("claim", job)
-                if attempt.state == "queued":
+            if job.state in ("reconciliation_required", "interrupted") and attempt is not None:
+                return ("reconcile", job, attempt)
+            if attempt is not None and attempt.state in ACTIVE_ATTEMPT_STATES:
+                if attempt.state == "queued" and job.state == "queued" and scheduling:
                     return ("admit", job, attempt)
-                if attempt.state in ACTIVE_ATTEMPT_STATES:
+                if attempt.state in ("admitted", "running"):
                     return ("lookup", job, attempt)
-            if job.state in ("admitted", "running") and attempt is not None:
-                if attempt.state in ACTIVE_ATTEMPT_STATES:
-                    return ("lookup", job, attempt)
+                # A queued attempt that may not be admitted now: no action.
+                continue
+            if job.state == "queued" and attempt is None and scheduling:
+                return ("claim", job, None)
         return None
 
     def _do_claim(
         self, repo: JobRepository, project_id: str, job: Job
     ) -> float | None:
-        active = self._activation
         params = job.parameters if isinstance(job.parameters, dict) else {}
         stage = params.get("stage")
         reserve = params.get("reserve_usd")
@@ -773,11 +1032,8 @@ class WorkerEngine:
             self._wait_reasons[job.job_id] = "invalid_parameters"
             return None
         try:
-            # Resolve the activation info first, then take the registry guard,
-            # then commit — never nest a registry call inside the guard.
-            with self._registry.execution_write_guard(
-                active.token, project_id, allow_draining=False
-            ):
+            # New dispatch: active-only guard (no draining).
+            with self._write_guard(project_id, allow_draining=False):
                 repo.begin_attempt(
                     job.job_id,
                     dispatch_kind="external_synthetic",
@@ -825,7 +1081,8 @@ class WorkerEngine:
                 job_id=job.job_id,
                 attempt_id=attempt.attempt_id,
             )
-            # 2) admit under the same stable attempt identity (the dispatch id).
+            # 2) admit under the same stable attempt identity (the dispatch id);
+            #    external work is done outside the registry lock.
             backend = SyntheticBackend(
                 self._data_dir, expected_continuity_id=continuity
             )
@@ -842,14 +1099,18 @@ class WorkerEngine:
                 job_id=job.job_id,
                 attempt_id=attempt.attempt_id,
             )
-            repo.mark_admitted(
-                attempt.attempt_id, admission_id="adm_" + attempt.attempt_id
-            )
+            # 3) record the durable admitted state under the active-only guard.
+            with self._write_guard(project_id, allow_draining=False):
+                repo.mark_admitted(
+                    attempt.attempt_id, admission_id="adm_" + attempt.attempt_id
+                )
         except SyntheticBackendError:
             repo.escalate_to_human(job.job_id)
             self._wait_reasons[job.job_id] = "admission_indeterminate"
             return None
         except JobError:
+            return None
+        except ReviewAgentError:
             return None
         return 0.0
 
@@ -860,11 +1121,7 @@ class WorkerEngine:
         if continuity is None:
             # No continuity checkpoint ⇒ by ordering the dispatch could not have
             # been issued: reopen the same attempt identity (never mint a new one).
-            try:
-                repo.resume_proven_undispatched(attempt.attempt_id)
-            except JobError:
-                return None
-            return 0.0
+            return self._resume_same_attempt(repo, project_id, job, attempt)
         backend = SyntheticBackend(self._data_dir, expected_continuity_id=continuity)
         result = backend.lookup(attempt.attempt_id, project_id)
         if result.status == "completed" and result.definitive and result.result is not None:
@@ -875,11 +1132,16 @@ class WorkerEngine:
                 attempt,
                 {"kind": "synthetic_numeric", "value": result.result.value},
             )
+        if result.status == "absent" and result.definitive:
+            # A definitively-absent identity was never admitted: same identity.
+            return self._resume_same_attempt(repo, project_id, job, attempt)
         if result.status == "failed" and result.definitive_failure:
             try:
-                repo.mark_definitive_failure(attempt.attempt_id)
-                repo.settle_cost(attempt.attempt_id, cost_state="not_incurred")
-            except JobError:
+                # Reconciliation of known work: allow_draining finish.
+                with self._write_guard(project_id, allow_draining=True):
+                    repo.mark_definitive_failure(attempt.attempt_id)
+                    repo.settle_cost(attempt.attempt_id, cost_state="not_incurred")
+            except (JobError, ReviewAgentError):
                 return None
             return 0.0
         if result.status == "admitted" and not result.definitive:
@@ -893,31 +1155,32 @@ class WorkerEngine:
                 return max(0.05, min(remaining + 0.02, 1.0))
             return 0.25
         # unknown / lost journal / identity conflict / ambiguous: escalate and
-        # retain arbitration. Never a new identity, never a silent success.
+        # retain arbitration. Never a new identity, never a silent success, and
+        # never polled in a busy loop (the job becomes waiting_human).
         try:
-            repo.mark_ambiguous(attempt.attempt_id)
-            repo.escalate_to_human(job.job_id)
-        except JobError:
+            with self._write_guard(project_id, allow_draining=True):
+                repo.mark_ambiguous(attempt.attempt_id)
+                repo.escalate_to_human(job.job_id)
+        except (JobError, ReviewAgentError):
             return None
         self._wait_reasons[job.job_id] = result.reason or "reconciliation_required"
         return None
+
+    def _resume_same_attempt(
+        self, repo: JobRepository, project_id: str, job: Job, attempt: Any
+    ) -> float | None:
+        try:
+            with self._write_guard(project_id, allow_draining=True):
+                repo.resume_proven_undispatched(attempt.attempt_id)
+        except (JobError, ReviewAgentError):
+            return None
+        return 0.0
 
     def _do_reconcile(
         self, repo: JobRepository, project_id: str, job: Job, attempt: Any
     ) -> float | None:
         # Recovery already recorded the attempt as interrupted/ambiguous. Decide
         # from durable state, with the ordering argument for a missing checkpoint.
-        continuity = self._checkpoint_continuity(attempt)
-        if continuity is None:
-            try:
-                repo.resume_proven_undispatched(attempt.attempt_id)
-            except JobError:
-                repo.escalate_to_human(job.job_id)
-                self._wait_reasons[job.job_id] = "reconciliation_required"
-                return None
-            return 0.0
-        # A recorded continuity id means a dispatch may have been issued: look it
-        # up authoritatively; absence of a local receipt is never proof.
         return self._do_lookup(repo, project_id, job, attempt)
 
     def _accept_result(
@@ -928,7 +1191,6 @@ class WorkerEngine:
         attempt: Any,
         result: Any,
     ) -> float | None:
-        active = self._activation
         self._fire(
             "before_commit",
             project_id=project_id,
@@ -937,14 +1199,13 @@ class WorkerEngine:
         )
         try:
             # allow_draining=True is reconciliation-only: finishing a write the
-            # engine had already accepted before a drain.
-            with self._registry.execution_write_guard(
-                active.token, project_id, allow_draining=True
-            ):
+            # engine had already accepted before a drain/pause. Fencing protects
+            # accepted local writes; a paused/cancelled job keeps its state.
+            with self._write_guard(project_id, allow_draining=True):
                 repo.accept_result(
                     attempt.attempt_id, result_kind="synthetic_numeric", result=result
                 )
-            repo.settle_cost(attempt.attempt_id, cost_state="known", amount_usd="0")
+                repo.settle_cost(attempt.attempt_id, cost_state="known", amount_usd="0")
         except JobError:
             return None
         except ReviewAgentError:
