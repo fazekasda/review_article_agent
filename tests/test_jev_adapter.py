@@ -22,6 +22,8 @@ Run:
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -29,7 +31,7 @@ import sys
 import unittest
 import urllib.error
 import urllib.request
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from unittest import mock
 
@@ -450,6 +452,35 @@ class PerQuestionFailureTests(unittest.TestCase):
         result = run(transport, qs=qs)
         return result, result.outcomes
 
+    def test_error_answer_reason_and_message_never_echoed(self):
+        payload = valid_payload()
+        payload["answers"]["study_design"] = {
+            "type": "error",
+            "reason": "refused-PRIVATE_SOURCE_TEXT_CANARY",
+            "message": "PRIVATE_SOURCE_TEXT_CANARY",
+        }
+        result, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["study_design"].outcome, "partial_error")
+        self.assertIsNone(outcomes["study_design"].per_question_error.code)
+        blob = json.dumps(
+            {
+                "detail": outcomes["study_design"].diagnostic.detail_redacted,
+                "message": outcomes["study_design"].per_question_error.message_redacted,
+            }
+        )
+        self.assertNotIn("PRIVATE_SOURCE_TEXT_CANARY", blob)
+        self.assertNotIn("refused", blob)
+
+    def test_refusal_is_static(self):
+        payload = valid_payload()
+        payload["answers"]["study_design"] = {"type": "error", "reason": "refused"}
+        _, outcomes = self._outcomes(payload)
+        self.assertEqual(outcomes["study_design"].outcome, "refusal")
+        self.assertEqual(
+            outcomes["study_design"].diagnostic.detail_redacted,
+            "provider refused this question",
+        )
+
     def test_never_an_exclusion(self):
         payload = valid_payload()
         payload["answers"]["study_design"] = {"type": "error", "reason": "refused"}
@@ -753,15 +784,21 @@ class GuardTests(unittest.TestCase):
         self.assertNotIn(API_KEY, sent)
         self.assertNotIn(API_KEY, json.dumps(result.__dict__, default=str))
 
-    def test_provider_error_text_redacted_in_diagnostic(self):
+    def test_provider_error_text_never_echoed_in_diagnostic(self):
         body = json.dumps(
-            {"error": {"code": 400, "message": f"bad key {API_KEY} from sk-or-v1-leak"}}
+            {
+                "error": {
+                    "code": 400,
+                    "message": f"bad key {API_KEY} from sk-or-v1-leak SOURCE_CANARY",
+                }
+            }
         )
         result = run(FakeTransport(resp(400, body)))
         detail = result.diagnostic.detail_redacted
         self.assertNotIn(API_KEY, detail)
         self.assertNotIn("sk-or-", detail)
-        self.assertIn("[REDACTED]", detail)
+        self.assertNotIn("SOURCE_CANARY", detail)
+        self.assertIn("http 400", detail)
 
     def test_redact_peer_text(self):
         out = jev.redact_peer_text("failed sk-or-v1-abc123 with Bearer sk-or-v1-xyz\nnext")
@@ -848,6 +885,354 @@ class InstalledPackageTests(unittest.TestCase):
         self.assertFalse(hasattr(jev, "live_jev"))
         self.assertFalse(hasattr(jev, "default_questions"))
         self.assertFalse(hasattr(jev, "main"))
+
+
+# --------------------------------------------------------------------------- #
+# Focused repairs (T3-R1 reproductions)
+# --------------------------------------------------------------------------- #
+NESTED_BODY = "[" * 200_000 + "]" * 200_000
+
+
+class RepairModelPlanTests(unittest.TestCase):
+    def test_plan_rejects_unrelated_model(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.plan_dispatch(
+                questions(), STATE, reserve_usd="0.25", model="openai/expensive-unrelated"
+            )
+
+    def test_build_request_rejects_unrelated_model(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.build_request(questions(), STATE, model="openai/expensive-unrelated")
+
+    def test_execute_blocks_unrelated_model_zero_calls(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, model="openai/expensive-unrelated")
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.calls_attempted, 0)
+        self.assertEqual(transport.calls, [])
+
+    def test_plan_rejects_unbounded_timeout(self):
+        for bad in (float("nan"), float("inf"), float("-inf"), 0, -1, 1e9, True):
+            with self.assertRaises(jev.JevValidationError):
+                jev.plan_dispatch(questions(), STATE, reserve_usd="0.25", timeout=bad)
+
+    def test_execute_blocks_bad_timeout_zero_calls(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, timeout=float("nan"))
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(transport.calls, [])
+
+
+class PlanImmutabilityTests(unittest.TestCase):
+    def test_state_mutation_after_planning_does_not_change_body(self):
+        state = {"text": "ORIGINAL"}
+        plan = jev.plan_dispatch(questions(), state, reserve_usd="0.25")
+        state["text"] = "MUTATED AFTER RESERVATION"
+        body = json.loads(plan.request_body)
+        self.assertEqual(body["state"]["text"], "ORIGINAL")
+        # the frozen plan copy is unchanged too
+        self.assertEqual(plan.request["state"]["text"], "ORIGINAL")
+
+    def test_plan_request_is_deep_frozen(self):
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        with self.assertRaises(TypeError):
+            plan.request["state"] = {"text": "x"}
+        with self.assertRaises(TypeError):
+            plan.request["state"]["text"] = "x"
+        with self.assertRaises(TypeError):
+            plan.request["questions"]["q"] = {}
+
+    def test_dispatched_bytes_match_returned_hash_and_size(self):
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = jev.dispatch_plan(plan, api_key=API_KEY, transport=transport)
+        sent = transport.calls[0]["body"]
+        self.assertEqual(sent, plan.request_body)
+        self.assertEqual(len(sent), result.request_bytes)
+        self.assertEqual(hashlib.sha256(sent).hexdigest(), result.request_sha256)
+
+    def test_dispatch_refuses_alias_mutated_request(self):
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        # Bypass the freeze by swapping the attribute outright (frozen dataclass).
+        object.__setattr__(plan, "request", {"model": jev.MODEL, "state": {"t": 1}, "questions": {}})
+        transport = FakeTransport(resp(200, valid_payload()))
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=transport)
+        self.assertEqual(transport.calls, [])
+
+
+class ForgedPlanTests(unittest.TestCase):
+    def _valid_plan(self):
+        return jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+
+    def test_forged_model_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), model="openai/expensive-unrelated")
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_bound_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), cost_upper_bound_usd="0")
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_reserve_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), reserve_usd="0")
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_size_refused(self):
+        plan = self._valid_plan()
+        plan = dataclasses.replace(plan, request_bytes=plan.request_bytes + 1)
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_digest_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), request_sha256="00" * 32)
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_pricing_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), pricing_version="nope")
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_endpoint_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), endpoint="https://evil.example/x")
+        with self.assertRaises(jev.JevError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_non_decimal_bound_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), cost_upper_bound_usd="abc")
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_empty_questions_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), questions=())
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_non_mapping_request_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), request=[])
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+    def test_forged_non_int_size_refused(self):
+        plan = dataclasses.replace(self._valid_plan(), request_bytes="big")
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+
+
+class StatusClassificationTests(unittest.TestCase):
+    CANARY = "PRIVATE_SOURCE_TEXT_CANARY"
+
+    def _body(self):
+        return json.dumps({"error": {"code": 999, "message": self.CANARY}})
+
+    def test_only_documented_4xx_are_not_incurred(self):
+        for status in (400, 401, 402, 403, 404, 413):
+            result = run(FakeTransport(jev.TransportResponse(status, self._body())))
+            self.assertEqual(result.cost.state, "not_incurred", status)
+            self.assertFalse(result.cost.reserve_retained)
+
+    def test_all_other_non_200_are_ambiguous_unknown(self):
+        for status in (429, 500, 501, 502, 503, 504, 507, 524, 529, 302, 301, 201, 204):
+            result = run(FakeTransport(jev.TransportResponse(status, self._body())))
+            self.assertEqual(result.cost.state, "unknown", status)
+            self.assertTrue(result.cost.reserve_retained, status)
+            self.assertIsNone(result.cost.amount_usd, status)
+
+    def test_ambiguous_reply_never_echoes_the_canary(self):
+        for status in (501, 507, 302, 201):
+            result = run(FakeTransport(jev.TransportResponse(status, self._body())))
+            blob = json.dumps(
+                {
+                    "detail": result.diagnostic.detail_redacted,
+                    "code": result.diagnostic.code,
+                    "outcomes": {k: o.outcome for k, o in result.outcomes.items()},
+                }
+            )
+            self.assertNotIn(self.CANARY, blob)
+            self.assertIn(str(status), result.diagnostic.detail_redacted)
+
+
+class StrictValidationRepairTests(unittest.TestCase):
+    def _run(self, payload):
+        return run(FakeTransport(resp(200, payload)))
+
+    def test_score_just_outside_range_is_malformed(self):
+        payload = valid_payload()
+        payload["answers"]["confidence_level"] = {"type": "score", "score": -0.0000001}
+        result = self._run(payload)
+        self.assertEqual(result.outcomes["confidence_level"].outcome, "malformed")
+
+    def test_score_just_above_max_is_malformed(self):
+        payload = valid_payload()
+        payload["answers"]["confidence_level"] = {"type": "score", "score": 2.0000001}
+        result = self._run(payload)
+        self.assertEqual(result.outcomes["confidence_level"].outcome, "malformed")
+
+    def test_score_at_bounds_is_answered(self):
+        for value in (0, 2):
+            payload = valid_payload()
+            payload["answers"]["confidence_level"] = {"type": "score", "score": value}
+            result = self._run(payload)
+            self.assertEqual(result.outcomes["confidence_level"].outcome, "answered")
+
+    def test_legend_wrong_value_type_is_malformed_not_coerced(self):
+        payload = valid_payload()
+        payload["answers"]["confidence_level"]["legend"] = {"0": 42}
+        result = self._run(payload)
+        self.assertEqual(result.outcomes["confidence_level"].outcome, "malformed")
+        self.assertIsNone(result.outcomes["confidence_level"].answer)
+
+    def test_duplicate_json_keys_rejected(self):
+        body = (
+            '{"model":"%s","model":"%s","answers":{"q":{"type":"noul","noul":0.5}},'
+            '"usage":{"input_tokens":1,"output_tokens":1}}' % (jev.MODEL, jev.MODEL)
+        )
+        result = run(
+            FakeTransport(resp(200, body)),
+            qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
+        )
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_wrong_response_model_is_protocol_error(self):
+        payload = valid_payload(model="openai/gpt-4o")
+        result = self._run(payload)
+        self.assertEqual(result.status, "protocol_error")
+
+    def test_dated_response_snapshot_accepted_and_recorded(self):
+        payload = valid_payload(model="typesafe/jev-1.14-20261014")
+        result = self._run(payload)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.actual_model, "typesafe/jev-1.14-20261014")
+
+
+class PostSubmissionNoEscapeTests(unittest.TestCase):
+    def test_deeply_nested_body_does_not_escape(self):
+        result = run(FakeTransport(resp(200, NESTED_BODY)))  # must not raise
+        self.assertEqual(result.status, "protocol_error")
+        self.assertTrue(result.submitted)
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_malformed_transport_response_is_unknown(self):
+        for bad in ({"status": 200, "body_text": "{}"}, "nope", object()):
+            result = run(FakeTransport(bad))
+            self.assertEqual(result.status, "protocol_error")
+            self.assertTrue(result.submitted)
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
+
+    def test_non_int_status_is_unknown(self):
+        result = run(FakeTransport(jev.TransportResponse("200", "{}")))
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+    def test_unexpected_validation_exception_does_not_escape(self):
+        payload = valid_payload()
+        # An undeclared question name is an envelope defect -> protocol_error.
+        payload["answers"]["boom"] = {"type": "noul", "noul": 0.5}
+        result = run(FakeTransport(resp(200, payload)))
+        self.assertEqual(result.status, "protocol_error")
+        self.assertTrue(result.submitted)
+        # The body carried a valid reported cost, which is independently honoured.
+        self.assertEqual(result.cost.state, "known")
+        self.assertEqual(result.cost.amount_usd, "0.00002037")
+
+    def test_malformed_envelope_without_cost_stays_unknown(self):
+        payload = valid_payload()
+        payload["answers"]["boom"] = {"type": "noul", "noul": 0.5}
+        payload["usage"].pop("cost", None)
+        result = run(FakeTransport(resp(200, payload)))
+        self.assertEqual(result.status, "protocol_error")
+        self.assertEqual(result.cost.state, "unknown")
+        self.assertTrue(result.cost.reserve_retained)
+
+
+class MoneyMathTests(unittest.TestCase):
+    def test_estimate_is_independent_of_ambient_precision(self):
+        with localcontext() as ctx:
+            ctx.prec = 2
+            bound = jev.estimate_cost_bound(12345)
+        self.assertEqual(bound["cost_upper_bound_usd"], "0.00051849")
+        self.assertEqual(
+            Decimal(bound["cost_upper_bound_usd"]),
+            Decimal(12345) * Decimal("0.042") / Decimal(1_000_000),
+        )
+
+    def test_plan_bound_independent_of_ambient_precision(self):
+        with localcontext() as ctx:
+            ctx.prec = 2
+            plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        expected = (
+            Decimal(plan.request_bytes) * Decimal("0.042") / Decimal(1_000_000)
+        )
+        self.assertEqual(Decimal(plan.cost_upper_bound_usd), expected)
+
+    def test_pricing_override_validated(self):
+        for bad in (0.042, "0", "-1", "1e999999", True, "abc"):
+            with self.assertRaises(jev.JevValidationError):
+                jev.estimate_cost_bound(1000, input_usd_per_million=bad)
+
+
+class DispatchBoundRepairTests(unittest.TestCase):
+    def test_timeout_override_bounded_at_dispatch(self):
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        transport = FakeTransport(resp(200, valid_payload()))
+        with self.assertRaises(jev.JevValidationError):
+            jev.dispatch_plan(plan, api_key=API_KEY, timeout=float("inf"), transport=transport)
+        self.assertEqual(transport.calls, [])
+
+    def test_attempt_no_bounds(self):
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        for bad in (0, -1, 10 ** 9, 1.5, True):
+            with self.assertRaises(jev.JevValidationError):
+                jev.dispatch_plan(plan, api_key=API_KEY, attempt_no=bad, transport=FakeTransport())
+        transport = FakeTransport(resp(200, valid_payload()))
+        result = run(transport, attempt_no=2)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.attempt_no, 2)
+
+    def test_server_cap_disabled_still_bounded(self):
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25", server_cap=False)
+        self.assertNotIn("provider", plan.request)
+        self.assertIsNotNone(plan.cost_upper_bound_usd)
+        self.assertLessEqual(
+            Decimal(plan.cost_upper_bound_usd), Decimal(plan.reserve_usd)
+        )
+        # still dispatchable
+        result = jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport(resp(200, valid_payload())))
+        self.assertEqual(result.status, "completed")
+
+
+class CostRecordInvariantRepairTests(unittest.TestCase):
+    def test_amount_must_be_string(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="known", amount_usd=0.001)
+
+    def test_amount_rejects_negative(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="known", amount_usd="-1")
+
+    def test_currency_must_be_usd(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="unknown", currency="EUR")
+
+    def test_reserve_retained_must_match_state(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="unknown", reserve_usd="0.25", reserve_retained=False)
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="known", amount_usd="0.1", reserve_retained=True)
+
+    def test_reserve_must_be_positive_decimal(self):
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="unknown", reserve_usd="0", reserve_retained=True)
+        with self.assertRaises(jev.JevValidationError):
+            jev.CostRecord(state="unknown", reserve_usd=0.25, reserve_retained=True)
 
 
 if __name__ == "__main__":

@@ -77,12 +77,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any, Callable, Mapping, Sequence
 
 from ..domain.errors import ReviewAgentError
@@ -153,10 +154,16 @@ OUTPUT_USD_PER_MILLION_TOKENS = "0"
 SAFE_MAX_REQUEST_BYTES = 32_768
 #: Upper bound on a response body we will read (protects against unbounded input).
 MAX_RESPONSE_BYTES = 1_048_576
-#: Bounded wall-clock for one dispatch.
+#: Bounded wall-clock for one dispatch, and the inclusive bound every explicit
+#: timeout override must satisfy (a non-finite or unbounded timeout is refused).
 DEFAULT_TIMEOUT_SECONDS = 60.0
+MIN_TIMEOUT_SECONDS = 0.1
+MAX_TIMEOUT_SECONDS = 300.0
 #: This adapter performs exactly one dispatch per call; retry is a later policy.
 MAX_DISPATCH_ATTEMPTS = 1
+#: Inclusive upper bound on a caller-supplied ``attempt_no`` (a retry is a new
+#: attempt number; absurd/unbounded values are refused).
+MAX_ATTEMPT_NO = 1000
 
 #: Canonical question kinds and their wire spelling.
 PREDICATE = "predicate"
@@ -195,11 +202,15 @@ DISPATCH_STATUSES = (
 _ROUTE = "direct_call"
 _BUCKET = "direct_call"
 
-#: HTTP statuses whose billing is ambiguous (a request may have been billed).
-_API_AMBIGUOUS_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 524, 529})
+#: The **only** HTTP statuses that document a definitive, pre-billing rejection
+#: (from the fetched Decisions OpenAPI: 400/401/402/403/404/413). Every other
+#: non-200 status -- including 429 and every 3xx/5xx and an unrecognized non-200
+#: 2xx -- is *ambiguous*: the request may have been billed, so it is never
+#: recorded ``not_incurred``.
+_DEFINITIVE_STATUSES = frozenset({400, 401, 402, 403, 404, 413})
 
-#: Score tolerance for a fractional index against declared levels.
-_SCORE_EPS = Decimal("0.000001")
+#: The pinned model, including any dated response snapshot (``<MODEL>-<date>``).
+_MODEL_SNAPSHOT_PREFIX = MODEL + "-"
 
 #: Bounds on an accepted exact decimal (mirrors ``runtime.jobs`` patterns): a
 #: bounded input length/width, bounded significant digits, and a bounded base-10
@@ -295,10 +306,6 @@ def _as_decimal(value: Any) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
-def _is_probability(value: Any) -> bool:
-    return _is_finite_number(value) and Decimal(0) <= _as_decimal(value) <= Decimal(1)
-
-
 def _bounded_decimal(
     value: object, field: str, *, strictly_positive: bool = False
 ) -> Decimal:
@@ -349,18 +356,164 @@ def _exact_decimal_string(amount: Decimal) -> str:
     return format(amount, "f")
 
 
-def _parse_json(text: str) -> Any:
-    """Parse JSON with ``parse_float=Decimal`` (no float round-trip).
+#: Fixed precision used for every money computation. Independent of the ambient
+#: :mod:`decimal` context, so an application that sets ``localcontext().prec = 2``
+#: cannot change a bound. ``_MAX_ADJUSTED_EXPONENT`` (24) plus up to 40 significant
+#: digits of pricing keeps every accepted product exact within this precision.
+_MONEY_PRECISION = 80
 
-    ``NaN``/``Infinity``/``-Infinity`` constants are rejected so the envelope
-    validator never sees a non-finite number.
+
+def _money_cost(request_bytes: int, input_usd_per_million: str) -> Decimal:
+    """Exact ``bytes * price_per_million / 1e6`` under a **fixed** precision.
+
+    Never consults the caller's ambient :mod:`decimal` context, so the result is
+    deterministic regardless of any ``localcontext`` the application has set.
     """
+    with localcontext() as ctx:
+        ctx.prec = _MONEY_PRECISION
+        ctx.Emax = 999_999_999
+        ctx.Emin = -999_999_999
+        cost = (
+            Decimal(request_bytes)
+            * Decimal(input_usd_per_million)
+            / Decimal(1_000_000)
+        )
+        # Force the result out of the local context before it is returned.
+        return +cost
+
+
+def _require_timeout(value: object) -> float:
+    """Validate a finite, bounded timeout override and return it as ``float``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise JevValidationError("timeout must be a finite number")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise JevValidationError("timeout must be a finite number") from exc
+    if not math.isfinite(seconds):
+        raise JevValidationError("timeout must be finite")
+    if seconds < MIN_TIMEOUT_SECONDS or seconds > MAX_TIMEOUT_SECONDS:
+        raise JevValidationError("timeout is outside the permitted range")
+    return seconds
+
+
+def _require_attempt_no(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise JevValidationError("attempt_no must be an integer")
+    if value < 1 or value > MAX_ATTEMPT_NO:
+        raise JevValidationError("attempt_no is outside the permitted range")
+    return value
+
+
+def _require_max_request_bytes(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise JevValidationError("max_request_bytes must be an integer")
+    if value < 1 or value > SAFE_MAX_REQUEST_BYTES:
+        raise JevValidationError("max_request_bytes is outside the permitted range")
+    return value
+
+
+def _require_model(model: object) -> str:
+    """The **request** model must be exactly the pinned Jev model."""
+    if not isinstance(model, str) or model != MODEL:
+        raise JevValidationError("model must be exactly the pinned Jev model")
+    return model
+
+
+def _require_jev_response_model(model: object) -> str:
+    """The **response** model must be the pinned model or a dated snapshot."""
+    if not isinstance(model, str) or not model:
+        raise JevProtocolError("response model must be a non-empty string")
+    if model != MODEL and not model.startswith(_MODEL_SNAPSHOT_PREFIX):
+        raise JevProtocolError("response model is not the pinned Jev model")
+    return model
+
+
+#: Fixed precision for probability range checks, so an ambient ``localcontext``
+#: cannot make a finite comparison round a value into range.
+_PROB_PRECISION = 40
+
+
+def _in_closed_unit(value: Any) -> bool:
+    if not _is_finite_number(value):
+        return False
+    with localcontext() as ctx:
+        ctx.prec = _PROB_PRECISION
+        return Decimal(0) <= _as_decimal(value) <= Decimal(1)
+
+
+def _is_probability(value: Any) -> bool:
+    return _in_closed_unit(value)
+
+
+class _FrozenDict(dict):
+    """A ``dict`` whose content can never be mutated (JSON-portable, immutable).
+
+    ``isinstance(x, dict)`` still holds, so :func:`canonical_json` and
+    :func:`json.dumps` accept it, but every mutating method raises ``TypeError``.
+    This is a defensive deep-freeze for a dispatch plan: an alias that mutates a
+    plan's ``state``/``questions`` fails immediately rather than silently changing
+    the bytes a later dispatch would send.
+    """
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError("frozen dict is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    update = _immutable
+    pop = _immutable
+    popitem = _immutable
+    clear = _immutable
+    setdefault = _immutable
+    __ior__ = _immutable
+
+
+def _deep_freeze(value: Any) -> Any:
+    """Recursively freeze a JSON-portable value to immutable containers."""
+    if isinstance(value, dict):
+        if isinstance(value, _FrozenDict):
+            return value
+        return _FrozenDict({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    return value
+
+
+def _no_duplicate_keys(pairs: Any) -> dict:
+    """``object_pairs_hook`` that rejects a duplicate key at any nesting level."""
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate JSON key")
+        out[key] = value
+    return out
+
+
+def _parse_json(text: object) -> Any:
+    """Strictly parse JSON with ``parse_float=Decimal`` (no float round-trip).
+
+    Rejects non-string input, a duplicate key at any depth, and the
+    ``NaN``/``Infinity``/``-Infinity`` constants. *Any* parse failure -- including
+    a :class:`RecursionError` from a pathologically deep document -- becomes a
+    loud :class:`JevProtocolError` (never an escaping exception).
+    """
+    if not isinstance(text, str):
+        raise JevProtocolError("response body is not a string")
+
     def _reject(_token: str) -> Any:
         raise ValueError("non-finite JSON constant")
 
     try:
-        return json.loads(text, parse_float=Decimal, parse_constant=_reject)
-    except (ValueError, TypeError) as exc:
+        return json.loads(
+            text,
+            parse_float=Decimal,
+            parse_constant=_reject,
+            object_pairs_hook=_no_duplicate_keys,
+        )
+    except JevProtocolError:
+        raise
+    except Exception as exc:  # ValueError, RecursionError, ...
         raise JevProtocolError("response body is not valid JSON") from exc
 
 
@@ -371,7 +524,10 @@ def estimate_cost_bound(
 
     Assumes one input token per request byte (real tokenisation is looser, so
     this over-estimates) and ignores free output tokens. All arithmetic is exact
-    ``Decimal``; ``cost_upper_bound_usd`` is an exact decimal string.
+    ``Decimal`` under a **fixed** precision, independent of the ambient decimal
+    context; ``cost_upper_bound_usd`` is an exact decimal string. The pricing
+    override is validated (a positive, bounded exact decimal) so it cannot be used
+    to fabricate an under-estimate.
     """
     if isinstance(request_bytes, bool) or not isinstance(request_bytes, int):
         raise JevValidationError("request_bytes must be an integer")
@@ -379,11 +535,16 @@ def estimate_cost_bound(
         raise JevValidationError("request_bytes must not be negative")
     if request_bytes > SAFE_MAX_REQUEST_BYTES:
         raise JevValidationError("request exceeds the default-mode byte bound")
-    cost = (
-        Decimal(request_bytes)
-        * Decimal(input_usd_per_million)
-        / Decimal(1_000_000)
+    if not isinstance(input_usd_per_million, str):
+        raise JevValidationError("pricing must be an exact decimal string")
+    price = _bounded_decimal(
+        input_usd_per_million, "input_usd_per_million", strictly_positive=True
     )
+    if _exact_decimal_string(price) != input_usd_per_million:
+        raise JevValidationError("pricing must be a canonical exact decimal string")
+    cost = _money_cost(request_bytes, input_usd_per_million)
+    if cost < 0:  # pragma: no cover - defensive
+        raise JevValidationError("cost bound must not be negative")
     return {
         "input_tokens_upper_bound": request_bytes,
         "usd_per_million_input_tokens": input_usd_per_million,
@@ -533,8 +694,7 @@ def _serialize_request(
     model: str,
     server_cap_usd: str | None,
 ) -> dict:
-    if not isinstance(model, str) or not model:
-        raise JevValidationError("model must be a non-empty string")
+    _require_model(model)
     if state is None:
         raise JevValidationError("state is required")
     # Fail closed if the state is not portable JSON (rejects NaN, deep nesting…).
@@ -574,7 +734,9 @@ def build_request(
     server_cap = None
     if max_request_cost_usd is not None:
         server_cap = _exact_decimal_string(
-            _bounded_decimal(max_request_cost_usd, "max_request_cost_usd")
+            _bounded_decimal(
+                max_request_cost_usd, "max_request_cost_usd", strictly_positive=True
+            )
         )
     return _serialize_request(
         canonical, state, model=model, server_cap_usd=server_cap
@@ -667,7 +829,14 @@ class CostRecord:
     def __post_init__(self) -> None:
         if self.state not in COST_STATES:
             raise JevValidationError("cost state is not a known literal")
-        if self.state in ("known", "estimated"):
+        if self.currency != "USD":
+            raise JevValidationError("cost currency must be USD")
+        if self.accounting_bucket != _BUCKET or self.route != _ROUTE:
+            raise JevValidationError(
+                "direct calls must use the direct_call route/accounting bucket"
+            )
+        with_amount = self.state in ("known", "estimated")
+        if with_amount:
             if self.amount_usd is None:
                 raise JevValidationError(
                     f"cost state {self.state!r} requires amount_usd"
@@ -676,11 +845,18 @@ class CostRecord:
             raise JevValidationError(
                 f"cost state {self.state!r} must not carry amount_usd"
             )
-        if self.state == "unknown" and self.amount_usd is not None:
-            raise JevValidationError("unknown cost is not zero")
-        if self.accounting_bucket != _BUCKET or self.route != _ROUTE:
+        if self.amount_usd is not None:
+            if not isinstance(self.amount_usd, str):
+                raise JevValidationError("amount_usd must be an exact decimal string")
+            _bounded_decimal(self.amount_usd, "amount_usd")  # non-negative, bounded
+        if self.reserve_usd is not None:
+            if not isinstance(self.reserve_usd, str):
+                raise JevValidationError("reserve_usd must be an exact decimal string")
+            _bounded_decimal(self.reserve_usd, "reserve_usd", strictly_positive=True)
+        # A reserve is retained iff the cost is unresolved (unknown/estimated).
+        if self.reserve_retained != (self.state in ("unknown", "estimated")):
             raise JevValidationError(
-                "direct calls must use the direct_call route/accounting bucket"
+                "reserve_retained must match an unresolved (unknown/estimated) cost"
             )
 
 
@@ -734,13 +910,14 @@ def _normalize_answer(name: str, question: QuestionDef, answer: Any) -> Answer:
             confidence=confidence,
             probabilities=probabilities,
         )
-    # score
+    # score: the index must lie within [0, len(levels)-1] with **no** epsilon
+    # tolerance outside that closed range (a value just outside is malformed).
     levels = list(question.levels)
     score = answer.get("score")
     if not _is_finite_number(score):
         raise JevProtocolError(f"answer {name!r}.score must be a finite number")
     score_dec = _as_decimal(score)
-    if score_dec < -_SCORE_EPS or score_dec > (len(levels) - 1) + _SCORE_EPS:
+    if score_dec < 0 or score_dec > (len(levels) - 1):
         raise JevProtocolError(
             f"answer {name!r}.score is outside the declared levels"
         )
@@ -748,9 +925,22 @@ def _normalize_answer(name: str, question: QuestionDef, answer: Any) -> Answer:
     legend = None
     raw_legend = answer.get("legend")
     if raw_legend is not None:
-        if not isinstance(raw_legend, Mapping) or not set(raw_legend) <= index_keys:
-            raise JevProtocolError(f"answer {name!r}.legend keys must be level indices")
-        legend = {str(k): str(v) for k, v in raw_legend.items()}
+        if not isinstance(raw_legend, Mapping):
+            raise JevProtocolError(f"answer {name!r}.legend must be an object")
+        legend = {}
+        for key, value in raw_legend.items():
+            if key not in index_keys:
+                raise JevProtocolError(
+                    f"answer {name!r}.legend keys must be level indices"
+                )
+            # The published legend value union permits objects/arrays, but C02
+            # stores a string; a structured value is *unsupported/malformed* and
+            # is never coerced to a fabricated string.
+            if not isinstance(value, str):
+                raise JevProtocolError(
+                    f"answer {name!r}.legend values must be strings"
+                )
+            legend[key] = value
     confidence, probabilities = _common(answer, name, index_keys)
     return Answer(
         answer_kind=SCORE,
@@ -776,17 +966,26 @@ def _common(
                 f"answer {name!r}.probabilities has undeclared keys"
             )
         probabilities = {
-            str(k): _require_probability(name, f"probabilities[{k}]", v)
-            for k, v in raw.items()
+            key: _require_probability(name, "probabilities", value)
+            for key, value in raw.items()
         }
     return confidence, probabilities
 
 
 def _error_outcome(name: str, question: QuestionDef, answer: Mapping[str, Any]) -> DecisionOutcome:
+    """A defensive per-question error answer -> a retained, **static** diagnostic.
+
+    The peer's ``reason``/``message`` are used only to classify refusal vs error;
+    they are never echoed (a peer-controlled string is not a safe diagnostic).
+    """
     reason = answer.get("reason")
-    message = redact_peer_text(answer.get("message", "")) if answer.get("message") else ""
     refused = isinstance(reason, str) and reason.lower() in ("refused", "refusal")
     outcome = "refusal" if refused else "partial_error"
+    message = (
+        "provider refused this question"
+        if refused
+        else "provider reported a per-question error"
+    )
     return DecisionOutcome(
         question_id=name,
         question_kind=question.question_kind,
@@ -794,12 +993,12 @@ def _error_outcome(name: str, question: QuestionDef, answer: Mapping[str, Any]) 
         per_question_error=PerQuestionError(
             question_id=name,
             reason="provider_error",
-            message_redacted=message or "provider reported a per-question error",
-            code=reason if isinstance(reason, str) and reason else None,
+            message_redacted=message,
+            code=None,
         ),
         diagnostic=Diagnostic(
             code="provider_refusal" if refused else "provider_error",
-            detail_redacted=message or "provider reported a per-question error",
+            detail_redacted=message,
             raised_at=_utc_now(),
         ),
     )
@@ -888,9 +1087,9 @@ def validate_response(
     usage = payload.get("usage")
     if not isinstance(usage, Mapping):
         raise JevProtocolError("response.usage must be an object")
-    model = payload.get("model")
-    if not isinstance(model, str) or not model:
-        raise JevProtocolError("response.model must be a non-empty string")
+    # The response model must be the pinned Jev model (or a dated snapshot). An
+    # unrelated model is an envelope defect: its answers are not Jev's.
+    model = _require_jev_response_model(payload.get("model"))
     input_tokens = usage.get("input_tokens")
     output_tokens = usage.get("output_tokens")
     for label, value in (("input_tokens", input_tokens), ("output_tokens", output_tokens)):
@@ -977,17 +1176,21 @@ def validate_response(
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class DispatchPlan:
-    """A validated, cost-bounded plan for **one** direct dispatch.
+    """A validated, cost-bounded, **immutable** plan for one direct dispatch.
 
     It carries the exact ``reserve_usd`` the application must persist before the
-    dispatch is admitted, plus the exact request bytes/digest and the pricing
-    reference the bound was derived from. Building a plan sends nothing.
+    dispatch is admitted, the exact serialized ``request_body`` bytes (recompute
+    and re-checked at dispatch), the request bytes/digest, and the pricing
+    reference the bound was derived from. ``request`` is a deeply frozen copy for
+    inspection; the body bytes are what is actually sent. Building a plan sends
+    nothing.
     """
 
     endpoint: str
     model: str
     questions: tuple[QuestionDef, ...]
     request: Mapping[str, Any]
+    request_body: bytes
     request_bytes: int
     request_sha256: str
     cost_upper_bound_usd: str
@@ -1014,13 +1217,18 @@ def plan_dispatch(
 ) -> DispatchPlan:
     """Plan one bounded dispatch. Sends nothing; raises on any defect.
 
-    The reserve is validated as an exact, strictly positive decimal and the
-    conservative cost upper bound must be ``<= reserve`` — otherwise nothing is
-    issued (contract §5.6 "reserve before dispatch"). A server-side cap
-    (``provider.max_price.request``) is added when ``server_cap`` is true.
+    The model must be exactly the pinned Jev model; the reserve is validated as an
+    exact, strictly positive decimal; the timeout/byte limit are finite and
+    bounded; and the conservative cost upper bound must be ``<= reserve`` —
+    otherwise nothing is issued (contract §5.6 "reserve before dispatch"). A
+    server-side cap (``provider.max_price.request``) is added when ``server_cap``
+    is true.
     """
     if endpoint != ENDPOINT:
         raise JevEndpointError("planning is restricted to the documented endpoint")
+    _require_model(model)
+    seconds = _require_timeout(timeout)
+    limit = _require_max_request_bytes(max_request_bytes)
     canonical = validate_questions(questions)
     reserve = _bounded_decimal(reserve_usd, "reserve_usd", strictly_positive=True)
     reserve_str = _exact_decimal_string(reserve)
@@ -1030,8 +1238,11 @@ def plan_dispatch(
         model=model,
         server_cap_usd=reserve_str if server_cap else None,
     )
+    # Deep-freeze: the plan's request/state/questions cannot be mutated by an
+    # alias after the reservation, and the exact bytes are stored immutably.
+    request = _deep_freeze(request)
     body = canonical_json(request)
-    if len(body) > max_request_bytes:
+    if len(body) > limit:
         raise JevValidationError("request exceeds the default-mode byte bound")
     bound = estimate_cost_bound(len(body))
     if Decimal(bound["cost_upper_bound_usd"]) > reserve:
@@ -1043,6 +1254,7 @@ def plan_dispatch(
         model=model,
         questions=canonical,
         request=request,
+        request_body=body,
         request_bytes=len(body),
         request_sha256=hashlib.sha256(body).hexdigest(),
         cost_upper_bound_usd=bound["cost_upper_bound_usd"],
@@ -1051,10 +1263,122 @@ def plan_dispatch(
         output_usd_per_million_tokens=OUTPUT_USD_PER_MILLION_TOKENS,
         reserve_usd=reserve_str,
         server_cap_usd=reserve_str if server_cap else None,
-        timeout_seconds=float(timeout),
+        timeout_seconds=seconds,
         supported_question_ids=supported,
         unsupported_question_ids=unsupported,
     )
+
+
+def _check_plan_shape(plan: DispatchPlan) -> None:
+    """Re-verify the serialized plan request's shape (defense in depth)."""
+    if plan.request.get("model") != MODEL:
+        raise JevValidationError("plan request model is not the pinned Jev model")
+    if plan.request.get("state") is None:
+        raise JevValidationError("plan request state is missing")
+    wire = plan.request.get("questions")
+    if not isinstance(wire, Mapping) or not wire:
+        raise JevValidationError("plan request questions are missing")
+    for name, question in wire.items():
+        if not isinstance(question, Mapping):
+            raise JevValidationError("plan request question is malformed")
+        qtype = question.get("type")
+        if qtype not in ("noul", "choice", "score"):
+            raise JevValidationError("plan request question type is unsupported")
+        if not isinstance(question.get("instructions"), str) or not question.get("instructions"):
+            raise JevValidationError("plan request question instructions are missing")
+        criteria = question.get("criteria")
+        if qtype == "noul":
+            if not isinstance(criteria, Mapping) or set(criteria) != {"true", "false"}:
+                raise JevValidationError("plan request noul criteria are malformed")
+        elif qtype == "choice":
+            if not isinstance(criteria, Mapping) or not criteria:
+                raise JevValidationError("plan request choice criteria are malformed")
+        elif not isinstance(criteria, (list, tuple)) or not criteria:
+            raise JevValidationError("plan request score criteria are malformed")
+
+
+def _revalidate_plan(plan: object) -> DispatchPlan:
+    """Re-validate a plan at dispatch time. Raises **only** :class:`JevError`.
+
+    Any unexpected failure while re-checking a (possibly forged) plan is
+    normalised to :class:`JevValidationError`, so a malformed plan can never
+    escape the dispatch boundary as a non-adapter exception.
+    """
+    try:
+        return _revalidate_plan_inner(plan)
+    except JevError:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive against forgeries
+        raise JevValidationError("plan is malformed") from exc
+
+
+def _revalidate_plan_inner(plan: object) -> DispatchPlan:
+    """The actual plan re-check: exact body bytes, size, digest, bound, reserve,
+    server cap, pinned pricing/model/endpoint, bounded timeout, and shape must
+    all agree with the recorded request."""
+    if not isinstance(plan, DispatchPlan):
+        raise JevValidationError("plan must be a DispatchPlan")
+    if plan.endpoint != ENDPOINT:
+        raise JevEndpointError("dispatch is restricted to the documented endpoint")
+    if plan.model != MODEL:
+        raise JevValidationError("plan model is not the pinned Jev model")
+    if (
+        plan.pricing_version != PRICING_VERSION
+        or plan.input_usd_per_million_tokens != INPUT_USD_PER_MILLION_TOKENS
+        or plan.output_usd_per_million_tokens != OUTPUT_USD_PER_MILLION_TOKENS
+    ):
+        raise JevValidationError("plan pricing reference is not the pinned one")
+    _require_timeout(plan.timeout_seconds)
+    reserve = _bounded_decimal(plan.reserve_usd, "reserve_usd", strictly_positive=True)
+    if (
+        isinstance(plan.request_bytes, bool)
+        or not isinstance(plan.request_bytes, int)
+        or plan.request_bytes < 1
+        or plan.request_bytes > SAFE_MAX_REQUEST_BYTES
+    ):
+        raise JevValidationError("plan request size is outside the permitted range")
+    if not isinstance(plan.request_body, (bytes, bytearray)) or not plan.request_body:
+        raise JevValidationError("plan request body is missing")
+    body = bytes(plan.request_body)
+    if len(body) != plan.request_bytes:
+        raise JevValidationError("plan request size mismatch")
+    if hashlib.sha256(body).hexdigest() != plan.request_sha256:
+        raise JevValidationError("plan request digest mismatch")
+    if not isinstance(plan.request, Mapping):
+        raise JevValidationError("plan request is not an object")
+    try:
+        current = canonical_json(plan.request)
+    except Exception as exc:
+        raise JevValidationError("plan request is not portable JSON") from exc
+    if current != body:
+        raise JevValidationError("plan request was mutated after planning")
+    validate_questions(plan.questions)
+    _check_plan_shape(plan)
+    bound = estimate_cost_bound(plan.request_bytes)
+    bound_amount = _bounded_decimal(
+        plan.cost_upper_bound_usd, "cost_upper_bound_usd"
+    )
+    if Decimal(bound["cost_upper_bound_usd"]) != bound_amount:
+        raise JevValidationError("plan cost bound mismatch")
+    if bound_amount > reserve:
+        raise JevBudgetError("cost upper bound exceeds the reserve")
+    provider = plan.request.get("provider")
+    if plan.server_cap_usd is None:
+        if provider is not None:
+            raise JevValidationError("plan server cap presence mismatch")
+    else:
+        cap = _bounded_decimal(plan.server_cap_usd, "server_cap_usd", strictly_positive=True)
+        if not isinstance(provider, Mapping):
+            raise JevValidationError("plan server cap is missing")
+        max_price = provider.get("max_price")
+        cap_value = max_price.get("request") if isinstance(max_price, Mapping) else None
+        if cap_value != plan.server_cap_usd:
+            raise JevValidationError("plan server cap mismatch")
+        if cap != reserve:
+            raise JevValidationError("plan server cap must equal the reserve")
+    if not plan.supported_question_ids:
+        raise JevValidationError("plan has no supported questions")
+    return plan
 
 
 # --------------------------------------------------------------------------- #
@@ -1106,6 +1430,7 @@ def post_decisions(
         raise JevEndpointError("dispatch is restricted to the documented endpoint")
     if not api_key:
         raise JevCredentialError("a non-empty credential is required")
+    timeout = _require_timeout(timeout)
     request = urllib.request.Request(
         endpoint,
         data=body,
@@ -1230,6 +1555,73 @@ def _blocked(
     )
 
 
+def _submitted_result(
+    plan: DispatchPlan,
+    attempt_no: int,
+    *,
+    status: str,
+    http_status: int | None,
+    code: str,
+    message: str,
+    reported_cost: str | None = None,
+    definitive: bool = False,
+) -> DispatchResult:
+    """A result for a request that **was submitted** (never ``not_incurred``).
+
+    The cost is ``not_incurred`` only for a documented definitive pre-billing
+    rejection (the caller passes ``definitive=True``); a salvageable,
+    independently validated reported cost is ``known``; every other outcome keeps
+    the reserve ``unknown``. The diagnostic text is static (never peer content).
+    """
+    if definitive:
+        cost = _not_incurred_cost(plan.reserve_usd)
+    elif reported_cost is not None:
+        cost = _known_cost(reported_cost, plan.reserve_usd)
+    else:
+        cost = _unknown_cost(plan.reserve_usd)
+    return DispatchResult(
+        status=status,
+        calls_attempted=1,
+        submitted=True,
+        attempt_no=attempt_no,
+        idempotent_admission_proven=False,
+        no_automatic_retry=True,
+        endpoint=plan.endpoint,
+        model=plan.model,
+        actual_model=None,
+        provider=None,
+        response_id=None,
+        usage=None,
+        cost=cost,
+        outcomes=_unsupported_outcomes(plan.questions),
+        http_status=http_status,
+        request_bytes=plan.request_bytes,
+        request_sha256=plan.request_sha256,
+        cost_upper_bound_usd=plan.cost_upper_bound_usd,
+        reserve_usd=plan.reserve_usd,
+        diagnostic=Diagnostic(code=code, detail_redacted=message, raised_at=_utc_now()),
+    )
+
+
+def _best_effort_cost(body_text: object) -> str | None:
+    """Salvage a valid reported cost from any received body, never raising."""
+    try:
+        payload = _parse_json(body_text)
+    except Exception:
+        return None
+    try:
+        return _extract_reported_cost(payload)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _safe_status(response: object) -> int | None:
+    status = getattr(response, "status", None)
+    if isinstance(status, bool) or not isinstance(status, int):
+        return None
+    return status
+
+
 def dispatch_plan(
     plan: DispatchPlan,
     *,
@@ -1240,120 +1632,110 @@ def dispatch_plan(
 ) -> DispatchResult:
     """Execute one planned dispatch. Exactly one POST; never retries.
 
-    Pre-call refusals (endpoint/credential) raise; once the request is submitted,
-    no outcome raises — every result is returned so a possibly-billed call is
-    never reported ``not_incurred``. A server-reported cost is an exact decimal
-    string; an absent one is explicit ``unknown`` with the reserve retained.
+    The plan is re-validated (frozen body bytes, size, digest, bound, positive
+    reserve, server cap, pinned pricing/model/endpoint, bounded timeout, shape);
+    a forged or mutated plan is refused before anything is sent. Pre-call
+    refusals raise; once the request is submitted, **no** outcome raises — every
+    result is returned so a possibly-billed call is never reported
+    ``not_incurred``. A server-reported cost is an exact decimal string; an absent
+    one is explicit ``unknown`` with the reserve retained.
     """
-    if plan.endpoint != ENDPOINT:
-        raise JevEndpointError("dispatch is restricted to the documented endpoint")
+    _revalidate_plan(plan)
     if not api_key:
         raise JevCredentialError("a non-empty credential is required")
-    if isinstance(attempt_no, bool) or not isinstance(attempt_no, int) or attempt_no < 1:
-        raise JevValidationError("attempt_no must be a positive integer")
-
-    body = canonical_json(plan.request)
-    effective_timeout = plan.timeout_seconds if timeout is None else float(timeout)
-    calls_attempted = 1
+    attempt = _require_attempt_no(attempt_no)
+    effective_timeout = (
+        plan.timeout_seconds if timeout is None else _require_timeout(timeout)
+    )
+    body = bytes(plan.request_body)
     try:
         response = transport(
             body, api_key, endpoint=plan.endpoint, timeout=effective_timeout
         )
-    except Exception:  # noqa: BLE001 - MUST NOT escape as not_incurred
-        return DispatchResult(
-            status="transport_error",
-            calls_attempted=calls_attempted,
-            submitted=True,
-            attempt_no=attempt_no,
-            idempotent_admission_proven=False,
-            no_automatic_retry=True,
-            endpoint=plan.endpoint,
-            model=plan.model,
-            actual_model=None,
-            provider=None,
-            response_id=None,
-            usage=None,
-            cost=_unknown_cost(plan.reserve_usd),
-            outcomes=_unsupported_outcomes(plan.questions),
-            http_status=None,
-            request_bytes=plan.request_bytes,
-            request_sha256=plan.request_sha256,
-            cost_upper_bound_usd=plan.cost_upper_bound_usd,
-            reserve_usd=plan.reserve_usd,
-            diagnostic=Diagnostic(
-                code="transport_error",
-                detail_redacted="the request did not complete; billing is ambiguous",
-                raised_at=_utc_now(),
-            ),
-        )
-
-    if response.truncated:
-        return _protocol_error_result(
+    except Exception:  # noqa: BLE001 - a submitted call must not escape as no-call
+        return _submitted_result(
             plan,
-            attempt_no,
-            http_status=response.status,
-            message="response body exceeded the permitted size",
-            reported_cost=None,
+            attempt,
+            status="transport_error",
+            http_status=None,
+            code="transport_error",
+            message="the request did not complete; billing is ambiguous",
+        )
+    try:
+        return _finish_dispatch(plan, response, attempt)
+    except Exception:  # noqa: BLE001 - MUST NOT escape as not_incurred
+        return _submitted_result(
+            plan,
+            attempt,
+            status="protocol_error",
+            http_status=_safe_status(response),
+            code="protocol_error",
+            message="the request was submitted and the response could not be processed",
         )
 
-    if response.status != 200:
-        definitive = response.status not in _API_AMBIGUOUS_STATUSES
-        code, message = _parse_api_error(response.body_text)
-        return DispatchResult(
-            status="api_error",
-            calls_attempted=calls_attempted,
-            submitted=True,
-            attempt_no=attempt_no,
-            idempotent_admission_proven=False,
-            no_automatic_retry=True,
-            endpoint=plan.endpoint,
-            model=plan.model,
-            actual_model=None,
-            provider=None,
-            response_id=None,
-            usage=None,
-            cost=(
-                _not_incurred_cost(plan.reserve_usd)
-                if definitive
-                else _unknown_cost(plan.reserve_usd)
-            ),
-            outcomes={},
-            http_status=response.status,
-            request_bytes=plan.request_bytes,
-            request_sha256=plan.request_sha256,
-            cost_upper_bound_usd=plan.cost_upper_bound_usd,
-            reserve_usd=plan.reserve_usd,
-            diagnostic=Diagnostic(
+
+def _finish_dispatch(
+    plan: DispatchPlan, response: object, attempt_no: int
+) -> DispatchResult:
+    """Classify a received response. Runs entirely after the send boundary."""
+    if not isinstance(response, TransportResponse):
+        return _submitted_result(
+            plan, attempt_no, status="protocol_error", http_status=None,
+            code="protocol_error", message="malformed transport response",
+        )
+    status = response.status
+    if isinstance(status, bool) or not isinstance(status, int):
+        return _submitted_result(
+            plan, attempt_no, status="protocol_error", http_status=None,
+            code="protocol_error", message="malformed transport response",
+        )
+    if not isinstance(response.body_text, str) or not isinstance(response.truncated, bool):
+        return _submitted_result(
+            plan, attempt_no, status="protocol_error", http_status=status,
+            code="protocol_error", message="malformed transport response",
+        )
+    if response.truncated:
+        return _submitted_result(
+            plan, attempt_no, status="protocol_error", http_status=status,
+            code="protocol_error", message="response body exceeded the permitted size",
+            reported_cost=_best_effort_cost(response.body_text),
+        )
+    if status != 200:
+        # Only the documented definitive pre-billing statuses may be
+        # ``not_incurred``; every other non-200 status is ambiguous.
+        if status in _DEFINITIVE_STATUSES:
+            return _submitted_result(
+                plan, attempt_no, status="api_error", http_status=status,
                 code="api_error",
-                detail_redacted=message or "provider rejected the request",
-                raised_at=_utc_now(),
-            ),
+                message=f"http {status}: definitive rejection (not billed)",
+                definitive=True,
+            )
+        return _submitted_result(
+            plan, attempt_no, status="api_error", http_status=status,
+            code="api_error",
+            message=f"http {status}: ambiguous; billing may have occurred",
+            reported_cost=_best_effort_cost(response.body_text),
         )
-
-    # --- post-submission boundary: nothing below may raise ------------------ #
+    # http 200 -> the request was definitively submitted
     try:
         payload = _parse_json(response.body_text)
     except JevProtocolError:
-        return _protocol_error_result(
-            plan,
-            attempt_no,
-            http_status=200,
-            message="response body is not valid JSON",
-            reported_cost=None,
+        return _submitted_result(
+            plan, attempt_no, status="protocol_error", http_status=200,
+            code="protocol_error",
+            message="the request was submitted (http 200) and the response was malformed",
+            reported_cost=_best_effort_cost(response.body_text),
         )
-
     reported_cost = _extract_reported_cost(payload)
     try:
         validated = validate_response(payload, plan.questions)
-    except JevProtocolError as exc:
-        return _protocol_error_result(
-            plan,
-            attempt_no,
-            http_status=200,
-            message=redact_peer_text(exc),
+    except JevProtocolError:
+        return _submitted_result(
+            plan, attempt_no, status="protocol_error", http_status=200,
+            code="protocol_error",
+            message="the request was submitted (http 200) and the response was malformed",
             reported_cost=reported_cost,
         )
-
     cost = (
         _known_cost(validated.cost_usd, plan.reserve_usd)
         if validated.cost_usd is not None
@@ -1361,7 +1743,7 @@ def dispatch_plan(
     )
     return DispatchResult(
         status="completed",
-        calls_attempted=calls_attempted,
+        calls_attempted=1,
         submitted=True,
         attempt_no=attempt_no,
         idempotent_admission_proven=False,
@@ -1381,62 +1763,6 @@ def dispatch_plan(
         reserve_usd=plan.reserve_usd,
         diagnostic=None,
     )
-
-
-def _protocol_error_result(
-    plan: DispatchPlan,
-    attempt_no: int,
-    *,
-    http_status: int,
-    message: str,
-    reported_cost: str | None,
-) -> DispatchResult:
-    cost = (
-        _known_cost(reported_cost, plan.reserve_usd)
-        if reported_cost is not None
-        else _unknown_cost(plan.reserve_usd)
-    )
-    return DispatchResult(
-        status="protocol_error",
-        calls_attempted=1,
-        submitted=True,
-        attempt_no=attempt_no,
-        idempotent_admission_proven=False,
-        no_automatic_retry=True,
-        endpoint=plan.endpoint,
-        model=plan.model,
-        actual_model=None,
-        provider=None,
-        response_id=None,
-        usage=None,
-        cost=cost,
-        outcomes={},
-        http_status=http_status,
-        request_bytes=plan.request_bytes,
-        request_sha256=plan.request_sha256,
-        cost_upper_bound_usd=plan.cost_upper_bound_usd,
-        reserve_usd=plan.reserve_usd,
-        diagnostic=Diagnostic(
-            code="protocol_error",
-            detail_redacted=message,
-            raised_at=_utc_now(),
-        ),
-    )
-
-
-def _parse_api_error(body_text: str) -> tuple[int | None, str]:
-    try:
-        payload = json.loads(body_text)
-    except (ValueError, TypeError):
-        return None, redact_peer_text(body_text) or "unparseable error body"
-    if isinstance(payload, Mapping):
-        error = payload.get("error")
-        if isinstance(error, Mapping):
-            code = error.get("code") if isinstance(error.get("code"), int) else None
-            return code, redact_peer_text(error.get("message", "")) or "no error message"
-        if isinstance(error, str):
-            return None, redact_peer_text(error)
-    return None, redact_peer_text(body_text) or "unrecognized error body"
 
 
 # --------------------------------------------------------------------------- #
@@ -1522,10 +1848,21 @@ def execute(
             endpoint=endpoint,
             model=model,
         )
-    return dispatch_plan(
-        plan,
-        api_key=api_key,
-        attempt_no=attempt_no,
-        timeout=timeout,
-        transport=transport,
-    )
+    try:
+        return dispatch_plan(
+            plan,
+            api_key=api_key,
+            attempt_no=attempt_no,
+            timeout=timeout,
+            transport=transport,
+        )
+    except JevError:
+        # Every ``dispatch_plan`` raise is a pre-call refusal (the send boundary
+        # never raises); report it as a blocked, not-incurred result.
+        return _blocked(
+            questions,
+            code="dispatch_refused",
+            detail="the dispatch was refused before any request was sent",
+            endpoint=endpoint,
+            model=model,
+        )
