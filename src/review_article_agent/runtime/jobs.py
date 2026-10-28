@@ -1003,6 +1003,10 @@ class JobRepository:
           receipt alone is never proof that nothing was dispatched;
         * keeps the **same** ``attempt_id``/``fence`` — no new identity, no new
           reserve, no fence bump;
+        * **durably records the proven-un dispatched proof** by replacing the
+          attempt checkpoint with a ``proven_undispatched`` marker (dropping any
+          continuity/phase), so a queued attempt is never mistaken for
+          potentially-issued remote work that would pin arbitration;
         * clears the job's unresolved bit and returns it to ``queued`` unless the
           job is scheduling-held (``paused``/``cancelled``), whose state is
           preserved (a resume still cannot bypass an explicit pause/cancel).
@@ -1016,17 +1020,23 @@ class JobRepository:
                     f"attempt {attempt_id!r} carries an external admission; it "
                     f"cannot be reopened as an undispatched same attempt."
                 )
-            if attempt.state == "queued":
-                return attempt  # already reopened (idempotent)
-            if attempt.state not in ("interrupted", "ambiguous"):
+            if attempt.state not in ("queued", "interrupted", "ambiguous"):
                 raise JobStateError(
-                    f"attempt {attempt_id!r} is {attempt.state!r}; only an "
-                    f"interrupted/ambiguous undispatched attempt may be reopened."
+                    f"attempt {attempt_id!r} is {attempt.state!r}; only a "
+                    f"queued/interrupted/ambiguous undispatched attempt may be "
+                    f"reopened."
                 )
+            # The trusted proof is recorded here: no continuity id/phase survives,
+            # so the predicate treats the attempt as pinning no external work.
             self._conn().execute(
                 "UPDATE job_attempt SET state = 'queued', outcome_unresolved = 0, "
-                " ended_at_utc = NULL WHERE project_id = ? AND attempt_id = ?",
-                (self.project_id, attempt_id),
+                " ended_at_utc = NULL, checkpoint_json = ? "
+                "WHERE project_id = ? AND attempt_id = ?",
+                (
+                    _json_dumps({"phase": "proven_undispatched"}),
+                    self.project_id,
+                    attempt_id,
+                ),
             )
             self._conn().execute(
                 "UPDATE job SET outcome_unresolved = 0 "

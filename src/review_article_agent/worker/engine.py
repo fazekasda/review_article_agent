@@ -280,6 +280,7 @@ class WorkerEngine:
         self._stopping = False
         self._paused_projects: set[str] = set()
         self._wait_reasons: dict[str, str] = {}
+        self._owner_audit: list[dict[str, Any]] = []
         self._hooks: dict[str, list[Callable[..., None]]] = {
             name: [] for name in FAULT_SEAMS
         }
@@ -530,32 +531,40 @@ class WorkerEngine:
         self._release(project_id)
 
     # -- project-work predicates --------------------------------------------- #
+    def _job_has_potential_remote(self, repo: JobRepository, job: Job) -> bool:
+        """True if ``job`` currently occupies the serial remote slot.
+
+        Counts **attempt-level** unresolved flags (not only the job flag): any
+        unresolved job or attempt, a ``waiting_external`` gate, an
+        admitted/running attempt, or a queued attempt that still carries a
+        continuity checkpoint. A queued attempt marked ``proven_undispatched``
+        (no continuity) is predispatch: by ordering it cannot have been issued.
+        """
+        if job.outcome_unresolved or job.state == "waiting_external":
+            return True
+        for attempt in repo.attempts(job.job_id):
+            if attempt.outcome_unresolved:
+                return True
+            if attempt.state in ("admitted", "running"):
+                return True
+            if (
+                attempt.state == "queued"
+                and self._checkpoint_continuity(attempt) is not None
+            ):
+                return True
+        return False
+
     def _remote_state(self, project_id: str) -> str:
         """Classify a project's potential remote work: ``remote``/``none``/``unreadable``.
 
-        Potential remote work is any **unresolved** job or attempt, a
-        ``waiting_external`` gate, an admitted/running attempt, or a **queued**
-        attempt that already carries a continuity checkpoint (so a dispatch may
-        have been issued). A queued attempt with **no** checkpoint is predispatch:
-        by ordering the request could not have been issued, so it does not pin
-        arbitration. An unreadable store is ``unreadable`` (fail closed at the
-        callers, never silently treated as safe).
+        Fail closed: an unreadable store is ``unreadable`` and is treated as
+        remote by callers rather than silently as safe.
         """
         try:
             with self.open_repository(project_id) as repo:
                 for job in repo.list():
-                    if job.outcome_unresolved or job.state == "waiting_external":
+                    if self._job_has_potential_remote(repo, job):
                         return "remote"
-                    for attempt in repo.attempts(job.job_id):
-                        if attempt.outcome_unresolved:
-                            return "remote"
-                        if attempt.state in ("admitted", "running"):
-                            return "remote"
-                        if (
-                            attempt.state == "queued"
-                            and self._checkpoint_continuity(attempt) is not None
-                        ):
-                            return "remote"
             return "none"
         except (ReviewAgentError, OSError):
             return "unreadable"
@@ -578,12 +587,23 @@ class WorkerEngine:
             return True
         return False
 
-    def _recovery_report(self) -> tuple[list[str], list[str]]:
-        """Return ``(remote_projects, unreadable_projects)`` across all stores."""
+    def _registry_projects(self) -> list[Any] | None:
+        """Return the registered projects, or ``None`` if the registry is unavailable."""
         try:
-            projects = self._registry.list_projects()
+            return self._registry.list_projects()
         except ReviewAgentError:
-            return [], []
+            return None
+
+    def _recovery_report(self) -> tuple[list[str], list[str], bool]:
+        """Return ``(remote_projects, unreadable_projects, registry_available)``.
+
+        ``registry_available`` is ``False`` when the project list cannot be read;
+        callers must then fail closed (block new dispatch) rather than report a
+        clean bill of health.
+        """
+        projects = self._registry_projects()
+        if projects is None:
+            return [], [], False
         remote: list[str] = []
         unreadable: list[str] = []
         for info in projects:
@@ -592,16 +612,22 @@ class WorkerEngine:
                 unreadable.append(info.project_id)
             elif state == "remote":
                 remote.append(info.project_id)
-        return remote, unreadable
+        return remote, unreadable, True
 
     def _new_dispatch_blockers(self, project_id: str) -> dict[str, Any] | None:
         """Return recovery blockers that forbid NEW dispatch for ``project_id``.
 
-        A different store with unresolved remote work — or any unreadable store
-        (which cannot be proven safe) — blocks new dispatch. The project's own
-        remote work is not a blocker (it is reconciled by this engine).
+        A different store with unresolved remote work, any unreadable store
+        (which cannot be proven safe), or an unreadable registry forbids new
+        dispatch. The project's own remote work is not a blocker.
         """
-        remote, unreadable = self._recovery_report()
+        remote, unreadable, available = self._recovery_report()
+        if not available:
+            return {
+                "recovery_projects": [],
+                "unreadable_projects": [],
+                "registry_unavailable": True,
+            }
         other_remote = [pid for pid in remote if pid != project_id]
         if other_remote or unreadable:
             return {
@@ -633,7 +659,7 @@ class WorkerEngine:
             state = "draining"
         else:
             state = "active"
-        remote, unreadable = self._recovery_report()
+        remote, unreadable, available = self._recovery_report()
         return {
             "ok": True,
             "app": APP_NAME,
@@ -645,6 +671,8 @@ class WorkerEngine:
             "paused_projects": sorted(self._paused_projects),
             "recovery_projects": remote,
             "unreadable_projects": unreadable,
+            "registry_available": available,
+            "owner_reconciliations": len(self._owner_audit),
         }
 
     def _op_submit(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -853,12 +881,39 @@ class WorkerEngine:
         ):
             raise _RequestError(ErrorCode.BAD_VALUE)
 
-        # An explicit owner reconcile is an authorized write for the active
-        # project only: another executing project must never be crossed.
+        # Fixed synthetic protocol: an arbitrary/untrusted result payload is
+        # rejected before any write, and no resolution other than
+        # ``accepted_local_result`` may carry result fields at all.
+        result_kind = request.get("result_kind")
+        result = request.get("result")
+        if resolution == "accepted_local_result":
+            result = self._validate_reconcile_result(result_kind, result)
+            result_kind = "synthetic_numeric"
+        else:
+            if result_kind is not None or result is not None:
+                raise _RequestError(ErrorCode.BAD_VALUE)
+
+        # An explicit owner reconcile is a **known-work disposition**. When no
+        # activation is held (e.g. several restored unknown projects), it may
+        # acquire a RECONCILIATION-ONLY activation (immediately draining, so no
+        # new dispatch) for one project while other blockers remain, then release
+        # it. It never crosses or steals another executing project.
         current = self._registry.activation()
+        acquired_token: str | None = None
         if current.state == "none":
-            return self._error(ErrorCode.NOT_ACTIVATED)
-        if current.active_project_id != project_id:
+            try:
+                activated = self._registry.activate_execution(project_id)
+            except ReviewAgentError:
+                return self._error(ErrorCode.WRONG_PROJECT)
+            acquired_token = activated.activation_token
+            try:
+                self._registry.begin_drain(acquired_token)
+            except ReviewAgentError:
+                self._release_token_quiet(acquired_token)
+                return self._error(ErrorCode.WRONG_PROJECT)
+            self._activation = _ActiveExecution(project_id, acquired_token)
+            self._draining = True
+        elif current.active_project_id != project_id:
             return self._error(ErrorCode.WRONG_PROJECT)
 
         try:
@@ -870,18 +925,64 @@ class WorkerEngine:
                         job = repo.reconcile(
                             job_id,
                             resolution=resolution,
-                            result_kind=request.get("result_kind"),
-                            result=request.get("result"),
+                            result_kind=result_kind,
+                            result=result,
                         )
                 except JobError:
                     return self._error(ErrorCode.INVALID_STATE)
                 except ReviewAgentError:
                     return self._error(ErrorCode.WRONG_PROJECT)
-                result = {"ok": True, "job": self._job_dict(repo, job)}
+                payload: dict[str, Any] = {
+                    "ok": True,
+                    "job": self._job_dict(repo, job),
+                    "owner_control": True,
+                }
         except ReviewAgentError as exc:
             raise _RequestError(ErrorCode.BAD_VALUE) from exc
+        finally:
+            if acquired_token is not None:
+                self._release_token_quiet(acquired_token)
+                self._activation = None
+                self._draining = False
+        # Explicit owner control is recorded (in-memory audit; not a scientific
+        # approval and not a durable store in this step).
+        self._owner_audit.append(
+            {
+                "project_id": project_id,
+                "job_id": job_id,
+                "resolution": resolution,
+                "acquired": acquired_token is not None,
+            }
+        )
+        del self._owner_audit[:-100]
         self._maybe_release_active()
-        return result
+        return payload
+
+    def _release_token_quiet(self, token: str) -> None:
+        try:
+            self._registry.release_execution(token)
+        except ReviewAgentError:
+            return
+
+    @staticmethod
+    def _validate_reconcile_result(result_kind: Any, result: Any) -> dict[str, Any]:
+        """Constrain an owner-supplied accepted result to the fixed synthetic shape.
+
+        Exactly ``result_kind == "synthetic_numeric"`` and
+        ``result == {"kind": "synthetic_numeric", "value": <int 0..999999>}``.
+        Any other kind, extra/unknown field, string payload, boolean, or
+        out-of-range value is rejected before any write.
+        """
+        if result_kind != "synthetic_numeric":
+            raise _RequestError(ErrorCode.BAD_VALUE)
+        if not isinstance(result, dict) or set(result) != {"kind", "value"}:
+            raise _RequestError(ErrorCode.BAD_VALUE)
+        if result.get("kind") != "synthetic_numeric":
+            raise _RequestError(ErrorCode.BAD_VALUE)
+        value = result.get("value")
+        if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= 999999):
+            raise _RequestError(ErrorCode.BAD_VALUE)
+        return {"kind": "synthetic_numeric", "value": value}
 
     def _op_drain(self, request: dict[str, Any]) -> dict[str, Any]:
         project_id = self._resolve_project(request)
@@ -911,7 +1012,15 @@ class WorkerEngine:
 
         current = self._registry.activation()
         if current.state == "none":
-            remote, unreadable = self._recovery_report()
+            remote, unreadable, available = self._recovery_report()
+            if not available:
+                return self._blocked(
+                    {
+                        "recovery_projects": [],
+                        "unreadable_projects": [],
+                        "registry_unavailable": True,
+                    }
+                )
             if unreadable:
                 return self._blocked(
                     {"recovery_projects": remote, "unreadable_projects": unreadable}
@@ -958,7 +1067,15 @@ class WorkerEngine:
                 {"recovery_projects": [old_pid], "unreadable_projects": []}
             )
         # No OTHER store may still hold unresolved remote work either.
-        remote, unreadable = self._recovery_report()
+        remote, unreadable, available = self._recovery_report()
+        if not available:
+            return self._blocked(
+                {
+                    "recovery_projects": [old_pid],
+                    "unreadable_projects": [],
+                    "registry_unavailable": True,
+                }
+            )
         other_remote = [pid for pid in remote if pid not in (old_pid, project_id)]
         if other_remote or unreadable:
             return self._blocked(
@@ -1028,8 +1145,8 @@ class WorkerEngine:
         current = self._registry.activation()
         if current.state != "none":
             return
-        remote, unreadable = self._recovery_report()
-        if unreadable or len(remote) != 1:
+        remote, unreadable, available = self._recovery_report()
+        if not available or unreadable or len(remote) != 1:
             return
         project_id = remote[0]
         try:
@@ -1087,18 +1204,28 @@ class WorkerEngine:
             return None
 
     def _plan(self, repo: JobRepository, project_id: str) -> tuple | None:
-        """Pick the next action, separating scheduling from reconciliation.
+        """Pick the next action for the single serial remote executor.
 
-        New dispatch (``claim``/``admit``) is returned only when scheduling is
-        allowed. Reconciliation (``lookup``/``reconcile``) of an already-admitted
-        or interrupted attempt is returned **independently of the job's held
-        state** (paused/cancelled included), so remote work still finishes under
-        an ``allow_draining`` guard while the held state is preserved.
+        One project executes at most one synthetic dispatch at a time. If ANY
+        job currently occupies the serial slot (attempt-level unresolved, an
+        admitted/running attempt, a ``waiting_external`` gate, or a queued
+        attempt that still carries a continuity checkpoint), then **no** new
+        ``claim``/``admit`` is returned for any other job: authorized new jobs may
+        be queued but are not dispatched until the occupying remote is quiesced or
+        given an explicit human disposition.
+
+        Reconciliation (``lookup``/``reconcile``) of an already-admitted or
+        interrupted attempt is returned independently of the job's held state
+        (paused/cancelled included). ``waiting_human``/``waiting_external`` are
+        never polled (no busy loop).
         """
         scheduling = self._scheduling_allowed(project_id)
-        for job in repo.list():
+        jobs = repo.list()
+        occupied = any(self._job_has_potential_remote(repo, job) for job in jobs)
+        for job in jobs:
             if job.state in ("waiting_human", "waiting_external"):
-                # A waiting gate is never polled (no busy loop).
+                # A waiting gate is never polled, but it still occupies the slot
+                # (tracked via ``occupied``) and blocks other dispatch.
                 continue
             attempt = (
                 None
@@ -1109,15 +1236,19 @@ class WorkerEngine:
                 # Attempt-level recovery is independent of the job's held state.
                 return ("reconcile", job, attempt)
             if attempt is not None and attempt.state in ACTIVE_ATTEMPT_STATES:
-                if attempt.state == "queued" and job.state == "queued" and scheduling:
-                    return ("admit", job, attempt)
+                if attempt.state == "queued":
+                    if (
+                        job.state == "queued"
+                        and scheduling
+                        and not occupied
+                    ):
+                        return ("admit", job, attempt)
+                    continue
                 if attempt.state in ("admitted", "running"):
                     return ("lookup", job, attempt)
-                # A queued attempt that may not be admitted now: no action.
-                continue
             if job.state == "reconciliation_required" and attempt is not None:
                 return ("reconcile", job, attempt)
-            if job.state == "queued" and attempt is None and scheduling:
+            if job.state == "queued" and attempt is None and scheduling and not occupied:
                 return ("claim", job, None)
         return None
 

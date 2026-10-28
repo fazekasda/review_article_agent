@@ -25,6 +25,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -33,11 +34,13 @@ import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from review_article_agent.domain.errors import StoreError  # noqa: E402
 from review_article_agent.runtime.ipc import WorkerIPCClient, WorkerIPCServer  # noqa: E402
 from review_article_agent.runtime.jobs import JobStateError  # noqa: E402
 from review_article_agent.storage import Registry, paths  # noqa: E402
@@ -160,6 +163,17 @@ class EngineTestBase(unittest.TestCase):
                     outcome=str(params.get("outcome", "complete")),
                 )
             return job.job_id, attempt.attempt_id
+
+    def _dispatch_count(self) -> int:
+        """Count provider dispatch rows in the synthetic journal (0 if absent)."""
+        path = os.path.join(str(self.data_dir), "runtime", "synthetic.sqlite3")
+        if not os.path.exists(path):
+            return 0
+        conn = sqlite3.connect(path)
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM dispatch").fetchone()[0])
+        finally:
+            conn.close()
 
 
 class ValidationTest(EngineTestBase):
@@ -816,6 +830,271 @@ class SubmitValidationTest(EngineTestBase):
         # No durable job was created for any invalid request.
         with self._repo() as repo:
             self.assertEqual(repo.list(), [])
+
+
+class SerialExecutorTest(EngineTestBase):
+    """One serial remote slot: a new job is not dispatched while another
+    potential remote occupies the slot (task T4-R3 defect 1)."""
+
+    def _settle(self, max_ticks: int = 8) -> None:
+        for _ in range(max_ticks):
+            if self.engine.tick() is None:
+                return
+
+    def test_second_job_not_dispatched_while_first_unresolved(self) -> None:
+        self._activate()
+        first = self._submit_numeric("amb-a", outcome="ambiguous", delay_ms=0)
+        job_a = first["job"]["job_id"]
+        self._settle()
+        with self._repo() as repo:
+            self.assertEqual(repo.get(job_a).state, "waiting_human")
+            self.assertTrue(repo.get(job_a).outcome_unresolved)
+
+        second = self._submit_numeric("complete-b", outcome="complete", delay_ms=0)
+        job_b = second["job"]["job_id"]
+        for _ in range(6):
+            self.engine.tick()
+        with self._repo() as repo:
+            self.assertEqual(len(repo.attempts(job_a)), 1)
+            self.assertEqual(len(repo.attempts(job_b)), 0)  # not claimed/admitted
+        self.assertEqual(self._dispatch_count(), 1)
+        # No busy loop while blocked.
+        self.assertIsNone(self.engine.tick())
+        # Repeated ambiguous jobs cannot add unbounded remote calls.
+        self._submit_numeric("amb-c", outcome="ambiguous", delay_ms=0)
+        for _ in range(6):
+            self.engine.tick()
+        self.assertEqual(self._dispatch_count(), 1)
+
+    def test_second_job_dispatches_after_first_given_disposition(self) -> None:
+        self._activate()
+        first = self._submit_numeric("amb-d", outcome="ambiguous", delay_ms=0)
+        job_a = first["job"]["job_id"]
+        self._settle()
+        self._submit_numeric("complete-e", outcome="complete", delay_ms=0)
+        with self._repo() as repo:
+            job_b = [j for j in repo.list() if j.job_id != job_a][0].job_id
+        resolved = self.engine.handle(
+            _req(
+                "reconcile",
+                project_id=self.project.project_id,
+                job_id=job_a,
+                resolution="definitive_failure",
+            )
+        )
+        self.assertTrue(resolved["ok"])
+        self._drain_engine()
+        with self._repo() as repo:
+            self.assertGreaterEqual(len(repo.attempts(job_b)), 1)
+        self.assertEqual(self._dispatch_count(), 2)
+
+
+class ReconcileResultBoundaryTest(EngineTestBase):
+    """Owner reconcile accepts only the fixed synthetic result shape
+    (task T4-R3 defect 2)."""
+
+    CANARY = "synthetic-secret-canary"
+
+    def _ambiguous(self, request_id: str) -> str:
+        self._activate()
+        submitted = self._submit_numeric(request_id, outcome="ambiguous", delay_ms=0)
+        for _ in range(5):
+            if self.engine.tick() is None:
+                break
+        return submitted["job"]["job_id"]
+
+    def test_arbitrary_result_kind_and_text_are_rejected_and_not_persisted(self) -> None:
+        job_id = self._ambiguous("secret-1")
+        res = self.engine.handle(
+            _req(
+                "reconcile",
+                project_id=self.project.project_id,
+                job_id=job_id,
+                resolution="accepted_local_result",
+                result_kind=self.CANARY,
+                result={"token": self.CANARY},
+            )
+        )
+        self.assertFalse(res["ok"])
+        with self._repo() as repo:
+            self.assertIsNone(repo.accepted_result(job_id))
+        store = paths.store_path_for(
+            self.registry.get(self.project.project_id).root_path
+        )
+        self.assertNotIn(self.CANARY.encode(), Path(store).read_bytes())
+        status = self.engine.handle(
+            _req("job_status", project_id=self.project.project_id, job_id=job_id)
+        )
+        self.assertNotIn(self.CANARY, json.dumps(status))
+
+    def test_only_fixed_synthetic_shape_accepted(self) -> None:
+        job_id = self._ambiguous("shape-1")
+        bad = [
+            ("synthetic_numeric", {"kind": "synthetic_numeric", "value": 1, "extra": 2}),
+            ("synthetic_numeric", {"kind": "synthetic_numeric", "value": "1"}),
+            ("synthetic_numeric", {"kind": "synthetic_numeric", "value": 1_000_000}),
+            ("synthetic_numeric", {"kind": "text", "value": 1}),
+            ("synthetic_numeric", {"kind": "synthetic_numeric"}),
+            ("other", {"kind": "synthetic_numeric", "value": 1}),
+        ]
+        for kind, payload in bad:
+            res = self.engine.handle(
+                _req(
+                    "reconcile",
+                    project_id=self.project.project_id,
+                    job_id=job_id,
+                    resolution="accepted_local_result",
+                    result_kind=kind,
+                    result=payload,
+                )
+            )
+            self.assertFalse(res["ok"], f"{payload!r} should be rejected")
+        good = self.engine.handle(
+            _req(
+                "reconcile",
+                project_id=self.project.project_id,
+                job_id=job_id,
+                resolution="accepted_local_result",
+                result_kind="synthetic_numeric",
+                result={"kind": "synthetic_numeric", "value": 123},
+            )
+        )
+        self.assertTrue(good["ok"])
+        with self._repo() as repo:
+            accepted = repo.accepted_result(job_id)
+        self.assertEqual(accepted.result, {"kind": "synthetic_numeric", "value": 123})
+
+    def test_other_resolutions_reject_result_fields(self) -> None:
+        job_id = self._ambiguous("otherres-1")
+        res = self.engine.handle(
+            _req(
+                "reconcile",
+                project_id=self.project.project_id,
+                job_id=job_id,
+                resolution="definitive_failure",
+                result={"kind": "synthetic_numeric", "value": 1},
+            )
+        )
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["code"], "bad_value")
+
+
+class PredispatchReleaseTest(EngineTestBase):
+    """A proven-undispatched predispatch attempt does not pin arbitration
+    (task T4-R3 defect 3)."""
+
+    def test_paused_predispatch_restart_releases_and_resume_reuses_attempt(self) -> None:
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        job_id, attempt_id = self._simulate_dispatch(
+            request_id="pause-predispatch", admitted=False, steps=6
+        )
+        with self._repo() as repo:
+            repo.pause(job_id)
+
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        self._drive(engine)
+
+        self.assertEqual(self._dispatch_count(), 0)  # zero backend rows
+        with self._repo() as repo:
+            self.assertEqual(repo.attempt(attempt_id).state, "queued")
+            self.assertEqual(repo.get(job_id).state, "paused")
+        # The proven-undispatched attempt released arbitration.
+        self.assertEqual(self.registry.activation().state, "none")
+        # ... so a switch is now allowed.
+        self.assertTrue(
+            engine.handle(_req("switch", project_id=other.project_id))["ok"]
+        )
+        # Switching back and owner-resuming reuses the SAME identity.
+        self.assertTrue(
+            engine.handle(_req("switch", project_id=self.project.project_id))["ok"]
+        )
+        self.assertTrue(
+            engine.handle(_req("resume", project_id=self.project.project_id))["ok"]
+        )
+        self._drive(engine)
+        with self._repo() as repo:
+            job = repo.get(job_id)
+            attempts = repo.attempts(job_id)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].attempt_id, attempt_id)
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(self._dispatch_count(), 1)
+
+
+class MultipleUnknownReconcileTest(EngineTestBase):
+    """Owner can reconcile each restored-unknown project in turn
+    (task T4-R3 defect 4)."""
+
+    def _restore_admitted(self, project_id: str, request_id: str) -> str:
+        with self.engine.open_repository(project_id) as repo:
+            job = repo.submit(
+                request_id, task_kind=SYNTHETIC_NUMERIC_TASK,
+                parameters=self._params(),
+            )
+            attempt = repo.begin_attempt(
+                job.job_id, dispatch_kind="external_synthetic",
+                stage="s", reserve_usd="0.10",
+            )
+            repo.mark_admitted(attempt.attempt_id, admission_id="adm-" + attempt.attempt_id)
+            return job.job_id
+
+    def test_owner_can_reconcile_each_unknown_project_in_turn(self) -> None:
+        other = self.registry.create_project(self.tmp / "b", name="B")
+        job_a = self._restore_admitted(self.project.project_id, "mu-a")
+        job_b = self._restore_admitted(other.project_id, "mu-b")
+
+        engine = self._new_engine()
+        engine.reconcile_startup()
+        self.assertEqual(self.registry.activation().state, "none")
+        # Both new-dispatch and switch routes are blocked.
+        self.assertFalse(_submit_to(engine, self.project.project_id, "blocked-1")["ok"])
+        self.assertFalse(
+            engine.handle(_req("switch", project_id=other.project_id))["ok"]
+        )
+        # Owner reconciles A, then B — each acquiring a reconciliation-only
+        # activation that is released again.
+        first = engine.handle(
+            _req(
+                "reconcile",
+                project_id=self.project.project_id,
+                job_id=job_a,
+                resolution="definitive_failure",
+            )
+        )
+        self.assertTrue(first["ok"])
+        self.assertTrue(first["owner_control"])
+        self.assertEqual(self.registry.activation().state, "none")
+        second = engine.handle(
+            _req(
+                "reconcile",
+                project_id=other.project_id,
+                job_id=job_b,
+                resolution="definitive_failure",
+            )
+        )
+        self.assertTrue(second["ok"])
+        self.assertEqual(self.registry.activation().state, "none")
+        # No new backend calls were made to resolve the unknown projects.
+        self.assertEqual(self._dispatch_count(), 0)
+        # With both resolved, new dispatch is allowed again.
+        self.assertTrue(_submit_to(engine, self.project.project_id, "after-1")["ok"])
+
+
+class RegistryUnavailableTest(EngineTestBase):
+    def test_registry_list_failure_blocks_new_dispatch(self) -> None:
+        self._activate()
+        with mock.patch.object(
+            self.engine._registry, "list_projects", side_effect=StoreError("boom")
+        ):
+            status = self.engine.handle(_req("status"))
+            self.assertFalse(status["registry_available"])
+            res = self._submit_numeric("reg-1")
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["code"], "switch_blocked")
+            self.assertTrue(res["registry_unavailable"])
+        # A readable registry again allows dispatch.
+        self.assertTrue(self._submit_numeric("reg-2")["ok"])
 
 
 class DetachedEntrypointTest(EngineTestBase):
