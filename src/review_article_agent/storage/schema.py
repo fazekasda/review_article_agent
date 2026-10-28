@@ -42,7 +42,7 @@ Migration = Callable[[sqlite3.Connection], None]
 # --------------------------------------------------------------------------- #
 # Per-project store schema
 # --------------------------------------------------------------------------- #
-STORE_SCHEMA_VERSION = 3
+STORE_SCHEMA_VERSION = 4
 
 #: Registry maps project IDs to names and locations, records the single
 #: *selected* project, and records durable **execution activation** (which
@@ -333,10 +333,178 @@ def _store_v3(conn: sqlite3.Connection) -> None:
         )
 
 
+def _store_v4(conn: sqlite3.Connection) -> None:
+    """Add the durable synthetic job/attempt/budget tables (C02 §5.6/§6.3/§8).
+
+    These tables back the Step 03 durable worker's ``runtime/jobs.py``:
+    per-project **synthetic** jobs and dispatch attempts, an at-most-once
+    accepted-result row keyed by the attempt's *fence*, and the exact-decimal
+    budget reserves recorded **before** a synthetic external dispatch is
+    admitted (``reserve before dispatch``, C02 §5.6/§6.3).
+
+    Only new tables and triggers are added; migration 1/2/3 rows (project
+    identity, artifacts, revisions, rights, dependencies, import requests, and
+    fixture approvals) are never rewritten, so their exact bytes/refs are
+    preserved across the upgrade (``ARCH-ASSETS``; step doc line 21).
+
+    Design notes enforced at the database:
+
+    * **Job identity is explicit and idempotent.** ``job_id`` is derived from
+      ``(project_id, request_id)`` and ``UNIQUE(project_id, request_id)`` makes
+      a repeated submit with the same request key return the same single row.
+    * **Fencing.** ``job.current_fence`` is the highest fence issued for a job;
+      ``job_attempt`` rows are unique per ``(job, fence)`` and per
+      ``(job, attempt_no)``. Accepting a result only ever writes through the
+      *current* fence.
+    * **At-most-once accepted result.** ``job_accepted_result`` is unique per
+      ``(job, fence)`` **and** per logical job, and is immutable (never
+      ``UPDATE``d/``DELETE``d) so a stale attempt cannot overwrite a newer
+      authorized result (C02 §8.2/§8.3).
+    * **Reserve before dispatch.** ``job_budget_reserve`` holds exact-decimal
+      reserve amounts; a reserve is retained (never zeroed) until an explicit
+      settlement replaces it, so an ``unknown`` cost keeps its reserve
+      (C02 §5.6/§6.3).
+    """
+    conn.execute(
+        """
+        CREATE TABLE job (
+            project_id         TEXT NOT NULL,
+            job_id             TEXT NOT NULL,
+            request_id         TEXT NOT NULL,
+            fingerprint        TEXT NOT NULL,
+            task_kind          TEXT NOT NULL,
+            parameters_json    TEXT NOT NULL,
+            state              TEXT NOT NULL CHECK (state IN (
+                'queued', 'admitted', 'running', 'waiting_human',
+                'waiting_external', 'paused', 'cancelled', 'completed',
+                'failed', 'interrupted', 'reconciliation_required')),
+            outcome_unresolved INTEGER NOT NULL DEFAULT 0
+                               CHECK (outcome_unresolved IN (0, 1)),
+            resume_state       TEXT,
+            current_attempt_id TEXT,
+            current_fence      INTEGER NOT NULL DEFAULT 0,
+            attempts_total     INTEGER NOT NULL DEFAULT 0,
+            retries_used       INTEGER NOT NULL DEFAULT 0,
+            accepted_fence     INTEGER,
+            created_at_utc     TEXT NOT NULL,
+            updated_at_utc     TEXT NOT NULL,
+            PRIMARY KEY (project_id, job_id),
+            UNIQUE (project_id, request_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE job_attempt (
+            project_id         TEXT NOT NULL,
+            attempt_id         TEXT NOT NULL,
+            job_id             TEXT NOT NULL,
+            fence              INTEGER NOT NULL,
+            attempt_no         INTEGER NOT NULL,
+            dispatch_kind      TEXT NOT NULL CHECK (dispatch_kind IN (
+                'local', 'external_synthetic')),
+            state              TEXT NOT NULL CHECK (state IN (
+                'queued', 'admitted', 'running', 'succeeded',
+                'definitive_failure', 'ambiguous', 'interrupted')),
+            prior_outcome      TEXT NOT NULL CHECK (prior_outcome IN (
+                'none', 'definitive_failure', 'ambiguous', 'succeeded',
+                'interrupted')),
+            retry_authorized_by TEXT,
+            outcome_unresolved INTEGER NOT NULL DEFAULT 0
+                               CHECK (outcome_unresolved IN (0, 1)),
+            admission_id       TEXT,
+            external_ref       TEXT,
+            checkpoint_json    TEXT,
+            reserve_usd        TEXT,
+            cost_state         TEXT NOT NULL DEFAULT 'not_incurred',
+            cost_amount_usd    TEXT,
+            started_at_utc     TEXT NOT NULL,
+            ended_at_utc       TEXT,
+            PRIMARY KEY (project_id, attempt_id),
+            UNIQUE (project_id, job_id, fence),
+            UNIQUE (project_id, job_id, attempt_no),
+            FOREIGN KEY (project_id, job_id)
+                REFERENCES job (project_id, job_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE job_accepted_result (
+            project_id     TEXT NOT NULL,
+            job_id         TEXT NOT NULL,
+            attempt_id     TEXT NOT NULL,
+            fence          INTEGER NOT NULL,
+            result_kind    TEXT NOT NULL,
+            result_json    TEXT NOT NULL,
+            result_digest  TEXT NOT NULL,
+            accepted_at_utc TEXT NOT NULL,
+            PRIMARY KEY (project_id, job_id, fence),
+            UNIQUE (project_id, job_id),
+            FOREIGN KEY (project_id, job_id)
+                REFERENCES job (project_id, job_id),
+            FOREIGN KEY (project_id, attempt_id)
+                REFERENCES job_attempt (project_id, attempt_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE job_budget_policy (
+            project_id       TEXT PRIMARY KEY,
+            project_cap_usd  TEXT NOT NULL,
+            stage_cap_usd    TEXT NOT NULL,
+            updated_at_utc   TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE job_budget_reserve (
+            project_id     TEXT NOT NULL,
+            reserve_id     TEXT NOT NULL,
+            job_id         TEXT NOT NULL,
+            attempt_id     TEXT,
+            stage          TEXT NOT NULL,
+            amount_usd     TEXT NOT NULL,
+            state          TEXT NOT NULL CHECK (state IN (
+                'held', 'retained', 'settled')),
+            created_at_utc TEXT NOT NULL,
+            PRIMARY KEY (project_id, reserve_id),
+            FOREIGN KEY (project_id, job_id)
+                REFERENCES job (project_id, job_id)
+        )
+        """
+    )
+
+    # The accepted result is the *fenced* exactly-once local write: once written
+    # it can never be rewritten or removed, so a later (even newer-fenced)
+    # attempt cannot overwrite an already-authorized result (C02 §8.2/§8.3).
+    conn.execute(
+        """
+        CREATE TRIGGER job_accepted_result_no_update
+        BEFORE UPDATE ON job_accepted_result
+        BEGIN
+            SELECT RAISE(ABORT, 'job_accepted_result rows are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER job_accepted_result_no_delete
+        BEFORE DELETE ON job_accepted_result
+        BEGIN
+            SELECT RAISE(ABORT, 'job_accepted_result rows are immutable');
+        END
+        """
+    )
+
+
 STORE_MIGRATIONS: Mapping[int, Migration] = {
     1: _store_v1,
     2: _store_v2,
     3: _store_v3,
+    4: _store_v4,
 }
 
 
