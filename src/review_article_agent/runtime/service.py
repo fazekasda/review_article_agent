@@ -10,8 +10,8 @@ a process whose Linux identity it owns.
 
 Authoritative sources (read-only):
 
-* ``docs/implementation/04-agent-runtime.md`` deliverables 1/4 and the
-  handoff note ("Document actual API/SDK versions, adapter contracts, …").
+* ``docs/implementation/04-agent-runtime.md`` deliverables 1/4 and the handoff
+  note ("Document actual API/SDK versions, adapter contracts, …").
 * ``docs/specification.md`` lines 14-16 (app-owned OpenCode V2 service, separate
   from ordinary coding sessions; do not depend on OpenCode's private database or
   parse private credentials) and line 62 (documents/model outputs are untrusted
@@ -25,35 +25,62 @@ Authoritative sources (read-only):
   service registration, and ownership/``/proc``-identity guards. The harness is
   a **reference**: this module does not import it and never calls it at runtime.
 
+Trust boundary (repair R1)
+--------------------------
+
+The first revision copied the *disposable harness*' blanket protection of the
+whole of ``$HOME/.local``, ``$HOME/.config`` and ``$HOME/.cache``. That made the
+product's own XDG default data directory
+(``~/.local/share/review_article_agent``) unusable. This revision instead:
+
+* allows any **private, explicit** data directory, including the XDG default,
+  and protects only the *ordinary* OpenCode locations specifically
+  (``~/.config/opencode``, ``~/.local/{share,state}/opencode``,
+  ``~/.cache/opencode``, ``~/.opencode``), plus ``/etc``, ``/usr`` and ``/var``;
+* treats an inherited directory as a configuration **risk** only when it
+  actually carries configuration/instructions/plugins (an ``opencode.json(c)``,
+  ``AGENTS.md``, or an ``agents``/``skills``/``plugins``/``commands`` subdir). An
+  empty scratch directory such as a user's ``~/.opencode/plan`` contributes
+  nothing and is not a blocker;
+* ``lstat``-checks every path it manages (``data_dir``, root, ``home``, ``run``,
+  ``config``, ``projects``, locations, lock, marker, secret, records) and refuses
+  a symlink or a shared/foreign path **before** reading, chmod-ing, writing, or
+  signalling — it never follows an internal symlink and never chmods a foreign
+  directory;
+* requires an existing non-empty root to carry a correct marker
+  (``markerVersion`` + canonical ``root`` + ``ownerUid`` + non-empty
+  ``instanceId``) whose file is owned by the current user and is not a symlink.
+
 What this manager owns and does **not** own
 -------------------------------------------
 
 Owned here: the private tree, the ownership marker, the run records, the child
 process family, the HTTP Basic secret, and the *lifecycle* verbs ``start``,
-``status``, ``stop``, ``restart``. Nothing else is discovered or started
-automatically: there is **no** call to OpenCode's shared-service registration and
-**no** ``opencode service …`` invocation. A caller asks this manager to start;
-the manager never hunts the machine for an instance.
+``status``, ``stop``, ``restart``, plus ``location_for``. Nothing else is
+discovered or started automatically: there is **no** call to OpenCode's shared
+service registration and **no** ``opencode service …`` invocation. A caller asks
+this manager to start; the manager never hunts the machine for an instance.
 
 Deliberately **not** here: any model or provider call, any prompt/turn
 submission, any scientific decision, any approval, and any access to OpenCode's
-private database or its ordinary ``~/.local/state/opencode/service.json``
-registration. The only HTTP this module performs is a bounded readiness
-``GET /api/info`` and a config-source ``GET /api/config``; no session is created
-here. The connection parameters a future client needs (loopback URL, Basic user,
-the mode-0600 password file) are exposed safely — the secret itself is never
-placed in a config, a ledger, a log, an exception, or a ``repr``.
+private database or its ordinary shared-service registration file. The only HTTP
+this module performs is a bounded ``GET /api/info`` and ``GET /api/config``; no
+session is created here. The connection parameters a future client needs
+(loopback URL, Basic user, the mode-0600 password file) are exposed safely — the
+secret itself is never placed in a config, a ledger, a log, an exception, or a
+``repr``.
 
 Security boundary (do not overclaim)
 ------------------------------------
 
 OpenCode and this application run as the **same** user, so the environment scrub,
 the owner-only tree, the allowlisted child environment, the provider deny
-policies, and the identity-checked signalling are *lifecycle and configuration
-containment*, not a same-UID OS sandbox. A caller that already controls the user
-could defeat them. The generated ``permissions``/``policies`` are the same
-**model tool boundary** documented by :mod:`…runtime.roles`; they are not a proof
-against a compromised OpenCode process.
+policies, the identity-checked signalling, and the effective-config check are
+*lifecycle and configuration containment*, not a same-UID OS sandbox. A caller
+that already controls the user could defeat them. The generated
+``permissions``/``policies`` are the same **model tool boundary** documented by
+:mod:`…runtime.roles`; they are not a proof against a compromised OpenCode
+process.
 """
 
 from __future__ import annotations
@@ -63,12 +90,14 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import time
 import urllib.error
@@ -117,21 +146,34 @@ LOCATION_MARKER_NAME = ".location-owned.json"
 LOCATION_MARKER_KIND = "app-owned-review-agent-opencode-location"
 LOCATION_MARKER_VERSION = 1
 PID_RECORD_NAME = "instance.pid.json"
+PID_RECORD_VERSION = 1
 DESCRIPTOR_NAME = "instance.json"
 DESCRIPTOR_VERSION = 1
 DESCRIPTOR_KIND = "app-owned-review-agent-opencode-service"
 
-#: Bounded lifecycle deadlines (seconds).
+#: Bounded lifecycle deadlines (seconds). Every externally supplied timeout must
+#: be a finite number inside these bounds (``NaN``/``inf`` are refused).
 DEFAULT_START_TIMEOUT_S = 30.0
 DEFAULT_STOP_TIMEOUT_S = 15.0
 DEFAULT_LOCK_TIMEOUT_S = 20.0
+MIN_LIFECYCLE_TIMEOUT_S = 0.05
+MAX_LIFECYCLE_TIMEOUT_S = 600.0
 _PROBE_TIMEOUT_S = 3.0
 _PROBE_INTERVAL_S = 0.2
 _TERM_POLL_S = 0.15
 
+#: Bounds for on-disk records and HTTP bodies, and strict-JSON depth.
+MAX_RECORD_BYTES = 262_144
+MAX_HTTP_BODY_BYTES = 4_194_304
+MAX_JSON_DEPTH = 64
+
+#: The (*only*) HTTP paths this manager will request.
+_ALLOWED_PROBE_PATHS: frozenset[str] = frozenset({"/api/info", "/api/config"})
+
 #: The (*only*) provider credential environment variable names that may be
 #: supplied explicitly and injected into the child. Values are **never** written
-#: to the config or the ledger; only the names are recorded.
+#: to the config or the ledger; only the names (and a non-secret name fence) are
+#: recorded.
 KNOWN_PROVIDER_ENV_NAMES: frozenset[str] = frozenset(
     {
         "ANTHROPIC_API_KEY",
@@ -149,18 +191,36 @@ KNOWN_PROVIDER_ENV_NAMES: frozenset[str] = frozenset(
     }
 )
 
-#: Ancestor entries that would let OpenCode discover *unowned* configuration,
-#: instructions, or plugin directories for the child. Refused outright.
-_INHERITED_NAMES: tuple[str, ...] = (
-    "opencode.json",
-    "opencode.jsonc",
-    "AGENTS.md",
-    ".opencode",
+#: Configuration/instruction documents that make a directory an inheritance
+#: risk. Checked directly in every ancestor and in every inherited source
+#: directory.
+_INHERITED_DOCS: tuple[str, ...] = ("opencode.json", "opencode.jsonc", "AGENTS.md")
+
+#: Subdirectories that OpenCode loads as agents/skills/plugins/commands. Present
+#: in an ancestor or inherited ``.opencode`` they are an inheritance risk.
+_INHERITED_SUBDIRS: tuple[str, ...] = (
+    "agents",
+    "agent",
+    "skills",
+    "plugins",
+    "plugin",
+    "commands",
+    "command",
 )
 
-#: Machine/system configuration directories that a freshly-started server reads
-#: regardless of ``HOME``/``XDG_*``. Refused when present (Linux system dir plus
-#: the macOS managed directory, which is inert on Linux).
+#: OpenCode's project-source directory name.
+_OPENCODE_SOURCE_DIRNAME = ".opencode"
+
+#: Every entry name this manager treats as a configuration/instruction/plugin
+#: risk inside a directory it owns (the one exception is the manager's own
+#: generated config file, byte-compared).
+_RISK_ENTRY_NAMES: frozenset[str] = frozenset(
+    _INHERITED_DOCS + (_OPENCODE_SOURCE_DIRNAME,) + _INHERITED_SUBDIRS
+)
+
+#: Machine/system configuration directories a fresh server reads regardless of
+#: ``HOME``/``XDG_*``. Refused when present (Linux system dir plus the macOS
+#: managed directory, which is inert on Linux).
 _SYSTEM_CONFIG_DIRS: tuple[str, ...] = (
     "/etc/opencode",
     "/Library/Application Support/opencode",
@@ -170,6 +230,24 @@ _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _FIXTURE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _ordinary_opencode_paths() -> tuple[str, ...]:
+    """The **ordinary** OpenCode locations the app-owned tree must never touch.
+
+    Deliberately specific rather than a blanket ``$HOME/.local`` block, so the
+    product's own XDG default (``~/.local/share/review_article_agent``) remains a
+    supported data directory.
+    """
+    home = os.path.expanduser("~")
+    return (
+        os.path.join(home, ".config", "opencode"),
+        os.path.join(home, ".local", "share", "opencode"),
+        os.path.join(home, ".local", "state", "opencode"),
+        os.path.join(home, ".cache", "opencode"),
+        os.path.join(home, ".opencode"),
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Curated, static error messages (never interpolate a secret or external value)
@@ -181,6 +259,10 @@ _MSG_PROVIDER_ENV = (
     "to a non-empty string value."
 )
 _MSG_DATA_DIR = "The service data directory must be an absolute path."
+_MSG_DATA_DIR_UNSAFE = (
+    "The service data directory is a symlink, is not a directory, is owned by "
+    "another user, or is writable by other users."
+)
 _MSG_ROOT_SYMLINK = "The app-owned service root must not be a symbolic link."
 _MSG_ROOT_UNSAFE = "The app-owned service root is not a safe, owner-only location."
 _MSG_ROOT_INHERITED = (
@@ -192,6 +274,18 @@ _MSG_ROOT_UNOWNED = (
     "refusing to use or modify it."
 )
 _MSG_ROOT_NOT_DIR = "The app-owned service root exists and is not a directory."
+_MSG_DIR_UNSAFE = (
+    "An internal service directory is a symlink, is not a directory, or is not "
+    "owned by this application; refusing to follow or modify it."
+)
+_MSG_TREE_DIRTY = (
+    "The app-owned tree contains unowned configuration, instructions, or plugin "
+    "entries; refusing to start."
+)
+_MSG_BAD_TIMEOUT = (
+    "Lifecycle timeouts must be finite numbers within the supported bounds."
+)
+_MSG_BAD_PORT = "An explicit port must be an integer between 1 and 65535."
 _MSG_BINARY = "No executable opencode binary was found (supply an explicit path)."
 _MSG_BINARY_VERSION = (
     "The opencode binary version does not match the pinned version this "
@@ -201,6 +295,14 @@ _MSG_SERVER_VERSION = (
     "The running OpenCode server reported a version that does not match the "
     "pinned version; refusing to use it."
 )
+_MSG_SERVER_PID = (
+    "The running OpenCode server did not report the owned child's process id; "
+    "refusing to accept it."
+)
+_MSG_SERVER_CONFIG = (
+    "The running OpenCode server's effective configuration is not exactly this "
+    "manager's own; refusing to accept it."
+)
 _MSG_LOCK_TIMEOUT = (
     "Another lifecycle operation holds the singleton lock for this data "
     "directory; timed out without changing state."
@@ -208,7 +310,8 @@ _MSG_LOCK_TIMEOUT = (
 _MSG_LOCK_ERROR = "The singleton service lock could not be acquired."
 _MSG_CONFLICTING_CONFIG = (
     "A service instance is already running for this data directory with a "
-    "different configuration; refusing to start a conflicting instance."
+    "different configuration or credential context; refusing to start a "
+    "conflicting instance (call restart to adopt a new context)."
 )
 _MSG_FOREIGN_PROCESS = (
     "The recorded process does not match this instance's identity; refusing to "
@@ -216,6 +319,15 @@ _MSG_FOREIGN_PROCESS = (
 )
 _MSG_STOP_FOREIGN = (
     "A process is recorded that this manager does not own; refusing to stop it."
+)
+_MSG_NO_RECORD = "No process record is available for this instance."
+_MSG_INVALID_RECORD = (
+    "The recorded process state is unreadable or tampered; refusing to treat it "
+    "as absent."
+)
+_MSG_STILL_ALIVE = (
+    "The owned process did not exit within the stop deadline; refusing to "
+    "report it stopped or to clear its records."
 )
 _MSG_START_FAILED = "The OpenCode server did not become ready within the deadline."
 _MSG_START_EXITED = "The OpenCode server process exited during startup."
@@ -227,11 +339,17 @@ _MSG_LOCATION_UNOWNED = (
 _MSG_LOCATION_NOT_DIR = "A project location exists and is not a directory."
 _MSG_NOT_OWNED_STOP = "The service root is not owned by this application; refusing to stop."
 _MSG_PROBE = "The service did not answer a bounded readiness request."
+_MSG_PROBE_ORIGIN = "A readiness request was refused (origin, path, or redirect)."
+_MSG_PROBE_BODY = "A readiness response was not bounded, strict JSON."
 _MSG_FIXTURE = (
     "A fixture provider is accepted only as a loopback OpenAI-compatible "
     "endpoint with a fixed safe package."
 )
 _MSG_NO_SECRET = "No service secret is recorded for this instance."
+_MSG_CONFIG_DRIFT = (
+    "The generated configuration no longer matches its recorded bytes; refusing "
+    "to write or use a drifted configuration."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,7 +371,7 @@ class ServiceError(ReviewAgentError):
 
 
 class ServiceConfigError(ServiceError):
-    """A manager input (role configuration, provider env, fixture) is invalid."""
+    """A manager input (role configuration, provider env, fixture, knob) is invalid."""
 
 
 class ServiceOwnershipError(ServiceError):
@@ -261,7 +379,7 @@ class ServiceOwnershipError(ServiceError):
 
 
 class ServiceProcessError(ServiceError):
-    """A recorded process is foreign, stale, or not the owned instance."""
+    """A recorded process is foreign, stale, invalid, or not the owned instance."""
 
 
 class ServiceVersionError(ServiceError):
@@ -297,30 +415,189 @@ def _paths_overlap(a: str, b: str) -> bool:
     return a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep)
 
 
-def _atomic_write(path: Path, data: bytes, mode: int) -> None:
-    """Write ``data`` to ``path`` atomically with ``mode`` (owner-only default)."""
-    directory = path.parent
-    tmp = directory / f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+def _is_within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + os.sep)
+
+
+def _validate_timeout(name: str, value: object) -> float:
+    """Return a finite, bounded timeout or raise a redacted error."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ServiceConfigError(name, _MSG_BAD_TIMEOUT)
+    number = float(value)
+    if not math.isfinite(number) or number < MIN_LIFECYCLE_TIMEOUT_S or number > MAX_LIFECYCLE_TIMEOUT_S:
+        raise ServiceConfigError(name, _MSG_BAD_TIMEOUT)
+    return number
+
+
+def _validate_port(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ServiceConfigError("port", _MSG_BAD_PORT)
+    if value < 1 or value > 65535:
+        raise ServiceConfigError("port", _MSG_BAD_PORT)
+    return value
+
+
+def _lstat(path: str) -> os.stat_result | None:
     try:
-        os.write(fd, data)
+        return os.lstat(path)
+    except OSError:
+        return None
+
+
+def _file_bytes_strict(path: str, *, max_bytes: int) -> bytes | None:
+    """Bounded read of a regular, non-symlink file owned by this user."""
+    st = _lstat(path)
+    if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_uid != os.getuid() or st.st_size > max_bytes:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(max_bytes + 1)
+    except OSError:
+        return None
+    if len(data) > max_bytes:
+        return None
+    return data
+
+
+def _dir_has_risk(path: str) -> bool:
+    """True when ``path`` carries configuration/instructions/plugins.
+
+    A directory is only a *risk* when it actually contributes config: a config
+    document, or an agents/skills/plugins/commands subdirectory. An empty scratch
+    directory contributes nothing and is not a blocker.
+    """
+    st = _lstat(path)
+    if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        # A missing / non-directory / symlinked entry is suspicious: treat as risk.
+        return st is not None
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return True
+    for name in names:
+        if name in _INHERITED_DOCS:
+            return True
+        if name in _INHERITED_SUBDIRS:
+            child = os.path.join(path, name)
+            child_st = _lstat(child)
+            if child_st is not None and stat.S_ISDIR(child_st.st_mode):
+                return True
+    return False
+
+
+def _atomic_write(path: Path, data: bytes, mode: int) -> None:
+    """Write ``data`` to ``path`` atomically, owner-only, fsyncing the directory.
+
+    Refuses to follow a symlink at the target, loops over short writes, fsyncs
+    the file and the containing directory, and never leaves a temp file behind.
+    """
+    target = str(path)
+    if os.path.lexists(target):
+        st = _lstat(target)
+        if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.ELOOP, "refusing to replace a non-regular or symlinked path")
+    directory = str(path.parent)
+    tmp = os.path.join(directory, f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        view = memoryview(data)
+        offset = 0
+        while offset < len(view):
+            offset += os.write(fd, view[offset:])
         os.fsync(fd)
     finally:
         os.close(fd)
     try:
-        os.replace(str(tmp), str(path))
+        os.replace(tmp, target)
     except OSError:
         try:
-            os.unlink(str(tmp))
+            os.unlink(tmp)
         except OSError:
             pass
         raise
-    os.chmod(str(path), mode)
+    os.chmod(target, mode)
+    try:
+        dirfd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    except OSError:
+        pass
 
 
-def _read_json(path: Path) -> Any:
-    with open(str(path), "rb") as handle:
-        return json.loads(handle.read().decode("utf-8"))
+# --------------------------------------------------------------------------- #
+# Strict, bounded JSON
+# --------------------------------------------------------------------------- #
+
+
+def _reject_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON value {value!r} is not allowed")
+
+
+def _strict_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number {text!r} is not allowed")
+    return value
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: set[str] = set()
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON key {key!r} is not allowed")
+        seen.add(key)
+        result[key] = value
+    return result
+
+
+def _check_json_depth(obj: Any, limit: int) -> None:
+    stack: list[tuple[Any, int]] = [(obj, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            if depth > limit:
+                raise ValueError("JSON nesting too deep")
+            for value in node.values():
+                stack.append((value, depth + 1))
+        elif isinstance(node, list):
+            if depth > limit:
+                raise ValueError("JSON nesting too deep")
+            for value in node:
+                stack.append((value, depth + 1))
+
+
+def _strict_json(payload: bytes, *, max_depth: int = MAX_JSON_DEPTH) -> Any:
+    """Decode bounded ``payload`` as strict JSON, rejecting every ambiguity."""
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("not valid UTF-8") from exc
+    try:
+        obj = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+            parse_float=_strict_float,
+        )
+    except RecursionError as exc:
+        raise ValueError("JSON nested too deeply") from exc
+    _check_json_depth(obj, max_depth)
+    return obj
+
+
+def _read_bounded_json(path: Path, *, max_bytes: int = MAX_RECORD_BYTES) -> Any:
+    """Read a regular, owned, non-symlink file as bounded strict JSON."""
+    data = _file_bytes_strict(str(path), max_bytes=max_bytes)
+    if data is None:
+        raise ValueError("record is not a readable regular owned file")
+    return _strict_json(data)
 
 
 def _free_loopback_port() -> int:
@@ -348,7 +625,7 @@ def _pid_alive(pid: int) -> bool:
     return fields[0] != "Z"
 
 
-def _proc_starttime(pid: int) -> str | None:
+def _proc_field(pid: int, index: int) -> str | None:
     try:
         with open(f"/proc/{pid}/stat", "rb") as handle:
             raw = handle.read().decode("utf-8", "replace")
@@ -358,11 +635,14 @@ def _proc_starttime(pid: int) -> str | None:
     if close < 0:
         return None
     fields = raw[close + 1 :].split()
-    # After "pid (comm) " the fields begin at ``state`` (overall field 3), so the
-    # overall field 22 (``starttime``) is index 19 here.
-    if len(fields) <= 19:
+    # After "pid (comm) " the fields begin at ``state`` (overall field 3).
+    if len(fields) <= index:
         return None
-    return fields[19]
+    return fields[index]
+
+
+def _proc_starttime(pid: int) -> str | None:
+    return _proc_field(pid, 19)  # overall field 22
 
 
 def _proc_exe(pid: int) -> str | None:
@@ -396,6 +676,50 @@ def _proc_environ(pid: int) -> dict[str, str]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Bounded, proxy-free, redirect-free loopback HTTP
+# --------------------------------------------------------------------------- #
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: a redirect must never carry the Basic secret."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _build_loopback_opener() -> urllib.request.OpenerDirector:
+    # An empty ProxyHandler disables environment proxies entirely, so the Basic
+    # credential can never be forwarded to a proxy.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _RefuseRedirects(),
+    )
+
+
+_LOOPBACK_OPENER = _build_loopback_opener()
+
+
+def _validate_probe_url(url: str, path: str) -> str:
+    """Return ``url + path`` only for an exact loopback origin and known path."""
+    if not isinstance(url, str) or not isinstance(path, str) or path not in _ALLOWED_PROBE_PATHS:
+        raise ServiceProcessError("probe_path", _MSG_PROBE_ORIGIN)
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname != SERVICE_HOST:
+        raise ServiceProcessError("probe_origin", _MSG_PROBE_ORIGIN)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ServiceProcessError("probe_origin", _MSG_PROBE_ORIGIN)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ServiceProcessError("probe_origin", _MSG_PROBE_ORIGIN) from exc
+    if port is None or not (1 <= port <= 65535):
+        raise ServiceProcessError("probe_origin", _MSG_PROBE_ORIGIN)
+    if parsed.path not in ("", "/"):
+        raise ServiceProcessError("probe_origin", _MSG_PROBE_ORIGIN)
+    return f"http://{SERVICE_HOST}:{port}{path}"
+
+
 def _default_http_json(
     url: str,
     username: str,
@@ -403,16 +727,29 @@ def _default_http_json(
     timeout: float,
     path: str = "/api/info",
 ) -> Any:
-    """Bounded stdlib HTTP GET returning parsed JSON (readiness/config only)."""
-    request = urllib.request.Request(url.rstrip("/") + path)
+    """Bounded, proxy-free, redirect-free stdlib GET returning strict JSON."""
+    target = _validate_probe_url(url, path)
+    if not math.isfinite(float(timeout)) or float(timeout) <= 0:
+        raise ServiceProcessError("probe_timeout", _MSG_PROBE)
+    request = urllib.request.Request(target)
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
     request.add_header("Authorization", "Basic " + token)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-            return json.loads(response.read().decode("utf-8"))
+        with _LOOPBACK_OPENER.open(request, timeout=float(timeout)) as response:  # noqa: S310
+            if response.geturl() != target:
+                raise ServiceProcessError("probe_redirect", _MSG_PROBE_ORIGIN)
+            body = response.read(MAX_HTTP_BODY_BYTES + 1)
     except urllib.error.HTTPError as exc:
         exc.close()
         raise
+    except urllib.error.URLError:
+        raise
+    if len(body) > MAX_HTTP_BODY_BYTES:
+        raise ServiceProcessError("probe_body", _MSG_PROBE_BODY)
+    try:
+        return _strict_json(body)
+    except ValueError as exc:
+        raise ServiceProcessError("probe_json", _MSG_PROBE_BODY) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -439,7 +776,7 @@ class LoopbackFixtureProvider:
     def __post_init__(self) -> None:
         if not isinstance(self.provider_id, str) or not _PROVIDER_ID_RE.match(self.provider_id):
             raise ServiceConfigError("fixture_provider_id", _MSG_FIXTURE)
-        if self.provider_id in KNOWN_PROVIDER_ENV_NAMES or self.provider_id in {
+        if self.provider_id in {
             "opencode",
             "openrouter",
             "openai",
@@ -447,8 +784,12 @@ class LoopbackFixtureProvider:
         }:
             # Never shadow a built-in/catalog provider id.
             raise ServiceConfigError("fixture_provider_id", _MSG_FIXTURE)
+        if not isinstance(self.base_url, str):
+            raise ServiceConfigError("fixture_provider_url", _MSG_FIXTURE)
         parsed = urllib.parse.urlsplit(self.base_url)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ServiceConfigError("fixture_provider_url", _MSG_FIXTURE)
+        if parsed.username or parsed.password:
             raise ServiceConfigError("fixture_provider_url", _MSG_FIXTURE)
         try:
             port = parsed.port
@@ -469,7 +810,7 @@ class LoopbackFixtureProvider:
         object.__setattr__(self, "models", models)
 
     def to_config(self) -> dict[str, Any]:
-        """The V2 ``providers.<id>`` object (fixed package, no credential)."""
+        """The V2 ``providers.<id>`` object (fixed package, no real credential)."""
         return {
             "name": f"Fixture Provider ({self.provider_id})",
             "package": FIXTURE_PROVIDER_PACKAGE,
@@ -523,6 +864,17 @@ def build_service_config(
         provider_policies.append(
             {"action": "provider.use", "resource": provider_id, "effect": "allow"}
         )
+    if fixture_provider is not None:
+        if not isinstance(fixture_provider, LoopbackFixtureProvider):
+            raise ServiceConfigError("fixture_type", _MSG_FIXTURE)
+        if fixture_provider.provider_id not in allowed_providers:
+            provider_policies.append(
+                {
+                    "action": "provider.use",
+                    "resource": fixture_provider.provider_id,
+                    "effect": "allow",
+                }
+            )
 
     config: dict[str, Any] = dict(base)
     config["policies"] = provider_policies + list(base["policies"])
@@ -531,14 +883,7 @@ def build_service_config(
     config["compaction"] = {"auto": False}
 
     if fixture_provider is not None:
-        if not isinstance(fixture_provider, LoopbackFixtureProvider):
-            raise ServiceConfigError("fixture_type", _MSG_FIXTURE)
-        providers = dict(config.get("providers") or {})
-        providers[fixture_provider.provider_id] = fixture_provider.to_config()
-        config["providers"] = providers
-        config["policies"] = provider_policies + [
-            {"action": "provider.use", "resource": fixture_provider.provider_id, "effect": "allow"}
-        ] + list(base["policies"])
+        config["providers"] = {fixture_provider.provider_id: fixture_provider.to_config()}
 
     return config
 
@@ -608,7 +953,7 @@ class ServiceConnection:
 class ServiceStatus:
     """The result of :meth:`OpenCodeServiceManager.status` (never raises)."""
 
-    state: str  # running | stopped | foreign | unowned | unsafe | absent
+    state: str  # running | stopped | foreign | invalid | unowned | unsafe | absent
     running: bool
     pid: int | None = None
     url: str | None = None
@@ -656,15 +1001,30 @@ class OpenCodeServiceManager:
 
         self.configuration = configuration
         self.fixture_provider = fixture_provider
-        self.config = build_service_config(configuration, fixture_provider=fixture_provider)
-        self.config_fingerprint = _sha256_hex(canonical_json(self.config))
+        # The exact bytes are the source of truth; the fingerprint is derived
+        # from them, never from a mutable dict. ``config_bytes`` is recomputed
+        # and byte-compared at every write.
+        self._config_bytes = canonical_json(
+            build_service_config(configuration, fixture_provider=fixture_provider)
+        )
+        # The exact bytes written to disk (canonical JSON plus a trailing newline).
+        self._config_disk_bytes = self._config_bytes + b"\n"
+        self.config_fingerprint = _sha256_hex(self._config_bytes)
         self.provider_env = self._validate_provider_env(provider_env)
+        # A non-secret fence over the config plus the *names* of injected provider
+        # credentials. It lets a repeated start detect a changed credential
+        # context without ever persisting a secret value.
+        self.instance_fence = _sha256_hex(
+            self.config_fingerprint.encode("ascii")
+            + b"\x00"
+            + "\n".join(sorted(self.provider_env)).encode("utf-8")
+        )
 
         self._binary = os.fspath(binary) if binary is not None else None
-        self._port = port
-        self.start_timeout = float(start_timeout)
-        self.stop_timeout = float(stop_timeout)
-        self.lock_timeout = float(lock_timeout)
+        self._port = _validate_port(port)
+        self.start_timeout = _validate_timeout("start_timeout", start_timeout)
+        self.stop_timeout = _validate_timeout("stop_timeout", stop_timeout)
+        self.lock_timeout = _validate_timeout("lock_timeout", lock_timeout)
         self._http_get = http_get or _default_http_json
         self._sleep = sleep
         # Holds this process's own Popen only to keep the child identity stable
@@ -692,6 +1052,11 @@ class OpenCodeServiceManager:
 
     # -- input validation ------------------------------------------------- #
 
+    @property
+    def config_bytes(self) -> bytes:
+        """The exact canonical config bytes (source of truth, immutable)."""
+        return self._config_bytes
+
     @staticmethod
     def _validate_provider_env(provider_env: Mapping[str, str] | None) -> dict[str, str]:
         if provider_env is None:
@@ -709,17 +1074,46 @@ class OpenCodeServiceManager:
             out[name] = value
         return out
 
-    # -- lock ------------------------------------------------------------- #
+    def _expected_config_bytes(self) -> bytes:
+        """Recompute the config from stored inputs (never a mutable cache)."""
+        return canonical_json(
+            build_service_config(self.configuration, fixture_provider=self.fixture_provider)
+        )
+
+    def _expected_effective_config(self) -> dict[str, Any]:
+        return json.loads(self._config_bytes)
+
+    # -- data dir / lock -------------------------------------------------- #
+
+    def _prepare_data_dir(self) -> None:
+        """Create/verify the explicit data dir: no symlink, owned, private."""
+        target = str(self.data_dir)
+        existing = _lstat(target)
+        if existing is None:
+            os.makedirs(target, mode=0o700, exist_ok=True)
+            existing = _lstat(target)
+        if existing is None:
+            raise ServiceOwnershipError("data_dir", _MSG_DATA_DIR_UNSAFE)
+        if (
+            stat.S_ISLNK(existing.st_mode)
+            or not stat.S_ISDIR(existing.st_mode)
+            or existing.st_uid != os.getuid()
+            or (existing.st_mode & 0o022)
+        ):
+            raise ServiceOwnershipError("data_dir", _MSG_DATA_DIR_UNSAFE)
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+            fd = os.open(str(self.lock_file), flags, 0o600)
         except OSError as exc:
             raise ServiceLockError("lock_open", _MSG_LOCK_ERROR) from exc
-        deadline = time.monotonic() + self.lock_timeout
         try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                raise ServiceLockError("lock_open", _MSG_LOCK_ERROR)
+            deadline = time.monotonic() + self.lock_timeout
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -727,9 +1121,10 @@ class OpenCodeServiceManager:
                 except OSError as exc:
                     if exc.errno not in (errno.EACCES, errno.EAGAIN):
                         raise ServiceLockError("lock_error", _MSG_LOCK_ERROR) from exc
-                    if time.monotonic() >= deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         raise ServiceLockError("lock_timeout", _MSG_LOCK_TIMEOUT)
-                    self._sleep(0.05)
+                    self._sleep(min(0.05, remaining))
             yield
         finally:
             try:
@@ -743,27 +1138,38 @@ class OpenCodeServiceManager:
         """Refuse a symlinked, dangerous, or configurably-inherited root.
 
         Runs before anything is created. It rejects a symlinked root, ``/``,
-        ``/tmp``, ``/home``, ``/root`` and the user's home, any overlap with a
-        protected location, any ancestor above the root that contains unowned
-        OpenCode config/instructions/plugin directories, and the machine/system
-        configuration directories a fresh server would read.
+        ``/tmp``, ``/home``, ``/root`` and the user's home, any overlap with an
+        *ordinary OpenCode* location or a system directory, any ancestor above
+        the root that actually carries unowned configuration/instructions/plugin
+        entries, and the machine/system configuration directories a fresh server
+        would read.
         """
         if self.root.is_symlink():
             raise ServiceOwnershipError("root_symlink", _MSG_ROOT_SYMLINK)
+        data_st = _lstat(str(self.data_dir))
+        if data_st is not None and stat.S_ISLNK(data_st.st_mode):
+            raise ServiceOwnershipError("data_dir", _MSG_DATA_DIR_UNSAFE)
+
+        # The whole ancestor chain of the (explicit) data directory must be
+        # symlink-free. This is a deliberate fail-closed choice: a symlinked
+        # ancestor would let the tree's real location differ from the path the
+        # caller believes they are using (a foreign/shared path).
+        probe = str(self.data_dir)
+        while True:
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            if os.path.islink(parent):
+                raise ServiceOwnershipError("ancestor_symlink", _MSG_ROOT_UNSAFE)
+            probe = parent
+
         resolved = os.path.realpath(self.root)
         if resolved in {"/", "/tmp", "/home", "/root"} or resolved == os.path.realpath(
             os.path.expanduser("~")
         ):
             raise ServiceOwnershipError("root_unsafe", _MSG_ROOT_UNSAFE)
 
-        protected = [
-            os.path.join(os.path.expanduser("~"), ".config"),
-            os.path.join(os.path.expanduser("~"), ".local"),
-            os.path.join(os.path.expanduser("~"), ".cache"),
-            "/etc",
-            "/usr",
-            "/var",
-        ]
+        protected = list(_ordinary_opencode_paths()) + ["/etc", "/usr", "/var"]
         for entry in protected:
             if _paths_overlap(resolved, os.path.realpath(entry)):
                 raise ServiceOwnershipError("root_unsafe", _MSG_ROOT_UNSAFE)
@@ -771,9 +1177,12 @@ class OpenCodeServiceManager:
         # Ancestors above the root must not expose unowned config/instructions.
         ancestor = os.path.dirname(resolved)
         while True:
-            for name in _INHERITED_NAMES:
+            for name in _INHERITED_DOCS:
                 if os.path.lexists(os.path.join(ancestor, name)):
                     raise ServiceOwnershipError("root_inherited", _MSG_ROOT_INHERITED)
+            source = os.path.join(ancestor, _OPENCODE_SOURCE_DIRNAME)
+            if os.path.lexists(source) and _dir_has_risk(source):
+                raise ServiceOwnershipError("root_inherited", _MSG_ROOT_INHERITED)
             parent = os.path.dirname(ancestor)
             if parent == ancestor:
                 break
@@ -783,38 +1192,70 @@ class OpenCodeServiceManager:
             if os.path.lexists(system_dir):
                 raise ServiceOwnershipError("root_inherited", _MSG_ROOT_INHERITED)
 
-    def _marker_valid(self) -> bool:
-        if not os.path.isfile(self.marker) or self.marker.is_symlink():
-            return False
+    def _marker_doc(self) -> dict[str, Any] | None:
+        st = _lstat(str(self.marker))
+        if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_uid != os.getuid():
+            return None
         try:
-            doc = _read_json(self.marker)
+            doc = _read_bounded_json(self.marker)
         except (OSError, ValueError):
+            return None
+        return doc if isinstance(doc, dict) else None
+
+    def _marker_valid(self) -> bool:
+        doc = self._marker_doc()
+        if doc is None:
             return False
+        instance_id = doc.get("instanceId")
         return (
-            isinstance(doc, dict)
-            and doc.get("kind") == MARKER_KIND
+            doc.get("kind") == MARKER_KIND
+            and doc.get("markerVersion") == MARKER_VERSION
             and doc.get("root") == os.path.realpath(self.root)
             and doc.get("ownerUid") == os.getuid()
+            and isinstance(instance_id, str)
+            and len(instance_id) >= 16
         )
+
+    def _marker_instance_id(self) -> str | None:
+        doc = self._marker_doc()
+        if doc is None or doc.get("kind") != MARKER_KIND:
+            return None
+        instance_id = doc.get("instanceId")
+        return instance_id if isinstance(instance_id, str) else None
 
     def is_owned_root(self) -> bool:
         """True when the app-owned root exists with a valid ownership marker."""
-        return self.root.is_dir() and not self.root.is_symlink() and self._marker_valid()
+        return (
+            self.root.is_dir()
+            and not self.root.is_symlink()
+            and self._marker_valid()
+        )
 
     def _ensure_owned_root(self) -> None:
-        if self.root.is_symlink():
-            raise ServiceOwnershipError("root_symlink", _MSG_ROOT_SYMLINK)
-        if self.root.exists():
-            if not self.root.is_dir():
-                raise ServiceOwnershipError("root_not_dir", _MSG_ROOT_NOT_DIR)
-            if any(self.root.iterdir()):
-                if not self._marker_valid():
-                    raise ServiceOwnershipError("root_unowned", _MSG_ROOT_UNOWNED)
-                return
+        root_st = _lstat(str(self.root))
+        if root_st is None:
+            os.makedirs(str(self.root), mode=0o700, exist_ok=True)
+            os.chmod(str(self.root), 0o700)
             self._write_marker()
             return
-        os.makedirs(self.root, mode=0o700, exist_ok=True)
-        os.chmod(self.root, 0o700)
+        if stat.S_ISLNK(root_st.st_mode):
+            raise ServiceOwnershipError("root_symlink", _MSG_ROOT_SYMLINK)
+        if not stat.S_ISDIR(root_st.st_mode):
+            raise ServiceOwnershipError("root_not_dir", _MSG_ROOT_NOT_DIR)
+        if root_st.st_uid != os.getuid() or (root_st.st_mode & 0o022):
+            raise ServiceOwnershipError("root_unowned", _MSG_ROOT_UNOWNED)
+        try:
+            entries = os.listdir(str(self.root))
+        except OSError as exc:
+            raise ServiceOwnershipError("root_unowned", _MSG_ROOT_UNOWNED) from exc
+        if entries:
+            # A pre-existing non-empty root must carry our exact marker.
+            if not self._marker_valid():
+                raise ServiceOwnershipError("root_unowned", _MSG_ROOT_UNOWNED)
+            os.chmod(str(self.root), 0o700)
+            return
         self._write_marker()
 
     def _write_marker(self) -> None:
@@ -828,6 +1269,22 @@ class OpenCodeServiceManager:
         }
         _atomic_write(self.marker, canonical_json(doc) + b"\n", 0o600)
 
+    def _ensure_private_dir(self, directory: Path) -> None:
+        """Create or verify one owned, owner-private, non-symlink directory."""
+        target = str(directory)
+        st = _lstat(target)
+        if st is None:
+            os.makedirs(target, mode=0o700, exist_ok=True)
+            st = _lstat(target)
+        if (
+            st is None
+            or stat.S_ISLNK(st.st_mode)
+            or not stat.S_ISDIR(st.st_mode)
+            or st.st_uid != os.getuid()
+        ):
+            raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
+        os.chmod(target, 0o700)
+
     def _create_private_dirs(self) -> None:
         for directory in (
             self.home,
@@ -840,46 +1297,113 @@ class OpenCodeServiceManager:
             self.tmp,
             self.projects_dir,
         ):
-            os.makedirs(directory, mode=0o700, exist_ok=True)
-            os.chmod(directory, 0o700)
+            self._ensure_private_dir(directory)
+
+    # -- own-tree configuration hygiene ---------------------------------- #
+
+    def _scan_dir_for_risks(self, directory: Path) -> None:
+        if os.path.islink(str(directory)) or not os.path.isdir(str(directory)):
+            return
+        try:
+            entries = sorted(os.listdir(str(directory)))
+        except OSError:
+            return
+        for entry in entries:
+            if entry not in _RISK_ENTRY_NAMES:
+                continue
+            full = os.path.join(str(directory), entry)
+            if (
+                os.path.realpath(full) == os.path.realpath(str(self.config_file))
+                and _file_bytes_strict(full, max_bytes=MAX_RECORD_BYTES)
+                == self._config_disk_bytes
+                and self._config_disk_bytes == self._expected_config_bytes() + b"\n"
+            ):
+                continue  # the one exact, known generated config file
+            raise ServiceOwnershipError("tree_dirty", _MSG_TREE_DIRTY)
+
+    def _assert_tree_clean(self) -> None:
+        """Refuse unowned config/instruction/plugin entries inside the owned tree."""
+        self._scan_dir_for_risks(self.root)
+        self._scan_dir_for_risks(self.cwd)
+        self._scan_dir_for_risks(self.home)
+        self._scan_dir_for_risks(self.config_home)
+        self._scan_dir_for_risks(self.config_file.parent)
+        self._scan_dir_for_risks(self.projects_dir)
+        if os.path.isdir(str(self.projects_dir)) and not os.path.islink(str(self.projects_dir)):
+            for name in sorted(os.listdir(str(self.projects_dir))):
+                location = self.projects_dir / name
+                if os.path.isdir(str(location)) and not os.path.islink(str(location)):
+                    self._scan_dir_for_risks(location)
 
     # -- process identity ------------------------------------------------- #
 
-    def _read_pid_record(self) -> dict[str, Any] | None:
-        if not os.path.isfile(self.pid_record):
-            return None
+    def _read_pid_record(self) -> tuple[str, dict[str, Any] | None]:
+        """Return ``("absent"|"invalid"|"ok", doc)`` — never silently "absent"."""
+        if not os.path.lexists(str(self.pid_record)):
+            return ("absent", None)
         try:
-            doc = _read_json(self.pid_record)
+            doc = _read_bounded_json(self.pid_record)
         except (OSError, ValueError):
-            return None
-        return doc if isinstance(doc, dict) else None
+            return ("invalid", None)
+        if not isinstance(doc, dict):
+            return ("invalid", None)
+        if doc.get("recordVersion") != PID_RECORD_VERSION:
+            return ("invalid", None)
+        return ("ok", doc)
 
     def _secret_bytes(self) -> bytes | None:
-        if not os.path.isfile(self.secret_file):
-            return None
+        return _file_bytes_strict(str(self.secret_file), max_bytes=1024)
+
+    def _expected_exe(self) -> str | None:
         try:
-            with open(str(self.secret_file), "rb") as handle:
-                return handle.read()
-        except OSError:
+            return os.path.realpath(self._resolve_binary())
+        except ServiceError:
             return None
 
     def _identity_matches(self, pid: int, record: Mapping[str, Any]) -> bool:
-        """Prove ``pid`` is exactly the recorded, owned instance."""
+        """Prove ``pid`` is exactly the recorded, owned instance.
+
+        Binds the live ``/proc`` view to **expected manager paths** (cwd, HOME,
+        exe) and to the marker's ``instanceId`` and the pinned version — not just
+        to the record's own claims. That closes the "record says the right thing,
+        but it is not our tree/process" gap.
+        """
         try:
             rec_pid = int(record["pid"])
         except (KeyError, TypeError, ValueError):
             return False
         if rec_pid != pid or not _pid_alive(pid):
             return False
-        if _proc_starttime(pid) != record.get("starttime"):
+
+        starttime = _proc_starttime(pid)
+        if starttime is None or starttime != record.get("starttime"):
             return False
-        if _proc_exe(pid) != record.get("exe"):
+
+        live_exe = _proc_exe(pid)
+        expected_exe = self._expected_exe()
+        if live_exe is None or live_exe != record.get("exe"):
             return False
-        if _proc_cwd(pid) != record.get("cwd"):
+        if expected_exe is not None and live_exe != expected_exe:
             return False
+
+        expected_cwd = os.path.realpath(str(self.cwd))
+        live_cwd = _proc_cwd(pid)
+        if live_cwd is None or live_cwd != record.get("cwd") or live_cwd != expected_cwd:
+            return False
+
+        expected_home = os.path.realpath(str(self.home))
         environ = _proc_environ(pid)
-        if environ.get("HOME") != record.get("home"):
+        live_home = environ.get("HOME")
+        if live_home is None or live_home != record.get("home") or live_home != expected_home:
             return False
+
+        marker_instance = self._marker_instance_id()
+        if not marker_instance or record.get("markerInstanceId") != marker_instance:
+            return False
+
+        if record.get("version") not in (None, OPENCODE_PINNED_VERSION):
+            return False
+
         secret = self._secret_bytes()
         if secret is None:
             return False
@@ -891,14 +1415,16 @@ class OpenCodeServiceManager:
         return True
 
     def _process_state(self) -> str:
-        """One of ``none`` | ``stopped`` | ``ours`` | ``foreign``."""
-        record = self._read_pid_record()
-        if record is None:
+        """One of ``none`` | ``stopped`` | ``ours`` | ``foreign`` | ``invalid``."""
+        kind, record = self._read_pid_record()
+        if kind == "absent":
             return "none"
+        if kind == "invalid" or record is None:
+            return "invalid"
         try:
             pid = int(record["pid"])
         except (KeyError, TypeError, ValueError):
-            return "foreign"
+            return "invalid"
         if self._identity_matches(pid, record):
             return "ours"
         if _pid_alive(pid):
@@ -906,18 +1432,26 @@ class OpenCodeServiceManager:
         return "stopped"
 
     def _signal_owned(self, pid: int, record: Mapping[str, Any], sig: int) -> None:
-        """Send ``sig`` only after re-proving identity (pidfd when available)."""
-        if not self._identity_matches(pid, record):
-            raise ServiceProcessError("foreign_process", _MSG_FOREIGN_PROCESS)
+        """Signal ``pid`` only after pinning and re-proving identity.
+
+        ``pidfd_open`` runs **first** so the process image is pinned before the
+        identity check; a pid reused between check and signal cannot be
+        retargeted through the pidfd. Where pidfds are unavailable, identity is
+        re-proved immediately before ``os.kill``.
+        """
         pidfd: int | None = None
         try:
             pidfd = os.pidfd_open(pid, 0)  # type: ignore[attr-defined]
         except (AttributeError, OSError):
             pidfd = None
         try:
+            if not self._identity_matches(pid, record):
+                raise ServiceProcessError("foreign_process", _MSG_FOREIGN_PROCESS)
             if pidfd is not None and hasattr(signal, "pidfd_send_signal"):
                 signal.pidfd_send_signal(pidfd, sig)  # type: ignore[attr-defined]
             else:
+                if not self._identity_matches(pid, record):
+                    raise ServiceProcessError("foreign_process", _MSG_FOREIGN_PROCESS)
                 os.kill(pid, sig)
         finally:
             if pidfd is not None:
@@ -937,10 +1471,12 @@ class OpenCodeServiceManager:
             raise ServiceBinaryError("binary_missing", _MSG_BINARY)
         return candidate
 
+    def _path_dir(self) -> str:
+        return os.path.dirname(os.path.realpath(self._resolve_binary()))
+
     def _binary_env(self) -> dict[str, str]:
-        binary_dir = os.path.dirname(os.path.realpath(self._resolve_binary()))
         return {
-            "PATH": f"{binary_dir}:/usr/local/bin:/usr/bin:/bin",
+            "PATH": f"{self._path_dir()}:/usr/local/bin:/usr/bin:/bin",
             "HOME": str(self.home),
             "TMPDIR": str(self.tmp),
             "LANG": "C.UTF-8",
@@ -977,7 +1513,7 @@ class OpenCodeServiceManager:
         therefore absent by construction.
         """
         env = {
-            "PATH": f"{os.path.dirname(os.path.realpath(self._resolve_binary()))}:/usr/local/bin:/usr/bin:/bin",
+            "PATH": f"{self._path_dir()}:/usr/local/bin:/usr/bin:/bin",
             "HOME": str(self.home),
             "XDG_CONFIG_HOME": str(self.config_home),
             "XDG_DATA_HOME": str(self.data_home),
@@ -993,32 +1529,51 @@ class OpenCodeServiceManager:
 
     # -- config / secret -------------------------------------------------- #
 
+    def _verify_expected_config(self) -> bytes:
+        expected = self._expected_config_bytes()
+        if expected != self._config_bytes:
+            raise ServiceConfigError("config_drift", _MSG_CONFIG_DRIFT)
+        return expected
+
     def _write_config(self) -> None:
-        self.config_file.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.config_file.parent, 0o700)
-        _atomic_write(self.config_file, canonical_json(self.config) + b"\n", 0o600)
+        data = self._verify_expected_config()
+        expected = data + b"\n"
+        self._ensure_private_dir(self.config_file.parent)
+        _atomic_write(self.config_file, expected, 0o600)
+        # Verify the bytes actually on disk are exactly ours.
+        on_disk = _file_bytes_strict(str(self.config_file), max_bytes=MAX_RECORD_BYTES)
+        if on_disk != expected:
+            raise ServiceOwnershipError("config_disk", _MSG_TREE_DIRTY)
 
     def _write_secret(self, password: str) -> None:
         _atomic_write(self.secret_file, password.encode("utf-8"), 0o600)
 
     def read_password(self) -> str:
         """Return the per-run HTTP Basic secret (callers must not log it)."""
+        if not self.is_owned_root():
+            raise ServiceOwnershipError("root_unowned", _MSG_NOT_OWNED_STOP)
         data = self._secret_bytes()
         if data is None:
             raise ServiceOwnershipError("no_secret", _MSG_NO_SECRET)
         return data.decode("utf-8")
 
-    def _base_url(self) -> str | None:
-        if not os.path.isfile(self.port_file):
+    def _read_port(self) -> int | None:
+        data = _file_bytes_strict(str(self.port_file), max_bytes=64)
+        if data is None:
             return None
         try:
-            with open(str(self.port_file), "rb") as handle:
-                port = int(handle.read().decode("ascii").strip())
-        except (OSError, ValueError):
+            port = int(data.decode("ascii").strip())
+        except (ValueError, UnicodeDecodeError):
             return None
-        return f"http://{SERVICE_HOST}:{port}"
+        return port if 1 <= port <= 65535 else None
+
+    def _base_url(self) -> str | None:
+        port = self._read_port()
+        return None if port is None else f"http://{SERVICE_HOST}:{port}"
 
     def _fetch(self, path: str, timeout: float = _PROBE_TIMEOUT_S) -> Any:
+        if path not in _ALLOWED_PROBE_PATHS:
+            raise ServiceProcessError("probe_path", _MSG_PROBE_ORIGIN)
         url = self._base_url()
         if url is None:
             raise ServiceProcessError("not_running", _MSG_PROBE)
@@ -1028,6 +1583,10 @@ class OpenCodeServiceManager:
 
     def _spawn(self, binary: str, port: int, password: str) -> subprocess.Popen[bytes]:
         env = self._child_env(password)
+        for path in (self.stdout_file, self.stderr_file):
+            st = _lstat(str(path))
+            if st is not None and (stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode)):
+                raise ServiceOwnershipError("dir_unsafe", _MSG_DIR_UNSAFE)
         with open(str(self.stdout_file), "wb") as out, open(str(self.stderr_file), "wb") as err:
             return subprocess.Popen(  # noqa: S603 - explicit argv, shell=False
                 [binary, "serve", "--hostname", SERVICE_HOST, "--port", str(port)],
@@ -1042,15 +1601,17 @@ class OpenCodeServiceManager:
 
     def _capture_identity(self, pid: int, port: int, password: str) -> dict[str, Any]:
         return {
-            "recordVersion": 1,
+            "recordVersion": PID_RECORD_VERSION,
             "pid": pid,
             "starttime": _proc_starttime(pid),
             "exe": _proc_exe(pid),
             "cwd": _proc_cwd(pid),
-            "home": os.path.realpath(self.home),
+            "home": os.path.realpath(str(self.home)),
             "port": port,
             "passwordSha256": _sha256_hex(password.encode("utf-8")),
             "configFingerprint": self.config_fingerprint,
+            "instanceFence": self.instance_fence,
+            "markerInstanceId": self._marker_instance_id(),
             "providerEnvNames": sorted(self.provider_env),
         }
 
@@ -1059,17 +1620,82 @@ class OpenCodeServiceManager:
     ) -> dict[str, Any]:
         url = f"http://{SERVICE_HOST}:{port}"
         deadline = time.monotonic() + self.start_timeout
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ServiceStartError("start_timeout", _MSG_START_FAILED)
             if proc.poll() is not None:
                 raise ServiceStartError("server_exited", _MSG_START_EXITED)
             try:
-                info = self._http_get(url, SERVICE_USERNAME, password, _PROBE_TIMEOUT_S, "/api/info")
+                info = self._http_get(
+                    url,
+                    SERVICE_USERNAME,
+                    password,
+                    min(_PROBE_TIMEOUT_S, max(0.05, remaining)),
+                    "/api/info",
+                )
             except Exception:  # bounded readiness: not-yet-up is expected
                 info = None
             if isinstance(info, dict) and info.get("version"):
                 return info
-            self._sleep(_PROBE_INTERVAL_S)
-        raise ServiceStartError("start_timeout", _MSG_START_FAILED)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ServiceStartError("start_timeout", _MSG_START_FAILED)
+            self._sleep(min(_PROBE_INTERVAL_S, remaining))
+
+    def _assert_server_owned(self, pid: int, port: int, password: str) -> None:
+        """Prove the ready server is our child and runs only our effective config."""
+        url = f"http://{SERVICE_HOST}:{port}"
+        info = self._http_get(url, SERVICE_USERNAME, password, _PROBE_TIMEOUT_S, "/api/info")
+        if not isinstance(info, dict) or info.get("pid") != pid:
+            raise ServiceProcessError("server_pid", _MSG_SERVER_PID)
+        if info.get("version") != OPENCODE_PINNED_VERSION:
+            raise ServiceVersionError("server_version", _MSG_SERVER_VERSION)
+        sources = self._http_get(url, SERVICE_USERNAME, password, _PROBE_TIMEOUT_S, "/api/config")
+        if not isinstance(sources, list):
+            raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        merged: dict[str, Any] | None = None
+        for source in sources:
+            if not isinstance(source, dict):
+                raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+            source_path = source.get("path")
+            if not isinstance(source_path, str):
+                raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+            real = os.path.realpath(source_path)
+            if source.get("type") == "document":
+                if real != os.path.realpath(str(self.config_file)):
+                    raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+                if merged is None and isinstance(source.get("info"), dict):
+                    merged = source["info"]
+            elif not _is_within(real, os.path.realpath(str(self.root))):
+                # An inherited source directory is only acceptable if it carries
+                # no configuration/instructions/plugins of its own.
+                if _dir_has_risk(real):
+                    raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        if merged is None:
+            raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        self._assert_effective_config_owned(merged)
+
+    def _assert_effective_config_owned(self, merged: Mapping[str, Any]) -> None:
+        expected = self._expected_effective_config()
+        if merged.get("policies") != expected.get("policies"):
+            raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        if merged.get("permissions") != expected.get("permissions"):
+            raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        if merged.get("agents") != expected.get("agents"):
+            raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        if merged.get("update") != "disable":
+            raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        if merged.get("warming") is not False:
+            raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        if merged.get("compaction") != {"auto": False}:
+            raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        for forbidden in ("model", "default_agent"):
+            if forbidden in merged:
+                raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
+        expected_providers = set(expected.get("providers", {}) or {})
+        if set(merged.get("providers", {}) or {}) != expected_providers:
+            raise ServiceProcessError("server_config", _MSG_SERVER_CONFIG)
 
     def _terminate_child(self, proc: subprocess.Popen[bytes]) -> None:
         """Terminate our own direct child (safe: the Popen object pins it)."""
@@ -1137,32 +1763,40 @@ class OpenCodeServiceManager:
         """Start the owned service, or return it idempotently if already running.
 
         Concurrent/idempotent: a second ``start`` with the **same** configuration
-        returns the running instance; a start with a **different** configuration
-        while an instance runs is refused. A foreign or stale record never
-        causes a signal to be sent.
+        and credential context returns the running instance; a start with a
+        **different** configuration or credential context while an instance runs
+        is refused. A foreign, invalid, or stale record never causes a signal.
         """
         self._assert_root_safe()
+        self._prepare_data_dir()
         with self._locked():
             return self._start_locked()
 
     def _start_locked(self) -> ServiceStatus:
         state = self._process_state()
         if state == "ours":
-            record = self._read_pid_record() or {}
-            if record.get("configFingerprint") != self.config_fingerprint:
+            _, record = self._read_pid_record()
+            record = record or {}
+            if (
+                record.get("configFingerprint") != self.config_fingerprint
+                or record.get("instanceFence") != self.instance_fence
+            ):
                 raise ServiceConfigError("conflicting_config", _MSG_CONFLICTING_CONFIG)
             return self._running_status(inspect=False)
         if state == "foreign":
             raise ServiceProcessError("foreign_process", _MSG_STOP_FOREIGN)
+        if state == "invalid":
+            raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
 
         self._ensure_owned_root()
         self._create_private_dirs()
+        self._assert_tree_clean()
 
         binary = self._resolve_binary()
         self._verify_binary_version(binary)
         self._write_config()
 
-        port = int(self._port) if self._port else _free_loopback_port()
+        port = self._port if self._port else _free_loopback_port()
         password = secrets.token_urlsafe(32)
         self._write_secret(password)
         _atomic_write(self.port_file, str(port).encode("ascii"), 0o600)
@@ -1170,23 +1804,27 @@ class OpenCodeServiceManager:
         proc = self._spawn(binary, port, password)
         self._proc = proc
         try:
+            # Record the owned child identity *immediately* after spawn so a crash
+            # between here and readiness still leaves a discoverable, owned record.
+            initial = self._capture_identity(proc.pid, port, password)
+            self._write_pid_record(initial)
+
             info = self._await_ready(proc, port, password)
-        except Exception:
+            version = str(info.get("version", ""))
+            if version != OPENCODE_PINNED_VERSION:
+                raise ServiceVersionError("server_version", _MSG_SERVER_VERSION)
+            self._assert_server_owned(proc.pid, port, password)
+
+            record = self._capture_identity(proc.pid, port, password)
+            record["version"] = version
+            self._write_pid_record(record)
+            self._write_descriptor(record, version)
+        except BaseException:
+            # Any failure after spawn must leave no unmanaged child behind.
             self._terminate_child(proc)
             self._proc = None
             self._clear_run_records()
             raise
-        version = str(info.get("version", ""))
-        if version != OPENCODE_PINNED_VERSION:
-            self._terminate_child(proc)
-            self._proc = None
-            self._clear_run_records()
-            raise ServiceVersionError("server_version", _MSG_SERVER_VERSION)
-
-        record = self._capture_identity(proc.pid, port, password)
-        record["version"] = version
-        self._write_pid_record(record)
-        self._write_descriptor(record, version)
         return ServiceStatus(
             state="running",
             running=True,
@@ -1200,17 +1838,20 @@ class OpenCodeServiceManager:
         """Stop **only** the owned instance; always keep the session data.
 
         There is deliberately no force-cleanup and no deletion of ordinary data
-        anywhere in this manager: only the run records are cleared. Sessions,
-        config, and the private tree persist.
+        anywhere in this manager: only the run records are cleared, and only
+        after the owned process is proven gone. If the process is still alive at
+        the deadline, or its identity can no longer be proven, nothing is
+        cleared and no "stopped" is reported.
         """
         self._assert_root_safe()
+        self._prepare_data_dir()
         with self._locked():
             return self._stop_locked()
 
     def _stop_locked(self) -> ServiceStatus:
-        if not self.root.exists() and not self.root.is_symlink():
+        if not os.path.lexists(str(self.root)):
             return ServiceStatus(state="absent", running=False, root=str(self.root))
-        if self.root.is_symlink():
+        if os.path.islink(str(self.root)):
             raise ServiceOwnershipError("root_symlink", _MSG_ROOT_SYMLINK)
         if not self._marker_valid():
             raise ServiceOwnershipError("root_unowned", _MSG_NOT_OWNED_STOP)
@@ -1222,25 +1863,31 @@ class OpenCodeServiceManager:
             return ServiceStatus(state="stopped", running=False, root=str(self.root))
         if state == "foreign":
             raise ServiceProcessError("foreign_process", _MSG_STOP_FOREIGN)
+        if state == "invalid":
+            raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
 
-        record = self._read_pid_record() or {}
+        _, record = self._read_pid_record()
+        record = record or {}
         pid = int(record["pid"])
         self._signal_owned(pid, record, signal.SIGTERM)
         deadline = time.monotonic() + self.stop_timeout
         while _pid_alive(pid) and time.monotonic() < deadline:
-            self._sleep(_TERM_POLL_S)
+            self._sleep(min(_TERM_POLL_S, max(0.0, deadline - time.monotonic())))
         if _pid_alive(pid):
+            # The identity may have changed under us; re-prove before the hard kill.
             self._signal_owned(pid, record, signal.SIGKILL)
-            deadline = time.monotonic() + 5.0
-            while _pid_alive(pid) and time.monotonic() < deadline:
-                self._sleep(_TERM_POLL_S)
+            hard_deadline = time.monotonic() + min(self.stop_timeout, 5.0)
+            while _pid_alive(pid) and time.monotonic() < hard_deadline:
+                self._sleep(min(_TERM_POLL_S, max(0.0, hard_deadline - time.monotonic())))
+        if _pid_alive(pid):
+            raise ServiceProcessError("still_alive", _MSG_STILL_ALIVE)
         try:
             os.waitpid(pid, os.WNOHANG)
         except (ChildProcessError, OSError):
             pass
         if self._proc is not None:
             try:
-                self._proc.poll()  # settle returncode so the Popen can be dropped
+                self._proc.poll()
             except Exception:  # pragma: no cover - defensive
                 pass
             self._proc = None
@@ -1250,15 +1897,16 @@ class OpenCodeServiceManager:
     def restart(self) -> ServiceStatus:
         """Replace **only** the owned process, keeping the private data tree."""
         self._assert_root_safe()
+        self._prepare_data_dir()
         with self._locked():
             self._stop_locked()
             return self._start_locked()
 
     def status(self) -> ServiceStatus:
         """Report the current state without ever raising or signalling."""
-        if not self.root.exists() and not self.root.is_symlink():
+        if not os.path.lexists(str(self.root)):
             return ServiceStatus(state="absent", running=False, root=str(self.root))
-        if self.root.is_symlink() or not self.root.is_dir():
+        if os.path.islink(str(self.root)) or not os.path.isdir(str(self.root)):
             return ServiceStatus(state="unsafe", running=False, root=str(self.root))
         if not self._marker_valid():
             return ServiceStatus(state="unowned", running=False, root=str(self.root))
@@ -1267,11 +1915,17 @@ class OpenCodeServiceManager:
             return self._running_status(inspect=True)
         if state == "foreign":
             return ServiceStatus(state="foreign", running=False, root=str(self.root))
+        if state == "invalid":
+            return ServiceStatus(state="invalid", running=False, root=str(self.root))
         return ServiceStatus(state="stopped", running=False, root=str(self.root))
 
     def _running_status(self, *, inspect: bool) -> ServiceStatus:
-        record = self._read_pid_record() or {}
-        pid = int(record.get("pid", 0)) or None
+        _, record = self._read_pid_record()
+        record = record or {}
+        try:
+            pid = int(record.get("pid", 0)) or None
+        except (TypeError, ValueError):
+            pid = None
         version = record.get("version")
         if inspect:
             try:
@@ -1297,49 +1951,63 @@ class OpenCodeServiceManager:
         The application project id is validated as an opaque, traversal-safe
         identifier; the location is a private owned subdirectory under the
         service root, deliberately separate from the real project directory. A
-        symlink, an unowned non-empty directory, or a file at the location is
-        refused.
+        symlink, an unowned non-empty directory, a file at the location, or a
+        location that has acquired unowned configuration entries is refused.
         """
         validate_identifier(project_id, "project_id")
         self._assert_root_safe()
+        self._prepare_data_dir()
         with self._locked():
             self._ensure_owned_root()
             self._create_private_dirs()
+            self._assert_tree_clean()
             location = self.projects_dir / project_id
-            if location.is_symlink():
+            st = _lstat(str(location))
+            if st is not None and stat.S_ISLNK(st.st_mode):
                 raise ServiceLocationError("location_symlink", _MSG_LOCATION_SYMLINK)
-            if location.exists():
-                if not location.is_dir():
-                    raise ServiceLocationError("location_not_dir", _MSG_LOCATION_NOT_DIR)
-                if any(location.iterdir()):
-                    if not self._location_marker_valid(location, project_id):
-                        raise ServiceOwnershipError("location_unowned", _MSG_LOCATION_UNOWNED)
-                    doc = _read_json(location / LOCATION_MARKER_NAME)
-                    return ProjectLocation(
-                        app_project_id=project_id,
-                        directory=str(location),
-                        location_id=str(doc.get("instanceId", "")),
-                        root=str(self.root),
-                    )
-            else:
-                os.makedirs(location, mode=0o700, exist_ok=True)
-                os.chmod(location, 0o700)
-            return self._write_location_marker(location, project_id)
+            if st is not None and not stat.S_ISDIR(st.st_mode):
+                raise ServiceLocationError("location_not_dir", _MSG_LOCATION_NOT_DIR)
+            if st is not None and st.st_uid != os.getuid():
+                raise ServiceOwnershipError("location_unowned", _MSG_LOCATION_UNOWNED)
+            if st is not None:
+                try:
+                    entries = os.listdir(str(location))
+                except OSError as exc:
+                    raise ServiceOwnershipError("location_unowned", _MSG_LOCATION_UNOWNED) from exc
+                if entries and not self._location_marker_valid(location, project_id):
+                    raise ServiceOwnershipError("location_unowned", _MSG_LOCATION_UNOWNED)
+                os.chmod(str(location), 0o700)
+                self._scan_dir_for_risks(location)
+                doc = _read_json_marker(location / LOCATION_MARKER_NAME)
+                return ProjectLocation(
+                    app_project_id=project_id,
+                    directory=str(location),
+                    location_id=str((doc or {}).get("instanceId", "")),
+                    root=str(self.root),
+                )
+            self._ensure_private_dir(location)
+            result = self._write_location_marker(location, project_id)
+            self._scan_dir_for_risks(location)
+            return result
 
     def _location_marker_valid(self, location: Path, project_id: str) -> bool:
         marker = location / LOCATION_MARKER_NAME
-        if not os.path.isfile(marker) or marker.is_symlink():
+        st = _lstat(str(marker))
+        if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
             return False
-        try:
-            doc = _read_json(marker)
-        except (OSError, ValueError):
+        if st.st_uid != os.getuid():
+            return False
+        doc = _read_json_marker(marker)
+        if doc is None:
             return False
         return (
-            isinstance(doc, dict)
-            and doc.get("kind") == LOCATION_MARKER_KIND
-            and doc.get("root") == os.path.realpath(location)
+            doc.get("kind") == LOCATION_MARKER_KIND
+            and doc.get("markerVersion") == LOCATION_MARKER_VERSION
+            and doc.get("root") == os.path.realpath(str(location))
             and doc.get("ownerUid") == os.getuid()
             and doc.get("appProjectId") == project_id
+            and isinstance(doc.get("instanceId"), str)
+            and len(doc.get("instanceId", "")) >= 16
         )
 
     def _write_location_marker(self, location: Path, project_id: str) -> ProjectLocation:
@@ -1347,7 +2015,7 @@ class OpenCodeServiceManager:
         doc = {
             "kind": LOCATION_MARKER_KIND,
             "markerVersion": LOCATION_MARKER_VERSION,
-            "root": os.path.realpath(location),
+            "root": os.path.realpath(str(location)),
             "ownerUid": os.getuid(),
             "appProjectId": project_id,
             "instanceId": instance_id,
@@ -1364,7 +2032,16 @@ class OpenCodeServiceManager:
     # -- safe discovery for a future client ------------------------------ #
 
     def connection(self) -> ServiceConnection:
-        """Explicit connection parameters for a future client (no secret)."""
+        """Explicit connection parameters for a future client (no secret).
+
+        Requires a validated owned root, a valid current record, the owned
+        process, and (implicitly) a readable secret; a corrupted or absent
+        instance is refused rather than reported as a usable connection.
+        """
+        if not self.is_owned_root():
+            raise ServiceOwnershipError("root_unowned", _MSG_NOT_OWNED_STOP)
+        if self._process_state() != "ours":
+            raise ServiceProcessError("not_running", _MSG_PROBE)
         url = self._base_url()
         if url is None:
             raise ServiceProcessError("not_running", _MSG_PROBE)
@@ -1374,35 +2051,42 @@ class OpenCodeServiceManager:
 
     def descriptor(self) -> ServiceDescriptor:
         """The safe, secret-free descriptor of the currently recorded instance."""
-        if os.path.isfile(self.descriptor_file):
+        if not self.is_owned_root():
+            raise ServiceOwnershipError("root_unowned", _MSG_NOT_OWNED_STOP)
+        kind, record = self._read_pid_record()
+        if kind == "invalid":
+            raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
+        record = record or {}
+
+        if os.path.lexists(str(self.descriptor_file)):
             try:
-                doc = _read_json(self.descriptor_file)
-            except (OSError, ValueError):
-                doc = None
-            if isinstance(doc, dict) and doc.get("descriptorVersion") == DESCRIPTOR_VERSION:
-                dirs = doc.get("dirs", {})
-                url = doc.get("url")
-                if isinstance(url, str):
-                    return ServiceDescriptor(
-                        url=url,
-                        pid=int(doc.get("pid", 0)),
-                        version=str(doc.get("opencodeVersion", "")),
-                        binary=str(doc.get("binary", "")),
-                        root=str(dirs.get("root", self.root)),
-                        password_file=str(self.secret_file),
-                        home=str(dirs.get("home", self.home)),
-                        xdg_config_home=str(dirs.get("xdgConfigHome", self.config_home)),
-                        xdg_data_home=str(dirs.get("xdgDataHome", self.data_home)),
-                        xdg_state_home=str(dirs.get("xdgStateHome", self.state_home)),
-                        xdg_cache_home=str(dirs.get("xdgCacheHome", self.cache_home)),
-                        cwd=str(dirs.get("cwd", self.cwd)),
-                        provider_env_names=tuple(doc.get("providerEnvNames", ())),
-                    )
-        url = self._base_url() or ""
-        record = self._read_pid_record() or {}
+                doc = _read_bounded_json(self.descriptor_file)
+            except (OSError, ValueError) as exc:
+                raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD) from exc
+            if not isinstance(doc, dict) or doc.get("descriptorVersion") != DESCRIPTOR_VERSION:
+                raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
+            dirs = doc.get("dirs", {})
+            url = doc.get("url")
+            if not isinstance(url, str) or not isinstance(dirs, dict):
+                raise ServiceProcessError("invalid_record", _MSG_INVALID_RECORD)
+            return ServiceDescriptor(
+                url=url,
+                pid=int(doc.get("pid", 0) or 0),
+                version=str(doc.get("opencodeVersion", "")),
+                binary=str(doc.get("binary", "")),
+                root=str(dirs.get("root", self.root)),
+                password_file=str(self.secret_file),
+                home=str(dirs.get("home", self.home)),
+                xdg_config_home=str(dirs.get("xdgConfigHome", self.config_home)),
+                xdg_data_home=str(dirs.get("xdgDataHome", self.data_home)),
+                xdg_state_home=str(dirs.get("xdgStateHome", self.state_home)),
+                xdg_cache_home=str(dirs.get("xdgCacheHome", self.cache_home)),
+                cwd=str(dirs.get("cwd", self.cwd)),
+                provider_env_names=tuple(doc.get("providerEnvNames", ())),
+            )
         return ServiceDescriptor(
-            url=url,
-            pid=int(record.get("pid", 0)) or 0,
+            url=self._base_url() or "",
+            pid=int(record.get("pid", 0) or 0),
             version=str(record.get("version", "")),
             binary=str(record.get("exe", "")),
             root=str(self.root),
@@ -1420,13 +2104,21 @@ class OpenCodeServiceManager:
         """The config *source* list from ``GET /api/config`` (readiness only).
 
         Used to prove that the running instance reads only this manager's own
-        generated config directory and no inherited global/ancestor/system
-        document.
+        generated config document and no inherited configuration.
         """
         sources = self._fetch("/api/config")
         if not isinstance(sources, list):
             raise ServiceProcessError("bad_config_sources", _MSG_PROBE)
         return sources
+
+
+def _read_json_marker(path: Path) -> dict[str, Any] | None:
+    """Bounded strict JSON for a marker file; ``None`` on any anomaly."""
+    try:
+        doc = _read_bounded_json(path)
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 __all__ = [
@@ -1441,8 +2133,14 @@ __all__ = [
     "LoopbackFixtureProvider",
     "MARKER_KIND",
     "MARKER_NAME",
+    "MAX_HTTP_BODY_BYTES",
+    "MAX_JSON_DEPTH",
+    "MAX_LIFECYCLE_TIMEOUT_S",
+    "MAX_RECORD_BYTES",
+    "MIN_LIFECYCLE_TIMEOUT_S",
     "OPENCODE_PINNED_VERSION",
     "OpenCodeServiceManager",
+    "PID_RECORD_VERSION",
     "ProjectLocation",
     "SERVICE_HOST",
     "SERVICE_ROOT_DIRNAME",

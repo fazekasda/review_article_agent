@@ -11,32 +11,35 @@ under ``/tmp/opencode`` and asserts:
 
 * start / status / stop / restart of an *owned* real process, loopback + HTTP
   Basic auth verified (401 unauthenticated), pinned ``2.2.0`` reported by both
-  the binary and ``GET /api/info``;
+  the binary and ``GET /api/info``, and the server's ``pid`` equal to the owned
+  child;
 * the child environment is scrubbed of every inherited ``OPENCODE_*`` /
   ``OPENCHAMBER_*`` / ``AI_AGENT`` variable and every provider secret, while an
   explicitly supplied, **known** provider credential name is injected and never
   persisted to the config or the ledger;
 * the merged config denies **all** providers and allows only the configured role
   providers, denies all tools/integrations, disables update/warming/automatic
-  compaction, and reads **only** the manager's own config source;
+  compaction, and the server reads only the manager's own config document;
 * two clean, owned, symlink-free project locations; and a restart that preserves
   sessions (real HTTP session create/read, ``cost == 0``);
-* refusals that never signal or harm a foreign process: an unsafe/unowned root,
-  a symlinked root, an inherited ancestor config, a foreign PID record, a stale
-  PID, a wrong binary/server version, and a conflicting concurrent config.
+* refusals that never signal or harm a foreign process: an unsafe/unowned root, a
+  symlinked root, a symlinked internal directory, a symlinked lock, a dirty
+  marked location, an inherited ancestor config, a foreign PID record, a stale
+  PID, a corrupted record (reported invalid, never absent), a wrong
+  binary/server version, conflicting config/credential contexts, and invalid
+  timeouts/ports.
 
-**No model, provider, or paid call is made anywhere**, and no source text is
-uploaded: sessions are created with an empty workspace and never prompted. Real
-OpenCode tests skip when the pinned binary is absent; they run here.
-
-Static/source-of-truth reminders live in the module docstring — this file is
-evidence, not a second specification.
+The manager itself performs only bounded ``GET /api/info`` and ``GET /api/config``
+and never submits a prompt. Session creation lives in this file's private HTTP
+helper (used solely to evidence restart persistence); **no model, provider, paid
+call, or source upload is made**.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import http.server
 import json
 import os
 import shutil
@@ -48,6 +51,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -59,6 +63,7 @@ from review_article_agent.runtime.service import (  # noqa: E402
     LoopbackFixtureProvider,
     OpenCodeServiceManager,
     ServiceConfigError,
+    ServiceLockError,
     ServiceOwnershipError,
     ServiceProcessError,
     ServiceVersionError,
@@ -159,10 +164,43 @@ def _pid_alive(pid: int) -> bool:
     return bool(fields) and fields[0] != "Z"
 
 
+def _pids_with_cwd(path: str) -> list[int]:
+    wanted = os.path.realpath(path)
+    found: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            if os.path.realpath(os.readlink(f"/proc/{entry}/cwd")) == wanted:
+                found.append(int(entry))
+        except OSError:
+            continue
+    return found
+
+
 def _file_fingerprint(path: Path):
     if not path.exists():
         return None
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class _MiniServer:
+    """A tiny threaded HTTP server recording requests (hermetic tests)."""
+
+    def __init__(self, handler) -> None:
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def origin(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +232,7 @@ class _ServiceCase(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Pure configuration / fixture provider (no process)
+# Pure configuration / fixture provider / knobs (no process)
 # --------------------------------------------------------------------------- #
 
 
@@ -207,7 +245,6 @@ class PureConfigTests(unittest.TestCase):
             p for p in policies if p["action"] == "provider.use" and p["effect"] == "allow"
         ]
         self.assertEqual({p["resource"] for p in allows}, {"openrouter", "anthropic"})
-        # The deny-all must precede every allow.
         deny_index = policies.index(policies[0])
         self.assertLess(deny_index, policies.index(allows[0]))
         self.assertIn({"action": "tool.use", "resource": "*", "effect": "deny"}, policies)
@@ -219,12 +256,10 @@ class PureConfigTests(unittest.TestCase):
         self.assertEqual(config["warming"], False)
         self.assertEqual(config["compaction"], {"auto": False})
         self.assertEqual(config["$schema"], roles.OPENCODE_CONFIG_SCHEMA_URL)
-        # No top-level model/default_agent: the model is per-role and explicit.
         self.assertNotIn("model", config)
         self.assertNotIn("default_agent", config)
         for v1_key in roles.OPENCODE_DEPRECATED_V1_KEYS:
             self.assertNotIn(v1_key, config)
-        # Deterministic bytes.
         self.assertEqual(service_config_bytes(_role_config()), service_config_bytes(_role_config()))
 
     def test_fixture_provider_is_fixed_loopback_only(self) -> None:
@@ -244,12 +279,13 @@ class PureConfigTests(unittest.TestCase):
             config["policies"],
         )
         refused = [
-            ("fx", "https://evil.example/v1", ("m",)),  # remote host
-            ("fx", "http://127.0.0.1:59321/v2", ("m",)),  # wrong path
-            ("openrouter", "http://127.0.0.1:59321/v1", ("m",)),  # shadows a catalog provider
-            ("fx", "http://127.0.0.1/v1", ("m",)),  # no port
-            ("FX", "http://127.0.0.1:59321/v1", ("m",)),  # unsafe id
-            ("fx", "http://127.0.0.1:59321/v1", ()),  # no models
+            ("fx", "https://evil.example/v1", ("m",)),
+            ("fx", "http://127.0.0.1:59321/v2", ("m",)),
+            ("openrouter", "http://127.0.0.1:59321/v1", ("m",)),
+            ("fx", "http://127.0.0.1/v1", ("m",)),
+            ("FX", "http://127.0.0.1:59321/v1", ("m",)),
+            ("fx", "http://127.0.0.1:59321/v1", ()),
+            ("fx", "http://user:pw@127.0.0.1:59321/v1", ("m",)),
         ]
         for provider_id, base_url, models in refused:
             with self.assertRaises(ServiceConfigError, msg=(provider_id, base_url)):
@@ -258,27 +294,43 @@ class PureConfigTests(unittest.TestCase):
     def test_provider_env_allowlist_is_enforced(self) -> None:
         base = Path(tempfile.mkdtemp(dir=SCRATCH_BASE, prefix="raa-service-env-"))
         try:
-            with self.assertRaises(ServiceConfigError):
-                OpenCodeServiceManager(
-                    data_dir=base, configuration=_role_config(), provider_env={"EVIL_VAR": "x"}
-                )
-            with self.assertRaises(ServiceConfigError):
-                OpenCodeServiceManager(
-                    data_dir=base,
-                    configuration=_role_config(),
-                    provider_env={"OPENROUTER_API_KEY": ""},
-                )
-            with self.assertRaises(ServiceConfigError):
-                OpenCodeServiceManager(
-                    data_dir=base, configuration=_role_config(), provider_env={"lowercase": "x"}
-                )
-            # An explicit known name is accepted.
+            for bad in (
+                {"EVIL_VAR": "x"},
+                {"OPENROUTER_API_KEY": ""},
+                {"lowercase": "x"},
+            ):
+                with self.assertRaises(ServiceConfigError):
+                    OpenCodeServiceManager(
+                        data_dir=base, configuration=_role_config(), provider_env=bad
+                    )
             ok = OpenCodeServiceManager(
                 data_dir=base,
                 configuration=_role_config(),
                 provider_env={"OPENROUTER_API_KEY": "value"},
             )
             self.assertEqual(ok.provider_env, {"OPENROUTER_API_KEY": "value"})
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_invalid_lifecycle_knobs_refused(self) -> None:
+        base = Path(tempfile.mkdtemp(dir=SCRATCH_BASE, prefix="raa-service-knobs-"))
+        try:
+            for knob in ("start_timeout", "stop_timeout", "lock_timeout"):
+                for value in (float("nan"), float("inf"), -1.0, 0.0, 1e9, True, "5"):
+                    with self.assertRaises(ServiceConfigError, msg=(knob, value)):
+                        OpenCodeServiceManager(
+                            data_dir=base, configuration=_role_config(), **{knob: value}
+                        )
+            for port in (0, 70000, -1, True):
+                with self.assertRaises(ServiceConfigError, msg=port):
+                    OpenCodeServiceManager(
+                        data_dir=base, configuration=_role_config(), port=port
+                    )
+            # A sane explicit port is accepted.
+            ok = OpenCodeServiceManager(
+                data_dir=base, configuration=_role_config(), port=45123
+            )
+            self.assertEqual(ok._port, 45123)
         finally:
             shutil.rmtree(base, ignore_errors=True)
 
@@ -299,11 +351,42 @@ class PureConfigTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Refusals that need no running server
+# Filesystem trust boundary (no running server)
 # --------------------------------------------------------------------------- #
 
 
-class RefusalTests(_ServiceCase):
+class FilesystemBoundaryTests(_ServiceCase):
+    def test_default_xdg_data_dir_supported(self) -> None:
+        with tempfile.TemporaryDirectory(dir=SCRATCH_BASE) as home:
+            with mock.patch.dict(os.environ, {"HOME": home}, clear=False):
+                data = os.path.join(home, ".local", "share", "review_article_agent")
+                manager = OpenCodeServiceManager(
+                    data_dir=data, configuration=_role_config(), binary=OPENCODE_BIN
+                )
+                self._managers.append(manager)
+                manager._assert_root_safe()  # must not raise (blanket .local block removed)
+                manager._prepare_data_dir()
+                self.assertTrue(os.path.isdir(data))
+                # An empty ancestor `.opencode` (e.g. ~/.opencode/plan) contributes
+                # nothing and must not block the product default.
+                os.makedirs(os.path.join(home, ".opencode", "plan"))
+                manager._assert_root_safe()
+                # A risky ancestor `.opencode/agents` is refused.
+                os.makedirs(os.path.join(home, ".opencode", "agents"))
+                with self.assertRaises(ServiceOwnershipError):
+                    manager._assert_root_safe()
+
+    def test_ordinary_opencode_locations_still_protected(self) -> None:
+        with tempfile.TemporaryDirectory(dir=SCRATCH_BASE) as home:
+            with mock.patch.dict(os.environ, {"HOME": home}, clear=False):
+                for relative in (".config/opencode", ".local/share/opencode", ".opencode"):
+                    data = os.path.join(home, relative)
+                    manager = OpenCodeServiceManager(
+                        data_dir=data, configuration=_role_config(), binary=OPENCODE_BIN
+                    )
+                    with self.assertRaises(ServiceOwnershipError, msg=relative):
+                        manager._assert_root_safe()
+
     def test_symlink_root_refused_and_target_untouched(self) -> None:
         target = self.data_dir / "real-target"
         target.mkdir()
@@ -325,6 +408,16 @@ class RefusalTests(_ServiceCase):
         self.assertTrue((root / "sentinel").is_file())
         self.assertFalse(manager.marker.exists())
 
+    def test_wrong_marker_version_refused(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_marker")
+        doc = json.loads(manager.marker.read_text(encoding="utf-8"))
+        doc["markerVersion"] = 999
+        manager.marker.write_text(json.dumps(doc), encoding="utf-8")
+        self.assertFalse(manager.is_owned_root())
+        with self.assertRaises(ServiceOwnershipError):
+            manager.stop()
+
     def test_inherited_ancestor_config_refused(self) -> None:
         outer = self.data_dir / "outer"
         inner = outer / "inner"
@@ -335,14 +428,56 @@ class RefusalTests(_ServiceCase):
             manager.start()
         self.assertFalse((inner / service.SERVICE_ROOT_DIRNAME).exists())
 
+    def test_internal_dir_symlink_refused_without_chmod(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_ok")  # creates + marks the owned root, no server
+        unrelated = self.data_dir / "unrelated"
+        unrelated.mkdir()
+        os.chmod(unrelated, 0o755)
+        shutil.rmtree(manager.home)
+        os.symlink(unrelated, manager.home)
+        with self.assertRaises(ServiceOwnershipError):
+            manager.location_for("prj_other")
+        # The unrelated directory is untouched (never chmod-ed to 0700).
+        self.assertEqual(os.stat(unrelated).st_mode & 0o777, 0o755)
+
+    def test_dirty_marked_location_refused(self) -> None:
+        manager = self.manager()
+        location = manager.location_for("prj_dirty")
+        (Path(location.directory) / "opencode.json").write_text("{}", encoding="utf-8")
+        with self.assertRaises(ServiceOwnershipError):
+            manager.location_for("prj_dirty")
+
+    def test_lock_symlink_refused(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_lock")
+        decoy = self.data_dir / "decoy.lock"
+        decoy.write_text("", encoding="utf-8")
+        manager.lock_file.unlink()  # location_for already created the real lock file
+        os.symlink(decoy, manager.lock_file)
+        with self.assertRaises(ServiceLockError):
+            manager.stop()
+
+    def test_corrupted_record_is_invalid_not_absent(self) -> None:
+        manager = self.manager()
+        manager.location_for("prj_corrupt")
+        manager.pid_record.write_text("{not json", encoding="utf-8")
+        self.assertEqual(manager.status().state, "invalid")
+        with self.assertRaises(ServiceProcessError):
+            manager.stop()
+        with self.assertRaises(ServiceProcessError):
+            manager.start()
+        # The unresolved record is NOT cleared.
+        self.assertTrue(manager.pid_record.exists())
+
     def test_stale_pid_record_cleared_without_signal(self) -> None:
         manager = self.manager()
-        manager.location_for("prj_stale")  # creates + marks the owned root, no server
-        dead_pid = 2_000_000_000  # far above any real pid space on this host
+        manager.location_for("prj_stale")
         manager.pid_record.write_text(
             json.dumps(
                 {
-                    "pid": dead_pid,
+                    "recordVersion": 1,
+                    "pid": 2_000_000_000,  # far above any real pid space
                     "starttime": "1",
                     "exe": "/nonexistent",
                     "cwd": "/nonexistent",
@@ -358,6 +493,99 @@ class RefusalTests(_ServiceCase):
 
 
 # --------------------------------------------------------------------------- #
+# HTTP trust boundary (hermetic; no real opencode)
+# --------------------------------------------------------------------------- #
+
+
+class HttpBoundaryTests(unittest.TestCase):
+    def test_redirect_refused_and_secret_not_forwarded(self) -> None:
+        sink_hits: list[dict[str, str]] = []
+
+        class Sink(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                sink_hits.append(dict(self.headers))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"version":"2.2.0"}')
+
+            def log_message(self, *args):  # noqa: ANN002
+                pass
+
+        sink = _MiniServer(Sink)
+        sink_origin = sink.origin
+
+        class Origin(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", f"{sink_origin}/api/info")
+                self.end_headers()
+
+            def log_message(self, *args):  # noqa: ANN002
+                pass
+
+        origin = _MiniServer(Origin)
+        try:
+            with self.assertRaises(urllib.error.HTTPError):
+                service._default_http_json(origin.origin, "opencode", CANARY, 3.0, "/api/info")
+            self.assertEqual(sink_hits, [], "the redirect target must never be contacted")
+        finally:
+            origin.close()
+            sink.close()
+
+    def test_proxy_environment_ignored(self) -> None:
+        proxy_hits: list[str] = []
+        responses = {"n": 0}
+
+        class Origin(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                responses["n"] += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"version":"2.2.0","pid":7}')
+
+            def log_message(self, *args):  # noqa: ANN002
+                pass
+
+        class Proxy(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                proxy_hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):  # noqa: ANN002
+                pass
+
+        origin = _MiniServer(Origin)
+        proxy = _MiniServer(Proxy)
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"HTTP_PROXY": proxy.origin, "http_proxy": proxy.origin, "ALL_PROXY": proxy.origin},
+                clear=False,
+            ):
+                result = service._default_http_json(origin.origin, "opencode", "pw", 3.0, "/api/info")
+            self.assertEqual(result.get("version"), "2.2.0")
+            self.assertEqual(proxy_hits, [], "environment proxies must be disabled")
+        finally:
+            origin.close()
+            proxy.close()
+
+    def test_probe_origin_and_path_restricted(self) -> None:
+        # A non-loopback origin, an unknown path, and an origin with a path are refused.
+        for url, path in (
+            ("http://example.com", "/api/info"),
+            ("http://127.0.0.1:1234", "/api/session"),
+            ("http://127.0.0.1:1234/other", "/api/info"),
+            ("https://127.0.0.1:1234", "/api/info"),
+        ):
+            with self.assertRaises(ServiceProcessError, msg=(url, path)):
+                service._default_http_json(url, "opencode", "pw", 1.0, path)
+
+
+# --------------------------------------------------------------------------- #
 # Real, owned process (skipped only when the pinned binary is absent)
 # --------------------------------------------------------------------------- #
 
@@ -370,17 +598,14 @@ class RealServiceTests(_ServiceCase):
         self.assertTrue(started.running)
         self.assertEqual(started.state, "running")
         self.assertEqual(started.version, "2.2.0")
-        self.assertEqual(started.url, f"http://127.0.0.1:{int(manager.port_file.read_text())}")
+        self.assertEqual(started.url, f"http://127.0.0.1:{manager._read_port()}")
 
-        # Unauthenticated access is refused; authenticated /api/info is pinned.
         self.assertEqual(_http_status(started.url, "/api/info"), 401)
         code, info = _http("GET", started.url, "/api/info", manager.read_password())
         self.assertEqual(code, 200)
         self.assertEqual(info["version"], "2.2.0")
         self.assertEqual(info["pid"], started.pid)
 
-        # The merged config denies all providers, allows only role providers,
-        # denies tools/integrations, and disables update/warming/compaction.
         sources = manager.config_sources()
         self.assertTrue(sources)
         for source in sources:
@@ -405,7 +630,6 @@ class RealServiceTests(_ServiceCase):
         self.assertNotIn("model", merged)
         self.assertNotIn("default_agent", merged)
 
-        # File modes are owner-only.
         self.assertEqual(os.stat(manager.secret_file).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(manager.marker).st_mode & 0o777, 0o600)
         for directory in (
@@ -424,7 +648,6 @@ class RealServiceTests(_ServiceCase):
         self.assertEqual(stopped.state, "stopped")
         self.assertFalse(manager.status().running)
         self.assertFalse(manager.secret_file.exists())
-        # Ordinary data survives a stop; only run records are cleared.
         self.assertTrue(manager.root.is_dir())
         self.assertTrue(manager.home.is_dir())
 
@@ -432,10 +655,8 @@ class RealServiceTests(_ServiceCase):
         manager = self.manager()
         started = manager.start()
         argv = _proc_cmdline(started.pid)
-        port = int(manager.port_file.read_text())
-        self.assertEqual(
-            argv[1:], ["serve", "--hostname", "127.0.0.1", "--port", str(port)]
-        )
+        port = manager._read_port()
+        self.assertEqual(argv[1:], ["serve", "--hostname", "127.0.0.1", "--port", str(port)])
         self.assertNotIn("--service", argv)
         self.assertNotIn("service", argv)
 
@@ -459,9 +680,7 @@ class RealServiceTests(_ServiceCase):
             self.assertEqual(env.get("HOME"), str(manager.home))
             self.assertEqual(env.get("OPENCODE_PASSWORD"), manager.read_password())
             self.assertNotEqual(env.get("OPENCODE_PASSWORD"), CANARY)
-            # Only the explicitly supplied known credential name is injected.
             self.assertEqual(env.get("OPENROUTER_API_KEY"), CANARY)
-            # The credential value is never persisted; only its name is recorded.
             self.assertNotIn(CANARY, manager.config_file.read_text(encoding="utf-8"))
             self.assertNotIn(CANARY, manager.descriptor_file.read_text(encoding="utf-8"))
             self.assertIn("OPENROUTER_API_KEY", manager.descriptor_file.read_text(encoding="utf-8"))
@@ -479,6 +698,7 @@ class RealServiceTests(_ServiceCase):
         self.assertNotIn(password, manager.config_file.read_text(encoding="utf-8"))
         self.assertNotIn(password, manager.pid_record.read_text(encoding="utf-8"))
         self.assertNotIn(password, manager.descriptor_file.read_text(encoding="utf-8"))
+        self.assertNotIn(password, manager.config_bytes.decode("utf-8"))
         for text in (
             repr(manager),
             repr(manager.descriptor()),
@@ -502,9 +722,7 @@ class RealServiceTests(_ServiceCase):
             self.assertTrue(path.is_relative_to(manager.root))
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o700)
             self.assertTrue((path / ".location-owned.json").is_file())
-        # Idempotent for the same project.
         self.assertEqual(first.location_id, manager.location_for("prj_alpha").location_id)
-        # Traversal / non-opaque ids are refused.
         for bad in ("../escape", "a/b", "", ".hidden", "a\\b", ".."):
             with self.assertRaises(ValueError):
                 manager.location_for(bad)
@@ -522,7 +740,6 @@ class RealServiceTests(_ServiceCase):
         )
         session_id = created["data"]["id"]
         self.assertEqual(created["data"]["cost"], 0)
-        # The application project id is not OpenCode's own project id.
         self.assertNotEqual(created["data"].get("projectID"), "prj_persist")
 
         restarted = manager.restart()
@@ -532,7 +749,7 @@ class RealServiceTests(_ServiceCase):
         ids = [entry["id"] for entry in listing["data"]]
         self.assertIn(session_id, ids)
 
-    def test_concurrent_start_idempotent_and_conflicting_config_refused(self) -> None:
+    def test_concurrent_start_idempotent_and_conflicting_context_refused(self) -> None:
         manager = self.manager()
         results: list[tuple[str, object]] = []
 
@@ -552,11 +769,16 @@ class RealServiceTests(_ServiceCase):
         self.assertEqual(len({status.pid for status in oks}), 1)
         self.assertTrue(manager.status().running)
 
-        # A second manager instance with the same config is idempotent.
+        # Same config + same credential context: idempotent.
         same = self.manager()
         self.assertEqual(same.start().pid, oks[0].pid)
 
-        # A different config while an instance runs is refused, unharmed.
+        # Same config, DIFFERENT credential context: refused (never silently reuse).
+        different_creds = self.manager(provider_env={"OPENROUTER_API_KEY": "other-value"})
+        with self.assertRaises(ServiceConfigError):
+            different_creds.start()
+
+        # Different config while an instance runs: refused, unharmed.
         conflicting = self.manager(
             configuration=_role_config(critic=("anthropic", "claude-different-5-5"))
         )
@@ -574,12 +796,62 @@ class RealServiceTests(_ServiceCase):
         self.assertEqual(manager.status().state, "foreign")
         with self.assertRaises(ServiceProcessError):
             manager.stop()
-        # The real process was never signalled.
         self.assertTrue(_pid_alive(started.pid))
-        # Restore the truthful record and stop cleanly.
         record["starttime"] = original_starttime
         manager.pid_record.write_text(json.dumps(record), encoding="utf-8")
         self.assertEqual(manager.stop().state, "stopped")
+
+    def test_foreign_unrelated_process_never_signalled(self) -> None:
+        manager = self.manager()
+        manager.start()
+        real_record = manager.pid_record.read_text(encoding="utf-8")
+        unrelated = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        try:
+            manager.pid_record.write_text(
+                json.dumps(
+                    {
+                        "recordVersion": 1,
+                        "pid": unrelated.pid,
+                        "starttime": "1",
+                        "exe": "/nonexistent",
+                        "cwd": "/nonexistent",
+                        "home": "/nonexistent",
+                        "passwordSha256": "0" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(manager.status().state, "foreign")
+            with self.assertRaises(ServiceProcessError):
+                manager.stop()
+            self.assertTrue(_pid_alive(unrelated.pid), "an unrelated process was harmed")
+        finally:
+            unrelated.terminate()
+            try:
+                unrelated.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                unrelated.kill()
+            # Restore our truthful record and stop cleanly so no owned child leaks.
+            manager.pid_record.write_text(real_record, encoding="utf-8")
+            manager.stop()
+
+    def test_failed_record_write_leaves_no_unmanaged_child(self) -> None:
+        manager = self.manager()
+        original = manager._write_pid_record
+        state = {"calls": 0}
+
+        def flaky(record):  # noqa: ANN001
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise OSError("simulated record-write failure")
+            return original(record)
+
+        manager._write_pid_record = flaky  # type: ignore[assignment]
+        with self.assertRaises(OSError):
+            manager.start()
+        self.assertIsNone(manager._proc)
+        self.assertFalse(manager.pid_record.exists())
+        self.assertEqual(_pids_with_cwd(str(manager.cwd)), [], "an unmanaged child survived")
 
     def test_wrong_server_version_fails_closed(self) -> None:
         def fake_http(url, username, password, timeout, path="/api/info"):
@@ -590,7 +862,24 @@ class RealServiceTests(_ServiceCase):
             manager.start()
         self.assertFalse(manager.pid_record.exists())
         self.assertFalse(manager.secret_file.exists())
+        self.assertEqual(_pids_with_cwd(str(manager.cwd)), [])
         self.assertFalse(manager.status().running)
+
+    def test_server_pid_mismatch_fails_closed(self) -> None:
+        real = service._default_http_json
+
+        def fake_http(url, username, password, timeout, path="/api/info"):
+            info = real(url, username, password, timeout, path)
+            if path == "/api/info" and isinstance(info, dict):
+                info = dict(info)
+                info["pid"] = (info.get("pid") or 0) + 1
+            return info
+
+        manager = self.manager(http_get=fake_http)
+        with self.assertRaises(ServiceProcessError):
+            manager.start()
+        self.assertFalse(manager.pid_record.exists())
+        self.assertEqual(_pids_with_cwd(str(manager.cwd)), [])
 
     def test_fixture_provider_config_loads_in_real_server(self) -> None:
         fixture = LoopbackFixtureProvider(
@@ -613,12 +902,16 @@ class RealServiceTests(_ServiceCase):
         self.assertEqual(providers["fxprov"]["settings"]["baseURL"], "http://127.0.0.1:59321/v1")
 
     def test_ordinary_service_registration_untouched(self) -> None:
-        registration = Path(os.path.expanduser("~/.local/state/opencode/service.json"))
-        before = _file_fingerprint(registration)
+        registrations = [
+            Path(os.path.expanduser("~/.config/opencode/service.json")),
+            Path(os.path.expanduser("~/.local/state/opencode/service.json")),
+        ]
+        before = [_file_fingerprint(path) for path in registrations]
         manager = self.manager()
         manager.start()
         manager.stop()
-        self.assertEqual(before, _file_fingerprint(registration))
+        after = [_file_fingerprint(path) for path in registrations]
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":  # pragma: no cover
