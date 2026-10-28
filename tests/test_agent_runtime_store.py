@@ -27,6 +27,7 @@ Run with::
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import sys
 import tempfile
@@ -1180,6 +1181,208 @@ class ReadIntegrityDenialTest(RuntimeTestBase):
             RuntimeRepository(store).record_task(task, request_id="r", configuration=cfg)
 
 
+class IntegrityHardeningTest(RuntimeTestBase):
+    """Repair R2: fail-closed integrity for existing durable runtime mappings.
+
+    The R1 read/replay validators re-derived a proposal's *fields* but never
+    compared the stored canonical bytes with the re-derived mapping, so a
+    tampered canonical (an added ``actor``/``authority`` field, or a changed
+    canonical role/model/target) whose ``stored_digest`` was recomputed survived.
+    These tests pin the exact canonical/provenance equality, the re-derived
+    ``task_id``/``mapping_id``, malformed-row normalization, and static (never
+    id/content-echoing) integrity problems.
+    """
+
+    def _populated(self):
+        store = self.new_store()
+        self.addCleanup(store.close)
+        artifact, _ = self.seed_revision(store)
+        runtime = RuntimeRepository(store)
+        mapping = runtime.record_session_mapping(
+            service_instance_id="svc_1",
+            clean_location=str(self.tmp / "clean"),
+            session_id="ses_1",
+            role="writer",
+            model="openrouter/anthropic/claude-sonnet-5-5#high",
+            configuration=_config(),
+        )
+        task, cfg = self.make_task(store, artifact)
+        record = runtime.record_task(task, request_id="req-1", configuration=cfg)
+        proposal = runtime.record_proposal(
+            record, {"content": {"finding": "x"}}, configuration=cfg
+        )
+        return store, runtime, mapping, record, proposal
+
+    def _rewrite_proposal_canonical(self, store, record_id, mutate):
+        """Drop immutability, mutate the canonical JSON, and re-pin the digest.
+
+        Simulates an attacker who can write the row directly and fixes the
+        stored digest to match the tampered bytes.
+        """
+        conn = store.connection
+        conn.execute("DROP TRIGGER runtime_proposal_no_update")
+        row = conn.execute(
+            "SELECT canonical FROM runtime_proposal WHERE record_id = ?",
+            (record_id,),
+        ).fetchone()
+        data = json.loads(bytes(row["canonical"]).decode("utf-8"))
+        mutate(data)
+        canonical = json.dumps(
+            data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        conn.execute(
+            "UPDATE runtime_proposal SET canonical = ?, stored_digest = ? "
+            "WHERE record_id = ?",
+            (canonical, hashlib.sha256(canonical).hexdigest(), record_id),
+        )
+
+    def test_tampered_proposal_canonical_authority_is_denied(self) -> None:
+        store, runtime, _mapping, _record, proposal = self._populated()
+
+        def add_authority(data):
+            # The machine proposal tries to construct authority it cannot have.
+            data["actor"] = {"actor_kind": "human", "actor_id": "owner"}
+            data["authority"] = "owner_authenticated"
+            data["owner_auth_ref"] = "auth_synthetic"
+
+        self._rewrite_proposal_canonical(store, proposal.record_id, add_authority)
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_proposal(proposal.record_id)
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.proposals_for_task(proposal.task_id)
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.list_proposals()
+        self.assertTrue(runtime.verify_all_integrity())
+
+    def test_tampered_proposal_canonical_role_model_target_is_denied(self) -> None:
+        store, runtime, _mapping, _record, proposal = self._populated()
+
+        def relabel(data):
+            data["role"] = "critic"
+            data["model"] = {
+                "provider_id": "openrouter",
+                "model_id": "evil/other",
+                "variant": "high",
+            }
+            data["target"] = {
+                "project_id": data["target"]["project_id"],
+                "artifact_id": "art_forged",
+                "revision_id": "rev_forged",
+            }
+
+        self._rewrite_proposal_canonical(store, proposal.record_id, relabel)
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_proposal(proposal.record_id)
+        self.assertTrue(runtime.verify_all_integrity())
+
+    def test_tampered_task_id_is_denied(self) -> None:
+        store = self.new_store()
+        self.addCleanup(store.close)
+        artifact, _ = self.seed_revision(store)
+        runtime = RuntimeRepository(store)
+        task, cfg = self.make_task(store, artifact)
+        record = runtime.record_task(task, request_id="req-1", configuration=cfg)
+        conn = store.connection
+        conn.execute("DROP TRIGGER runtime_bounded_task_no_update")
+        conn.execute(
+            "UPDATE runtime_bounded_task SET task_id = ? WHERE task_id = ?",
+            ("rtask_" + "0" * 32, record.task_id),
+        )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_task_by_request("req-1")
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.list_tasks()
+        self.assertTrue(runtime.verify_all_integrity())
+
+    def test_tampered_session_mapping_id_is_denied(self) -> None:
+        store, runtime, mapping, _record, _proposal = self._populated()
+        conn = store.connection
+        conn.execute("DROP TRIGGER runtime_session_mapping_no_update")
+        conn.execute(
+            "UPDATE runtime_session_mapping SET mapping_id = ? WHERE mapping_id = ?",
+            ("rmap_" + "0" * 32, mapping.mapping_id),
+        )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_session_mapping_for("ses_1")
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.list_session_mappings()
+        self.assertTrue(runtime.verify_all_integrity())
+
+    def test_malformed_rows_normalize_to_corruption_error(self) -> None:
+        # A malformed stored row must fail closed as RuntimeCorruptionError on the
+        # read path, never leak RuntimeValidationError or a raw exception.
+        store, runtime, _mapping, record, _proposal = self._populated()
+        conn = store.connection
+
+        conn.execute("DROP TRIGGER runtime_session_mapping_no_update")
+        conn.execute(
+            "UPDATE runtime_session_mapping SET created_at_utc = ? WHERE session_id = ?",
+            ("not-a-timestamp", "ses_1"),
+        )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_session_mapping_for("ses_1")
+
+        conn.execute("DROP TRIGGER runtime_bounded_task_no_update")
+        conn.execute(
+            "UPDATE runtime_bounded_task SET fingerprint = ? WHERE task_id = ?",
+            ("not-hex", record.task_id),
+        )
+        with self.assertRaises(RuntimeCorruptionError):
+            runtime.get_task(record.task_id)
+
+    def test_integrity_problems_are_static_and_do_not_echo_ids(self) -> None:
+        store, runtime, _mapping, record, _proposal = self._populated()
+        conn = store.connection
+        conn.execute("DROP TRIGGER runtime_bounded_task_no_update")
+        conn.execute(
+            "UPDATE runtime_bounded_task SET request_id = ? WHERE task_id = ?",
+            ("SYNTHETIC_CANARY_REQUEST", record.task_id),
+        )
+        problems = store_integrity_problems(conn, store.project_id)
+        self.assertTrue(problems)
+        for problem in problems:
+            self.assertNotIn("SYNTHETIC_CANARY_REQUEST", problem)
+            self.assertNotIn(record.task_id, problem)
+            self.assertNotIn(store.project_id, problem)
+
+    def test_replay_conflict_messages_are_static(self) -> None:
+        store = self.new_store()
+        self.addCleanup(store.close)
+        artifact, _ = self.seed_revision(store)
+        runtime = RuntimeRepository(store)
+        task, cfg = self.make_task(store, artifact)
+        runtime.record_task(task, request_id="req-canary", configuration=cfg)
+        other, _ = self.make_task(store, artifact, step_limit=3)
+        try:
+            runtime.record_task(other, request_id="req-canary", configuration=cfg)
+        except RuntimeConflictError as exc:
+            self.assertNotIn("req-canary", str(exc))
+        else:  # pragma: no cover - the divergent request must conflict
+            self.fail("divergent request accepted")
+
+        runtime.record_session_mapping(
+            service_instance_id="svc_1",
+            clean_location=str(self.tmp / "clean"),
+            session_id="ses_canary",
+            role="writer",
+            model="openrouter/anthropic/claude-sonnet-5-5#high",
+            configuration=cfg,
+        )
+        try:
+            runtime.record_session_mapping(
+                service_instance_id="svc_2",
+                clean_location=str(self.tmp / "clean"),
+                session_id="ses_canary",
+                role="writer",
+                model="openrouter/anthropic/claude-sonnet-5-5#high",
+                configuration=cfg,
+            )
+        except RuntimeConflictError as exc:
+            self.assertNotIn("ses_canary", str(exc))
+        else:  # pragma: no cover - the divergent session must conflict
+            self.fail("divergent session accepted")
+
+
 class AtomicityAndTimestampTest(RuntimeTestBase):
     def test_no_writes_on_proposal_failure(self) -> None:
         store = self.new_store()
@@ -1240,6 +1443,36 @@ class AtomicityAndTimestampTest(RuntimeTestBase):
             _config(), created_at_utc="2026-10-27T00:00:00Z"
         )
         self.assertEqual(snap.created_at_utc, "2026-10-27T00:00:00Z")
+
+    def test_non_rfc3339_timestamp_shapes_are_rejected(self) -> None:
+        # datetime.fromisoformat tolerates these shapes; the intended stored
+        # format (date T time seconds + explicit UTC) does not.
+        store = self.new_store()
+        self.addCleanup(store.close)
+        runtime = RuntimeRepository(store)
+        rejected = (
+            "2026-10-27 00:00:00+00:00",   # space separator
+            "20261027T000000+00:00",       # basic layout, no separators
+            "2026-10-27T00:00Z",           # missing seconds
+            "2026-10-27T00:00:00-00:00",   # negative zero offset
+            "2026-10-27T00:00:00",         # no offset
+            "2026-10-27",                  # date only
+        )
+        for value in rejected:
+            with self.assertRaises(RuntimeValidationError):
+                runtime.record_configuration(_config(), created_at_utc=value)
+        accepted = (
+            "2026-10-27T00:00:00Z",
+            "2026-10-27T00:00:00+00:00",
+            "2026-10-27T00:00:00.500000+00:00",
+        )
+        for value in accepted:
+            fresh = self.new_store("ts_" + value.replace(":", "").replace("+", "p"))
+            self.addCleanup(fresh.close)
+            snap = RuntimeRepository(fresh).record_configuration(
+                _config(), created_at_utc=value
+            )
+            self.assertEqual(snap.created_at_utc, value)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -67,6 +67,7 @@ object exposes a ``to_mapping()`` JSON-safe view.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -88,6 +89,7 @@ from ..domain.records import (
 )
 from ..runtime.roles import (
     SCIENTIFIC_ROLES,
+    AgentRoleError,
     BoundedTask,
     ModelRef,
     RoleConfiguration,
@@ -126,6 +128,14 @@ _URLSAFE_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
 #: mirrored so a pathlike session id cannot be recorded.
 _SESSION_ID_RE = re.compile(r"ses[A-Za-z0-9_-]+")
 
+#: The intended stored timestamp shape: ``YYYY-MM-DDThh:mm:ss[.ffffff]`` with an
+#: explicit UTC designator (``Z`` or ``+00:00``). Enforced by fullmatch so a
+#: non-RFC form that ``datetime.fromisoformat`` happens to accept (a space
+#: separator, the basic ``YYYYMMDDThhmmss`` layout, ``-00:00``) is refused.
+_UTC_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)$"
+)
+
 #: Upper bound on any recorded opaque URL-safe identifier.
 MAX_URL_ID_LENGTH = 128
 
@@ -160,9 +170,19 @@ def _require_nonempty_str(value: object, field: str) -> str:
 
 
 def _require_utc_timestamp(value: object, field: str) -> str:
-    """Validate an exact RFC 3339 **UTC** timestamp (never a bare non-empty string)."""
+    """Validate an exact RFC 3339 **UTC** timestamp (never a bare non-empty string).
+
+    The intended stored shape is ``YYYY-MM-DDThh:mm:ss[.ffffff]`` with an explicit
+    UTC designator (``Z`` or ``+00:00``). It is enforced by an anchored pattern
+    *before* parsing, so a shape ``datetime.fromisoformat`` tolerates but the
+    contract does not intend (a space separator, the basic ``YYYYMMDDThhmmss``
+    layout, ``-00:00``, a missing seconds field) is refused rather than silently
+    normalized.
+    """
     text = _require_nonempty_str(value, field)
-    candidate = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    if _UTC_TIMESTAMP_RE.fullmatch(text) is None:
+        raise RuntimeValidationError(f"{field}: must be an RFC 3339 UTC timestamp")
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
     try:
         parsed = datetime.fromisoformat(candidate)
     except ValueError as exc:
@@ -227,6 +247,45 @@ class RuntimeConflictError(RuntimeRepositoryError):
 
 class RuntimeCorruptionError(RuntimeRepositoryError):
     """A stored runtime row fails structural/hash/link revalidation on read."""
+
+
+def _fail_closed_row(what: str):
+    """Decorate a stored-row validator so a malformed row fails closed.
+
+    A stored row is untrusted input. Any helper that rejects it — a typed record
+    error, a ``ValueError``, a missing column, a non-string field — must surface
+    as the single typed :class:`RuntimeCorruptionError` rather than leak a raw
+    exception or a ``RuntimeValidationError`` a caller might mistake for a
+    transient input error. The message is static: it never echoes the offending
+    value.
+    """
+
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(self, row):
+            try:
+                return func(self, row)
+            except RuntimeCorruptionError:
+                raise
+            except RuntimeConflictError:
+                raise
+            except (
+                RecordValidationError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+                UnicodeError,
+                AgentRoleError,
+                sqlite3.Error,
+            ) as exc:
+                raise RuntimeCorruptionError(
+                    f"{what}: stored row is malformed."
+                ) from exc
+
+        return wrapper
+
+    return decorate
 
 
 # --------------------------------------------------------------------------- #
@@ -743,6 +802,7 @@ class RuntimeRepository:
         self._validate_config_row(stored)
         return stored
 
+    @_fail_closed_row("configuration")
     def _validate_config_row(self, row: sqlite3.Row) -> RuntimeConfigSnapshot:
         """Structurally revalidate a configuration row; fail closed on corruption."""
         if row["project_id"] != self.project_id:
@@ -901,8 +961,8 @@ class RuntimeRepository:
                     config_row["config_digest"],
                 ):
                     raise RuntimeConflictError(
-                        f"session {session_id!r} is already mapped with different "
-                        f"values; refusing a divergent session mapping."
+                        "session mapping: a different mapping is already recorded "
+                        "for this session; refusing a divergent replay."
                     )
                 return self._validate_session_row(existing)
             self._conn().execute(
@@ -931,15 +991,23 @@ class RuntimeRepository:
         assert stored is not None  # just committed
         return stored
 
+    @_fail_closed_row("session mapping")
     def _validate_session_row(self, row: sqlite3.Row) -> RuntimeSessionMapping:
         """Structurally revalidate a session mapping and its config link."""
         if row["project_id"] != self.project_id:
             raise RuntimeCorruptionError("session mapping: foreign project row.")
+        mapping_id = validate_identifier(row["mapping_id"], "mapping_id")
         _require_url_safe(row["service_instance_id"], "service_instance_id")
         if row["opencode_project_id"] is not None:
             _require_url_safe(row["opencode_project_id"], "opencode_project_id")
         _require_clean_location(row["clean_location"])
-        _require_session_id(row["session_id"])
+        session_id = _require_session_id(row["session_id"])
+        # The mapping id is derived, never free-form: re-derive it from the stored
+        # session so a retargeted or fabricated mapping id cannot survive a read.
+        if mapping_id != _scoped_id("rmap", self.project_id, session_id):
+            raise RuntimeCorruptionError(
+                "session mapping: mapping id is not session-scoped."
+            )
         role = row["role"]
         if role not in SCIENTIFIC_ROLES:
             raise RuntimeCorruptionError("session mapping: unknown role.")
@@ -966,11 +1034,11 @@ class RuntimeRepository:
             )
         return RuntimeSessionMapping(
             project_id=row["project_id"],
-            mapping_id=row["mapping_id"],
+            mapping_id=mapping_id,
             service_instance_id=row["service_instance_id"],
             opencode_project_id=row["opencode_project_id"],
             clean_location=row["clean_location"],
-            session_id=row["session_id"],
+            session_id=session_id,
             role=role,
             provider_id=row["provider_id"],
             model_id=row["model_id"],
@@ -1078,8 +1146,8 @@ class RuntimeRepository:
                 stored = self._validate_task_row(existing)
                 if stored.fingerprint != fingerprint:
                     raise RuntimeConflictError(
-                        f"request {request_id!r} was already recorded with a "
-                        f"different task; refusing to create a second task."
+                        "task: a different task is already recorded for this "
+                        "request; refusing a divergent replay."
                     )
                 return stored
             config_row = self._ensure_configuration(
@@ -1147,24 +1215,21 @@ class RuntimeRepository:
         revision = self._artifacts.get_revision(ref["artifact_id"], ref["revision_id"])
         if revision is None:
             raise RuntimeValidationError(
-                f"ref {ref['artifact_id']!r}/{ref['revision_id']!r} does not exist "
-                f"in this project."
+                "ref: a referenced revision does not exist in this project."
             )
         current = self._artifacts.current_revision(ref["artifact_id"])
         if current is None or current.revision_id != ref["revision_id"]:
-            current_id = None if current is None else current.revision_id
             raise RuntimeValidationError(
-                f"ref {ref['revision_id']!r} is not the current revision of "
-                f"{ref['artifact_id']!r} (current {current_id!r}); refusing a "
-                f"stale/outdated reference."
+                "ref: a referenced revision is not the current revision; "
+                "refusing a stale/outdated reference."
             )
         self._verify_revision_integrity(ref["artifact_id"], ref["revision_id"])
         if require_digest is not None:
             content = self._artifacts.read_content(ref["artifact_id"], ref["revision_id"])
             if _sha256_hex(content) != _bare_hex(require_digest, "digest"):
                 raise RuntimeValidationError(
-                    f"ref {ref['artifact_id']!r}/{ref['revision_id']!r} digest does "
-                    f"not match the stored content."
+                    "ref: a referenced revision digest does not match the stored "
+                    "content."
                 )
 
     def _verify_revision_integrity(self, artifact_id: str, revision_id: str) -> None:
@@ -1172,14 +1237,13 @@ class RuntimeRepository:
         revision = self._artifacts.get_revision(artifact_id, revision_id)
         if revision is None:
             raise RuntimeValidationError(
-                f"revision {artifact_id!r}/{revision_id!r} does not exist."
+                "revision: a referenced revision does not exist."
             )
         content = self._artifacts.read_content(artifact_id, revision_id)
         expected = _bare_hex(revision.content_sha256, "content_sha256")
         if len(content) != revision.byte_size or _sha256_hex(content) != expected:
             raise RuntimeValidationError(
-                f"revision {artifact_id!r}/{revision_id!r} content does not match "
-                f"its recorded digest/byte size."
+                "revision: content does not match its recorded digest/byte size."
             )
         self._verify_pinned_rights(revision, require_current=True)
 
@@ -1198,7 +1262,7 @@ class RuntimeRepository:
         ).fetchone()
         if row is None:
             raise RuntimeValidationError(
-                f"rights record {ref.as_dict()!r} is missing."
+                "rights record: the pinned rights record is missing."
             )
         canonical = bytes(row["canonical"])
         if _sha256_hex(canonical) != _bare_hex(row["content_sha256"], "content_sha256"):
@@ -1238,14 +1302,21 @@ class RuntimeRepository:
             ).fetchone()["newest"]
             if newest is not None and ref.record_revision < newest:
                 raise RuntimeValidationError(
-                    f"rights record {ref.rights_id!r} revision "
-                    f"{ref.record_revision} is superseded by {newest}; refusing."
+                    "rights record: the pinned rights revision is superseded; "
+                    "refusing."
                 )
 
+    @_fail_closed_row("task")
     def _validate_task_row(self, row: sqlite3.Row) -> RuntimeTaskRecord:
         """Structurally revalidate a task row, its config link, and child inputs."""
         if row["project_id"] != self.project_id:
             raise RuntimeCorruptionError("task: foreign project row.")
+        task_id = validate_identifier(row["task_id"], "task_id")
+        request_id = validate_identifier(row["request_id"], "request_id")
+        # The task id is derived from the request key, never free-form: re-derive
+        # it so a retargeted or fabricated task id cannot survive a read.
+        if task_id != _scoped_id("rtask", self.project_id, request_id):
+            raise RuntimeCorruptionError("task: task id is not request-scoped.")
         _require_utc_timestamp(row["created_at_utc"], "created_at_utc")
         _bare_hex(row["fingerprint"], "fingerprint")
         config_row = self._config_row_by_digest(row["config_digest"])
@@ -1283,7 +1354,7 @@ class RuntimeRepository:
             or row["step_limit"] != bounded.step_limit
         ):
             raise RuntimeCorruptionError("task: projected columns do not match canonical.")
-        input_refs = self._validate_task_inputs(row["task_id"], bounded)
+        input_refs = self._validate_task_inputs(task_id, bounded)
         # Every referenced revision must exist and its pinned digest must match the
         # stored content (historical existence only — never a currentness check).
         target = {
@@ -1296,8 +1367,8 @@ class RuntimeRepository:
             self._verify_structural_ref(dict(ref), ref["digest"])
         return RuntimeTaskRecord(
             project_id=row["project_id"],
-            task_id=row["task_id"],
-            request_id=row["request_id"],
+            task_id=task_id,
+            request_id=request_id,
             fingerprint=row["fingerprint"],
             role=row["role"],
             config_digest=row["config_digest"],
@@ -1353,8 +1424,7 @@ class RuntimeRepository:
         revision = self._artifacts.get_revision(ref["artifact_id"], ref["revision_id"])
         if revision is None:
             raise RuntimeCorruptionError(
-                f"task: referenced revision {ref['artifact_id']!r}/"
-                f"{ref['revision_id']!r} is missing."
+                "task: a referenced revision is missing."
             )
         content = self._artifacts.read_content(ref["artifact_id"], ref["revision_id"])
         expected = _bare_hex(revision.content_sha256, "content_sha256")
@@ -1443,8 +1513,8 @@ class RuntimeRepository:
                 self._validate_proposal_row(existing)
                 if bytes(existing["canonical"]) != canonical:
                     raise RuntimeConflictError(
-                        f"proposal {proposal.proposal_id!r} already exists for this "
-                        f"task with different content; refusing a divergent proposal."
+                        "proposal: a different proposal is already recorded for "
+                        "this task; refusing a divergent replay."
                     )
                 return self._validate_proposal_row(existing)
             self._conn().execute(
@@ -1532,10 +1602,14 @@ class RuntimeRepository:
             "task: must be a persisted RuntimeTaskRecord or a BoundedTask."
         )
 
+    @_fail_closed_row("proposal")
     def _validate_proposal_row(self, row: sqlite3.Row) -> RuntimeProposalRecord:
         """Revalidate a proposal row and re-derive its provenance from its task."""
         if row["project_id"] != self.project_id:
             raise RuntimeCorruptionError("proposal: foreign project row.")
+        proposal_id = _bare_hex(row["proposal_id"], "proposal_id")
+        task_id = validate_identifier(row["task_id"], "task_id")
+        record_id = validate_identifier(row["record_id"], "record_id")
         _require_utc_timestamp(row["created_at_utc"], "created_at_utc")
         canonical = bytes(row["canonical"])
         if _sha256_hex(canonical) != row["stored_digest"]:
@@ -1550,33 +1624,34 @@ class RuntimeRepository:
             raise RuntimeCorruptionError("proposal: canonical bytes are not a proposal.")
         task_row = self._conn().execute(
             "SELECT * FROM runtime_bounded_task WHERE project_id = ? AND task_id = ?",
-            (self.project_id, row["task_id"]),
+            (self.project_id, task_id),
         ).fetchone()
         if task_row is None:
             raise RuntimeCorruptionError("proposal: task link row is missing.")
         task = self._validate_task_row(task_row)
         expected_record_id = _scoped_id(
-            "prop", self.project_id, task.task_id + "\x00" + row["proposal_id"]
+            "prop", self.project_id, task.task_id + "\x00" + proposal_id
         )
-        if row["record_id"] != expected_record_id:
+        if record_id != expected_record_id:
             raise RuntimeCorruptionError("proposal: record id is not task-scoped.")
         # Re-derive the proposal from the persisted task + its content, so a
         # tampered payload/provenance/digest cannot survive a read.
         try:
+            configuration = self._config_role_configuration(task)
             bounded = BoundedTask.from_mapping(
                 json.loads(task.canonical.decode("utf-8")),
-                configuration=self._config_role_configuration(task),
+                configuration=configuration,
             )
             derived = submit_proposal(
                 bounded, {"content": parsed.get("content")},
-                configuration=self._config_role_configuration(task),
+                configuration=configuration,
             )
-        except (RecordValidationError, ValueError) as exc:
+        except (RecordValidationError, ValueError, AgentRoleError) as exc:
             raise RuntimeCorruptionError(
                 "proposal: cannot re-derive the proposal from its task."
             ) from exc
         drift = (
-            derived.proposal_id != row["proposal_id"]
+            derived.proposal_id != proposal_id
             or derived.role != row["role"]
             or derived.model.provider_id != row["provider_id"]
             or derived.model.model_id != row["model_id"]
@@ -1591,11 +1666,21 @@ class RuntimeRepository:
             raise RuntimeCorruptionError(
                 "proposal: re-derived provenance does not match the stored row."
             )
+        # Exact canonical/provenance equality: the stored bytes must be *precisely*
+        # the canonical bytes of the re-derived proposal. This closes the gap where
+        # a tampered canonical (an added ``actor``/``authority`` field, or a changed
+        # canonical role/model/target) whose ``stored_digest`` was updated to match
+        # still agreed field-by-field with the re-derivation. The model's proposal
+        # can therefore never carry authority the derivation did not produce.
+        if canonical_json(derived.to_mapping()) != canonical:
+            raise RuntimeCorruptionError(
+                "proposal: canonical bytes do not match re-derived provenance."
+            )
         return RuntimeProposalRecord(
             project_id=row["project_id"],
-            record_id=row["record_id"],
-            proposal_id=row["proposal_id"],
-            task_id=row["task_id"],
+            record_id=record_id,
+            proposal_id=proposal_id,
+            task_id=task_id,
             role=row["role"],
             provider_id=row["provider_id"],
             model_id=row["model_id"],
@@ -1695,11 +1780,15 @@ class RuntimeRepository:
                 f"SELECT * FROM {table} WHERE project_id = ? ORDER BY rowid",
                 (self.project_id,),
             ).fetchall()
-            for row in rows:
+            for index, row in enumerate(rows):
                 try:
                     validator(row)
-                except RuntimeRepositoryError as exc:
-                    problems.append(f"{table}: {exc}")
+                except Exception:  # noqa: BLE001 - a corrupt row must not abort the sweep
+                    # Static and value-free: the sweep never echoes a stored id,
+                    # digest, or content into a problem description.
+                    problems.append(
+                        f"{table}: row {index} failed integrity revalidation"
+                    )
         return problems
 
 
