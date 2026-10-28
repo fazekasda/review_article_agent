@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import http.client
 import io
 import sys
 import unittest
@@ -489,6 +490,33 @@ class RetryAfterOverflowTests(unittest.TestCase):
         self.assertIsNone(transport._parse_retry_after({"retry-after": "-5"}))
         self.assertIsNone(transport._parse_retry_after({}))
 
+    def test_parse_retry_after_beyond_int_digit_limit_is_not_ignored(self):
+        # Python's int() digit limit is ~4300; a longer decimal must not be
+        # silently dropped (which would let a retry happen sooner than asked).
+        for digits in (4301, 5000, 20000):
+            with self.subTest(digits=digits):
+                value = transport._parse_retry_after({"retry-after": "9" * digits})
+                self.assertIsNotNone(value)
+                self.assertGreater(value, transport.MAX_RETRY_DELAY_SECONDS)
+
+    def test_parse_retry_after_leading_zeros_and_zero(self):
+        self.assertEqual(
+            transport._parse_retry_after(
+                {"retry-after": "0" * 5000 + "5"}
+            ),
+            5.0,
+        )
+        self.assertEqual(
+            transport._parse_retry_after({"retry-after": "0" * 5000}), 0.0
+        )
+        self.assertEqual(transport._parse_retry_after({"retry-after": "+7"}), 7.0)
+
+    def test_parse_retry_after_negative_and_malformed_are_conservative(self):
+        self.assertIsNone(transport._parse_retry_after({"retry-after": "-5"}))
+        self.assertIsNone(transport._parse_retry_after({"retry-after": "12.5"}))
+        self.assertIsNone(transport._parse_retry_after({"retry-after": "9" * 5000 + "x"}))
+        self.assertIsNone(transport._parse_retry_after({"retry-after": "not a date"}))
+
     def test_huge_retry_after_is_a_bounded_failure(self):
         client, fake, sleep, _ = make_client(
             [response(429, headers={"Retry-After": "9" * 400})],
@@ -505,6 +533,19 @@ class RetryAfterOverflowTests(unittest.TestCase):
         self.assertGreater(
             result.attempts[0].retry_after_seconds, transport.MAX_RETRY_DELAY_SECONDS
         )
+
+    def test_gigantic_retry_after_beyond_digit_limit_is_a_bounded_failure(self):
+        client, fake, sleep, _ = make_client(
+            [response(429, headers={"Retry-After": "9" * 5000})],
+            retry_delay=1.0,
+            max_retry_delay=5.0,
+        )
+        result = client.get(ESEARCH, {"term": "x"})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure, "retry_after_exceeds_bound")
+        self.assertEqual(result.attempt_count, 1)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(sleep.calls, [])
 
 
 # --------------------------------------------------------------------------- #
@@ -545,6 +586,100 @@ class TransportResponseTests(unittest.TestCase):
         self.assertEqual(result.failure, "response_too_large")
         self.assertEqual(result.body, b"")
         self.assertEqual(result.attempts[0].outcome, "too_large")
+
+
+# --------------------------------------------------------------------------- #
+# Broken HTTP connections (repair 2)
+# --------------------------------------------------------------------------- #
+class _BadStatusOpener:
+    def open(self, request, timeout=None):
+        raise http.client.BadStatusLine("")
+
+
+class _BrokenReadResponse:
+    status = 200
+    headers = {}
+
+    def read(self, n=-1):
+        raise http.client.IncompleteRead(b"partial")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _BrokenReadOpener:
+    def open(self, request, timeout=None):
+        return _BrokenReadResponse()
+
+
+class _BrokenHTTPError(urllib.error.HTTPError):
+    def read(self, n=-1):
+        raise http.client.IncompleteRead(b"partial")
+
+
+class _BrokenErrorOpener:
+    def open(self, request, timeout=None):
+        raise _BrokenHTTPError(ESEARCH, 500, "boom", {}, None)
+
+
+class BrokenConnectionTests(unittest.TestCase):
+    def test_bad_status_line_becomes_network_error(self):
+        with mock.patch.object(transport, "_http_opener", return_value=_BadStatusOpener()):
+            with self.assertRaises(transport.TransportNetworkError):
+                transport.http_get(ESEARCH, timeout=5.0, max_response_bytes=1024)
+
+    def test_incomplete_read_becomes_network_error(self):
+        with mock.patch.object(
+            transport, "_http_opener", return_value=_BrokenReadOpener()
+        ):
+            with self.assertRaises(transport.TransportNetworkError):
+                transport.http_get(ESEARCH, timeout=5.0, max_response_bytes=1024)
+
+    def test_wrapper_retries_broken_http_connections(self):
+        clock = FakeClock()
+        sleep = FakeSleep(clock)
+        with mock.patch.object(transport, "_http_opener", return_value=_BadStatusOpener()):
+            client = transport.DiscoveryTransport(
+                sleep=sleep,
+                clock=clock,
+                utcnow=lambda: "2026-10-28T00:00:00+00:00",
+                rate_spacing=0.0,
+            )
+            result = client.get(ESEARCH, {"term": "x"})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure, "network_error")
+        self.assertEqual(result.attempt_count, 3)
+        self.assertEqual([a.outcome for a in result.attempts], ["network_error"] * 3)
+        self.assertEqual(sleep.calls, [1.0, 1.0])
+
+    def test_wrapper_retries_incomplete_read(self):
+        clock = FakeClock()
+        sleep = FakeSleep(clock)
+        with mock.patch.object(
+            transport, "_http_opener", return_value=_BrokenReadOpener()
+        ):
+            client = transport.DiscoveryTransport(
+                sleep=sleep,
+                clock=clock,
+                utcnow=lambda: "2026-10-28T00:00:00+00:00",
+                rate_spacing=0.0,
+            )
+            result = client.get(ESEARCH, {"term": "x"})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure, "network_error")
+        self.assertEqual(result.attempt_count, 3)
+
+    def test_broken_error_body_returns_bounded_static_status(self):
+        with mock.patch.object(
+            transport, "_http_opener", return_value=_BrokenErrorOpener()
+        ):
+            out = transport.http_get(ESEARCH, timeout=5.0, max_response_bytes=1024)
+        self.assertEqual(out.status, 500)
+        self.assertEqual(out.body, b"")
+        self.assertFalse(out.truncated)
 
 
 if __name__ == "__main__":

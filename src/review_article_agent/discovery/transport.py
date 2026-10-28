@@ -57,6 +57,7 @@ guarantee.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import math
 import re
 import time
@@ -163,6 +164,13 @@ MAX_RETRY_DELAY_SECONDS = 60.0
 #: :data:`MAX_RETRY_DELAY_SECONDS`), so such a value yields an explicit
 #: ``retry_after_exceeds_bound`` failure instead of an ``OverflowError``.
 _RETRY_AFTER_OVERFLOW = MAX_RETRY_DELAY_SECONDS + 1.0
+
+#: Any decimal ``Retry-After`` with more significant digits than this is a
+#: genuine (huge) delay that cannot be a permitted retry: it is detected
+#: lexically **before** ``int()`` so a value beyond Python's integer-string
+#: digit limit (``sys.set_int_max_str_digits``, ~4300) is never silently
+#: dropped, and it is reported as :data:`_RETRY_AFTER_OVERFLOW`.
+_MAX_RETRY_AFTER_DIGITS = 18
 
 #: Per-instance minimum spacing between consecutive requests (NCBI's public,
 #: unauthenticated limit is ~3 requests/second, so the default is ~0.34s).
@@ -438,6 +446,14 @@ def http_get(
     ``truncated`` rather than silently returned. A 4xx/5xx is returned as a
     :class:`TransportResponse` carrying its (bounded) body for the caller to
     classify; a network-level failure raises.
+
+    A broken connection or malformed status line (``http.client.HTTPException``,
+    e.g. ``IncompleteRead``/``BadStatusLine``) is **not** an ``OSError``; it is
+    caught here and re-raised as a static :class:`TransportNetworkError` so the
+    caller records a bounded, retryable attempt instead of leaking a raw
+    exception. A non-200 ``HTTPError`` whose error body cannot be read is
+    returned as a bounded static HTTP outcome (its status, an empty body), never
+    as a fabricated 200.
     """
     validated_url = build_request_url(url)
     timeout = _require_finite_float(
@@ -472,6 +488,9 @@ def http_get(
                 truncated=len(raw) > max_response_bytes,
             )
     except urllib.error.HTTPError as exc:
+        # A non-200 status is a bounded static HTTP outcome. If its error body
+        # cannot be read (a broken error stream), keep the status with an empty
+        # body rather than fabricating a 200 or leaking the raw exception.
         try:
             raw = exc.read(max_response_bytes + 1)
             headers = (
@@ -479,15 +498,25 @@ def http_get(
                 if exc.headers is not None
                 else {}
             )
-        except Exception:  # pragma: no cover - defensive
+        except Exception:  # noqa: BLE001 - a broken error body is not fatal
             raw, headers = b"", {}
+        finally:
+            try:
+                exc.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
         return TransportResponse(
             status=int(exc.code),
             body=raw[:max_response_bytes],
             headers=headers,
             truncated=len(raw) > max_response_bytes,
         )
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        http.client.HTTPException,
+    ) as exc:
         raise TransportNetworkError("the request did not complete") from exc
 
 
@@ -601,12 +630,17 @@ def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
     """Parse a ``Retry-After`` header (integer seconds or an HTTP-date).
 
     Returns a non-negative number of seconds, or ``None`` when absent or
-    unparseable (the caller then falls back to its own retry delay). A value
-    too large to represent as a finite float (e.g. a 400-digit integer) is
-    returned as the conservative finite sentinel :data:`_RETRY_AFTER_OVERFLOW`,
-    which always exceeds any permitted bound and therefore yields an explicit
-    ``retry_after_exceeds_bound`` failure rather than an ``OverflowError`` or a
-    silently ignored delay.
+    unparseable (the caller then falls back to its own retry delay).
+
+    A **decimal** value is detected lexically *before* ``int()``: a value with
+    more significant digits than :data:`_MAX_RETRY_AFTER_DIGITS` is a genuine
+    (huge) delay and is returned as the conservative finite sentinel
+    :data:`_RETRY_AFTER_OVERFLOW`, which always exceeds any permitted bound and
+    therefore yields an explicit ``retry_after_exceeds_bound`` failure. This
+    holds even for a value beyond Python's integer-string digit limit (which
+    would otherwise raise ``ValueError`` and be silently dropped). A malformed
+    value (a non-decimal, non-date string) returns ``None``. The raw header is
+    never retained.
     """
     raw: str | None = None
     for key, value in headers.items():
@@ -618,33 +652,38 @@ def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
     raw = str(raw).strip()
     if not raw:
         return None
-    try:
-        seconds = int(raw)
-    except ValueError:
+    digits = raw[1:] if raw.startswith("+") else raw
+    if digits.isdecimal():
+        # Lexical bound first: never let int() hit its digit limit and raise.
+        significant = digits.lstrip("0")
+        if len(significant) > _MAX_RETRY_AFTER_DIGITS:
+            return _RETRY_AFTER_OVERFLOW
         try:
-            when = parsedate_to_datetime(raw)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if when is None:
-            return None
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=timezone.utc)
+            seconds = int(significant or "0")
+        except ValueError:  # pragma: no cover - defensive
+            return _RETRY_AFTER_OVERFLOW
         try:
-            delta = (when - datetime.now(timezone.utc)).total_seconds()
+            value = float(seconds)
         except (OverflowError, ValueError):  # pragma: no cover - defensive
             return _RETRY_AFTER_OVERFLOW
-        if not math.isfinite(delta):
+        if not math.isfinite(value):
             return _RETRY_AFTER_OVERFLOW
-        return max(0.0, delta)
-    if seconds < 0:
-        return None
+        return value
     try:
-        value = float(seconds)
-    except (OverflowError, ValueError):
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    try:
+        delta = (when - datetime.now(timezone.utc)).total_seconds()
+    except (OverflowError, ValueError):  # pragma: no cover - defensive
         return _RETRY_AFTER_OVERFLOW
-    if not math.isfinite(value):
+    if not math.isfinite(delta):
         return _RETRY_AFTER_OVERFLOW
-    return value
+    return max(0.0, delta)
 
 
 class DiscoveryTransport:
