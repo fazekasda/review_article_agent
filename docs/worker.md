@@ -1,12 +1,15 @@
-# Worker runtime safety contract (Step 03, partial)
+# Worker runtime safety contract (Step 03)
 
-> Scope: a concise **runtime safety contract reference** for the already-integrated Step 03
-> foundation and engine — the detached-worker launcher, the owner-authenticated local control
-> transport, the durable synthetic job/attempt store, the engine, and the synthetic external fixture
-> backend. It changes no policy/spec/schema/CLI decision. **It is not a completion handoff, and not
-> evidence Step 03 is complete**: the new-job CLI, the full crash/`SIGKILL` matrix, and final
-> step-acceptance accounting are parallel/pending (a Step 03 handoff is pending). Everything here is
-> synthetic; no real model, provider, network, scientific result, or approval is involved or claimed.
+> Scope: a concise **runtime safety contract reference** for the integrated Step 03 foundation and
+> engine — the detached-worker launcher, the owner-authenticated local control transport, the durable
+> synthetic job/attempt store, the engine, and the synthetic external fixture backend — plus the
+> integrated worker-lifecycle and synthetic job-control CLI. It changes no policy/spec/schema/CLI
+> decision. Step 03 is **complete**: the new-job CLI, the full crash/`SIGKILL` matrix, and the
+> step-acceptance accounting are now integrated and evidenced in the
+> [Step 03 handoff](implementation/handoffs/03-durable-worker.md); the `job` control surface is
+> documented in [`cli.md`](cli.md) §10. This document remains a **reference**, not the completion
+> handoff. Everything here is synthetic; no real model, provider, network, scientific result, or
+> approval is involved or claimed.
 > Authority: [`implementation/03-durable-worker.md`](implementation/03-durable-worker.md),
 > [`decisions/001-runtime-language.md`](decisions/001-runtime-language.md),
 > [`decisions/002-step01-contracts-and-policies.md`](decisions/002-step01-contracts-and-policies.md),
@@ -67,9 +70,10 @@ key allowlist; any extra key (including a caller-supplied `uid`/`actor`) is reje
 - **Fixed result shape**: `accepted_local_result` must be exactly `{"kind": "synthetic_numeric",
   "value": <int 0..999999>}`; any other kind, field, string payload, boolean, or out-of-range value is
   rejected before any write. No arbitrary command, payload, or data is ever executed.
-- Lifecycle CLI spellings here are exactly `worker start|status|stop` ([`cli.md`](cli.md) §9);
-  parallel task T5c will extend that surface. This document describes IPC version 1 and its current
-  operations generically and does not speculate on future CLI.
+- Lifecycle CLI spellings are exactly `worker start|status|stop` ([`cli.md`](cli.md) §9); the
+  synthetic job-control CLI (`job run|status|list|pause|resume|cancel|switch|drain|reconcile|attach`,
+  [`cli.md`](cli.md) §10) is integrated over this same IPC version 1 surface. This document describes
+  IPC version 1 and its operations generically.
 
 ## 4. Durable jobs, attempts, results, budget
 
@@ -194,9 +198,9 @@ provider with no real egress:
 
 - No real model/provider, network call, scientific result, or scientific approval exists in this slice;
   every task is a bounded synthetic numeric task, and no exactly-once external execution or billing is
-  claimed. The recovery matrix documented by tests is not the complete `SIGKILL` matrix; the new-job
-  CLI and full step acceptance are pending (Step 03 handoff, T7), and a snapshot proves storage
-  integrity, not remote quiescence.
+  claimed. The full crash/`SIGKILL` matrix and the step-acceptance accounting are now integrated and
+  evidenced in the [Step 03 handoff](implementation/handoffs/03-durable-worker.md); a snapshot still
+  proves storage integrity, not remote quiescence.
 
 ## 11. Ownership map, safety tests, and verification
 
@@ -220,6 +224,5 @@ provider with no real egress:
   engine recovery, process lifecycle, activation, fixture backend, worker+backup, lifecycle CLI.
 - **Verification**: `python3 scripts/check_contract_docs.py --self-test` stays green (this document
   adds no fixture/schema semantics); `git diff --check` is clean; local markdown link targets in this
-  document resolve to existing files. Completion claims stay unticked here: the pending CLI/matrix
-  status and the full step acceptance (with latest test counts) will be recorded by the final Step 03
-  handoff, not by this partial reference.
+  document resolve to existing files. The full step acceptance (with latest test counts) is recorded
+  in the [Step 03 handoff](implementation/handoffs/03-durable-worker.md).
