@@ -888,6 +888,22 @@ class RuntimeDispatchRepository:
             )
         return self._require_dispatch(dispatch_id)
 
+    def _require_own_transaction(self) -> None:
+        """Refuse a transaction-owned primitive invoked with no open transaction.
+
+        ``ProjectStore.transaction`` is a single ``BEGIN IMMEDIATE`` and **cannot
+        nest**, so the atomic composition path (the direct-Jev result commit) owns
+        exactly one transaction and calls these primitives **inside** it. A
+        primitive reached without an open transaction would either perform work
+        nobody commits or silently autocommit a partial transition, so it fails
+        closed instead of guessing.
+        """
+        if not self._conn().in_transaction:
+            raise DispatchStateError(
+                "this dispatch transition must run inside a caller-owned store "
+                "transaction."
+            )
+
     def accept_result(
         self,
         dispatch_id: str,
@@ -905,7 +921,31 @@ class RuntimeDispatchRepository:
         from a ``submitted``/``admitted``/``unknown`` dispatch (the last is the
         same-identity reconciliation of a restart-orphaned submission); refused
         from ``reserved`` (no I/O was issued) or a terminal state.
+
+        This public form owns its own transaction; a caller that must compose it
+        with other writes (the direct-Jev result commit) uses the transaction-owned
+        primitive :meth:`_accept_result_in_transaction` instead.
         """
+        with self._store.transaction():
+            return self._accept_result_in_transaction(
+                dispatch_id,
+                fence=fence,
+                result_kind=result_kind,
+                result_ref=result_ref,
+                result_digest=result_digest,
+            )
+
+    def _accept_result_in_transaction(
+        self,
+        dispatch_id: str,
+        *,
+        fence: int,
+        result_kind: str,
+        result_ref: str,
+        result_digest: str,
+    ) -> DispatchRecord:
+        """The transaction-owned accept primitive (caller owns the unit of work)."""
+        self._require_own_transaction()
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
             raise DispatchValidationError("fence: must be a positive integer")
@@ -914,44 +954,43 @@ class RuntimeDispatchRepository:
         )
         result_ref = validate_identifier(result_ref, "result_ref")
         result_digest = _require_digest(result_digest, "result_digest")
-        with self._store.transaction():
-            record = self._require_dispatch(dispatch_id)
-            if fence != record.current_fence:
-                raise DispatchStaleFenceError(
-                    "the supplied fence is not the dispatch's current fence; a stale "
-                    "attempt cannot accept a result."
-                )
-            if record.state == "completed":
-                if (
-                    record.result_kind,
-                    record.result_ref,
-                    record.result_digest,
-                ) == (result_kind, result_ref, result_digest):
-                    return record
-                raise DispatchConflictError(
-                    "the dispatch already has a different accepted result."
-                )
-            if record.state not in _ACCEPTABLE_STATES:
-                raise DispatchStateError(
-                    "a local result can only follow a recorded submission; this "
-                    "dispatch is not in an acceptable state."
-                )
-            now = _utc_now()
-            self._conn().execute(
-                "UPDATE runtime_dispatch_state SET state = 'completed', "
-                " result_kind = ?, result_ref = ?, result_digest = ?, "
-                " ended_at_utc = ?, updated_at_utc = ? "
-                "WHERE project_id = ? AND dispatch_id = ?",
-                (
-                    result_kind,
-                    result_ref,
-                    result_digest,
-                    now,
-                    now,
-                    self.project_id,
-                    dispatch_id,
-                ),
+        record = self._require_dispatch(dispatch_id)
+        if fence != record.current_fence:
+            raise DispatchStaleFenceError(
+                "the supplied fence is not the dispatch's current fence; a stale "
+                "attempt cannot accept a result."
             )
+        if record.state == "completed":
+            if (
+                record.result_kind,
+                record.result_ref,
+                record.result_digest,
+            ) == (result_kind, result_ref, result_digest):
+                return record
+            raise DispatchConflictError(
+                "the dispatch already has a different accepted result."
+            )
+        if record.state not in _ACCEPTABLE_STATES:
+            raise DispatchStateError(
+                "a local result can only follow a recorded submission; this "
+                "dispatch is not in an acceptable state."
+            )
+        now = _utc_now()
+        self._conn().execute(
+            "UPDATE runtime_dispatch_state SET state = 'completed', "
+            " result_kind = ?, result_ref = ?, result_digest = ?, "
+            " ended_at_utc = ?, updated_at_utc = ? "
+            "WHERE project_id = ? AND dispatch_id = ?",
+            (
+                result_kind,
+                result_ref,
+                result_digest,
+                now,
+                now,
+                self.project_id,
+                dispatch_id,
+            ),
+        )
         return self._require_dispatch(dispatch_id)
 
     def mark_failed(self, dispatch_id: str) -> DispatchRecord:
@@ -962,28 +1001,47 @@ class RuntimeDispatchRepository:
         unresolved remote outcome must never be reclassified as a definitive
         failure, because that would make an ambiguous dispatch look retry-eligible
         (C02 §8.1.1/§8.3). Reconcile or escalate instead.
+
+        This public form owns its own transaction; a caller that must compose it
+        with other writes uses the transaction-owned primitive
+        :meth:`_mark_failed_in_transaction` instead.
         """
-        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         with self._store.transaction():
-            record = self._require_dispatch(dispatch_id)
-            if record.state == "failed":
-                return record
-            if record.state == "completed":
-                raise DispatchStateError(
-                    "the dispatch already completed; it cannot be marked failed."
-                )
-            if record.state == "unknown":
-                raise DispatchStateError(
-                    "an ambiguous (unknown) dispatch cannot be turned into a "
-                    "definitive failure; reconcile or escalate it instead."
-                )
-            now = _utc_now()
-            self._conn().execute(
-                "UPDATE runtime_dispatch_state SET state = 'failed', "
-                " ended_at_utc = ?, updated_at_utc = ? "
-                "WHERE project_id = ? AND dispatch_id = ?",
-                (now, now, self.project_id, dispatch_id),
+            return self._mark_failed_in_transaction(dispatch_id)
+
+    def _mark_failed_in_transaction(
+        self, dispatch_id: str, *, definitive_rejection: bool = False
+    ) -> DispatchRecord:
+        """The transaction-owned fail primitive (caller owns the unit of work).
+
+        ``definitive_rejection`` may only be set by a caller holding a **validated**
+        documented pre-billing rejection (a definitive HTTP 400/401/402/403/404/413
+        at the send boundary): that actual evidence resolves an ambiguous
+        (``unknown``) remote outcome, so it may become a definitive ``failed``. It
+        is never a caller-supplied success/terminal flag — the evidence is derived
+        from the recorded result envelope, never trusted as a boolean.
+        """
+        self._require_own_transaction()
+        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
+        record = self._require_dispatch(dispatch_id)
+        if record.state == "failed":
+            return record
+        if record.state == "completed":
+            raise DispatchStateError(
+                "the dispatch already completed; it cannot be marked failed."
             )
+        if record.state == "unknown" and not definitive_rejection:
+            raise DispatchStateError(
+                "an ambiguous (unknown) dispatch cannot be turned into a "
+                "definitive failure; reconcile or escalate it instead."
+            )
+        now = _utc_now()
+        self._conn().execute(
+            "UPDATE runtime_dispatch_state SET state = 'failed', "
+            " ended_at_utc = ?, updated_at_utc = ? "
+            "WHERE project_id = ? AND dispatch_id = ?",
+            (now, now, self.project_id, dispatch_id),
+        )
         return self._require_dispatch(dispatch_id)
 
     def recover(self, dispatch_id: str) -> DispatchRecord:
@@ -996,19 +1054,27 @@ class RuntimeDispatchRepository:
         * a ``reserved`` dispatch (never submitted) is left untouched;
         * ``unknown``/``completed``/``failed`` are terminal and untouched.
 
-        No new identity is ever minted and no reserve is released.
+        No new identity is ever minted and no reserve is released. This public
+        form owns its own transaction; a caller that must compose it with other
+        writes uses the transaction-owned primitive
+        :meth:`_recover_in_transaction` instead.
         """
-        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         with self._store.transaction():
-            record = self._require_dispatch(dispatch_id)
-            if record.state == "submitted":
-                self._conn().execute(
-                    "UPDATE runtime_dispatch_state SET state = 'unknown', "
-                    " updated_at_utc = ? WHERE project_id = ? AND dispatch_id = ?",
-                    (_utc_now(), self.project_id, dispatch_id),
-                )
-                return self._require_dispatch(dispatch_id)
-            return record
+            return self._recover_in_transaction(dispatch_id)
+
+    def _recover_in_transaction(self, dispatch_id: str) -> DispatchRecord:
+        """The transaction-owned reconcile primitive (caller owns the unit of work)."""
+        self._require_own_transaction()
+        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
+        record = self._require_dispatch(dispatch_id)
+        if record.state == "submitted":
+            self._conn().execute(
+                "UPDATE runtime_dispatch_state SET state = 'unknown', "
+                " updated_at_utc = ? WHERE project_id = ? AND dispatch_id = ?",
+                (_utc_now(), self.project_id, dispatch_id),
+            )
+            return self._require_dispatch(dispatch_id)
+        return record
 
     # -- cost ----------------------------------------------------------------- #
     def settle_cost(
@@ -1033,7 +1099,33 @@ class RuntimeDispatchRepository:
         erased by a later weaker settlement (a ``known 2.00`` over a ``0.10``
         reserve must never fall back to ``0.10``). A refused downgrade raises
         :class:`DispatchConflictError` and changes nothing.
+
+        This public form owns its own transaction; a caller that must compose it
+        with other writes uses the transaction-owned primitive
+        :meth:`_settle_cost_in_transaction` instead.
         """
+        with self._store.transaction():
+            return self._settle_cost_in_transaction(
+                dispatch_id, cost_state=cost_state, amount_usd=amount_usd
+            )
+
+    def _settle_cost_in_transaction(
+        self,
+        dispatch_id: str,
+        *,
+        cost_state: str,
+        amount_usd: str | None = None,
+        allow_definitive_not_incurred: bool = False,
+    ) -> DispatchRecord:
+        """The transaction-owned cost-settlement primitive (caller owns the unit).
+
+        The same monotonic policy as :meth:`settle_cost`, plus the one documented
+        exception: a **validated definitive pre-billing rejection** may resolve an
+        already-``unknown`` cost to ``not_incurred`` (nothing was billed). That flag
+        is set only by the result-commit path from the recorded result envelope; a
+        standalone caller can never release a reserve this way.
+        """
+        self._require_own_transaction()
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         _require_enum(cost_state, COST_STATES, "cost_state")
         if cost_state in _COST_STATES_WITH_AMOUNT:
@@ -1048,15 +1140,19 @@ class RuntimeDispatchRepository:
                     "an unknown/not_incurred cost must not carry an amount_usd."
                 )
             recorded = None
-        with self._store.transaction():
-            current = self._require_dispatch(dispatch_id)
-            self._assert_cost_settlement_monotonic(current, cost_state, recorded)
-            self._conn().execute(
-                "UPDATE runtime_dispatch_state SET cost_state = ?, "
-                " cost_amount_usd = ?, updated_at_utc = ? "
-                "WHERE project_id = ? AND dispatch_id = ?",
-                (cost_state, recorded, _utc_now(), self.project_id, dispatch_id),
-            )
+        current = self._require_dispatch(dispatch_id)
+        self._assert_cost_settlement_monotonic(
+            current,
+            cost_state,
+            recorded,
+            allow_definitive_not_incurred=allow_definitive_not_incurred,
+        )
+        self._conn().execute(
+            "UPDATE runtime_dispatch_state SET cost_state = ?, "
+            " cost_amount_usd = ?, updated_at_utc = ? "
+            "WHERE project_id = ? AND dispatch_id = ?",
+            (cost_state, recorded, _utc_now(), self.project_id, dispatch_id),
+        )
         return self._require_dispatch(dispatch_id)
 
     def _assert_cost_settlement_monotonic(
@@ -1064,13 +1160,16 @@ class RuntimeDispatchRepository:
         current: DispatchRecord,
         new_state: str,
         new_amount: str | None,
+        *,
+        allow_definitive_not_incurred: bool = False,
     ) -> None:
         """Refuse a settlement that would weaken or lower an established cost."""
         if new_state == "not_incurred" and current.cost_state != "not_incurred":
-            raise DispatchConflictError(
-                "an incurred or unknown cost cannot be re-declared as not incurred; "
-                "refusing to release the reserve."
-            )
+            if not allow_definitive_not_incurred:
+                raise DispatchConflictError(
+                    "an incurred or unknown cost cannot be re-declared as not incurred; "
+                    "refusing to release the reserve."
+                )
         if current.cost_amount_usd is not None:
             if new_amount is None:
                 raise DispatchConflictError(

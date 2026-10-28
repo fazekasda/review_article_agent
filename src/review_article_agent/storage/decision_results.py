@@ -54,16 +54,22 @@ What this module **is not** (the boundary)
 
 * It performs **no** network, transport, or model call, and **no** execution. It
   records an observation of a result it is handed.
-* It **grants no authority** and makes **no** completion claim: it is an **inert
-  observation**, **not** an accepted local result, **not** a scientific
+* It **grants no authority** and makes **no** completion claim: a recorded
+  observation is **inert**, **not** an accepted local result, **not** a scientific
   eligibility/exclusion decision, and **not** a claim of remote quiescence
   (:data:`RESULT_GRANTS_AUTHORITY`/``RESULT_ACCEPTS_LOCAL_RESULT``/
-  ``RESULT_CLAIMS_REMOTE_QUIESCENCE` are all ``False``). It never calls
+  ``RESULT_CLAIMS_REMOTE_QUIESCENCE` are all ``False``). The inert
+  :meth:`DecisionResultRepository.record_result` never calls
   ``accept_result``/``recover``/``settle_cost`` and never advances the dispatch
   state machine: a whole-call ``unknown`` result is persisted but the dispatch
   **stays** ``submitted``/``unknown`` (it is never turned into ``completed`` and no
-  unknown cost is recorded as ``0``). The later atomic bridge is what accepts the
-  result and transitions the dispatch alongside these rows.
+  unknown cost is recorded as ``0``). The single atomic
+  :meth:`DecisionResultRepository.commit_result` is the local bridge: in **one**
+  store transaction it records the same observation, settles the exact cost
+  monotonically, and applies the derived local transition (accept a completed
+  result / fail a definitive pre-billing rejection / recover an ambiguous outcome
+  to ``unknown``). It is still **not** a transport: it performs no network call and
+  mints no new identity, and it claims nothing about remote quiescence.
 * It stores **no** credential, endpoint secret, raw peer text, or source bytes:
   only opaque ids, exact-decimal amounts, redacted diagnostics, and SHA-256
   digests (spec lines 62-63; ``docs/storage.md``).
@@ -137,9 +143,13 @@ __all__ = [
     "DecisionResultStateError",
     "DecisionResultStaleFenceError",
     "DecisionResultCorruptionError",
+    "RESULT_KIND",
+    "COMMIT_OUTCOMES",
+    "COMMIT_FAULT_SEAMS",
     "QuestionResultRef",
     "DecisionResultQuestion",
     "DecisionResultObservation",
+    "DecisionCommitOutcome",
     "DecisionResultRepository",
     "decision_result_integrity_problems",
 ]
@@ -188,6 +198,28 @@ PRIOR_OUTCOME_NONE = "none"
 #: invariant): only these may be recorded ``not_incurred``. Every other non-200
 #: status — including 429 and every 3xx/5xx — is ambiguous and stays ``unknown``.
 DEFINITIVE_REJECTION_STATUSES = frozenset({400, 401, 402, 403, 404, 413})
+
+#: The ``result_kind`` an accepted local direct-Jev result set is recorded under on
+#: its dispatch (C02 §8.2 uses an opaque kind/ref/digest triple for the accepted
+#: local result; this names the full per-question decision set).
+RESULT_KIND = "jev_decision_set"
+
+#: The derived local outcomes of one committed direct Jev result. They are
+#: **derived from the validated result envelope + its HTTP status**, never taken
+#: from a caller-supplied success/terminal/authenticated boolean:
+#:
+#: * ``completed`` — an HTTP 200 result (per-question failures included) accepted as
+#:   the dispatch's single local result;
+#: * ``failed`` — a documented definitive pre-billing rejection (400/401/402/403/
+#:   404/413); never a scientific negative and never an accepted result;
+#: * ``unknown`` — any transport/protocol failure or ambiguous API status: the
+#:   remote outcome is unresolved, the reserve is retained, and no result is accepted.
+COMMIT_OUTCOMES = ("completed", "failed", "unknown")
+
+#: Fault-injection seam names of the atomic commit path (in-process tests only).
+#: Each fires inside the single commit transaction, so a hook that raises must roll
+#: back the whole 1+N observation, the cost settlement, and the dispatch state.
+COMMIT_FAULT_SEAMS = ("after_set_insert", "after_cost", "before_accept")
 
 #: Dispatch states in which a recorded observation remains valid history: a result
 #: may follow a recorded submission/admission/unknown outcome, and a later atomic
@@ -331,6 +363,7 @@ _M_CONTRADICTION = (
     "the supplied dispatch result contradicts the recorded intent, status, or cost "
     "relation; nothing was written"
 )
+_M_BAD_SEAM = "a commit fault seam is not a documented commit seam"
 
 
 # --------------------------------------------------------------------------- #
@@ -676,6 +709,40 @@ class DecisionResultQuestion:
 
     def to_mapping(self) -> dict[str, Any]:
         return _thaw(self.record)
+
+
+@dataclass(frozen=True)
+class DecisionCommitOutcome:
+    """The result of one atomic observe + cost-settle + dispatch transition."""
+
+    observation: DecisionResultObservation
+    dispatch: DispatchRecord
+    outcome: str
+    replayed: bool
+
+    def __post_init__(self) -> None:
+        if self.outcome not in COMMIT_OUTCOMES:
+            raise DecisionResultValidationError(_M_STATUS)
+
+
+def _derive_commit_outcome(observation: DecisionResultObservation) -> str:
+    """Derive the local outcome from the validated observation envelope alone.
+
+    Only the recorded (already fully validated) ``status``/``http_status`` decide
+    the outcome — never a caller boolean. A ``completed`` HTTP 200 result completes
+    the dispatch; only a documented definitive pre-billing rejection fails it; every
+    other submitted failure or ambiguous API status is unresolved (``unknown``).
+    """
+    status = observation.status
+    if status == "completed":
+        return "completed"
+    if status == "api_error":
+        if observation.http_status in DEFINITIVE_REJECTION_STATUSES:
+            return "failed"
+        return "unknown"
+    if status in ("protocol_error", "transport_error"):
+        return "unknown"
+    raise DecisionResultValidationError(_M_STATUS)  # pragma: no cover - guarded
 
 
 # --------------------------------------------------------------------------- #
@@ -1035,10 +1102,15 @@ class DecisionResultRepository:
         store = ProjectStore.open_at(app_dir, expected_project_id=pid)
         results = DecisionResultRepository(store)
 
+        # Inert observation only (no dispatch transition):
         observation = results.record_result(
             dispatch_id, result, fence=dispatch.current_fence
         )
-        # -> one immutable full-set observation + one canonical row per question.
+
+        # Or the one atomic observe + settle + transition commit:
+        committed = results.commit_result(
+            dispatch_id, result, fence=dispatch.current_fence
+        )
     """
 
     def __init__(
@@ -1059,6 +1131,12 @@ class DecisionResultRepository:
             if intents is not None
             else DecisionIntentRepository(store, runtime=self._runtime, dispatch=self._dispatch)
         )
+        # In-process fault-injection seams for the atomic commit path (empty unless
+        # a test registers a hook). They are never consulted by the inert record
+        # path and never change a production outcome.
+        self._commit_hooks: dict[str, list[Any]] = {
+            name: [] for name in COMMIT_FAULT_SEAMS
+        }
 
     @property
     def project_id(self) -> str:
@@ -1067,6 +1145,23 @@ class DecisionResultRepository:
 
     def _conn(self) -> sqlite3.Connection:
         return self._store.connection
+
+    def _require_own_transaction(self) -> None:
+        """Refuse a transaction-owned primitive invoked with no open transaction."""
+        if not self._conn().in_transaction:
+            raise DecisionResultStateError(
+                "this result commit must run inside a caller-owned store transaction."
+            )
+
+    def add_commit_fault_hook(self, seam: str, hook) -> None:
+        """Register an in-process fault hook at a :data:`COMMIT_FAULT_SEAMS` seam."""
+        if seam not in self._commit_hooks:
+            raise DecisionResultValidationError(_M_BAD_SEAM)
+        self._commit_hooks[seam].append(hook)
+
+    def _fire_commit_seam(self, seam: str, **info: Any) -> None:
+        for hook in self._commit_hooks[seam]:
+            hook(**info)
 
     # -- record (atomic: reload parents + project + insert set + rows) -------- #
     def record_result(
@@ -1092,68 +1187,198 @@ class DecisionResultRepository:
         intent/status relation is refused with a static typed error and the whole
         1+N set rolls back rather than committing a corrupt observation.
 
-        This is an **inert observation**: it never advances the dispatch state
-        machine and never records an unknown cost as ``0``. An identical replay
-        (same fence, same canonical bytes) returns the stored observation; a
-        divergent replay raises :class:`DecisionResultConflictError`; a stale fence
-        raises :class:`DecisionResultStaleFenceError`. A refused call writes
-        nothing.
+        This remains the **inert observation** entry point: it never advances the
+        dispatch state machine and never records an unknown cost as ``0``. An
+        identical replay (same fence, same canonical bytes) returns the stored
+        observation; a divergent replay raises :class:`DecisionResultConflictError`;
+        a stale fence raises :class:`DecisionResultStaleFenceError`. A refused call
+        writes nothing. The atomic observe+settle+transition path is
+        :meth:`commit_result`.
         """
         if not isinstance(result, jev.DispatchResult):
             raise DecisionResultValidationError(_M_BAD_RESULT)
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
             raise DecisionResultValidationError(_M_BAD_FENCE)
+        with self._store.transaction():
+            _inserted, observation = self._record_result_in_transaction(
+                dispatch_id, result, fence=fence
+            )
+            return observation
+
+    def _record_result_in_transaction(
+        self, dispatch_id: str, result: jev.DispatchResult, *, fence: int
+    ) -> tuple[bool, DecisionResultObservation]:
+        """The transaction-owned observe primitive (caller owns the unit of work).
+
+        Returns ``(inserted, observation)``: ``inserted`` is ``True`` when this call
+        wrote the 1+N set, ``False`` when it replayed an identical stored
+        observation. It opens no transaction (``ProjectStore.transaction`` cannot
+        nest) and therefore requires one already open on this connection.
+        """
+        self._require_own_transaction()
         project_id = _identifier(self.project_id)
+        dispatch = self._require_dispatch(dispatch_id)
+        if dispatch.route != RESULT_ROUTE:
+            raise DecisionResultValidationError(_M_ROUTE)
+        if fence != dispatch.current_fence:
+            raise DecisionResultStaleFenceError(_M_STALE_FENCE)
+        intent = self._require_intent(dispatch_id)
+        if intent.project_id != project_id or intent.dispatch_id != dispatch_id:
+            raise DecisionResultValidationError(_M_BAD_INTENT)
+        if (
+            intent.task_id != dispatch.task_id
+            or intent.task_fingerprint != dispatch.task_fingerprint
+            or intent.route != dispatch.route
+            or intent.stage != dispatch.stage
+            or intent.input_digest != dispatch.input_digest
+            or intent.version_digest != dispatch.version_digest
+            or intent.reserve_usd != dispatch.reserve_usd
+            or intent.bound_evidence_digest != dispatch.bound_evidence_digest
+        ):
+            raise DecisionResultValidationError(_M_BAD_INTENT)
+        self._require_persisted_task(dispatch.task_id)
+
+        self._assert_result_binds_intent(result, intent, dispatch)
+        built = self._build_observation(project_id, dispatch, intent, result)
+
+        existing = self._set_row(dispatch_id)
+        if existing is not None:
+            stored = self._validate_set_row(existing)
+            if stored.canonical != built["canonical"]:
+                raise DecisionResultConflictError(_M_DIVERGENT)
+            return False, stored
+
+        if dispatch.state == "completed":
+            raise DecisionResultStateError(_M_COMPLETED)
+        if dispatch.state not in _ACCEPTABLE_STATES:
+            raise DecisionResultStateError(_M_STATE)
+        self._insert_observation(built)
+        # The final full cross-validation must finish INSIDE this transaction:
+        # revalidate the just-inserted set + question rows with the same shared
+        # read validators so a contradictory envelope/intent/status/cost relation
+        # rolls back the entire 1+N set instead of committing a corrupt record.
+        row = self._set_row(dispatch_id)
+        if row is None:  # pragma: no cover - just inserted
+            raise DecisionResultCorruptionError(_M_PARTIAL_SET)
+        try:
+            return True, self._validate_set_row(row)
+        except DecisionResultCorruptionError as exc:
+            raise DecisionResultValidationError(_M_CONTRADICTION) from exc
+
+    # -- atomic commit (observe + settle + dispatch transition, ONE transaction) - #
+    def commit_result(
+        self,
+        dispatch_id: str,
+        result: jev.DispatchResult,
+        *,
+        fence: int,
+    ) -> DecisionCommitOutcome:
+        """Record one direct Jev result **and** apply its local transition atomically.
+
+        In **one** store transaction this composes three already-validated steps:
+
+        1. the complete, independently revalidated 1+N observation (exactly as the
+           inert :meth:`record_result`, sharing the same transaction-owned
+           primitive);
+        2. the exact cost settlement under the existing monotonic policy — the
+           reserve is retained for an unresolved cost and an overrun is counted at
+           the larger actual; the **only** ``not_incurred`` comes from a validated
+           definitive pre-billing rejection;
+        3. the dispatch transition the validated result envelope **derives** — never
+           a caller terminal/success/authenticated boolean:
+
+           * ``completed`` (HTTP 200, per-question failures included) →
+             ``accept_result`` with ``result_kind=RESULT_KIND``, ``result_ref`` the
+             observation's ``result_id`` and ``result_digest`` its content digest, so
+             the dispatch reaches ``completed`` exactly once even when the cost is
+             ``unknown`` (the reserve is still retained);
+           * a documented definitive pre-billing rejection (definitive
+             ``api_error``) → the cost is ``not_incurred`` and the dispatch is
+             ``failed``: never a scientific negative, never an accepted result;
+           * any transport/protocol failure or ambiguous API status → the dispatch
+             is reconciled to ``unknown`` (retaining the reserve; a known reported
+             cost does **not** resolve the operation) with no accepted result, no
+             new identity and no retry.
+
+        An observation already recorded for this dispatch is an **idempotent
+        replay**: the stored observation is returned and the dispatch is left
+        exactly as it is — so a replay against an already-``unknown`` fence stays
+        ``unknown``, a replay against a ``completed`` one stays ``completed`` with
+        no fence change and no duplicate cost, and a second accepted result can
+        never be created. A **divergent** replay raises
+        :class:`DecisionResultConflictError` and a **stale fence** raises
+        :class:`DecisionResultStaleFenceError`; either writes nothing.
+
+        Every failure (a contradiction in the result envelope, a cost/incurred
+        contradiction, a stale/divergent replay, or an injected fault-seam hook)
+        rolls back the set, its question rows, the cost settlement, and the
+        dispatch state together, so no partial observation or half-transition is
+        ever visible. This performs **no** network call and touches **no** registry.
+        """
+        if not isinstance(result, jev.DispatchResult):
+            raise DecisionResultValidationError(_M_BAD_RESULT)
+        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
+        if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
+            raise DecisionResultValidationError(_M_BAD_FENCE)
 
         with self._store.transaction():
+            inserted, observation = self._record_result_in_transaction(
+                dispatch_id, result, fence=fence
+            )
+            outcome = _derive_commit_outcome(observation)
+            if not inserted:
+                # Idempotent replay: never a second accepted result, never a
+                # re-settlement, never a fence change, never a state change.
+                dispatch = self._require_dispatch(dispatch_id)
+                return DecisionCommitOutcome(
+                    observation=observation,
+                    dispatch=dispatch,
+                    outcome=outcome,
+                    replayed=True,
+                )
+
+            self._fire_commit_seam(
+                "after_set_insert", dispatch_id=dispatch_id, observation=observation
+            )
+            self._fire_commit_seam(
+                "before_accept", dispatch_id=dispatch_id, outcome=outcome
+            )
+            if outcome == "completed":
+                self._dispatch._accept_result_in_transaction(
+                    dispatch_id,
+                    fence=fence,
+                    result_kind=RESULT_KIND,
+                    result_ref=observation.result_id,
+                    result_digest=observation.digest,
+                )
+            elif outcome == "failed":
+                self._dispatch._mark_failed_in_transaction(
+                    dispatch_id, definitive_rejection=True
+                )
+            else:  # unknown: reconcile the ambiguous remote outcome
+                self._dispatch._recover_in_transaction(dispatch_id)
+
+            # Settle the exact observed cost monotonically. The terminal/unknown
+            # state is written first so the row is always read-consistent (an
+            # in-flight state can never carry not_incurred); the one not_incurred
+            # is the definitive pre-billing rejection.
+            self._dispatch._settle_cost_in_transaction(
+                dispatch_id,
+                cost_state=observation.cost["state"],
+                amount_usd=observation.cost.get("amount_usd"),
+                allow_definitive_not_incurred=(outcome == "failed"),
+            )
+            self._fire_commit_seam(
+                "after_cost", dispatch_id=dispatch_id, outcome=outcome
+            )
             dispatch = self._require_dispatch(dispatch_id)
-            if dispatch.route != RESULT_ROUTE:
-                raise DecisionResultValidationError(_M_ROUTE)
-            if fence != dispatch.current_fence:
-                raise DecisionResultStaleFenceError(_M_STALE_FENCE)
-            intent = self._require_intent(dispatch_id)
-            if intent.project_id != project_id or intent.dispatch_id != dispatch_id:
-                raise DecisionResultValidationError(_M_BAD_INTENT)
-            if (
-                intent.task_id != dispatch.task_id
-                or intent.task_fingerprint != dispatch.task_fingerprint
-                or intent.route != dispatch.route
-                or intent.stage != dispatch.stage
-                or intent.input_digest != dispatch.input_digest
-                or intent.version_digest != dispatch.version_digest
-                or intent.reserve_usd != dispatch.reserve_usd
-                or intent.bound_evidence_digest != dispatch.bound_evidence_digest
-            ):
-                raise DecisionResultValidationError(_M_BAD_INTENT)
-            self._require_persisted_task(dispatch.task_id)
-
-            self._assert_result_binds_intent(result, intent, dispatch)
-            built = self._build_observation(project_id, dispatch, intent, result)
-
-            existing = self._set_row(dispatch_id)
-            if existing is not None:
-                stored = self._validate_set_row(existing)
-                if stored.canonical != built["canonical"]:
-                    raise DecisionResultConflictError(_M_DIVERGENT)
-                return stored
-
-            if dispatch.state == "completed":
-                raise DecisionResultStateError(_M_COMPLETED)
-            if dispatch.state not in _ACCEPTABLE_STATES:
-                raise DecisionResultStateError(_M_STATE)
-            self._insert_observation(built)
-            # The final full cross-validation must finish INSIDE this transaction:
-            # revalidate the just-inserted set + question rows with the same shared
-            # read validators so a contradictory envelope/intent/status/cost relation
-            # rolls back the entire 1+N set instead of committing a corrupt record.
-            row = self._set_row(dispatch_id)
-            if row is None:  # pragma: no cover - just inserted
-                raise DecisionResultCorruptionError(_M_PARTIAL_SET)
-            try:
-                return self._validate_set_row(row)
-            except DecisionResultCorruptionError as exc:
-                raise DecisionResultValidationError(_M_CONTRADICTION) from exc
+            return DecisionCommitOutcome(
+                observation=observation,
+                dispatch=dispatch,
+                outcome=outcome,
+                replayed=False,
+            )
 
     # -- reads --------------------------------------------------------------- #
     def get_result(self, dispatch_id: str) -> DecisionResultObservation | None:
