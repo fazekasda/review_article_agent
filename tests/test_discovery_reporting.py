@@ -936,5 +936,321 @@ class PersistenceTests(ReportingTestBase):
             self.coverage.current()
 
 
+# --------------------------------------------------------------------------- #
+# R1-R1 repair: trustworthy reusable historical report snapshots
+# --------------------------------------------------------------------------- #
+class HistorySnapshotRepairTests(ReportingTestBase):
+    def _setup(self):
+        a = self.observe("req_a", self.pubmed_run((self.rec(pmid="1", source_id="a"),)))
+        revision = self.ingest_corpus([a.run_id], request_id="corpus-1")
+        corpus_ref = self.ref(revision.artifact_id, revision.revision_id)
+        plan_ref = self.build_plan()
+        return corpus_ref, plan_ref
+
+    def _forge(self, revision, mutate) -> None:
+        """Rewrite a stored revision's envelope with a recomputed content hash."""
+
+        import hashlib
+        import sqlite3
+
+        content = self.artifacts.read_content(revision.artifact_id, revision.revision_id)
+        envelope = json.loads(content.decode("utf-8"))
+        mutate(envelope)
+        forged = canonical_json(envelope)
+        conn = sqlite3.connect(paths.store_path_for(str(self.tmp / "project")))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='revision_no_update'"
+            ).fetchone()
+            saved = row[0] if row and row[0] else None
+            conn.execute("DROP TRIGGER IF EXISTS revision_no_update")
+            conn.execute(
+                "UPDATE revision SET content = ?, content_sha256 = ?, byte_size = ? "
+                "WHERE project_id = ? AND artifact_id = ? AND revision_id = ?",
+                (
+                    forged,
+                    "sha256:" + hashlib.sha256(forged).hexdigest(),
+                    len(forged),
+                    self.project_id,
+                    revision.artifact_id,
+                    revision.revision_id,
+                ),
+            )
+            if saved:
+                conn.execute(saved)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _get(self, revision):
+        return self.coverage.get(
+            {
+                "project_id": self.project_id,
+                "artifact_id": revision.artifact_id,
+                "revision_id": revision.revision_id,
+            }
+        )
+
+    # -- defect 1: multiple report revisions under the default artifact ------ #
+    def test_multiple_report_revisions_with_exact_parent(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        first = self.record(corpus_ref, plan_ref, request_id="coverage-1")
+        b = self.observe("req_b", self.pubmed_run((self.rec(pmid="2", source_id="b"),)))
+        second_corpus = self.ingest_corpus([b.run_id], request_id="corpus-2")
+        second_ref = self.ref(second_corpus.artifact_id, second_corpus.revision_id)
+
+        second = self.record(second_ref, plan_ref, request_id="coverage-2")
+        self.assertNotEqual(second.revision_id, first.revision_id)
+        self.assertEqual(second.parent_revision_id, first.revision_id)
+        # Both revisions remain independently readable.
+        self.assertEqual(self._get(first)["payload"]["corpus"]["ref"], corpus_ref)
+        self.assertEqual(self._get(second)["payload"]["corpus"]["ref"], second_ref)
+
+    # -- defect 2: replay compares the logical input binding, not work ------- #
+    def _fixed_record(self, corpus_ref, plan_ref, **kwargs):
+        rid = kwargs.pop("revision_id", None) or CoverageRepository.new_revision_id()
+        artifact_id = kwargs.pop("artifact_id", DEFAULT_COVERAGE_ARTIFACT_ID)
+        return self.coverage.record_report(
+            corpus_ref,
+            plan_ref=plan_ref,
+            request_id=kwargs.pop("request_id", "coverage-1"),
+            rights=self.rights(artifact_id, rid),
+            revision_id=rid,
+            artifact_id=artifact_id,
+            **kwargs,
+        )
+
+    def test_replay_stable_after_new_work_and_cost(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        first = self._fixed_record(corpus_ref, plan_ref)
+        before = self._get(first)
+        content_before = self.artifacts.read_content(first.artifact_id, first.revision_id)
+        # Unrelated mutable project state grows after the report.
+        self.observe("req_late", self.pubmed_run((self.rec(pmid="99", source_id="late"),)))
+        jobs = JobRepository(self.store)
+        job = jobs.submit("job-late", task_kind="synthetic_probe", parameters={"n": 1})
+        jobs.begin_attempt(job.job_id, dispatch_kind="external_synthetic", stage="s1", reserve_usd="0.30")
+
+        again = self._fixed_record(corpus_ref, plan_ref)
+        self.assertEqual(again.revision_id, first.revision_id)
+        self.assertEqual(
+            self.artifacts.read_content(first.artifact_id, first.revision_id), content_before
+        )
+        self.assertEqual(self._get(first), before)
+
+    def test_replay_after_new_corpus_head(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        first = self._fixed_record(corpus_ref, plan_ref)
+        # A new corpus revision moves the corpus artifact's current head.
+        b = self.observe("req_b", self.pubmed_run((self.rec(pmid="2", source_id="b"),)))
+        self.ingest_corpus([b.run_id], request_id="corpus-2")
+        again = self._fixed_record(corpus_ref, plan_ref)
+        self.assertEqual(again.revision_id, first.revision_id)
+
+    def test_divergent_logical_binding_same_key_conflicts(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        self._fixed_record(corpus_ref, plan_ref)
+        with self.assertRaises(CoverageConflictError):
+            self._fixed_record(
+                corpus_ref, plan_ref,
+                known_relevant=[{"namespace": "pmid", "value": "1"}],
+            )
+
+    # -- defect 3: stored read rederives logical sections --------------------- #
+    def test_forged_corpus_counts_and_totals_together_is_corruption(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        revision = self.record(corpus_ref, plan_ref, request_id="coverage-1")
+
+        def mutate(envelope):
+            payload = envelope["payload"]
+            payload["corpus"]["counts"]["candidates"] += 1
+            payload["totals"]["candidates"] += 1
+
+        self._forge(revision, mutate)
+        with self.assertRaises(CoverageCorruptionError):
+            self.coverage.current()
+
+    def test_forged_plan_boundaries_same_digest_is_corruption(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        revision = self.record(corpus_ref, plan_ref, request_id="coverage-1")
+
+        def mutate(envelope):
+            envelope["payload"]["plan"]["boundaries"]["expansion"]["max_hops"] = 99
+
+        self._forge(revision, mutate)
+        with self.assertRaises(CoverageCorruptionError):
+            self.coverage.current()
+
+    def test_forged_known_matching_together_is_corruption(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        revision = self.record(
+            corpus_ref, plan_ref, request_id="coverage-1",
+            known_relevant=[{"namespace": "pmid", "value": "1"}],
+        )
+
+        def mutate(envelope):
+            token = envelope["payload"]["known_relevant"]["tokens"][0]
+            token["present"] = False
+            token["candidate_matches"] = []
+            token["occurrence_count"] = 0
+            envelope["payload"]["known_relevant"]["matched"] = 0
+            envelope["payload"]["known_relevant"]["missing"] = 1
+
+        self._forge(revision, mutate)
+        with self.assertRaises(CoverageCorruptionError):
+            self.coverage.current()
+
+    def test_forged_known_fake_candidate_id_is_corruption(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        revision = self.record(
+            corpus_ref, plan_ref, request_id="coverage-1",
+            known_relevant=[{"namespace": "pmid", "value": "1"}],
+        )
+
+        def mutate(envelope):
+            token = envelope["payload"]["known_relevant"]["tokens"][0]
+            token["candidate_matches"] = ["cand_forged"]
+
+        self._forge(revision, mutate)
+        with self.assertRaises(CoverageCorruptionError):
+            self.coverage.current()
+
+    def test_removed_automatic_gap_is_corruption(self) -> None:
+        # A corpus with a partial failure guarantees an automatic limitation line.
+        ok_page = fx.page(records=(self.rec(pmid="5", source_id="5"),))
+        failed_page = fx.page(
+            page_index=1, records=(), total_count=1, complete=False,
+            stop_reason="failure", failure="http_status",
+            attempts=(fx.attempt(attempt_no=2, status=503, outcome="retryable"),),
+        )
+        partial = fx.result((ok_page, failed_page), stop_reason="failure", failure="http_status")
+        a = self.observe("req_a", partial)
+        revision_corpus = self.ingest_corpus([a.run_id], request_id="corpus-1")
+        corpus_ref = self.ref(revision_corpus.artifact_id, revision_corpus.revision_id)
+        plan_ref = self.build_plan()
+        revision = self.record(corpus_ref, plan_ref, request_id="coverage-1")
+
+        def mutate(envelope):
+            summary = envelope["payload"]["limitations_summary"]
+            envelope["payload"]["limitations_summary"] = [
+                line for line in summary if "page limit" not in line
+            ]
+
+        self._forge(revision, mutate)
+        with self.assertRaises(CoverageCorruptionError):
+            self.coverage.current()
+
+    # -- defect 4: each stored work row is revalidated against its run -------- #
+    def test_forged_work_row_with_consistent_totals_is_corruption(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        revision = self.record(corpus_ref, plan_ref, request_id="coverage-1")
+
+        def mutate(envelope):
+            work = envelope["payload"]["work"]
+            work["observations"][0]["attempt_count"] += 1
+            work["totals"]["http_attempts"] += 1
+
+        self._forge(revision, mutate)
+        with self.assertRaises(CoverageCorruptionError):
+            self.coverage.current()
+
+    # -- defect 5: report-time monetary snapshot, immutable identity pins ----- #
+    def _make_task(self):
+        runtime = RuntimeRepository(self.store)
+        artifact = self.artifacts.create_artifact("a-dispatch-src2", kind="document")
+        self.artifacts.import_revision(
+            artifact_id=artifact.artifact_id,
+            content=b"dispatch-source-bytes-2",
+            origin_locator="import:synthetic",
+            rights=self.rights(artifact.artifact_id, "rev_d2"),
+            revision_id="rev_d2",
+        )
+        config = RoleConfiguration.from_mapping(
+            {
+                "schema_version": 1,
+                "roles": {
+                    "writer": {
+                        "provider_id": "openrouter",
+                        "model_id": "anthropic/claude-sonnet-5-5",
+                        "variant": "high",
+                        "steps": 8,
+                    }
+                },
+            }
+        )
+        mapping = {
+            "project_id": self.project_id,
+            "role": "writer",
+            "target": {
+                "project_id": self.project_id,
+                "artifact_id": artifact.artifact_id,
+                "revision_id": "rev_d2",
+            },
+            "input_refs": [],
+            "scope": ["section:introduction"],
+            "prompt_version": "writer.v1",
+            "size_limit": 4096,
+            "step_limit": 4,
+        }
+        bounded = BoundedTask.from_mapping(mapping, configuration=config)
+        return runtime.record_task(bounded, request_id="task-req2", configuration=config)
+
+    def test_settlement_after_report_does_not_invalidate(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        dispatch = RuntimeDispatchRepository(self.store)
+        reserved = dispatch.reserve_dispatch(
+            self._make_task(), request_id="call-1", route="direct_call", stage="s1",
+            input_digest=_DIG_A, version_digest=_DIG_B, reserve_usd="0.20",
+            bound_evidence_digest=_DIG_C,
+        )
+        dispatch.settle_cost(reserved.dispatch_id, cost_state="unknown")
+        revision = self.record(corpus_ref, plan_ref, request_id="coverage-1")
+        before = self._get(revision)
+        # A later legitimate settlement must not invalidate the frozen report.
+        dispatch.settle_cost(reserved.dispatch_id, cost_state="known", amount_usd="0.05")
+        self.assertEqual(self._get(revision), before)
+
+    def test_forged_immutable_pin_is_corruption(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        dispatch = RuntimeDispatchRepository(self.store)
+        dispatch.reserve_dispatch(
+            self._make_task(), request_id="call-1", route="direct_call", stage="s1",
+            input_digest=_DIG_A, version_digest=_DIG_B, reserve_usd="0.20",
+            bound_evidence_digest=_DIG_C,
+        )
+        revision = self.record(corpus_ref, plan_ref, request_id="coverage-1")
+
+        def mutate(envelope):
+            envelope["payload"]["monetary"]["pins"][0]["dispatch_id"] = "disp_missing"
+
+        self._forge(revision, mutate)
+        with self.assertRaises(CoverageCorruptionError):
+            self.coverage.current()
+
+    def test_forged_pin_route_is_corruption(self) -> None:
+        corpus_ref, plan_ref = self._setup()
+        dispatch = RuntimeDispatchRepository(self.store)
+        dispatch.reserve_dispatch(
+            self._make_task(), request_id="call-1", route="direct_call", stage="s1",
+            input_digest=_DIG_A, version_digest=_DIG_B, reserve_usd="0.20",
+            bound_evidence_digest=_DIG_C,
+        )
+        revision = self.record(corpus_ref, plan_ref, request_id="coverage-1")
+
+        def mutate(envelope):
+            monetary = envelope["payload"]["monetary"]
+            direct = monetary["runtime_dispatch"]["direct_call"]
+            empty = {key: (0 if isinstance(value, int) else "0") for key, value in direct.items()}
+            for key, value in direct.items():
+                monetary["runtime_dispatch"]["opencode_session"][key] = value
+            monetary["runtime_dispatch"]["direct_call"] = empty
+            monetary["pins"][0]["route"] = "opencode_session"
+
+        self._forge(revision, mutate)
+        with self.assertRaises(CoverageCorruptionError):
+            self.coverage.current()
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

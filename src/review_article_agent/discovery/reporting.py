@@ -111,10 +111,7 @@ from ..storage.artifacts import (
     sha256_digest,
 )
 from ..storage.discovery import DiscoveryRepository
-from .candidates import (
-    DOCUMENT_TYPE as CORPUS_DOCUMENT_TYPE,
-    CandidateRepository,
-)
+from .candidates import CandidateRepository
 from .context import read_context_document
 from .execution import METADATA_IMPORT_QUERY_PREFIX
 from .expansion import (
@@ -160,6 +157,19 @@ DEFAULT_COVERAGE_ARTIFACT_ID = "discovery.coverage"
 #: Request replay keys follow the existing bounded opaque-identifier convention.
 MAX_REQUEST_ID_CHARS = 512
 
+#: The monetary section is an immutable **report-time accounting snapshot**: the
+#: per-dispatch identity (id/route/reserve) is pinned and re-checked against the
+#: ledger on read, but the observed cost state/amount is explicit observed-at
+#: evidence, never an authenticity signature over a still-mutable ledger.
+MONETARY_BASIS = "report_time_accounting_snapshot"
+
+#: Explicit note carried by every monetary section.
+MONETARY_NOTE = (
+    "report-time accounting snapshot: dispatch identity/route/reserve are pinned "
+    "and re-checked against the ledger on read, but the observed cost state/amount "
+    "is explicit observed-at evidence and not a signature over later settlement"
+)
+
 #: Technical total response-byte cap for one report (not a scientific threshold).
 #: Crossing it is a static refusal, never silent truncation.
 MAX_RESPONSE_BYTES_TOTAL = 1 << 40
@@ -176,6 +186,7 @@ COVERAGE_NOTICE = (
 _REPORT_KEYS = frozenset(
     {
         "payload_version",
+        "input_binding",
         "corpus",
         "plan",
         "sources",
@@ -334,7 +345,7 @@ _KNOWN_TOKEN_KEYS = frozenset(
 )
 
 _MONETARY_KEYS = frozenset(
-    {"basis", "runtime_dispatch", "synthetic_jobs", "shared_exposure", "pins"}
+    {"basis", "note", "runtime_dispatch", "synthetic_jobs", "shared_exposure", "pins"}
 )
 
 _ROUTE_KEYS = frozenset(
@@ -787,7 +798,8 @@ def _monetary_section(store) -> dict:
     if synthetic < 0:
         raise CoverageCorruptionError(_M_CORRUPT_TOTALS)
     return {
-        "basis": "immutable_pinned_dispatch_rows",
+        "basis": MONETARY_BASIS,
+        "note": MONETARY_NOTE,
         "runtime_dispatch": runtime_dispatch,
         "synthetic_jobs": {
             "virtual_reserve_usd": _decimal_str(synthetic),
@@ -1279,81 +1291,48 @@ def _static_limitations(
 # --------------------------------------------------------------------------- #
 # Payload validation
 # --------------------------------------------------------------------------- #
-def _validate_corpus(section: dict, project_id: str, artifacts: ArtifactRepository) -> None:
+def _validate_corpus(section: dict, project_id: str, store) -> dict:
+    """Re-derive the corpus section from the actual same-project snapshot.
+
+    The exact (possibly historical) corpus revision is read through
+    :class:`CandidateRepository`, which revalidates its digest, envelope,
+    occurrence coverage, and run/payload agreement. The stored section must equal
+    the re-derived section exactly, so forged counts cannot survive.
+    """
     _exact_keys(section, _CORPUS_KEYS, _M_CORRUPT_PAYLOAD)
     ref = _ref_from_mapping(section["ref"], project_id, _M_CORRUPT_PAYLOAD)
-    if section["document_type"] != CORPUS_DOCUMENT_TYPE:
-        _fail(_M_CORRUPT_PAYLOAD)
-    _require_int(section["payload_version"])
-    _require_str(section["request_id"])
-    _require_str(section["content_sha256"])
-    run_ids = section["run_ids"]
-    if (
-        not isinstance(run_ids, list)
-        or run_ids != sorted(run_ids)
-        or len(set(run_ids)) != len(run_ids)
-    ):
-        _fail(_M_CORRUPT_PAYLOAD)
-    for run_id in run_ids:
-        _require_str(run_id)
-    if not isinstance(section["input_run_ids"], list):
-        _fail(_M_CORRUPT_PAYLOAD)
-    for run_id in section["input_run_ids"]:
-        _require_str(run_id)
-    counts = _exact_keys(section["counts"], _CORPUS_COUNT_KEYS, _M_CORRUPT_PAYLOAD)
-    for value in counts.values():
-        _require_int(value)
-    revision = artifacts.get_revision(ref["artifact_id"], ref["revision_id"])
-    if revision is None or revision.content_sha256 != section["content_sha256"]:
-        raise CoverageCorruptionError(_M_CORRUPT_PIN)
+    try:
+        snapshot = CandidateRepository(store).get(ref)
+    except Exception as exc:  # CandidateError / validate_ref
+        raise CoverageCorruptionError(_M_CORRUPT_PIN) from exc
+    rederived = _corpus_section(snapshot)
+    if rederived != section:
+        raise CoverageCorruptionError(_M_CORRUPT_TOTALS)
+    return snapshot
 
 
-def _validate_plan(section: dict, project_id: str, artifacts: ArtifactRepository) -> None:
+def _validate_plan(section: dict, project_id: str, store) -> None:
+    """Re-derive the plan section from the pinned context document revision.
+
+    The exact pinned plan revision is read with ``require_current=False`` (a
+    historical snapshot preserves its exact ref) and typed ``discovery_plan``,
+    then re-mapped. The stored section must equal the re-derived section.
+    """
     _exact_keys(section, _PLAN_KEYS, _M_CORRUPT_PAYLOAD)
     ref = _ref_from_mapping(section["ref"], project_id, _M_CORRUPT_PAYLOAD)
-    if section["document_type"] != "discovery_plan":
-        _fail(_M_CORRUPT_PAYLOAD)
-    _require_str(section["content_sha256"])
-    boundaries = _exact_keys(
-        section["boundaries"], frozenset({"expansion", "approved_queries"}), _M_CORRUPT_PAYLOAD
-    )
-    expansion = _exact_keys(
-        boundaries["expansion"],
-        frozenset({"max_hops", "max_sources", "max_requests", "page_size", "max_pages"}),
-        _M_CORRUPT_PAYLOAD,
-    )
-    for value in expansion.values():
-        _require_int(value)
-    for query in boundaries["approved_queries"]:
-        query = _exact_keys(
-            query, frozenset({"source", "query", "page_size", "max_pages"}), _M_CORRUPT_PAYLOAD
+    try:
+        document = read_context_document(
+            store, ref, expected_type="discovery_plan", require_current=False
         )
-        _require_str(query["source"])
-        _require_str(query["query"])
-        _require_int(query["page_size"], minimum=1)
-        _require_int(query["max_pages"], minimum=1)
-    terminology = section["terminology"]
-    if not isinstance(terminology, list):
-        _fail(_M_CORRUPT_PAYLOAD)
-    for term in terminology:
-        _require_str(term)
-    source_config = _exact_keys(
-        section["source_config"],
-        frozenset({"query_sources", "complementary_sources"}),
-        _M_CORRUPT_PAYLOAD,
+    except Exception as exc:  # DiscoveryContextError
+        raise CoverageCorruptionError(_M_CORRUPT_PIN) from exc
+    revision = ArtifactRepository(store).get_revision(
+        ref["artifact_id"], ref["revision_id"]
     )
-    for source in source_config["query_sources"]:
-        _require_str(source)
-    for entry in source_config["complementary_sources"]:
-        entry = _exact_keys(
-            entry, frozenset({"source", "mode", "rationale"}), _M_CORRUPT_PAYLOAD
-        )
-        _require_str(entry["source"])
-        _require_str(entry["mode"])
-        _require_str(entry["rationale"])
-    revision = artifacts.get_revision(ref["artifact_id"], ref["revision_id"])
-    if revision is None or revision.content_sha256 != section["content_sha256"]:
+    if revision is None:
         raise CoverageCorruptionError(_M_CORRUPT_PIN)
+    if _plan_section(document, revision) != section:
+        raise CoverageCorruptionError(_M_CORRUPT_TOTALS)
 
 
 def _recompute_source_totals(rows: list) -> dict:
@@ -1489,38 +1468,32 @@ def _validate_citations(section: dict, project_id: str, discovery) -> None:
             _fail(_M_CORRUPT_TOTALS)
 
 
-def _validate_known(known: dict) -> None:
+def _validate_known(known: dict, corpus_snapshot: dict) -> None:
+    """Re-derive the known-relevant section from the actual corpus candidates.
+
+    The declared tokens are re-matched against the exact same-project snapshot, so
+    forged candidate ids, present flags, and matched/missing counts are refused.
+    """
     known = _exact_keys(known, _KNOWN_KEYS, _M_CORRUPT_PAYLOAD)
     if known["status"] not in ("assessed", "not_assessed"):
         _fail(_M_CORRUPT_PAYLOAD)
     tokens = known["tokens"]
     if not isinstance(tokens, list):
         _fail(_M_CORRUPT_PAYLOAD)
-    matched = 0
+    declared = []
     for token in tokens:
         token = _exact_keys(token, _KNOWN_TOKEN_KEYS, _M_CORRUPT_PAYLOAD)
         namespace = _require_str(token["namespace"])
         if namespace not in _KNOWN_NAMESPACES and not namespace.startswith("native:"):
             _fail(_M_CORRUPT_PAYLOAD)
         _require_str(token["value"])
-        present = _require_bool(token["present"])
-        matches = token["candidate_matches"]
-        if not isinstance(matches, list) or matches != sorted(matches):
-            _fail(_M_CORRUPT_PAYLOAD)
-        for candidate_id in matches:
-            _require_str(candidate_id)
-        _require_int(token["occurrence_count"])
-        if present != bool(matches):
-            _fail(_M_CORRUPT_TOTALS)
-        matched += 1 if present else 0
-    if known["status"] == "not_assessed":
-        if tokens or known["matched"] != 0 or known["missing"] != 0:
-            _fail(_M_CORRUPT_TOTALS)
-    elif known["matched"] != matched or known["missing"] != len(tokens) - matched:
+        declared.append({"namespace": namespace, "value": token["value"]})
+    rederived = _known_section(corpus_snapshot, declared)
+    if rederived != known:
         _fail(_M_CORRUPT_TOTALS)
 
 
-def _validate_work(work: dict) -> None:
+def _validate_work(work: dict, discovery) -> None:
     work = _exact_keys(work, frozenset({"observations", "totals"}), _M_CORRUPT_PAYLOAD)
     rows = work["observations"]
     if not isinstance(rows, list):
@@ -1537,6 +1510,14 @@ def _validate_work(work: dict) -> None:
         if run_id in seen:
             _fail(_M_CORRUPT_PAYLOAD)
         seen.add(run_id)
+        # Each stored historical row is re-derived from its immutable observation;
+        # later unrelated runs must not stale the report, but a forged historical
+        # row must fail even when its totals are made internally consistent.
+        record = discovery.get_search(run_id)
+        if record is None:
+            raise CoverageCorruptionError(_M_CORRUPT_PIN)
+        if _work_row(record) != row:
+            raise CoverageCorruptionError(_M_CORRUPT_TOTALS)
         _require_str(row["source"])
         _require_str(row["query"])
         _require_str(row["started_at"])
@@ -1587,13 +1568,15 @@ def _validate_work(work: dict) -> None:
         _fail(_M_BOUND_TOTAL)
 
 
-def _validate_monetary(monetary: dict) -> None:
+def _validate_monetary(monetary: dict, store) -> None:
     monetary = _exact_keys(monetary, _MONETARY_KEYS, _M_CORRUPT_PAYLOAD)
-    if monetary["basis"] != "immutable_pinned_dispatch_rows":
+    if monetary["basis"] != MONETARY_BASIS:
         _fail(_M_CORRUPT_PAYLOAD)
+    _require_str(monetary["note"])
     pins = monetary["pins"]
     if not isinstance(pins, list):
         _fail(_M_CORRUPT_PAYLOAD)
+    dispatches = RuntimeDispatchRepository(store)
     routes: dict = {route: _blank_route() for route in DISPATCH_ROUTES}
     seen: set = set()
     for pin in pins:
@@ -1604,6 +1587,16 @@ def _validate_monetary(monetary: dict) -> None:
         seen.add(dispatch_id)
         route = _require_str(pin["route"])
         _require_str(pin["state"])
+        # Immutable identity pin: the dispatch must exist and its immutable route
+        # and reserve must match the ledger. The observed cost state/amount is
+        # report-time evidence and is NOT required to equal a later settlement
+        # (that would invalidate a legitimately frozen historical report).
+        try:
+            live = dispatches.get_dispatch(dispatch_id)
+        except Exception as exc:  # DispatchCorruptionError
+            raise CoverageCorruptionError(_M_CORRUPT_PIN) from exc
+        if live is None or live.route != route or live.reserve_usd != pin["reserve_usd"]:
+            raise CoverageCorruptionError(_M_CORRUPT_PIN)
         bucket = routes.setdefault(route, _blank_route())
         _accumulate_route(bucket, pin)
     for route in DISPATCH_ROUTES:
@@ -1652,26 +1645,41 @@ def _validate_guarantees(guarantees: dict, *, authorizing: bool, completeness: b
         _fail(_M_CORRUPT_CLAIM)
 
 
-def _validate_payload(payload: dict, *, project_id: str, artifacts, discovery) -> dict:
+def _validate_payload(payload: dict, *, project_id: str, store) -> dict:
     payload = _exact_keys(payload, _REPORT_KEYS, _M_CORRUPT_PAYLOAD)
     if payload["payload_version"] != COVERAGE_PAYLOAD_VERSION:
         _fail(_M_CORRUPT_PAYLOAD)
     if payload["notice"] != COVERAGE_NOTICE:
         _fail(_M_CORRUPT_PAYLOAD)
-    _validate_corpus(payload["corpus"], project_id, artifacts)
-    _validate_plan(payload["plan"], project_id, artifacts)
+    discovery = DiscoveryRepository(store)
+    corpus_snapshot = _validate_corpus(payload["corpus"], project_id, store)
+    _validate_plan(payload["plan"], project_id, store)
     _validate_sources(payload["sources"], payload["corpus"], discovery)
     _validate_totals(payload["totals"], payload["corpus"])
     _validate_citations(payload["citations"], project_id, discovery)
-    _validate_known(payload["known_relevant"])
-    _validate_work(payload["work"])
-    _validate_monetary(payload["monetary"])
+    _validate_known(payload["known_relevant"], corpus_snapshot)
+    _validate_work(payload["work"], discovery)
+    _validate_monetary(payload["monetary"], store)
     if not isinstance(payload["limitations"], list):
         _fail(_M_CORRUPT_PAYLOAD)
     if not isinstance(payload["limitations_summary"], list):
         _fail(_M_CORRUPT_PAYLOAD)
     for text in payload["limitations"] + payload["limitations_summary"]:
         _require_str(text)
+    # The logical request binding must equal the one re-derived from this payload.
+    if payload["input_binding"] != _binding_from_payload(payload):
+        _fail(_M_CORRUPT_TOTALS)
+    # The human-readable summary is re-derived so a malicious payload cannot erase
+    # an automatic known gap.
+    expected_summary = _static_limitations(
+        payload["corpus"]["counts"],
+        payload["sources"]["runs"],
+        payload["citations"],
+        payload["known_relevant"],
+        payload["limitations"],
+    )
+    if payload["limitations_summary"] != expected_summary:
+        _fail(_M_CORRUPT_TOTALS)
     _validate_guarantees(
         payload["guarantees"],
         authorizing=payload["authorizing"],
@@ -1681,24 +1689,82 @@ def _validate_payload(payload: dict, *, project_id: str, artifacts, discovery) -
 
 
 # --------------------------------------------------------------------------- #
+# Logical request binding (replay identity that excludes mutable work/monetary)
+# --------------------------------------------------------------------------- #
+def _expansion_digests(citations: dict) -> list:
+    return [
+        hashlib.sha256(canonical_json(mapping)).hexdigest()
+        for mapping in citations["reports"]
+    ]
+
+
+def _logical_binding(
+    corpus_section: dict,
+    plan_section: dict,
+    citations: dict,
+    known_tokens: list,
+    limitations_list: list,
+) -> dict:
+    """The canonical, deterministic identity of one logical coverage request.
+
+    It covers exactly the caller/durable inputs — corpus ref + digest, plan ref +
+    digest, the ordered expansion inputs (pinned refs and validated-mapping
+    digests), the declared known-relevant tokens, and the caller limitations — and
+    deliberately excludes the mutable cumulative work/monetary sections, so an
+    identical logical replay is recognised even after project work grows.
+    """
+    return {
+        "corpus": {
+            "artifact_id": corpus_section["ref"]["artifact_id"],
+            "revision_id": corpus_section["ref"]["revision_id"],
+            "content_sha256": corpus_section["content_sha256"],
+        },
+        "plan": {
+            "artifact_id": plan_section["ref"]["artifact_id"],
+            "revision_id": plan_section["ref"]["revision_id"],
+            "content_sha256": plan_section["content_sha256"],
+        },
+        "citation_pinned_refs": [
+            [ref["artifact_id"], ref["revision_id"]] for ref in citations["pinned_refs"]
+        ],
+        "citation_report_digests": _expansion_digests(citations),
+        "known_relevant": [[token["namespace"], token["value"]] for token in known_tokens],
+        "limitations": list(limitations_list),
+    }
+
+
+def _binding_from_payload(payload: dict) -> dict:
+    corpus = payload["corpus"]
+    plan = payload["plan"]
+    citations = payload["citations"]
+    known = payload["known_relevant"]
+    return {
+        "corpus": {
+            "artifact_id": corpus["ref"]["artifact_id"],
+            "revision_id": corpus["ref"]["revision_id"],
+            "content_sha256": corpus["content_sha256"],
+        },
+        "plan": {
+            "artifact_id": plan["ref"]["artifact_id"],
+            "revision_id": plan["ref"]["revision_id"],
+            "content_sha256": plan["content_sha256"],
+        },
+        "citation_pinned_refs": [
+            [ref["artifact_id"], ref["revision_id"]] for ref in citations["pinned_refs"]
+        ],
+        "citation_report_digests": _expansion_digests(citations),
+        "known_relevant": [[token["namespace"], token["value"]] for token in known["tokens"]],
+        "limitations": list(payload["limitations"]),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Public builder
 # --------------------------------------------------------------------------- #
-def build_coverage_report(
-    store,
-    corpus_ref,
-    *,
-    plan_ref,
-    expansion_reports=(),
-    known_relevant=(),
-    limitations=(),
+def _prepare_logical(
+    store, corpus_ref, plan_ref, expansion_reports, known_relevant, limitations
 ) -> dict:
-    """Build one deterministic coverage-report envelope from durable inputs.
-
-    Reads the exact corpus and plan revisions, the stored observations, any
-    supplied expansion reports, and the budget ledgers. Makes **no** provider,
-    model, worker, or approval call, and writes nothing. Returns the generic
-    document envelope ``{schema_version, document_type, payload}`` ready to store.
-    """
+    """Read and validate only the durable/logical inputs of one report."""
     project_id = store.project_id
     artifacts = ArtifactRepository(store)
     discovery = DiscoveryRepository(store)
@@ -1709,8 +1775,12 @@ def build_coverage_report(
     except Exception as exc:  # CandidateError / validate_ref etc.
         raise CoverageValidationError(_M_BAD_CORPUS) from exc
 
+    # The exact pinned plan revision is read with ``require_current=False`` so a
+    # historical snapshot keeps its exact ref even after the plan head moves.
     try:
-        plan_doc = read_context_document(store, plan_ref, expected_type="discovery_plan")
+        plan_doc = read_context_document(
+            store, plan_ref, expected_type="discovery_plan", require_current=False
+        )
     except Exception as exc:  # DiscoveryContextError etc.
         raise CoverageValidationError(_M_BAD_PLAN) from exc
     plan_ref_norm = _ref_from_mapping(plan_ref, project_id, _M_BAD_PLAN)
@@ -1720,20 +1790,41 @@ def build_coverage_report(
     if plan_revision is None:
         raise CoverageValidationError(_M_BAD_PLAN)
 
-    known_tokens = _coerce_known_relevant(known_relevant)
-    limitations_list = _coerce_limitations(limitations)
-
     corpus_section = _corpus_section(corpus)
     plan_section = _plan_section(plan_doc, plan_revision)
-    source_rows, source_totals = _sources_section(discovery, corpus)
     citations = _citations_section(store, discovery, project_id, expansion_reports)
+    known_tokens = _coerce_known_relevant(known_relevant)
+    limitations_list = _coerce_limitations(limitations)
     known = _known_section(corpus, known_tokens)
-    work_rows, work_totals = _work_section(discovery)
+    binding = _logical_binding(
+        corpus_section, plan_section, citations, known_tokens, limitations_list
+    )
+    return {
+        "project_id": project_id,
+        "corpus": corpus,
+        "corpus_section": corpus_section,
+        "plan_section": plan_section,
+        "citations": citations,
+        "known": known,
+        "known_tokens": known_tokens,
+        "limitations_list": limitations_list,
+        "binding": binding,
+    }
 
-    payload = {
+
+def _assemble_payload(prepared: dict, store) -> dict:
+    discovery = DiscoveryRepository(store)
+    corpus_section = prepared["corpus_section"]
+    citations = prepared["citations"]
+    known = prepared["known"]
+    limitations_list = prepared["limitations_list"]
+    source_rows, source_totals = _sources_section(discovery, prepared["corpus"])
+    work_rows, work_totals = _work_section(discovery)
+    return {
         "payload_version": COVERAGE_PAYLOAD_VERSION,
+        "input_binding": prepared["binding"],
         "corpus": corpus_section,
-        "plan": plan_section,
+        "plan": prepared["plan_section"],
         "sources": {"runs": source_rows, "totals": source_totals},
         "totals": dict(corpus_section["counts"]),
         "citations": citations,
@@ -1754,7 +1845,29 @@ def build_coverage_report(
         "completeness_claimed": False,
         "notice": COVERAGE_NOTICE,
     }
-    _validate_payload(payload, project_id=project_id, artifacts=artifacts, discovery=discovery)
+
+
+def build_coverage_report(
+    store,
+    corpus_ref,
+    *,
+    plan_ref,
+    expansion_reports=(),
+    known_relevant=(),
+    limitations=(),
+) -> dict:
+    """Build one deterministic coverage-report envelope from durable inputs.
+
+    Reads the exact corpus and plan revisions, the stored observations, any
+    supplied expansion reports, and the budget ledgers. Makes **no** provider,
+    model, worker, or approval call, and writes nothing. Returns the generic
+    document envelope ``{schema_version, document_type, payload}`` ready to store.
+    """
+    prepared = _prepare_logical(
+        store, corpus_ref, plan_ref, expansion_reports, known_relevant, limitations
+    )
+    payload = _assemble_payload(prepared, store)
+    _validate_payload(payload, project_id=prepared["project_id"], store=store)
     return {
         "schema_version": COVERAGE_ENVELOPE_SCHEMA_VERSION,
         "document_type": DOCUMENT_TYPE,
@@ -1858,7 +1971,6 @@ class CoverageRepository:
     def __init__(self, store) -> None:
         self._store = store
         self._artifacts = ArtifactRepository(store)
-        self._discovery = DiscoveryRepository(store)
 
     @property
     def project_id(self) -> str:
@@ -1895,14 +2007,27 @@ class CoverageRepository:
         """
         artifact_id = _artifact_identifier(artifact_id)
         request_id = _request_identifier(request_id)
-        document = build_coverage_report(
-            self._store,
-            corpus_ref,
-            plan_ref=plan_ref,
-            expansion_reports=expansion_reports,
-            known_relevant=known_relevant,
-            limitations=limitations,
+
+        # Read only the durable/logical inputs first, so an identical logical
+        # replay is recognised even after unrelated work/monetary state changed.
+        prepared = _prepare_logical(
+            self._store, corpus_ref, plan_ref, expansion_reports, known_relevant, limitations
         )
+
+        existing = self._find_request(artifact_id, request_id)
+        if existing is not None:
+            existing_revision, existing_binding = existing
+            if existing_binding == prepared["binding"]:
+                return existing_revision
+            raise CoverageConflictError(_M_DIVERGENT)
+
+        payload = _assemble_payload(prepared, self._store)
+        _validate_payload(payload, project_id=prepared["project_id"], store=self._store)
+        document = {
+            "schema_version": COVERAGE_ENVELOPE_SCHEMA_VERSION,
+            "document_type": DOCUMENT_TYPE,
+            "payload": payload,
+        }
 
         dependencies = [
             {**document["payload"]["corpus"]["ref"], "role": "derived_from"},
@@ -1912,6 +2037,10 @@ class CoverageRepository:
             dependencies.append({**ref, "role": "derived_from"})
 
         self._artifacts.create_artifact(artifact_id, kind="report", created_by="import")
+        # A genuinely new revision names the artifact's current head as its exact
+        # parent, so a second report can be recorded after a new search/decision.
+        current = self._artifacts.current_revision(artifact_id)
+        parent_revision_id = current.revision_id if current is not None else None
         try:
             return self._artifacts.import_revision(
                 artifact_id=artifact_id,
@@ -1919,6 +2048,7 @@ class CoverageRepository:
                 origin_locator=_origin_locator(request_id),
                 rights=rights,
                 revision_id=revision_id,
+                parent_revision_id=parent_revision_id,
                 dependencies=dependencies,
                 acquired_by="import",
                 request_id=request_id,
@@ -1949,14 +2079,26 @@ class CoverageRepository:
         return self._read(revision)
 
     # -- internals ----------------------------------------------------------- #
+    def _find_request(self, artifact_id: str, request_id: str):
+        """Return ``(revision, input_binding)`` for a recorded request key, if any.
+
+        The stored revision is fully revalidated (its binding is re-derived from
+        its own bytes and durable pins), so a corrupt historical report fails
+        closed rather than replaying.
+        """
+        locator = _origin_locator(request_id)
+        for revision in self._artifacts.list_revisions(artifact_id):
+            if revision.origin_locator != locator:
+                continue
+            assembled = self._read(revision)
+            return revision, assembled["payload"]["input_binding"]
+        return None
+
     def _read(self, revision: Revision) -> dict:
         document = _read_document(self._artifacts, revision)
         try:
             payload = _validate_payload(
-                document["payload"],
-                project_id=self.project_id,
-                artifacts=self._artifacts,
-                discovery=self._discovery,
+                document["payload"], project_id=self.project_id, store=self._store
             )
         except CoverageValidationError as exc:
             # A stored report that fails its own payload validation is corrupt.
