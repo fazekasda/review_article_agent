@@ -40,12 +40,20 @@ criterion, or policy was weakened.
 > `c8e52f0`, T2 repository `9f1ff31`). The coordinator's earlier codec-only run
 > was **223 discovery tests at `c8e52f0`**; this worker ran **252 discovery tests
 > OK**, **29 contract-doc checks OK**, **20 scripts tests OK**, and
-> `git diff --check` clean at `25827dd` before editing docs (§8.6). The coordinator
-> additionally reported **2,142 full core tests** at source-equivalent `7896af8`,
-> **164 backup tests**, and 29 contracts. A coordinator **combined run at
-> `25827dd` was still pending** when this handoff was written; **no 2,357-test
-> total and no latest full-suite claim is made here**. Every run is at the stated
-> **code head**, not at this handoff's own docs-only commit.
+> `git diff --check` clean at `25827dd` before editing docs (§8.6). The
+> coordinator's **full frozen combined suite at the same code HEAD `25827dd`**
+> then completed **PASSED** (log
+> `/tmp/opencode/search-records-combined.log`, read to verify): Python **3.14.4**,
+> **2,142 core tests in 239.488 s**, **20 scripts**, **79 Python retained
+> spikes**, **51 live-Jev mock**, **7 integration mock**, and **58 TypeScript**
+> tests — **2,357 tests total, no skips**; **29 contract checks**; `tsc --noEmit`
+> and `compileall -q src tests` pass; `git diff --check` pass. Existing
+> SQLite/subprocess/unclosed-file `ResourceWarning`s are disclosed, not failures.
+> No paid/provider/live adapter call or hosted transfer was made; Python 3.11
+> remains untested. That combined run is at **code HEAD `25827dd`, before this
+> docs update**, **not** at this handoff's own docs commit; the coordinator will
+> verify the final docs head. **No full-suite claim is made at the final docs
+> commit.**
 
 ## 1. Scope, base revisions, and authority used
 
@@ -390,16 +398,36 @@ not scientific validity or remote quiescence.
 
 ### 8.6 Verification of this added slice
 
-| Command (at code HEAD `25827dd`, before docs edits) | Result |
+Targeted checks at code HEAD `25827dd`, before docs edits:
+
+| Command | Result |
 | --- | --- |
 | `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_discovery_*.py'` | **252 OK** |
 | `python3 scripts/check_contract_docs.py --self-test` | **29 checks ok, 0 failed** |
 | `python3 -m unittest discover -s scripts -p 'test_*.py'` | **20 OK** |
 | `git diff --check` | clean |
 
-Coordinator-reported, not independently rerun in this worker: **2,142 full core
-tests** at source-equivalent `7896af8`, **164 backup tests**, 29 contract checks.
-The coordinator's combined run at `25827dd` was **pending** at handoff time, so
-the historic 2,282 total is **not** superseded here and the prospective
-2,357-test total is **not claimed**. No live smoke, paid model call, or hosted
-transfer was run for this slice.
+Confirmed **full frozen combined suite** at the same code HEAD `25827dd`
+(log `/tmp/opencode/search-records-combined.log`, read to verify), **ALL CHECKS
+PASSED**:
+
+| Check | Result |
+| --- | --- |
+| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` | **2,142 OK in 239.488 s**, no skips |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **20 OK** |
+| `python3 scripts/check_contract_docs.py --self-test` | **29 checks ok, 0 failed** |
+| `python3 -m unittest discover -s spikes/runtime/python -p 'test_*.py'` | **79 OK** |
+| `python3 -m unittest discover -s spikes/runtime/live-jev -p 'test_*.py'` | **51 OK** (mocked; no paid/provider call) |
+| `python3 -m unittest discover -s spikes/runtime/integration -p 'test_*.py'` | **7 OK** |
+| `npm --prefix spikes/runtime/typescript test` | **58 OK**, 0 skipped |
+| `(cd spikes/runtime/typescript && npx tsc --noEmit)` | pass |
+| `python3 -m compileall -q src tests` | pass |
+| `git diff --check` | pass |
+
+**Total 2,357 tests.** Python **3.14.4** was used; **3.11 remains untested**.
+Existing SQLite/subprocess/unclosed-file `ResourceWarning`s are disclosed, not
+failures. No paid/provider/live adapter call or hosted transfer was made. This
+run is at **code HEAD `25827dd`, before this documentation update**, **not** at
+this handoff's own docs commit; **no full-suite claim is made at the final docs
+commit**. The historic adapter total remains **2,282 at `de179b4` / `6e20946`**
+and is not conflated with this 2,357-test combined run.
