@@ -14,9 +14,11 @@ What it is
 ----------
 
 * A **stdlib-only** GET client with a fixed allowlist of HTTPS origins/paths:
-  NCBI E-utilities ``esearch.fcgi``/``efetch.fcgi`` and the Europe PMC REST
-  ``search`` endpoint. Any other host, scheme, port, or path is refused before a
-  socket is opened.
+  NCBI E-utilities ``esearch.fcgi``/``efetch.fcgi``, the Europe PMC REST
+  ``search`` endpoint, and one narrowly-shaped Europe PMC REST citation family
+  (``.../rest/{source}/{id}/references`` or ``/citations``, both segments
+  validated; see :func:`build_epmc_citation_url`). Any other host, scheme, port,
+  or path is refused before a socket is opened.
 * **No credentials.** No ``Authorization`` header is ever sent, a URL carrying
   userinfo is refused, and a query parameter whose name looks like a credential
   is refused. There is no paid call and no live smoke here.
@@ -75,6 +77,12 @@ from ..domain.errors import ReviewAgentError
 
 __all__ = [
     "ALLOWED_ENDPOINTS",
+    "EPMC_REST_BASE",
+    "CITATION_RELATIONS",
+    "MAX_CITATION_SOURCE_LEN",
+    "MAX_CITATION_ID_LEN",
+    "build_epmc_citation_url",
+    "validate_epmc_citation_identity",
     "ATTEMPT_OUTCOMES",
     "TRANSPORT_FAILURE_REASONS",
     "RETRYABLE_STATUSES",
@@ -131,6 +139,47 @@ ALLOWED_ENDPOINTS = (
     "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
     "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
 )
+
+#: The **one** bounded path *family* this transport may additionally contact: the
+#: Europe PMC REST citation relation of a single paper. The scheme/host/port
+#: rules are unchanged (still exactly https, default port, no userinfo/fragment),
+#: and the only variable segments are a validated native ``source`` and ``id``
+#: plus the fixed ``references``/``citations`` relation. This never adds a host;
+#: it narrows one documented shape on the already allowlisted ``www.ebi.ac.uk``.
+EPMC_REST_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+
+#: The two permitted citation relations (backward = references, forward = citations).
+CITATION_RELATIONS = ("references", "citations")
+
+#: Bounds on the two variable path segments of a citation URL.
+MAX_CITATION_SOURCE_LEN = 64
+MAX_CITATION_ID_LEN = 256
+
+#: A native provider-source token (``MED``/``PMC``/``PPR``/...): a short
+#: uppercase ASCII alphanumeric token. It never contains ``:``/``/``/``%``, so
+#: the composed ``source:id`` stays unambiguous and can never smuggle URL syntax.
+_NATIVE_SOURCE_RE = re.compile(r"[A-Z][A-Z0-9]*")
+
+#: A bounded, URL-safe provider record id: it must start alphanumeric and may only
+#: contain alphanumerics, ``.``, ``_`` and ``-``. This excludes ``/``, ``%``,
+#: ``?``, ``#``, ``:``, ``\``, ``@``, whitespace and control characters, so an id
+#: can never add a path segment, percent-encode the path, or carry a traversal.
+_CITATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+#: Fully-anchored regular expressions for the extra path *families* permitted on
+#: an allowlisted host. A family is matched against the URL path only and its
+#: captured segments are re-checked by :func:`_citation_path_is_safe`; it can
+#: therefore never widen the scheme/host/port/query rules enforced above.
+_CITATION_PATH_RE = re.compile(
+    r"/europepmc/webservices/rest/"
+    r"(?P<source>[A-Z][A-Z0-9]{0,63})/"
+    r"(?P<id>[A-Za-z0-9][A-Za-z0-9._-]{0,255})/"
+    r"(?P<relation>references|citations)"
+)
+
+_ALLOWED_PATH_PATTERNS: Mapping[str, tuple[re.Pattern[str], ...]] = {
+    "www.ebi.ac.uk": (_CITATION_PATH_RE,),
+}
 
 #: A stable, non-credential User-Agent (identifies the tool; carries no secret).
 USER_AGENT = "review-article-agent/0.0.0 (stdlib; local)"
@@ -259,6 +308,106 @@ def _require_bounded_int(
 # --------------------------------------------------------------------------- #
 # URL / parameter validation
 # --------------------------------------------------------------------------- #
+def _require_citation_segment(
+    value: object,
+    field_name: str,
+    pattern: re.Pattern[str],
+    max_len: int,
+    *,
+    forbid_traversal: bool = False,
+) -> str:
+    """Validate one variable citation-URL path segment (never URL syntax).
+
+    A segment must be a non-empty string within its length bound, must match its
+    strict alphabet (so ``/``, ``%``, ``?``, ``#``, ``:``, ``\\``, ``@``,
+    whitespace and control characters are impossible), and — for the record id —
+    must not contain a ``..`` traversal sequence. Nothing is ever stripped or
+    encoded: a value that is not already safe is refused, not repaired.
+    """
+    if not isinstance(value, str) or not value:
+        raise DiscoveryValidationError(f"{field_name}: must be a non-empty string")
+    if len(value) > max_len:
+        raise DiscoveryValidationError(f"{field_name}: is too long")
+    if value != value.strip() or any(ch.isspace() for ch in value):
+        raise DiscoveryValidationError(f"{field_name}: must not contain whitespace")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise DiscoveryValidationError(
+            f"{field_name}: must not contain control characters"
+        )
+    if pattern.fullmatch(value) is None:
+        raise DiscoveryValidationError(f"{field_name}: is not a safe identifier")
+    if forbid_traversal and ".." in value:
+        raise DiscoveryValidationError(
+            f"{field_name}: must not contain a traversal sequence"
+        )
+    return value
+
+
+def validate_epmc_citation_identity(
+    source: object, native_id: object, relation: object
+) -> tuple[str, str, str]:
+    """Validate a citation identity and return the exact ``(source, id, relation)``.
+
+    ``relation`` must be one of :data:`CITATION_RELATIONS` (``references`` for the
+    backward reference list, ``citations`` for the forward citation list);
+    ``source`` must be a Europe PMC native source token; ``native_id`` must be a
+    bounded, URL-safe provider record id. Every value is validated **before** it
+    is returned, and nothing is stripped or percent-encoded: an unsafe value is
+    refused, never repaired. The returned triple is exactly the safe path
+    segments :func:`build_epmc_citation_url` composes.
+    """
+    if relation not in CITATION_RELATIONS:
+        raise DiscoveryValidationError(
+            "relation: must be one of " + ", ".join(CITATION_RELATIONS)
+        )
+    validated_source = _require_citation_segment(
+        source, "source", _NATIVE_SOURCE_RE, MAX_CITATION_SOURCE_LEN
+    )
+    validated_id = _require_citation_segment(
+        native_id,
+        "id",
+        _CITATION_ID_RE,
+        MAX_CITATION_ID_LEN,
+        forbid_traversal=True,
+    )
+    return validated_source, validated_id, relation
+
+
+def build_epmc_citation_url(source: object, native_id: object, relation: object) -> str:
+    """Validate a paper identity and return its exact Europe PMC citation URL.
+
+    Every argument is validated (see :func:`validate_epmc_citation_identity`)
+    **before** a URL is returned, and the produced URL contains no query, no
+    fragment, no userinfo, and only already-safe path segments — so
+    :func:`build_request_url` (and therefore every real request) accepts it under
+    the narrow citation path family and nothing wider.
+    """
+    validated_source, validated_id, validated_relation = (
+        validate_epmc_citation_identity(source, native_id, relation)
+    )
+    return f"{EPMC_REST_BASE}/{validated_source}/{validated_id}/{validated_relation}"
+
+
+def _citation_path_is_safe(match: re.Match[str]) -> bool:
+    """Re-check the captured segments of a citation-family path match.
+
+    The family regex already restricts the alphabet; this adds the traversal and
+    relation checks so a matched path is only accepted when each variable segment
+    is genuinely safe and the relation is one of the two documented values.
+    """
+    groups = match.groupdict()
+    source = groups.get("source")
+    native_id = groups.get("id")
+    relation = groups.get("relation")
+    if relation not in CITATION_RELATIONS:
+        return False
+    if source is None or _NATIVE_SOURCE_RE.fullmatch(source) is None:
+        return False
+    if native_id is None or _CITATION_ID_RE.fullmatch(native_id) is None:
+        return False
+    return ".." not in source and ".." not in native_id
+
+
 def _validate_endpoint_parts(parts: urllib.parse.SplitResult) -> None:
     """Refuse anything that is not an allowlisted HTTPS origin+path."""
     if parts.scheme != "https":
@@ -277,8 +426,13 @@ def _validate_endpoint_parts(parts: urllib.parse.SplitResult) -> None:
     if host is None:
         raise DiscoveryEndpointError("url has no host")
     allowed_paths = _ALLOWED_ORIGINS.get(host)
-    if allowed_paths is None or parts.path not in allowed_paths:
-        raise DiscoveryEndpointError("url is not an allowlisted literature endpoint")
+    if allowed_paths is not None and parts.path in allowed_paths:
+        return
+    for pattern in _ALLOWED_PATH_PATTERNS.get(host, ()):
+        match = pattern.fullmatch(parts.path)
+        if match is not None and _citation_path_is_safe(match):
+            return
+    raise DiscoveryEndpointError("url is not an allowlisted literature endpoint")
 
 
 def _check_query_keys(query: str) -> None:
