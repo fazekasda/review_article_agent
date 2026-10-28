@@ -815,25 +815,43 @@ class RuntimeDispatchRepository:
         believe they hold the claim and might both issue I/O. Read/reconcile
         (:meth:`recover`, :meth:`get_dispatch`) is what may be replayed, never the
         send claim.
+
+        This public form owns its own transaction. A caller that must compose the
+        claim with a global serial-slot check (the session runner) uses the
+        transaction-owned primitive :meth:`_mark_submitted_in_transaction` inside
+        one caller-owned transaction instead.
         """
         dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
         with self._store.transaction():
-            record = self._require_dispatch(dispatch_id)
-            if record.state != "reserved":
-                raise DispatchStateError(
-                    "only a reserved dispatch may be submitted, and a submission is "
-                    "single-use; this caller did not win the send claim. Reconcile "
-                    "the existing dispatch instead of issuing I/O."
-                )
-            now = _utc_now()
-            self._conn().execute(
-                "UPDATE runtime_dispatch_state SET state = 'submitted', "
-                " cost_state = CASE WHEN cost_state = 'not_incurred' THEN 'unknown' "
-                " ELSE cost_state END, "
-                " started_at_utc = COALESCE(started_at_utc, ?), updated_at_utc = ? "
-                "WHERE project_id = ? AND dispatch_id = ?",
-                (now, now, self.project_id, dispatch_id),
+            return self._mark_submitted_in_transaction(dispatch_id)
+
+    def _mark_submitted_in_transaction(self, dispatch_id: str) -> DispatchRecord:
+        """The transaction-owned send-claim primitive (caller owns the unit of work).
+
+        It opens no transaction (``ProjectStore.transaction`` cannot nest) and
+        therefore requires one already open on this connection. The single-use
+        state check and the durable ``submitted`` transition happen in that one
+        caller-owned transaction, so a global serial-slot check composed with it
+        cannot interleave a competing claim.
+        """
+        self._require_own_transaction()
+        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
+        record = self._require_dispatch(dispatch_id)
+        if record.state != "reserved":
+            raise DispatchStateError(
+                "only a reserved dispatch may be submitted, and a submission is "
+                "single-use; this caller did not win the send claim. Reconcile "
+                "the existing dispatch instead of issuing I/O."
             )
+        now = _utc_now()
+        self._conn().execute(
+            "UPDATE runtime_dispatch_state SET state = 'submitted', "
+            " cost_state = CASE WHEN cost_state = 'not_incurred' THEN 'unknown' "
+            " ELSE cost_state END, "
+            " started_at_utc = COALESCE(started_at_utc, ?), updated_at_utc = ? "
+            "WHERE project_id = ? AND dispatch_id = ?",
+            (now, now, self.project_id, dispatch_id),
+        )
         return self._require_dispatch(dispatch_id)
 
     def mark_admitted(

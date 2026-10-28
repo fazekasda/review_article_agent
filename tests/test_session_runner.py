@@ -38,6 +38,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -64,6 +65,7 @@ from review_article_agent.runtime.opencode import (  # noqa: E402
     OpenCodeV2Client,
     ReconcileResult,
 )
+from review_article_agent.runtime.jobs import JobRepository  # noqa: E402
 from review_article_agent.runtime.roles import BoundedTask, RoleConfiguration  # noqa: E402
 from review_article_agent.runtime.service import LoopbackFixtureProvider  # noqa: E402
 from review_article_agent.storage import (  # noqa: E402
@@ -134,6 +136,7 @@ class _InMemoryClient:
         self.collect_error: Exception | None = None
         self.verify_fail_after: int | None = None
         self.reconcile_unknown = False
+        self.completion_tamper: str | None = None
         self._verify_count = 0
 
     def _external(self, name: str, **info) -> None:
@@ -284,9 +287,12 @@ class _InMemoryClient:
             "failed": "failed",
             "interrupted": "interrupted",
         }.get(outcome, "unknown")
-        return ReconcileResult(
-            admission_id, state, receipt, {"outcome": outcome, "message": idle}
-        )
+        completion = {"outcome": outcome, "message": idle}
+        if self.completion_tamper == "id":
+            completion = {"outcome": outcome, "message": dict(idle, id="msg_other")}
+        elif self.completion_tamper == "outcome":
+            completion = {"outcome": "failed", "message": idle}
+        return ReconcileResult(admission_id, state, receipt, completion)
 
     # -- test helpers ------------------------------------------------------
     def append_assistant(
@@ -455,6 +461,76 @@ class SessionRunnerTestBase(unittest.TestCase):
             "text": text,
             "prompt_version": prompt_version,
         }
+
+    def _record_task(self, request_id, *, role="writer", configuration=None):
+        configuration = configuration or self.configuration
+        role_config = configuration.for_role(role)
+        bounded = BoundedTask.from_mapping(
+            {
+                "project_id": self.info.project_id,
+                "role": role,
+                "target": {
+                    "project_id": self.info.project_id,
+                    "artifact_id": "art_target",
+                    "revision_id": "rev_1",
+                },
+                "input_refs": [
+                    {
+                        "project_id": self.info.project_id,
+                        "artifact_id": "art_input",
+                        "revision_id": "rev_in",
+                        "digest": _sha256_bytes(b"input-bytes"),
+                    }
+                ],
+                "scope": ["section:introduction"],
+                "prompt_version": f"{role}.direct",
+                "size_limit": 4096,
+                "step_limit": role_config.steps,
+            },
+            configuration=configuration,
+        )
+        return RuntimeRepository(self.store).record_task(
+            bounded, request_id=request_id, configuration=configuration
+        )
+
+    def _direct_dispatch(self):
+        runtime = RuntimeRepository(self.store)
+        task = self._record_task("req-direct")
+        role_config = runtime.get_configuration(
+            task.config_snapshot_id
+        ).role_configuration().for_role("writer")
+        _versions, _canonical, versions_digest = scenario_helpers._versions(
+            role_config.model.ref, task.prompt_version
+        )
+        return RuntimeDispatchRepository(self.store, runtime=runtime).reserve_dispatch(
+            task,
+            request_id="call-direct",
+            route="direct_call",
+            stage="section_drafting",
+            input_digest=_DIG_A,
+            version_digest=versions_digest,
+            reserve_usd="0.10",
+            bound_evidence_digest=_DIG_E,
+        )
+
+    def _synthetic_admitted_attempt(self):
+        jobs = JobRepository(self.store)
+        job = jobs.submit("job-synthetic", task_kind="synthetic")
+        attempt = jobs.begin_attempt(
+            job.job_id,
+            dispatch_kind="external_synthetic",
+            stage="section_drafting",
+            reserve_usd="0.01",
+        )
+        jobs.mark_admitted(attempt.attempt_id, admission_id="adm_" + "a" * 32)
+        return job, attempt
+
+    def _open_store(self):
+        store = ProjectStore.open_at(
+            paths.app_dir_for(self.info.root_path), expected_project_id=self.info.project_id
+        )
+        self.addCleanup(store.close)
+        return store
 
     def _submit(self, scenario, *, client=None, manager=None, token=None, **kwargs):
         return session_runner.submit_session_turn(
@@ -761,8 +837,11 @@ class ReconcileSessionTurnTest(SessionRunnerTestBase):
         self.assertEqual(content["actual_model_id"], WRITER_MODEL_ID)
         self.assertEqual(content["actual_variant"], "default")
         self.assertEqual(content["actual_cost_usd"], "0.0002")
+        self.assertEqual(content["final_cost_usd"], "0.0002")
         self.assertEqual(content["actual_usage"]["input_tokens"], 12)
         self.assertEqual(content["actual_usage"]["reported_cost"], "0.0002")
+        self.assertEqual(len(content["assistant_steps"]), 1)
+        self.assertEqual(content["assistant_steps"][0]["reported_cost_usd"], "0.0002")
 
         dispatch = RuntimeDispatchRepository(store2).get_dispatch(scenario["dispatch"].dispatch_id)
         self.assertEqual(dispatch.state, "completed")
@@ -804,6 +883,119 @@ class ReconcileSessionTurnTest(SessionRunnerTestBase):
         content = json.loads(proposal.canonical.decode("utf-8"))["content"]
         self.assertIsNone(content["actual_cost_usd"])
 
+    def test_all_assistant_steps_costs_are_summed_exactly(self) -> None:
+        scenario = self._scenario()
+        receipt = self._admitted(scenario)
+        self.client.append_assistant(
+            receipt.session_id, text="firststep", usage={"cost": "0.20", "input_tokens": 2}
+        )
+        self.client.append_assistant(
+            receipt.session_id, text="finalanswer", usage={"cost": "0.01", "input_tokens": 1}
+        )
+        self.client.append_idle(receipt.session_id, "succeeded")
+        outcome = self._reconcile(scenario)
+        self.assertEqual(outcome.state, "completed")
+        self.assertEqual(outcome.cost_state, "known")
+        self.assertEqual(outcome.cost_amount_usd, "0.21")
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch(
+            scenario["dispatch"].dispatch_id
+        )
+        self.assertEqual(dispatch.cost_state, "known")
+        self.assertEqual(dispatch.cost_amount_usd, "0.21")
+        proposal = RuntimeRepository(self.store).get_proposal(outcome.proposal_record_id)
+        content = json.loads(proposal.canonical.decode("utf-8"))["content"]
+        self.assertEqual(content["text"], "finalanswer")
+        self.assertEqual(content["actual_cost_usd"], "0.21")
+        self.assertEqual(content["final_cost_usd"], "0.01")
+        self.assertEqual(len(content["assistant_steps"]), 2)
+        self.assertEqual(content["assistant_steps"][0]["reported_cost_usd"], "0.20")
+        self.assertEqual(content["assistant_steps"][1]["reported_cost_usd"], "0.01")
+        self.assertEqual(content["assistant_steps"][0]["actual_model"], content["actual_model"])
+
+    def test_missing_earlier_step_cost_reports_unknown_total_not_final_only(self) -> None:
+        scenario = self._scenario()
+        receipt = self._admitted(scenario)
+        self.client.append_assistant(
+            receipt.session_id, text="firststep", usage={"input_tokens": 2}
+        )
+        self.client.append_assistant(
+            receipt.session_id, text="finalanswer", usage={"cost": "0.01"}
+        )
+        self.client.append_idle(receipt.session_id, "succeeded")
+        outcome = self._reconcile(scenario)
+        self.assertEqual(outcome.state, "completed")
+        self.assertEqual(outcome.cost_state, "unknown")
+        self.assertIsNone(outcome.cost_amount_usd)
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch(
+            scenario["dispatch"].dispatch_id
+        )
+        self.assertEqual(dispatch.cost_state, "unknown")
+        self.assertEqual(dispatch.reserve_usd, "0.10")
+        proposal = RuntimeRepository(self.store).get_proposal(outcome.proposal_record_id)
+        content = json.loads(proposal.canonical.decode("utf-8"))["content"]
+        self.assertIsNone(content["actual_cost_usd"])
+        self.assertEqual(content["final_cost_usd"], "0.01")
+        self.assertIsNone(content["assistant_steps"][0]["reported_cost_usd"])
+        self.assertEqual(content["assistant_steps"][1]["reported_cost_usd"], "0.01")
+
+    def test_messages_after_the_authoritative_idle_are_not_accepted(self) -> None:
+        scenario = self._scenario()
+        receipt = self._admitted(scenario)
+        self.client.append_assistant(
+            receipt.session_id, text="firststep", usage={"cost": "0.20"}
+        )
+        self.client.append_idle(receipt.session_id, "succeeded")
+        self.client.append_assistant(
+            receipt.session_id, text="afteridle", usage={"cost": "9.99"}
+        )
+        outcome = self._reconcile(scenario)
+        self.assertEqual(outcome.state, "completed")
+        self.assertEqual(outcome.cost_amount_usd, "0.20")
+        proposal = RuntimeRepository(self.store).get_proposal(outcome.proposal_record_id)
+        content = json.loads(proposal.canonical.decode("utf-8"))["content"]
+        self.assertEqual(content["text"], "firststep")
+        self.assertEqual(len(content["assistant_steps"]), 1)
+        self.assertEqual(content["actual_cost_usd"], "0.20")
+
+    def test_changed_terminal_id_returns_unknown(self) -> None:
+        scenario = self._scenario()
+        receipt = self._admitted(scenario)
+        self.client.append_assistant(
+            receipt.session_id, text="answer", usage={"cost": "0.01"}
+        )
+        self.client.append_idle(receipt.session_id, "succeeded")
+        self.client.completion_tamper = "id"
+        outcome = self._reconcile(scenario)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertTrue(outcome.reconciliation_required)
+
+    def test_changed_terminal_outcome_returns_unknown(self) -> None:
+        scenario = self._scenario()
+        receipt = self._admitted(scenario)
+        self.client.append_assistant(
+            receipt.session_id, text="answer", usage={"cost": "0.01"}
+        )
+        self.client.append_idle(receipt.session_id, "succeeded")
+        self.client.completion_tamper = "outcome"
+        outcome = self._reconcile(scenario)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertTrue(outcome.reconciliation_required)
+
+    def test_deeply_nested_usage_is_bounded_without_recursion_error(self) -> None:
+        scenario = self._scenario()
+        receipt = self._admitted(scenario)
+        nested: dict = {}
+        cursor = nested
+        for _ in range(200):
+            child: dict = {}
+            cursor["nested"] = child
+            cursor = child
+        self.client.append_assistant(receipt.session_id, usage={"cost": "0.01", "deep": nested})
+        self.client.append_idle(receipt.session_id, "succeeded")
+        outcome = self._reconcile(scenario)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertEqual(RuntimeRepository(self.store).list_proposals(), [])
+
     def test_failed_authoritative_terminal_marks_failed_without_a_result(self) -> None:
         scenario = self._scenario()
         receipt = self._admitted(scenario)
@@ -818,28 +1010,42 @@ class ReconcileSessionTurnTest(SessionRunnerTestBase):
         self.assertIsNone(dispatch.result_ref)
         self.assertEqual(RuntimeRepository(self.store).list_proposals(), [])
 
-    def test_refusal_and_malformed_success_never_become_a_result(self) -> None:
-        for label, message_kwargs in (
-            ("refusal", {"finish": "refusal"}),
-            ("malformed-model", {"model": {"providerID": FIXTURE_PROVIDER, "id": CRITIC_MODEL_ID}}),
-        ):
-            with self.subTest(label=label):
-                scenario = self._scenario(request_id=f"req-{label}", call_id=f"call-{label}")
-                receipt = self._admitted(scenario)
-                self.client.append_assistant(receipt.session_id, **message_kwargs)
-                self.client.append_idle(receipt.session_id, "succeeded")
-                outcome = self._reconcile(scenario)
-                self.assertEqual(outcome.state, "unknown")
-                self.assertTrue(outcome.reconciliation_required)
-                dispatch = RuntimeDispatchRepository(self.store).get_dispatch(
-                    scenario["dispatch"].dispatch_id
-                )
-                self.assertNotEqual(dispatch.state, "completed")
-                self.assertIsNone(dispatch.result_ref)
-                self.assertEqual(
-                    RuntimeRepository(self.store).proposals_for_task(scenario["task"].task_id),
-                    [],
-                )
+    def test_refusal_success_never_becomes_a_result(self) -> None:
+        scenario = self._scenario()
+        receipt = self._admitted(scenario)
+        self.client.append_assistant(receipt.session_id, finish="refusal")
+        self.client.append_idle(receipt.session_id, "succeeded")
+        outcome = self._reconcile(scenario)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertTrue(outcome.reconciliation_required)
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch(
+            scenario["dispatch"].dispatch_id
+        )
+        self.assertNotEqual(dispatch.state, "completed")
+        self.assertIsNone(dispatch.result_ref)
+        self.assertEqual(
+            RuntimeRepository(self.store).proposals_for_task(scenario["task"].task_id), []
+        )
+
+    def test_malformed_model_success_never_becomes_a_result(self) -> None:
+        scenario = self._scenario()
+        receipt = self._admitted(scenario)
+        self.client.append_assistant(
+            receipt.session_id,
+            model={"providerID": FIXTURE_PROVIDER, "id": CRITIC_MODEL_ID},
+        )
+        self.client.append_idle(receipt.session_id, "succeeded")
+        outcome = self._reconcile(scenario)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertTrue(outcome.reconciliation_required)
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch(
+            scenario["dispatch"].dispatch_id
+        )
+        self.assertNotEqual(dispatch.state, "completed")
+        self.assertIsNone(dispatch.result_ref)
+        self.assertEqual(
+            RuntimeRepository(self.store).proposals_for_task(scenario["task"].task_id), []
+        )
 
     def test_missing_owned_service_is_explicit_unknown_not_success(self) -> None:
         scenario = self._scenario()
@@ -914,6 +1120,144 @@ class ReconcileSessionTurnTest(SessionRunnerTestBase):
         with self.assertRaises(ProjectConflict):
             self._reconcile(scenario, token="act_" + "e" * 32)
         self.assertEqual(len(self.client.calls), calls_before)
+
+
+class SerialSlotArbitrationTest(SessionRunnerTestBase):
+    def test_second_dispatch_is_blocked_before_admit_then_allowed_after_completion(self) -> None:
+        first = self._scenario(request_id="req-1", call_id="call-1")
+        self._submit(first)
+        self.assertEqual(len(self.client.admissions), 1)
+
+        second = self._scenario(request_id="req-2", call_id="call-2")
+        with self.assertRaises(session_runner.SessionRunnerStateError):
+            self._submit(second)
+        self.assertEqual(len(self.client.admissions), 1)
+        second_dispatch = RuntimeDispatchRepository(self.store).get_dispatch(
+            second["dispatch"].dispatch_id
+        )
+        self.assertEqual(second_dispatch.state, "reserved")
+
+        session_id = self.client.admissions[0]["session_id"]
+        self.client.append_assistant(session_id, usage={"cost": "0.01"})
+        self.client.append_idle(session_id, "succeeded")
+        outcome = self._reconcile(first)
+        self.assertEqual(outcome.state, "completed")
+
+        retry = self._submit(second)
+        self.assertEqual(retry.state, "admitted")
+        self.assertEqual(len(self.client.admissions), 2)
+        second_dispatch = RuntimeDispatchRepository(self.store).get_dispatch(
+            second["dispatch"].dispatch_id
+        )
+        self.assertEqual(second_dispatch.state, "admitted")
+
+    def test_three_simultaneous_submits_only_one_wins(self) -> None:
+        scenarios = [
+            self._scenario(request_id=f"req-{i}", call_id=f"call-{i}") for i in range(3)
+        ]
+        admitted = []
+        blocked = []
+        for scenario in scenarios:
+            try:
+                receipt = self._submit(scenario)
+                admitted.append(receipt)
+            except session_runner.SessionRunnerStateError:
+                blocked.append(scenario)
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(len(blocked), 2)
+        self.assertEqual(len(self.client.admissions), 1)
+        states = sorted(
+            RuntimeDispatchRepository(self.store)
+            .get_dispatch(scenario["dispatch"].dispatch_id)
+            .state
+            for scenario in scenarios
+        )
+        self.assertEqual(states, ["admitted", "reserved", "reserved"])
+
+    def test_unknown_dispatch_retains_the_slot_and_blocks_competing_send(self) -> None:
+        first = self._scenario(request_id="req-1", call_id="call-1")
+        self.client.admit_error = OpenCodeTransportError("synthetic transport failure")
+        receipt = self._submit(first)
+        self.assertEqual(receipt.state, "unknown")
+        self.client.admit_error = None
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch(
+            first["dispatch"].dispatch_id
+        )
+        self.assertEqual(dispatch.state, "unknown")
+
+        second = self._scenario(request_id="req-2", call_id="call-2")
+        with self.assertRaises(session_runner.SessionRunnerStateError):
+            self._submit(second)
+        second_dispatch = RuntimeDispatchRepository(self.store).get_dispatch(
+            second["dispatch"].dispatch_id
+        )
+        self.assertEqual(second_dispatch.state, "reserved")
+        self.assertEqual(len(self.client.admissions), 0)
+
+    def test_direct_runtime_outstanding_blocks_a_competing_send(self) -> None:
+        direct = self._direct_dispatch()
+        RuntimeDispatchRepository(self.store).mark_submitted(direct.dispatch_id)
+        scenario = self._scenario()
+        with self.assertRaises(session_runner.SessionRunnerStateError):
+            self._submit(scenario)
+        self.assertEqual(self.client.admissions, [])
+
+    def test_synthetic_outstanding_attempt_blocks_a_competing_send(self) -> None:
+        self._synthetic_admitted_attempt()
+        scenario = self._scenario()
+        with self.assertRaises(session_runner.SessionRunnerStateError):
+            self._submit(scenario)
+        self.assertEqual(self.client.admissions, [])
+
+    def test_two_handles_race_one_send_claim_wins(self) -> None:
+        first = self._scenario(request_id="req-race-1", call_id="call-race-1")
+        second = self._scenario(request_id="req-race-2", call_id="call-race-2")
+        barrier = threading.Barrier(2)
+        results: list[tuple[str, str]] = []
+
+        def _claim(scenario):
+            # A SQLite connection is thread-bound: each worker opens its own handle.
+            store = ProjectStore.open_at(
+                paths.app_dir_for(self.info.root_path),
+                expected_project_id=self.info.project_id,
+            )
+            try:
+                repo = RuntimeDispatchRepository(store, runtime=RuntimeRepository(store))
+                barrier.wait(timeout=10)
+                try:
+                    session_runner._claim_send_slot(
+                        store,
+                        self.registry,
+                        self.token,
+                        self.info.project_id,
+                        repo,
+                        scenario["dispatch"].dispatch_id,
+                    )
+                    results.append(("won", scenario["dispatch"].dispatch_id))
+                except session_runner.SessionRunnerStateError:
+                    results.append(("blocked", scenario["dispatch"].dispatch_id))
+                except Exception as exc:  # pragma: no cover - unexpected thread failure
+                    results.append(("error", repr(exc)))
+            finally:
+                store.close()
+
+        threads = [
+            threading.Thread(target=_claim, args=(first,)),
+            threading.Thread(target=_claim, args=(second,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        outcomes = sorted(result for result, _dispatch in results)
+        self.assertEqual(outcomes, ["blocked", "won"])
+        states = sorted(
+            RuntimeDispatchRepository(self.store)
+            .get_dispatch(scenario["dispatch"].dispatch_id)
+            .state
+            for scenario in (first, second)
+        )
+        self.assertEqual(states, ["reserved", "submitted"])
 
 
 if __name__ == "__main__":  # pragma: no cover

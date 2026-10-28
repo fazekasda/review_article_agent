@@ -37,13 +37,14 @@ is an injected deterministic seam.
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterator, Mapping
 
 from ..domain.errors import ReviewAgentError
-from ..domain.records import canonical_json, validate_identifier
+from ..domain.records import RecordValidationError, canonical_json, validate_identifier
 from .dispatch import (
     DispatchConflictError,
     DispatchCorruptionError,
@@ -51,7 +52,9 @@ from .dispatch import (
     DispatchStateError,
     DispatchValidationError,
     RuntimeDispatchRepository,
+    runtime_dispatch_remote_state,
 )
+from .jobs import ACTIVE_ATTEMPT_STATES, JobRepository, _add_exact
 from .execution_boundary import (
     ExecutionBoundaryBlocked,
     assert_fixture_session_execution_allowed,
@@ -122,6 +125,17 @@ _M_COMPLETED = "dispatch: the accepted result triple is not the recorded proposa
 _M_WINDOW = "messages: the correlated assistant window is missing or unreadable."
 _M_MALFORMED = "message: the authoritative success did not contain a valid proposal."
 _M_COST = "cost: the reported actual cost is not defensible; retaining unknown reserve."
+_M_SLOT = (
+    "dispatch: another external operation already occupies the single serial "
+    "remote slot for this project; refusing a competing send claim."
+)
+_M_SLOT_UNREADABLE = (
+    "dispatch: the external-operation ledger cannot be proven safe; refusing a "
+    "competing send claim."
+)
+_M_TERMINAL = "messages: the correlated terminal does not match the observed idle."
+_M_STEP_MODEL = "message: an assistant step does not match the pinned concrete model."
+_M_STEP_USAGE = "message: an assistant step usage metadata is malformed."
 
 
 class SessionRunnerError(ReviewAgentError):
@@ -714,8 +728,11 @@ def _finish_submit(
         raise SessionRunnerStateError("session", _M_SESSION) from exc
     _empty_session(active_client, intent.session_id)
 
-    with _execution_guard(registry, activation_token, project_id):
-        dispatch_repo.mark_submitted(intent.dispatch_id)
+    # One registry-locked SQLite transaction: check the shared serial slot
+    # (runtime ledger **and** synthetic attempts) and win the single send claim.
+    _claim_send_slot(
+        store, registry, activation_token, project_id, dispatch_repo, intent.dispatch_id
+    )
 
     try:
         admission = active_client.admit(
@@ -825,6 +842,76 @@ def _mark_dispatch_unknown(
             dispatch_repo.recover(dispatch_id)
     except Exception:  # noqa: BLE001 - best effort; the durable row stays ambiguous
         return
+
+
+def _synthetic_remote_occupied(store: object, project_id: str) -> bool:
+    """True when a synthetic job/attempt occupies the serial remote slot.
+
+    Mirrors the existing worker arbitration (``WorkerEngine._job_has_potential_remote``)
+    and is deliberately **conservative** across a process boundary: an unresolved
+    job/attempt, a ``waiting_external`` gate, or **any** active attempt
+    (``queued``/``admitted``/``running``) means a competing route may be holding
+    or about to hold the single serial slot. A read failure is fail-closed
+    (occupied), never silently safe.
+    """
+    repo = JobRepository(store)
+    for job in repo.list():
+        if job.outcome_unresolved or job.state == "waiting_external":
+            return True
+        for attempt in repo.attempts(job.job_id):
+            if attempt.outcome_unresolved:
+                return True
+            if attempt.state in ACTIVE_ATTEMPT_STATES:
+                return True
+    return False
+
+
+def _assert_serial_slot_free(store: object, project_id: str) -> None:
+    """Fail closed unless this project's single serial remote slot is free.
+
+    Both layers the existing worker already arbitrates are checked: the durable
+    runtime dispatch ledger (``submitted``/``admitted``/``unknown``, or an
+    unreadable/corrupt ledger) **and** the synthetic job/attempt layer. A reserved
+    dispatch (recorded before any I/O) does not occupy the slot; a terminal one
+    does not either.
+    """
+    try:
+        state = runtime_dispatch_remote_state(store.connection, project_id)
+    except Exception as exc:  # noqa: BLE001 - an unreadable ledger is not safe
+        raise SessionRunnerStateError("dispatch", _M_SLOT_UNREADABLE) from exc
+    if state == "unreadable":
+        raise SessionRunnerStateError("dispatch", _M_SLOT_UNREADABLE)
+    if state == "remote":
+        raise SessionRunnerStateError("dispatch", _M_SLOT)
+    try:
+        if _synthetic_remote_occupied(store, project_id):
+            raise SessionRunnerStateError("dispatch", _M_SLOT)
+    except SessionRunnerStateError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - an unreadable job ledger is not safe
+        raise SessionRunnerStateError("dispatch", _M_SLOT_UNREADABLE) from exc
+
+
+def _claim_send_slot(
+    store: object,
+    registry: object,
+    activation_token: str,
+    project_id: str,
+    dispatch_repo: RuntimeDispatchRepository,
+    dispatch_id: str,
+) -> DispatchRecord:
+    """Atomically check the shared serial slot and win the single send claim.
+
+    The registry execution guard, the serial-slot check, and the durable
+    ``mark_submitted`` transition all happen in one short registry-locked SQLite
+    transaction, so two competing callers cannot both win: the loser observes the
+    winner's ``submitted`` dispatch (or an existing synthetic attempt) and is
+    refused. No remote I/O happens here.
+    """
+    with _execution_guard(registry, activation_token, project_id):
+        with store.transaction():
+            _assert_serial_slot_free(store, project_id)
+            return dispatch_repo._mark_submitted_in_transaction(dispatch_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1158,7 +1245,15 @@ def _accept_completed(
     result: ReconcileResult,
     client: object,
 ) -> ReconcileOutcome:
-    """Accept only an authoritative idle success with a valid assistant window."""
+    """Accept only an authoritative idle success with a valid assistant window.
+
+    The exact correlated turn is delimited by the observed authoritative idle
+    (matching ``result.completion``'s id **and** outcome); messages after that
+    terminal are never accepted. **Every** assistant step in the turn is captured
+    with its own actual model/usage/cost audit, and the settled cost is the exact
+    Decimal sum of all steps. If any step's cost is missing or malformed the total
+    is ``unknown`` (the reserve is retained), never the final step's cost.
+    """
     try:
         messages, truncated = client.collect_messages(
             intent.session_id, order="asc"
@@ -1167,45 +1262,76 @@ def _accept_completed(
         return _unknown_outcome(intent, result, "the assistant message window could not be read.")
     if truncated:
         return _unknown_outcome(intent, result, "the assistant message window was not fully read.")
-    window = _correlated_window(messages, intent.admission_id)
-    if window is None:
-        return _unknown_outcome(intent, result, _M_WINDOW)
-    assistant = [message for message in window if isinstance(message, dict) and message.get("type") == "assistant"]
+    turn = _correlated_turn(messages, intent.admission_id, result.completion)
+    if turn is None:
+        return _unknown_outcome(intent, result, _M_TERMINAL)
+    assistant = [
+        message for message in turn if isinstance(message, dict) and message.get("type") == "assistant"
+    ]
     if not assistant:
         return _unknown_outcome(intent, result, _M_MALFORMED)
-    final = assistant[-1]
-    if _message_refused_or_errored(final):
-        return _unknown_outcome(intent, result, "the assistant reported an error or refusal.")
-    text = _assistant_text(final)
+    pinned_model = _role_config(configuration, intent.role).model
+    steps: list[dict[str, Any]] = []
+    total = Decimal("0")
+    all_known = True
+    for index, message in enumerate(assistant):
+        if _message_refused_or_errored(message):
+            return _unknown_outcome(
+                intent, result, "an assistant step reported an error or refusal."
+            )
+        actual_model = _actual_model(message)
+        if actual_model is None or not actual_model.same_model(pinned_model):
+            return _unknown_outcome(intent, result, _M_STEP_MODEL)
+        agent = message.get("agent")
+        if isinstance(agent, str) and agent != intent.role:
+            return _unknown_outcome(
+                intent, result, "an assistant step role does not match the pinned role."
+            )
+        usage_raw = message.get("usage")
+        if usage_raw is None and "tokens" in message:
+            usage_raw = message.get("tokens")
+        try:
+            usage = _bounded_usage(usage_raw)
+            safe_usage = _safe_usage(usage)
+        except SessionRunnerValidationError:
+            return _unknown_outcome(intent, result, _M_STEP_USAGE)
+        cost = _actual_cost(usage, message)
+        if cost is None:
+            all_known = False
+        else:
+            total = _add_exact(total, Decimal(cost))
+        steps.append(
+            {
+                "index": index,
+                "actual_model": actual_model.ref,
+                "actual_provider": actual_model.provider_id,
+                "actual_model_id": actual_model.model_id,
+                "actual_variant": actual_model.variant,
+                "actual_usage": safe_usage,
+                "reported_cost_usd": cost,
+            }
+        )
+    final_step = steps[-1]
+    text = _final_assistant_text(assistant)
     if text is None:
         return _unknown_outcome(intent, result, _M_MALFORMED)
-    actual_model = _actual_model(final)
-    pinned_model = _role_config(configuration, intent.role).model
-    if actual_model is None or not actual_model.same_model(pinned_model):
-        return _unknown_outcome(intent, result, "the assistant message model does not match the pinned model.")
-    agent = final.get("agent")
-    if isinstance(agent, str) and agent != intent.role:
-        return _unknown_outcome(intent, result, "the assistant message role does not match the pinned role.")
-    usage = final.get("usage")
-    if usage is None and "tokens" in final:
-        usage = final.get("tokens")
-    if usage is not None and not isinstance(usage, Mapping):
-        return _unknown_outcome(intent, result, "the assistant usage metadata is malformed.")
-    cost_amount = _actual_cost(usage, final)
-    cost_state = "known" if cost_amount is not None else "unknown"
-    try:
-        safe_usage = _safe_usage(usage)
-    except SessionRunnerValidationError:
-        return _unknown_outcome(intent, result, "the assistant usage metadata is malformed.")
+    total_cost = format(total, "f") if all_known else None
+    cost_state = "known" if total_cost is not None else "unknown"
+    # The scalar compat fields repeat the final step; use a distinct copy so the
+    # proposal content is a tree (the non-authorizing key scan treats a repeated
+    # object as circular).
+    final_usage = _copy_json(final_step["actual_usage"])
     payload = {
         "content": {
             "text": text,
-            "actual_model": actual_model.ref,
-            "actual_provider": actual_model.provider_id,
-            "actual_model_id": actual_model.model_id,
-            "actual_variant": actual_model.variant,
-            "actual_usage": safe_usage,
-            "actual_cost_usd": cost_amount,
+            "actual_model": final_step["actual_model"],
+            "actual_provider": final_step["actual_provider"],
+            "actual_model_id": final_step["actual_model_id"],
+            "actual_variant": final_step["actual_variant"],
+            "actual_usage": final_usage,
+            "actual_cost_usd": total_cost,
+            "final_cost_usd": final_step["reported_cost_usd"],
+            "assistant_steps": steps,
         }
     }
     try:
@@ -1227,7 +1353,7 @@ def _accept_completed(
                     dispatch_repo,
                     intent.dispatch_id,
                     cost_state=cost_state,
-                    amount_usd=cost_amount,
+                    amount_usd=total_cost,
                 )
                 final_dispatch = dispatch_repo.get_dispatch(intent.dispatch_id)
     except ProposalError:
@@ -1348,10 +1474,28 @@ def _unknown_outcome(
     )
 
 
-def _correlated_window(
-    messages: object, admission_id: str
+def _correlated_turn(
+    messages: object, admission_id: str, completion: object
 ) -> list[dict[str, Any]] | None:
-    if not isinstance(messages, list):
+    """Return the exact turn's messages up to the observed authoritative idle.
+
+    The terminal is identified by **both** the id and outcome recorded in
+    ``completion`` (the client's correlation evidence). A missing, changed, or
+    non-success terminal returns ``None``; messages strictly after the terminal are
+    never included.
+    """
+    if not isinstance(messages, list) or not isinstance(completion, Mapping):
+        return None
+    if completion.get("outcome") != "succeeded":
+        return None
+    idle = completion.get("message")
+    if not isinstance(idle, Mapping):
+        return None
+    idle_id = idle.get("id")
+    idle_outcome = idle.get("outcome")
+    if not isinstance(idle_id, str) or not isinstance(idle_outcome, str):
+        return None
+    if idle_outcome != "succeeded":
         return None
     start = None
     for index, message in enumerate(messages):
@@ -1364,14 +1508,51 @@ def _correlated_window(
             break
     if start is None:
         return None
-    end = len(messages)
     for index in range(start + 1, len(messages)):
         message = messages[index]
-        if isinstance(message, dict) and message.get("type") in TURN_OPENING_TYPES:
-            end = index
-            break
-    window = messages[start + 1 : end]
-    return [message for message in window if isinstance(message, dict)]
+        if not isinstance(message, dict):
+            continue
+        if message.get("type") in TURN_OPENING_TYPES:
+            # The observed terminal is outside this turn: it cannot be trusted.
+            return None
+        if message.get("type") == "idle":
+            if message.get("id") == idle_id and message.get("outcome") == idle_outcome:
+                return [m for m in messages[start + 1 : index] if isinstance(m, dict)]
+            return None
+    return None
+
+
+def _bounded_usage(value: object) -> Mapping[str, Any] | None:
+    """Validate usage metadata as bounded, portable JSON **before** walking it.
+
+    The peer-supplied value is untrusted; a depth/size/portability check (the
+    canonical-JSON contract) runs first so the recursive :func:`_safe_usage` copy
+    can never be driven into a raw ``RecursionError``.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise SessionRunnerValidationError("usage", _M_STEP_USAGE)
+    try:
+        canonical_json(value)
+    except (
+        RecordValidationError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        UnicodeError,
+    ) as exc:
+        raise SessionRunnerValidationError("usage", _M_STEP_USAGE) from exc
+    return value
+
+
+def _final_assistant_text(assistant: list[Mapping[str, Any]]) -> str | None:
+    """The final valid assistant text in the turn (last step with usable text)."""
+    for message in reversed(assistant):
+        text = _assistant_text(message)
+        if text is not None:
+            return text
+    return None
 
 
 def _message_refused_or_errored(message: Mapping[str, Any]) -> bool:
@@ -1463,6 +1644,13 @@ _USAGE_KEY_ALIASES = {
     "modelid": "reported_model_id",
     "variant": "reported_variant",
 }
+
+
+def _copy_json(value: object) -> object:
+    """A deep, independent copy of an already JSON-safe value (no shared ids)."""
+    if value is None:
+        return None
+    return copy.deepcopy(value)
 
 
 def _safe_usage(value: object) -> object:
