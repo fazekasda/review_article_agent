@@ -12,7 +12,7 @@
 - [ ] [07 — Parsing, source assets, and reference structure](07-parsing.md) — **partial (scoped parsing MVP); not fully validated.** Integrated S7-CORE (stdlib XML-first structural core, locators), S7-STORE (durable report repository), and S7-CLI (personal `parsing` CLI) at `e39f91c`; XML/JATS/TEI supported. Not a full Step 07: no scientific correctness, PDF/OCR/full-text/visual extraction, human-adjudicated benchmark, or combined result is claimed — see the [handoff](handoffs/07-parsing.md).
 - [ ] [08 — Pilot, Jev screening, and exclusion audits](08-screening.md)
 - [x] [09 — Grounded extraction, appraisal, and output audits](09-extraction.md) — XML-text MVP; [evidence and limits](handoffs/09-extraction.md).
-- [ ] [10 — Synthesis, framework, outline, and argument record](10-synthesis.md)
+- [ ] [10 — Synthesis, framework, outline, and argument record](10-synthesis.md) — **locally focused verified MVP; full-suite verification pending integration.** Integrated schema, durable workflow, and `synthesis` CLI at `f697548`; all seven acceptance criteria are evidenced by the focused suites (`test_synthesis_schema` 49, `test_synthesis_workflow` 23, `test_cli_synthesis` 7). Deliberately **not ticked**: the coordinator's full-repo run and integration confirm it after this handoff — see the [step 10 handoff](handoffs/10-synthesis.md). No scientific/live-model validation; no blueprint generation.
 - [ ] [11 — Section blueprints and evidence-grounded drafting](11-drafting.md)
 - [ ] [12 — Bounded critique and original-source fact-checking](12-review.md)
 - [ ] [13 — Citation-origin tracing](13-origin-tracing.md)

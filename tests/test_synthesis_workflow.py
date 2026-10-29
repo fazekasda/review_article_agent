@@ -97,7 +97,7 @@ class SynthesisBase(WorkflowBase):
             "statements": [
                 {
                     "statement_id": statement_id,
-                    "text": "Compound Z reduced tumor volume in mice.",
+                    "text": "Compound Z did not reduce tumor volume in mice.",
                     "classification": "reported_evidence",
                     "evidence": [_FINDING],
                     "applicability": _context(),
