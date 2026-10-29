@@ -147,6 +147,11 @@ from .extraction import (
     build_extraction_parser,
     dispatch_extraction,
 )
+from .synthesis import (
+    SynthesisControlError,
+    build_synthesis_parser,
+    dispatch_synthesis,
+)
 
 PROG = "review-article-agent"
 
@@ -293,6 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parsing_parser(sub)
     build_screening_parser(sub)
     build_extraction_parser(sub)
+    build_synthesis_parser(sub)
 
     return parser
 
@@ -1039,6 +1045,13 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
                 f"unknown extraction command {args.extraction_command!r}"
             )
         return result
+    if args.command == "synthesis":
+        result = dispatch_synthesis(args, ctx)
+        if result is None:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(
+                f"unknown synthesis command {args.synthesis_command!r}"
+            )
+        return result
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -1136,6 +1149,17 @@ _EXTRACTION_CATEGORY_EXITS = {
 }
 
 
+#: Synthesis workflow proposal/read/blueprint/impact error categories mapped to
+#: the CLI's stable exit codes. ``synthesis`` raises :class:`SynthesisControlError`
+#: with a curated, value-free message; a failure records no revision and
+#: authorizes nothing.
+_SYNTHESIS_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+
+
 def _redirect_broken_stdout(out: TextIO) -> None:
     """Point a broken stdout stream's file descriptor at the null device.
 
@@ -1221,6 +1245,8 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
         return exc.category, _PARSING_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, ExtractionControlError):
         return exc.category, _EXTRACTION_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, SynthesisControlError):
+        return exc.category, _SYNTHESIS_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1268,6 +1294,9 @@ def _error_message(exc: BaseException, category: str) -> str:
         return str(exc)
     if isinstance(exc, ExtractionControlError):
         # Authored in ``cli.extraction``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, SynthesisControlError):
+        # Authored in ``cli.synthesis``; a static, curated, value-free message.
         return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):
