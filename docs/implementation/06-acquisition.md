@@ -24,3 +24,12 @@
 ## Handoff
 
 Document source licenses/terms actually checked, retrieval failures, version policy, disposition commands, and test assets. User-owned imports are not automatically proof of unrestricted processing rights.
+
+---
+
+## Implementation status (appended; requirements above unchanged)
+
+**Complete (scoped acquisition MVP), locally verified.** Full integration code+tests at `246df21`
+passed **3,079 tests, OK, no skips** (29 contract checks; `tsc`/`compileall`/`diffcheck` clean;
+no CI). The exact final docs-head result is recorded in the PR. Scientific parsing/screening/
+digestion are Step 07+. See the [handoff](handoffs/06-acquisition.md).

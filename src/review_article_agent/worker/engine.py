@@ -98,6 +98,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 
+from ..acquisition.transport import http_get as acquisition_http_get
 from ..discovery.execution import (
     DiscoveryExecutionBlockedError,
     DiscoveryExecutionError,
@@ -124,6 +125,7 @@ from ..runtime.jobs import (
 from ..storage import paths
 from ..storage.registry import Registry
 from ..storage.store import ProjectStore
+from . import acquisition as acquisition_jobs
 from . import discovery as discovery_jobs
 from .discovery import (
     AttemptCounter,
@@ -304,6 +306,7 @@ class WorkerEngine:
         discovery_transport: Callable[..., Any] | None = None,
         lead_transport: Callable[..., Any] | None = None,
         lead_api_key: str | None = None,
+        acquisition_transport: Callable[..., Any] | None = None,
     ) -> None:
         self._data_dir = os.path.abspath(os.fspath(data_dir))
         self._registry = registry if registry is not None else Registry(self._data_dir)
@@ -325,6 +328,14 @@ class WorkerEngine:
         if not callable(lowlevel):
             raise ValueError("discovery_transport must be a callable low-level transport")
         self._discovery_lowlevel = lowlevel
+        # Official full-text retrieval (Step 06): a *separate* low-level seam. The
+        # discovery ``http_get`` refuses full-text paths, so the default is the
+        # acquisition transport's own fixed-endpoint GET; trusted Python code (a
+        # test fixture) may inject a no-egress callable. Never reachable from JSON.
+        acq_lowlevel = acquisition_http_get if acquisition_transport is None else acquisition_transport
+        if not callable(acq_lowlevel):
+            raise ValueError("acquisition_transport must be a callable low-level transport")
+        self._acquisition_lowlevel = acq_lowlevel
         # Hosted lead: the default transport is the real direct-lead adapter (a
         # single POST to the one documented endpoint); it is only ever used for an
         # explicit, fully-guarded lead job. A test may inject a deterministic fake
@@ -882,7 +893,7 @@ class WorkerEngine:
             raise _RequestError(ErrorCode.BAD_VALUE)
         try:
             parameters = discovery_jobs.validate_submission(
-                mode, request.get("parameters"), project_id
+                mode, request.get("parameters"), project_id, request_id
             )
         except DiscoveryJobValidationError as exc:
             raise _RequestError(exc.code) from exc
@@ -1642,6 +1653,10 @@ class WorkerEngine:
             self._run_lead_dispatch(store, repo, project_id, job, attempt, token)
             return
 
+        if mode == discovery_jobs.MODE_ACQUIRE:
+            self._run_acquire_dispatch(store, repo, project_id, job, attempt, token)
+            return
+
         counter = AttemptCounter()
         transport = discovery_jobs.guard_transport(
             self._discovery_lowlevel,
@@ -1724,6 +1739,78 @@ class WorkerEngine:
         # preserves any held (paused/cancelled) scheduling state.
         if counter.interrupted or self._discovery_is_held(repo, project_id, job_id):
             self._wait_reasons[job_id] = "discovery_interrupted"
+
+    def _run_acquire_dispatch(
+        self,
+        store: Any,
+        repo: JobRepository,
+        project_id: str,
+        job: Job,
+        attempt: Any,
+        token: str,
+    ) -> None:
+        """Run one official full-text retrieval job (E1) with a durable GET journal.
+
+        A may-have-dispatched checkpoint is persisted under the registry write
+        guard before every GET and its safe metadata after it. A zero-I/O refusal
+        reopens the proven-undispatched attempt (escalating a persistent
+        obstruction); anything that may have been sent and has no proven report is
+        an unknown outcome (``waiting_human``) and is never re-sent.
+        """
+        job_id = job.job_id
+        run = acquisition_jobs.dispatch_acquire(
+            store,
+            self._registry,
+            token,
+            job,
+            attempt_id=attempt.attempt_id,
+            fence=job.current_fence,
+            lowlevel=self._acquisition_lowlevel,
+            stop_requested=lambda: self._discovery_stop_requested(repo, project_id, job_id),
+        )
+        if run.summary is not None and not run.journal_failed:
+            try:
+                # Fence the commit on the same captured lease (never the project's
+                # current token), so an old run can never commit under a new one.
+                with self._registry.execution_write_guard(
+                    token, project_id, allow_draining=True
+                ):
+                    repo.accept_result(
+                        attempt.attempt_id,
+                        result_kind=discovery_jobs.RESULT_KIND_ACQUISITION,
+                        result=acquisition_jobs.accepted_result(run.summary),
+                    )
+            except (JobError, ReviewAgentError):
+                # The report is durable; a restart proves it by replay.
+                return
+            if run.summary["status"] == "interrupted" or self._discovery_is_held(
+                repo, project_id, job_id
+            ):
+                self._wait_reasons[job_id] = "discovery_interrupted"
+            return
+
+        if run.summary is not None or run.sent:
+            # A GET was sent but the journal/report cannot prove a clean outcome.
+            self._discovery_fail(
+                repo, project_id, job, attempt, attempts=1, reason="indeterminate"
+            )
+            return
+
+        held = self._discovery_is_held(repo, project_id, job_id)
+        if held and run.error_code in ("interrupted", "not_active"):
+            self._discovery_fail(
+                repo, project_id, job, attempt, attempts=0, reason="stopped", escalate=False
+            )
+            return
+        self._discovery_fail(
+            repo,
+            project_id,
+            job,
+            attempt,
+            attempts=0,
+            reason="blocked" if run.blocked else "refused",
+            escalate=True,
+        )
 
     def _run_lead_dispatch(
         self,

@@ -16,8 +16,12 @@ dependencies = []
 review-article-agent = "review_article_agent.cli.main:main"
 
 [project.optional-dependencies]
-# Intentionally empty: the core is standard-library only. No agent framework.
+# The core is standard-library only. No agent framework.
 # New external dependencies remain an implementation-facing, versioned detail.
+# pdf: OPTIONAL input-integrity inspection of candidate PDFs (Step 06). pypdf is
+# BSD-3-Clause (license metadata of the 6.21.4 wheel; PyPI release checked
+# 2026-10-29). Without it the inspector reports status "unavailable".
+pdf = ["pypdf==6.21.4"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -81,6 +81,7 @@ from ..domain.records import (
     validate_ref,
 )
 from ..runtime import ipc
+from . import acquisition as acquisition_jobs
 
 __all__ = [
     "MODE_QUERY",
@@ -88,18 +89,21 @@ __all__ = [
     "MODE_METADATA_IMPORT",
     "MODE_EXPAND",
     "MODE_LEAD",
+    "MODE_ACQUIRE",
     "DISCOVERY_MODES",
     "TASK_KIND_QUERY",
     "TASK_KIND_SEED",
     "TASK_KIND_IMPORT",
     "TASK_KIND_EXPAND",
     "TASK_KIND_LEAD",
+    "TASK_KIND_ACQUIRE",
     "DISCOVERY_TASK_KINDS",
     "MODE_PARAMETER_KEYS",
     "LEAD_CREDENTIAL_ENV",
     "RESULT_KIND_OBSERVATION",
     "RESULT_KIND_EXPANSION",
     "RESULT_KIND_LEAD",
+    "RESULT_KIND_ACQUISITION",
     "MAX_DISCOVERY_PARAMETERS_BYTES",
     "MAX_EXPAND_ROOTS",
     "PREDISPATCH_PHASE",
@@ -136,9 +140,18 @@ MODE_SEED = "seed"
 MODE_METADATA_IMPORT = "metadata_import"
 MODE_EXPAND = "expand"
 MODE_LEAD = "lead"
+#: Official full-text retrieval (Step 06); validated/dispatched by ``worker.acquisition``.
+MODE_ACQUIRE = acquisition_jobs.MODE_ACQUIRE
 
 #: Every accepted discovery mode.
-DISCOVERY_MODES = (MODE_QUERY, MODE_SEED, MODE_METADATA_IMPORT, MODE_EXPAND, MODE_LEAD)
+DISCOVERY_MODES = (
+    MODE_QUERY,
+    MODE_SEED,
+    MODE_METADATA_IMPORT,
+    MODE_EXPAND,
+    MODE_LEAD,
+    MODE_ACQUIRE,
+)
 
 #: Durable job task kinds (the existing ``JobRepository`` accepts these strings).
 TASK_KIND_QUERY = "discovery_query"
@@ -146,6 +159,8 @@ TASK_KIND_SEED = "discovery_seed"
 TASK_KIND_IMPORT = "discovery_import"
 TASK_KIND_EXPAND = "discovery_expand"
 TASK_KIND_LEAD = "discovery_lead"
+#: A public-network task in the shared serial detached pool (not a discovery search).
+TASK_KIND_ACQUIRE = acquisition_jobs.TASK_KIND_ACQUIRE
 
 #: Every discovery job task kind.
 DISCOVERY_TASK_KINDS = frozenset(
@@ -155,6 +170,7 @@ DISCOVERY_TASK_KINDS = frozenset(
         TASK_KIND_IMPORT,
         TASK_KIND_EXPAND,
         TASK_KIND_LEAD,
+        TASK_KIND_ACQUIRE,
     }
 )
 
@@ -164,6 +180,7 @@ _MODE_BY_TASK_KIND = {
     TASK_KIND_IMPORT: MODE_METADATA_IMPORT,
     TASK_KIND_EXPAND: MODE_EXPAND,
     TASK_KIND_LEAD: MODE_LEAD,
+    TASK_KIND_ACQUIRE: MODE_ACQUIRE,
 }
 _TASK_KIND_BY_MODE = {mode: kind for kind, mode in _MODE_BY_TASK_KIND.items()}
 
@@ -176,6 +193,8 @@ MODE_PARAMETER_KEYS: dict[str, frozenset[str]] = {
     ),
     MODE_EXPAND: frozenset({"plan_ref", "corpus_ref", "roots"}),
     MODE_LEAD: frozenset({"batch_ref", "credential_env"}),
+    MODE_ACQUIRE: acquisition_jobs.ACQUIRE_REQUIRED_KEYS
+    | acquisition_jobs.ACQUIRE_OPTIONAL_KEYS,
 }
 
 #: The one, fixed environment-variable name a hosted-lead job may name.
@@ -185,6 +204,7 @@ LEAD_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
 RESULT_KIND_OBSERVATION = "discovery_observation"
 RESULT_KIND_EXPANSION = "discovery_expansion"
 RESULT_KIND_LEAD = "discovery_lead"
+RESULT_KIND_ACQUISITION = acquisition_jobs.RESULT_KIND_ACQUISITION
 
 #: Technical bound on the number of explicit expansion roots.
 MAX_EXPAND_ROOTS = 10_000
@@ -453,7 +473,10 @@ def _check_parameter_size(parameters: dict[str, Any]) -> None:
 
 
 def validate_submission(
-    mode: object, parameters: object, project_id: str
+    mode: object,
+    parameters: object,
+    project_id: str,
+    request_id: object = None,
 ) -> dict[str, Any]:
     """Strictly validate and canonicalise one discovery submission.
 
@@ -464,6 +487,10 @@ def validate_submission(
     """
     if mode not in DISCOVERY_MODES:
         raise _bad_value(_M_BAD_MODE)
+    if mode == MODE_ACQUIRE:
+        canonical = acquisition_jobs.validate_acquire(parameters, project_id, request_id)
+        _check_parameter_size(canonical)
+        return canonical
     allowed = MODE_PARAMETER_KEYS[mode]
     params = _require_keys(parameters, allowed)
 
@@ -653,6 +680,8 @@ def result_kind_for_mode(mode: str | None) -> str:
         return RESULT_KIND_EXPANSION
     if mode == MODE_LEAD:
         return RESULT_KIND_LEAD
+    if mode == MODE_ACQUIRE:
+        return RESULT_KIND_ACQUISITION
     return RESULT_KIND_OBSERVATION
 
 
@@ -670,6 +699,8 @@ def accepted_result(job: Any, raw: Any) -> tuple[str, Any]:
         return RESULT_KIND_EXPANSION, raw.to_mapping()
     if mode == MODE_LEAD:
         return RESULT_KIND_LEAD, dict(raw)
+    if mode == MODE_ACQUIRE:
+        return RESULT_KIND_ACQUISITION, acquisition_jobs.accepted_result(raw)
     return RESULT_KIND_OBSERVATION, observation_metadata(job, raw)
 
 
@@ -735,6 +766,8 @@ def status_projection(result_kind: str, result: Any) -> Any:
         return _expansion_summary(result)
     if result_kind == RESULT_KIND_LEAD:
         return _lead_summary(result)
+    if result_kind == RESULT_KIND_ACQUISITION:
+        return acquisition_jobs.status_projection(result)
     return result
 
 
@@ -1019,6 +1052,9 @@ def dispatch(
     """
     mode = mode_for_task_kind(job.task_kind)
     params = job.parameters if isinstance(job.parameters, dict) else {}
+    if mode == MODE_ACQUIRE:
+        # Acquisition has its own journaled runner (``acquisition.dispatch_acquire``).
+        raise DiscoveryJobValidationError("bad_value", _M_BAD_MODE)
     if mode == MODE_EXPAND:
         return dispatch_expand(store, registry, token, job, transport, job_held=job_held)
     if mode == MODE_LEAD:
@@ -1158,6 +1194,19 @@ def _replay_lead(store: Any, job: Any) -> ReplayedOutcome | None:
     )
 
 
+def _replay_acquire(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutcome | None:
+    """Reconstruct an acquisition result from the verified E1 report (zero GET)."""
+    proven = acquisition_jobs.replay_acquire(store, registry, token, job)
+    if proven is None:
+        return None
+    summary, complete = proven
+    return ReplayedOutcome(
+        result_kind=RESULT_KIND_ACQUISITION,
+        result=acquisition_jobs.accepted_result(summary),
+        complete=complete,
+    )
+
+
 def replay_only(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutcome | None:
     """Prove an existing durable outcome for ``job`` without any provider I/O.
 
@@ -1172,6 +1221,8 @@ def replay_only(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutc
         return _replay_expand(store, registry, token, job)
     if mode == MODE_LEAD:
         return _replay_lead(store, job)
+    if mode == MODE_ACQUIRE:
+        return _replay_acquire(store, registry, token, job)
     try:
         record = dispatch(store, registry, token, job, _replay_miss_transport)
     except Exception:  # noqa: BLE001 - any failure means "not proven present"

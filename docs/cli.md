@@ -947,3 +947,55 @@ categories are added to `classify_error()` and this table.
   checks remain green (this document adds no fixtures or schema field semantics).
 * The packaged console script and the absence of an invented license are checked
   by building a wheel offline in `tests/test_cli.py`.
+
+## 16. Acquisition — `acquisition` (Step 06 addition, MVP)
+
+The root `acquisition` group is the integrated **local** Step 06 surface over
+[`acquisition/imports.py`](../src/review_article_agent/acquisition/imports.py),
+[`acquisition/manifest.py`](../src/review_article_agent/acquisition/manifest.py),
+[`acquisition/validation.py`](../src/review_article_agent/acquisition/validation.py),
+[`acquisition/pdf_inspection.py`](../src/review_article_agent/acquisition/pdf_inspection.py),
+and [`acquisition/impact.py`](../src/review_article_agent/acquisition/impact.py)
+(implemented in [`cli/acquisition.py`](../src/review_article_agent/cli/acquisition.py)
+and [`cli/acquisition_manifest.py`](../src/review_article_agent/cli/acquisition_manifest.py)).
+Most commands are local readbacks or local writes; `acquisition retrieve run`
+submits one detached **official** retrieval job (queued admission only) and
+`acquisition retrieve show` performs a verified readback that issues no request.
+Step 06 is an **implemented MVP**; semantics, rights binding, P3 handling, and
+bounds are in [`acquisition.md`](acquisition.md) and the
+[handoff](implementation/handoffs/06-acquisition.md).
+
+| Command (exact `--help` spellings) | Purpose |
+| --- | --- |
+| `acquisition import FILE --artifact-id ID --request-id ID --rights-file PATH --occurrence-rights-file PATH --occurrence-revision-id ID --origin-locator TEXT --revision-id ID [--parent-revision-id ID] [--dependencies-file PATH] [--project ID]` | Store one local regular file as an authorized source revision plus an occurrence record. A proposal only. |
+| `acquisition missing --artifact-id ID --request-id ID --rights-file PATH --occurrence-rights-file PATH --occurrence-revision-id ID --origin-locator TEXT --reason TEXT [--project ID]` | Metadata-only "no full text acquired" event; stores no bytes and no source revision. |
+| `acquisition occurrence id --request-id ID [--project ID]` | Print the deterministic occurrence artifact id needed for the occurrence rights subject. |
+| `acquisition occurrence show [--request-id ID] [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Safe summary; `--content` is the private opt-in (origin locator, reason). |
+| `acquisition inspect FILE --identifiers-file PATH [--declared-media-type TYPE] [--pdf-inspect] [--content]` | Validate one local file against expected identifiers; stores nothing. `--pdf-inspect` runs the optional bounded `pypdf` inspector; `--content` reveals identifiers and a text preview. |
+| `acquisition impact --artifact-id ID --revision-id ID [--project ID]` | Read-only dependency-impact report for a source revision. |
+| `acquisition manifest propose --freeze-artifact-id ID --freeze-revision-id ID --entries-file PATH --rights-file PATH --revision-id ID --request-id ID [--artifact-id ID] [--project ID]` | Record one inert manifest proposal over the exact frozen roster. Records no approval. |
+| `acquisition manifest show [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Safe summary; `--content` returns the private validated document. |
+| `acquisition manifest status [--artifact-id ID] [--project ID]` | Current manifest, gate state, and whether acquisition holds. |
+| `acquisition manifest history [--artifact-id ID] [--project ID]` | Every manifest revision, newest first (safe summaries). |
+| `acquisition manifest require [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Succeeds only while the exact named gate `artifact_revision`/`acquisition.complete` currently makes acquisition complete. An acquisition prerequisite only. |
+| `acquisition queue --freeze-artifact-id ID --freeze-revision-id ID [--artifact-id ID] [--project ID]` | Read-only blocker queue for the exact frozen roster; works before any manifest exists. |
+| `acquisition folder import ROOT --entries-file PATH [--project ID] [--max-files N] [--max-total-bytes N]` | Atomic explicit folder-batch import of exactly the files named in `--entries-file`; all-or-nothing, a proposal only. |
+| `acquisition retrieve id --request-id ID [--project ID]` | Print the deterministic report and occurrence artifact ids for a request id (read-only; prepares the exact rights). |
+| `acquisition retrieve run --request-id ID --request-file PATH [--project ID] [--timeout SECONDS]` | Submit one exact acquire job from strict JSON; returns the queued admission only, never completion. |
+| `acquisition retrieve show --request-id ID [--project ID] [--content]` | Verified stored-report readback (safe summary; `--content` is the private opt-in); issues no request. |
+
+Notes:
+
+* All `RightsRecord` files are explicit caller input bound to their exact subject
+  (see [`acquisition.md`](acquisition.md) §3.1); nothing is defaulted or
+  fabricated. Side-input JSON files are read with a 1 MiB cap and strict parsing.
+* The manifest gate is recorded out of band with `gate prepare`/`gate confirm`
+  (§11) for the exact manifest artifact/revision, `--gate-kind artifact_revision`
+  and `--gate-id acquisition.complete`. It authorizes acquisition completion only,
+  never scientific work, screening, seeding, pilots, or hosted use. A large roster
+  can exceed the 10 000-entry gate-snapshot bound and block `gate prepare`.
+* PDFs are always manual review in the manifest; the inspector is a diagnostic
+  that is not wired into the gate.
+* Errors use the exit categories of §3 with static, value-free messages.
+* No test or app call in this section was run against a live source or paid
+  service.

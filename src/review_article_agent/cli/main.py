@@ -126,6 +126,11 @@ from .gates import (
     GateControlError,
     build_gates_parser,
 )
+from .acquisition import (
+    AcquisitionControlError,
+    build_acquisition_parser,
+    dispatch_acquisition,
+)
 from .discovery import (
     DiscoveryControlError,
     build_discovery_parser,
@@ -273,6 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_jobs_parser(sub)
     build_gates_parser(sub)
     build_discovery_parser(sub)
+    build_acquisition_parser(sub)
 
     return parser
 
@@ -996,6 +1002,13 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
                 f"unknown discovery command {args.discovery_command!r}"
             )
         return result
+    if args.command == "acquisition":
+        result = dispatch_acquisition(args, ctx)
+        if result is None:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(
+                f"unknown acquisition command {args.acquisition_command!r}"
+            )
+        return result
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -1151,6 +1164,8 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
         return exc.category, _GATE_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, DiscoveryControlError):
         return exc.category, _DISCOVERY_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, AcquisitionControlError):
+        return exc.category, _DISCOVERY_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1189,6 +1204,9 @@ def _error_message(exc: BaseException, category: str) -> str:
         return str(exc)
     if isinstance(exc, DiscoveryControlError):
         # Authored in ``cli.discovery``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, AcquisitionControlError):
+        # Authored in ``cli.acquisition``; a static, curated, value-free message.
         return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):

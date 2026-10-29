@@ -1,4 +1,4 @@
-# Worker runtime safety contract (Step 03, with a bounded Step 05 discovery addition)
+# Worker runtime safety contract (Step 03, with bounded Step 05 discovery and Step 06 retrieval additions)
 
 > Scope: a concise **runtime safety contract reference** for the integrated Step 03 foundation and
 > engine — the detached-worker launcher, the owner-authenticated local control transport, the durable
@@ -28,6 +28,10 @@
 > [`implementation/handoffs/05-discovery.md`](implementation/handoffs/05-discovery.md)); no
 > scientific validation, completeness, review/writer, or later-step feature is implemented or
 > claimed.
+>
+> **Step 06 addition (bounded).** The worker also schedules owner-controlled official
+> full-text retrieval jobs (`discovery_submit` `mode=acquire`, one `acquisition_fulltext`
+> job); §13 states their authority, fences, and limits.
 > Authority: [`implementation/03-durable-worker.md`](implementation/03-durable-worker.md),
 > [`decisions/001-runtime-language.md`](decisions/001-runtime-language.md),
 > [`decisions/002-step01-contracts-and-policies.md`](decisions/002-step01-contracts-and-policies.md),
@@ -435,3 +439,19 @@ and required by `discovery freeze require`).
   [`tests/test_cli_discovery_reports.py`](../tests/test_cli_discovery_reports.py) —
   worker discovery dispatch/replay/restart, submission route validation, and the
   discovery CLI surfaces.
+
+## 13. Owner-controlled official retrieval jobs (Step 06 addition)
+
+Extends §1–§12. The **only** official-full-text worker surface is `discovery_submit`
+`mode=acquire` over the integrated acquisition executor; limits are in
+[`acquisition.md`](acquisition.md) §7, [`cli.md`](cli.md) §16, and the [handoff](implementation/handoffs/06-acquisition.md).
+
+- `mode=acquire` strictly/purely validates the exact parameters (freeze ref, candidate id,
+  source/occurrence/report rights + revision ids, `terms_evidence`, optional
+  `parent_revision_id`/`transport_options`) into one `acquisition_fulltext` job under the
+  caller's `request_id`; no authority flag/URL/actor/source byte; returns a **queued admission only**.
+- A may-have-dispatched mark is journaled **before** every GET and safe metadata after;
+  the send admission is linearized with pause/cancel under the **captured** lease. **No
+  transaction or lock is held across network work** (the store connection stays open);
+  the safe result keeps refs/status/counts only, replays a proven result with zero I/O,
+  and never silently re-sends an ambiguous outcome (tests: worker + retrieval CLI suites).
