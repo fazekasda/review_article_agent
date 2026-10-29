@@ -1,62 +1,29 @@
-"""Small, immutable extraction pilots, batches, audits, and the synthesis gate.
+"""Immutable extraction pilots, batches, audits, and the synthesis gate.
 
-Responses are **durable runner receipts**, not imported text: every case is read
-back through one local seam, :func:`_require_run`, which delegates to
-``extraction.runner.require_run`` for a *verified* dispatch receipt (the runner
-worker owns that implementation; this module never parses a source itself).  Only
-the receipt's supplied passages and validated raw output are used.
+Each case is read back through one seam, :func:`_require_run`, which delegates to
+``extraction.runner.require_run`` for a verified durable dispatch receipt (the
+runner worker owns that; this module never parses a source).  Only the receipt's
+passages and validated raw output are used.  No generation defaults are invented:
+every dimension, model map, instruction/revision, size, and acceptance rule is an
+explicit project choice in an approved ``extraction.config``.  A weak study is
+never auto-excluded, no global score exists, and links stay model proposals.
 
-No generation defaults are invented here: every appraisal dimension, model map,
-instruction string/revision, size, and acceptance rule is an explicit project
-choice stored in an approved ``extraction.config`` document.  A weak study is
-never auto-excluded, no global quality score exists, and source/study/dataset/
-experiment links stay model *proposals*, never proof.
+Stored generic documents (``document_type`` in parentheses):
 
-Stored documents (generic versioned JSON envelope, ``document_type`` below):
+* ``extraction_config``: ``{config_schema_version:1, appraisal_dimensions:
+  [{dimension_id, formal_tool?, applicability?}], pilot_size, random_size,
+  risk_size, acceptance_rule, extraction_model, quality_model,
+  extraction_instructions(_revision), quality_instructions(_revision), parser,
+  normalization}``.  A model ``tool_applied`` may only name a dimension's
+  human-approved ``formal_tool`` (with its non-empty applicability); a bare
+  dimension requires no known tool.
+* ``extraction_pilot``: ``{config_ref, cases:[{id, extraction_ref, quality_ref}],
+  adjudications}``.  ``extraction_batch``: ``{config_ref, pilot_ref,
+  acquisition_ref, cases, seed}``.  ``extraction_audit``: ``{batch_ref, checks}``.
 
-* ``extraction_config`` payload::
-
-    {"config_schema_version": 1,
-     "appraisal_dimensions": [{"dimension_id": str, ...}, ...],
-     "pilot_size": int, "random_size": int, "risk_size": int,
-     "acceptance_rule": str,
-     "extraction_model": <LeadConfig mapping>,
-     "quality_model": <LeadConfig mapping>,
-     "extraction_instructions": str, "extraction_instructions_revision": str,
-     "quality_instructions": str, "quality_instructions_revision": str,
-     "parser": str, "normalization": str}
-
-* ``extraction_pilot`` payload::
-
-    {"config_ref": ref,
-     "cases": [{"id": str, "extraction_ref": ref, "quality_ref": ref}, ...],
-     "adjudications": {case_id: {"labels": [mandatory failure label, ...],
-        "inspected_original": true, "checked_omissions": bool,
-        "checked_qualifications": bool, "checked_fields": bool,
-        "important_failure": bool, "severity": "none|minor|major|blocking",
-        "rationale": str, "corrective_action": str|null}}}
-
-* ``extraction_batch`` payload::
-
-    {"config_ref": ref, "pilot_ref": ref, "acquisition_ref": ref,
-     "cases": [case, ...], "seed": str}
-
-* ``extraction_audit`` payload::
-
-    {"batch_ref": ref, "checks": {case_id: {"inspected_original": true,
-        "omissions": bool, "qualifications": bool, "fields": bool,
-        "important_error": bool, "rationale": str,
-        "corrective_action": str|null}}}
-
-Quality raw output (``validate_quality``)::
-
-    {"checks": {"omissions": bool, "qualifications": bool,
-                "field_correctness": bool, "negations": bool, "nulls": bool,
-                "numerical_units_denominators": bool, "species_models": bool,
-                "author_spin": bool, "tables_supplements": bool},
-     "issues": [{"severity": "blocking|major|minor|style",
-                 "description": str, "corrective_action": str|null}, ...],
-     "escalation": "none|human|stronger_model"}
+Named gates: config ``extraction.config`` and pilot ``extraction.pilot`` precede
+bulk work; batch/audit also carry extra ``extraction.batch``/``extraction.audit``
+gates; the final synthesis authority is the ``extraction.outputs`` gate.
 """
 
 from __future__ import annotations
@@ -301,9 +268,18 @@ def _attention(extraction):
     return reasons
 
 
-#: Attention reasons that must be explicitly escalated by the quality gate rather
-#: than silently accepted: incomplete coverage / appraisal.
+#: Attention reasons that must be escalated by the quality gate, not auto-accepted.
 _ESCALATION_ATTENTION = frozenset({"omitted_coverage", "declared_omissions", "unassessed_appraisal"})
+
+
+def _check_tools(extraction, formal_tools):
+    """A known ``tool_applied`` must name the dimension's approved formal tool."""
+    for entry in extraction["appraisal"]:
+        tool = entry["tool_applied"]
+        approved = formal_tools.get(entry["dimension_id"])
+        if tool is not None and tool["state"] == "known":
+            require(approved is not None, "appraisal reports an unapproved formal tool")
+            require(tool["value"] == approved, "appraisal tool does not match the approved formal_tool")
 
 
 def _numeric_incomplete(numeric):
@@ -355,6 +331,13 @@ class ExtractionWorkflowRepository:
     def _ref(self, ref):
         return validate_ref(ref, self.store.project_id)
 
+    def _verify_revision_bytes(self, artifact_id, revision_id):
+        """Require one stored revision's bytes to match its recorded hash/size."""
+        rev = self.artifacts.get_revision(artifact_id, revision_id)
+        require(rev is not None)
+        data = self.artifacts.read_content(artifact_id, revision_id)
+        require(sha256_digest(data) == rev.content_sha256 and len(data) == rev.byte_size)
+
     def _read(self, ref, kind, *, current=True):
         ref = self._ref(ref)
         rev = self.artifacts.get_revision(ref["artifact_id"], ref["revision_id"])
@@ -393,6 +376,7 @@ class ExtractionWorkflowRepository:
     # -- config (no generation defaults) ------------------------------------- #
     def _validate_config(self, payload):
         require(isinstance(payload, dict) and set(payload) == _CONFIG_KEYS)
+        require(type(payload["config_schema_version"]) is int)
         require(payload["config_schema_version"] == CONFIG_SCHEMA_VERSION)
         require(
             payload["parser"] == PARSER_VERSION and payload["normalization"] == NORMALIZATION_VERSION,
@@ -413,6 +397,12 @@ class ExtractionWorkflowRepository:
             require(isinstance(dimension_id, str) and dimension_id.strip() != "", "appraisal dimension_id")
             require(dimension_id not in seen, "duplicate appraisal dimension")
             require("score" not in raw, "appraisal dimension must not define a score")
+            provider = "formal_tool" in raw
+            rationale = "applicability" in raw
+            require(provider == rationale, "a formal_tool and its applicability must be declared together")
+            if provider:
+                _text(raw["formal_tool"], "appraisal formal_tool")
+                _text(raw["applicability"], "appraisal applicability")
             seen.add(dimension_id)
         for field in ("extraction_model", "quality_model"):
             try:
@@ -420,6 +410,13 @@ class ExtractionWorkflowRepository:
             except LeadError:
                 raise ExtractionWorkflowError("extraction workflow input, dependency, receipt, or approval is invalid or stale") from None
         return payload
+
+    @staticmethod
+    def _formal_tools(config):
+        return {
+            raw["dimension_id"]: raw.get("formal_tool")
+            for raw in config["appraisal_dimensions"]
+        }
 
     def require_config(self, ref):
         config = self._validate_config(self._read(ref, "config"))
@@ -463,6 +460,7 @@ class ExtractionWorkflowRepository:
             appraisal_dimensions=config["appraisal_dimensions"],
         )
         quality_result = validate_quality(quality["raw_output"])
+        _check_tools(normalized, self._formal_tools(config))
         attention = _attention(normalized)
         requires_escalation = bool(_ESCALATION_ATTENTION & set(attention))
         blocked = bool(quality_result["blocked"] or requires_escalation)
@@ -652,6 +650,10 @@ class ExtractionWorkflowRepository:
                 if artifact.kind != "report":
                     continue
                 for revision in self.artifacts.list_revisions(artifact.artifact_id):
+                    # Content integrity is verified before the document is
+                    # trusted, so tampered/corrupt stored bytes can never silently
+                    # authorize current outputs.
+                    self._verify_revision_bytes(artifact.artifact_id, revision.revision_id)
                     try:
                         doc = json.loads(self.artifacts.read_content(artifact.artifact_id, revision.revision_id))
                     except (ValueError, UnicodeDecodeError):
@@ -661,7 +663,13 @@ class ExtractionWorkflowRepository:
                     scanned += 1
                     require(scanned <= _AUDIT_SCAN_MAX_REVISIONS)
                     previous = doc.get("payload", {})
-                    if canonical_json(self._ref(previous.get("input", {}).get("batch_ref"))) == batch_id:
+                    # The stored audit's batch_ref must be an exact same-project
+                    # ref; a malformed/foreign one fails closed rather than being
+                    # skipped.
+                    previous_batch = canonical_json(
+                        self._ref(previous.get("input", {}).get("batch_ref"))
+                    )
+                    if previous_batch == batch_id:
                         require(not previous.get("paused", True), "this batch was permanently paused by an important error")
             limitations = sorted({reason for case in batch["cases"] for reason in case["attention"]})
             escalations = sorted({case["quality"]["escalation"] for case in batch["cases"]})

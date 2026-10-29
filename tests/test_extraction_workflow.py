@@ -27,6 +27,7 @@ if str(TESTS) not in sys.path:
 
 from test_acquisition_manifest import ManifestBase  # noqa: E402
 
+from review_article_agent.domain.records import canonical_json  # noqa: E402
 from review_article_agent.extraction import workflow  # noqa: E402
 from review_article_agent.extraction.workflow import (  # noqa: E402
     GATE_BATCH,
@@ -78,7 +79,7 @@ def _context(*, unknown_population=False):
     return context
 
 
-def _extraction_output(*, omitted=False, secondary=False, unknown_population=False):
+def _extraction_output(*, omitted=False, secondary=False, unknown_population=False, appraisal=None):
     asset = (
         {"target_kind": "asset", "target_id": "tbl1", "disposition": "omitted", "reason": "table_not_acquired"}
         if omitted
@@ -116,7 +117,9 @@ def _extraction_output(*, omitted=False, secondary=False, unknown_population=Fal
             {"target_kind": "passage", "target_id": "p1", "disposition": "finding", "finding_id": "F1"},
             asset,
         ],
-        "appraisal": [
+        "appraisal": appraisal
+        if appraisal is not None
+        else [
             {"dimension_id": "risk_of_bias", "state": "assessed", "judgement": "low", "rationale": "randomised"}
         ],
     }
@@ -138,17 +141,26 @@ class WorkflowBase(ManifestBase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self._n = 0
+        self._cfgrev = 1
         self.config_ref = self.put("config", self.config())
         self.approve_ref(self.config_ref, GATE_KIND, GATE_CONFIG)
 
     def _rebind(self):
         self.workflow = ExtractionWorkflowRepository(self.store)
 
-    # -- seam ---------------------------------------------------------------- #
+    def reconfigure(self, **overrides):
+        """Supersede the approved config with a new revision + fresh gate."""
+        parent = self.config_ref["revision_id"]
+        self._cfgrev += 1
+        self.config_ref = self.put(
+            "config", self.config(**overrides), revision=f"config-r{self._cfgrev}", parent=parent
+        )
+        self.approve_ref(self.config_ref, GATE_KIND, GATE_CONFIG)
+        return self.config_ref
+
     def _fake_require_run(self, store, ref, *, purpose):
         return self.receipts[(ref["artifact_id"], ref["revision_id"])]
 
-    # -- fixtures ------------------------------------------------------------ #
     def config(self, **overrides):
         cfg = {
             "config_schema_version": 1,
@@ -326,6 +338,47 @@ class PilotTests(WorkflowBase):
         case = self.case("c1", extraction_model="some/other-model")
         with self.assertRaises(ExtractionWorkflowError):
             self.build_pilot([case], {"c1": self.adjudication(MANDATORY_FAILURE_LABELS)})
+
+    def test_config_schema_version_type_is_exactly_int(self):
+        for bad in (True, "1", 1.0):
+            with self.assertRaises(ExtractionWorkflowError):
+                self.workflow._validate_config(self.config(config_schema_version=bad))
+
+    def test_approved_formal_tool_only(self):
+        # A dimension may carry one human-approved formal tool + applicability.
+        self.reconfigure(
+            appraisal_dimensions=[
+                {"dimension_id": "risk_of_bias", "formal_tool": "RoB2", "applicability": "randomised trials"}
+            ]
+        )
+        config = self.workflow._validate_config(self.workflow._read(self.config_ref, "config"))
+        config_id = canonical_json(self.workflow._ref(self.config_ref))
+
+        def appraisal(tool):
+            entry = {"dimension_id": "risk_of_bias", "state": "assessed", "judgement": "low", "rationale": "x"}
+            if tool is not None:
+                entry["tool_applied"] = {"state": "known", "value": tool}
+            return [entry]
+
+        allowed = self.case("c1", raw_output=_extraction_output(appraisal=appraisal("RoB2")))
+        self.assertEqual(self.workflow._case(config, config_id, allowed)["id"], "c1")
+        denied_tool = self.case("c2", raw_output=_extraction_output(appraisal=appraisal("OtherTool")))
+        with self.assertRaises(ExtractionWorkflowError):
+            self.workflow._case(config, config_id, denied_tool)
+
+        # A bare dimension must not report any known tool.
+        self.reconfigure(appraisal_dimensions=[{"dimension_id": "risk_of_bias"}])
+        bare_config = self.workflow._validate_config(self.workflow._read(self.config_ref, "config"))
+        bare_id = canonical_json(self.workflow._ref(self.config_ref))
+        bare_tool = self.case("c3", raw_output=_extraction_output(appraisal=appraisal("RoB2")))
+        with self.assertRaises(ExtractionWorkflowError):
+            self.workflow._case(bare_config, bare_id, bare_tool)
+
+        # A formal_tool without an explicit applicability is rejected outright.
+        with self.assertRaises(ExtractionWorkflowError):
+            self.workflow._validate_config(
+                self.config(appraisal_dimensions=[{"dimension_id": "risk_of_bias", "formal_tool": "RoB2"}])
+            )
 
     def test_restart_preserves_gated_pilot(self):
         case = self.case("c1")
