@@ -593,6 +593,57 @@ class ReplayTest(RunnerTestBase):
             self.run_extraction(request_id="run-x", artifact_id="a-run-other", revision_id="rev-run-other")
 
 
+class ReceiptIntegrityFixesTest(RunnerTestBase):
+    def test_unknown_source_key_escalates_even_without_findings(self):
+        output = _extraction_output(self.passages, self.source_keys)
+        output["source_records"].append({"source_key": "a-not-a-read-report", "source_kind": "document"})
+        self.transport.responses.append(_completion(output))
+        result = self.run_extraction(request_id="run-uk")
+        self.assertEqual(result["outcome"], "escalation")
+
+    def test_receipt_write_failure_rolls_back_atomic_commit(self):
+        from review_article_agent.extraction import runner as runner_mod  # noqa: E402
+
+        self.transport.responses.append(_completion(_extraction_output(self.passages, self.source_keys)))
+        with mock.patch.object(runner_mod, "_write_receipt_in_transaction", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.run_extraction(request_id="run-rb")
+        from review_article_agent.runtime.dispatch import RuntimeDispatchRepository  # noqa: E402
+
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch_by_request("run-rb")
+        # The whole unit of work rolled back: the dispatch is not completed, the
+        # settled cost was reverted (submitted-state ambiguity only), and no
+        # accepted result/receipt survives -- so no receipt/result/cost disagree.
+        self.assertNotEqual(dispatch.state, "completed")
+        self.assertNotEqual(dispatch.cost_state, "known")
+        self.assertIsNone(dispatch.result_ref)
+        self.assertIsNone(self.artifacts.get_artifact("a-run"))
+
+    def test_new_request_existing_revision_rejected_before_send(self):
+        self.pilot_extraction()
+        before = self.transport.call_count
+        with self.assertRaises(ExtractionRunnerError):
+            self.run_extraction(request_id="run-new", artifact_id="a-run-x", revision_id="rev-run-x")
+        self.assertEqual(self.transport.call_count, before)
+
+    def test_tampered_version_digest_rejected(self):
+        result = self.pilot_extraction()
+        from review_article_agent.extraction.runner import _load_run_receipt  # noqa: E402
+
+        _, _, original = _load_run_receipt(self.store, result["run_ref"])
+        tampered = dict(original)
+        tampered["version_digest"] = "0" * 64
+        self.artifacts.import_revision(
+            artifact_id="a-run-x", revision_id="rev-run-2",
+            content={"schema_version": 1, "document_type": "extraction_run", "payload": tampered},
+            origin_locator="import:forged",
+            rights=_rights(self.project_id, "a-run-x", "rev-run-2"),
+            parent_revision_id="rev-run-x", acquired_by="import",
+        )
+        with self.assertRaises(ExtractionReceiptError):
+            require_run(self.store, self.ref("a-run-x", "rev-run-2"), purpose="extraction")
+
+
 class HumanBlockTest(RunnerTestBase):
     def test_unreadable_report_blocks(self):
         # A source that does not parse to a usable report is a human block.
@@ -615,6 +666,262 @@ class HumanBlockTest(RunnerTestBase):
         with self.assertRaises(ExtractionRunnerError):
             self.run_extraction(request_id="run-plain", hosted_ref=hosted, report_refs=[parsed["report_ref"]])
         self.assertEqual(self.transport.call_count, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Real end-to-end flow: acquisition manifest -> pilot -> bulk -> audit -> outputs
+# --------------------------------------------------------------------------- #
+_TESTS = Path(__file__).resolve().parent
+if str(_TESTS) not in sys.path:
+    sys.path.insert(0, str(_TESTS))
+
+import test_acquisition_manifest as acq_manifest  # noqa: E402
+
+from review_article_agent.acquisition.manifest import AcquisitionRepository  # noqa: E402
+
+
+class FullFlowIntegrationTest(acq_manifest.ManifestBase):
+    """Positive full flow over a REAL frozen corpus + acquired manifest.
+
+    No ``_require_run`` seam patch and no fake acquisition: the runner reads real
+    receipts, the workflow reads the real pilot/batch/audit, and the manifest is
+    the real ``acquisition.complete`` gate.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.registry = Registry(str(self.tmp / "registry"))
+        self.registry.register_restored(str(self.tmp / "project"), project_id=self.project_id)
+        self.token = self.registry.activate_execution(self.project_id).activation_token
+        self.workflow = workflow.ExtractionWorkflowRepository(self.store)
+        self.transport = _FakeTransport()
+
+    def rights(self, artifact_id, revision_id, **overrides):  # type: ignore[override]
+        return _rights(self.project_id, artifact_id, revision_id)
+
+    # -- fixtures ------------------------------------------------------------ #
+    def _acquire(self):
+        _a, _b, src, entries = self.standard()
+        rev = self.make(entries)
+        self.gate(rev)
+        self.acq.require_acquired()
+        return src, self.ref_of(rev)
+
+    def _config_and_report(self, src):
+        repo = ParsingRepository(self.store)
+        parsed = repo.parse_stored_document(
+            src, report_artifact_id="art-rep", report_revision_id="rev-rep",
+            rights=self.rights("art-rep", "rev-rep"),
+        )
+        self.report_ref = parsed["report_ref"]
+        record = repo.read_report(self.report_ref)
+        self.passages = [
+            {"passage_id": f"art-rep:{p['passage_id']}", "source_key": "art-rep", "text": p["text"]}
+            for p in record["payload"]["passages"]
+        ]
+        for index, asset in enumerate(record["payload"].get("assets", [])):
+            aid = asset.get("id") or f"asset-{index}"
+            self.passages.append(
+                {"passage_id": f"art-rep:asset-{index}", "source_key": "art-rep",
+                 "text": asset.get("caption") or "", "asset_ids": [f"art-rep:{aid}:{index}"]}
+            )
+        self.source_ref = src
+        self.config_ref = self.workflow.propose(
+            "config", _config_payload(), artifact_id="art-cfg", revision_id="rev-cfg",
+            rights=self.rights("art-cfg", "rev-cfg"),
+        )
+        self.approve("art-cfg", "rev-cfg", workflow.GATE_KIND, workflow.GATE_CONFIG)
+
+    def _hosted(self, *, purpose, artifact_id, revision_id, extraction_ref=None, acquisition_ref=None):
+        deps = [self.config_ref, self.report_ref, self.source_ref]
+        if extraction_ref is not None:
+            deps.append(extraction_ref)
+        if acquisition_ref is not None:
+            deps.append(acquisition_ref)
+        document = _hosted_document(
+            self.config_ref, [self.report_ref], purpose=purpose,
+            extraction_ref=extraction_ref, acquisition_ref=acquisition_ref,
+        )
+        revision = self._put(artifact_id, "report", revision_id, document, dependencies=deps)
+        ref = self.ref_of(revision)
+        self.approve(artifact_id, revision_id, workflow.GATE_KIND, runner.hosted_use_gate_id(purpose))
+        return ref
+
+    def _execute(self, *, purpose, mode, request_id, artifact_id, revision_id, hosted_ref,
+                 extraction_ref=None, pilot_ref=None, report_refs=None):
+        return execute_run(
+            self.store, registry=self.registry, activation_token=self.token,
+            config_ref=self.config_ref,
+            report_refs=[self.report_ref] if report_refs is None else report_refs, purpose=purpose,
+            request_id=request_id, hosted_ref=hosted_ref, api_key="sk-or-test",
+            extraction_ref=extraction_ref, transport=self.transport, mode=mode, pilot_ref=pilot_ref,
+            artifact_id=artifact_id, revision_id=revision_id,
+            rights=self.rights(artifact_id, revision_id),
+        )
+
+    def _pilot(self):
+        """Pilot extraction + quality + adjudicated, gate-approved pilot document."""
+        self.transport.responses.append(_completion(_extraction_output(self.passages, ["art-rep"])))
+        pilot_hosted = self._hosted(purpose="extraction", artifact_id="art-hp", revision_id="rev-hp")
+        extraction = self._execute(
+            purpose="extraction", mode="pilot", request_id="p-run", artifact_id="art-pr", revision_id="rev-pr",
+            hosted_ref=pilot_hosted,
+        )
+        quality_hosted = self._hosted(
+            purpose="quality", artifact_id="art-hq", revision_id="rev-hq", extraction_ref=extraction["run_ref"]
+        )
+        self.transport.responses.append(_completion(_quality_output(), model=_QUALITY_MODEL))
+        quality = self._execute(
+            purpose="quality", mode="pilot", request_id="q-run", artifact_id="art-qr", revision_id="rev-qr",
+            hosted_ref=quality_hosted, extraction_ref=extraction["run_ref"],
+        )
+        adjudication = {
+            "labels": list(workflow.MANDATORY_FAILURE_LABELS),
+            "inspected_original": True, "checked_omissions": True, "checked_qualifications": True,
+            "checked_fields": True, "important_failure": False, "severity": "none",
+            "rationale": "human read the original", "corrective_action": None,
+        }
+        pilot_ref = self.workflow.propose(
+            "pilot",
+            {"config_ref": self.config_ref,
+             "cases": [{"id": "case-1", "extraction_ref": extraction["run_ref"], "quality_ref": quality["run_ref"]}],
+             "adjudications": {"case-1": adjudication}},
+            artifact_id="art-pilot", revision_id="rev-pilot", rights=self.rights("art-pilot", "rev-pilot"),
+        )
+        self.approve("art-pilot", "rev-pilot", workflow.GATE_KIND, workflow.GATE_PILOT)
+        return pilot_ref
+
+    def _bulk_case(self, pilot_ref, acquisition_ref, *, seed="seed-1"):
+        bulk_hosted = self._hosted(
+            purpose="extraction", artifact_id="art-hb", revision_id="rev-hb", acquisition_ref=acquisition_ref
+        )
+        self.transport.responses.append(_completion(_extraction_output(self.passages, ["art-rep"])))
+        extraction = self._execute(
+            purpose="extraction", mode="bulk", request_id="b-run", artifact_id="art-br", revision_id="rev-br",
+            hosted_ref=bulk_hosted, pilot_ref=pilot_ref,
+        )
+        quality_hosted = self._hosted(
+            purpose="quality", artifact_id="art-hbq", revision_id="rev-hbq",
+            extraction_ref=extraction["run_ref"], acquisition_ref=acquisition_ref,
+        )
+        self.transport.responses.append(_completion(_quality_output(), model=_QUALITY_MODEL))
+        quality = self._execute(
+            purpose="quality", mode="bulk", request_id="bq-run", artifact_id="art-bqr", revision_id="rev-bqr",
+            hosted_ref=quality_hosted, extraction_ref=extraction["run_ref"], pilot_ref=pilot_ref,
+        )
+        cases = [{"id": "case-1", "extraction_ref": extraction["run_ref"], "quality_ref": quality["run_ref"]}]
+        batch = self.workflow.propose(
+            "batch",
+            {"config_ref": self.config_ref, "pilot_ref": pilot_ref, "acquisition_ref": acquisition_ref,
+             "cases": cases, "seed": seed},
+            artifact_id="art-batch", revision_id="rev-batch", rights=self.rights("art-batch", "rev-batch"),
+        )
+        self.approve("art-batch", "rev-batch", workflow.GATE_KIND, workflow.GATE_BATCH)
+        return batch, cases
+
+    @staticmethod
+    def _check(*, important_error):
+        return {
+            "inspected_original": True, "omissions": True, "qualifications": True, "fields": True,
+            "important_error": important_error, "rationale": "human checked a sample",
+            "corrective_action": "re-run with correction" if important_error else None,
+        }
+
+    # -- tests ---------------------------------------------------------------- #
+    def test_positive_full_flow_to_synthesis(self):
+        src, acquisition_ref = self._acquire()
+        self._config_and_report(src)
+        pilot_ref = self._pilot()
+        batch_ref, _cases = self._bulk_case(pilot_ref, acquisition_ref)
+        audit_ref = self.workflow.propose(
+            "audit", {"batch_ref": batch_ref, "checks": {"case-1": self._check(important_error=False)}},
+            artifact_id="art-audit", revision_id="rev-audit", rights=self.rights("art-audit", "rev-audit"),
+        )
+        self.approve("art-audit", "rev-audit", workflow.GATE_KIND, workflow.GATE_OUTPUTS)
+        synthesis = self.workflow.require_for_synthesis(audit_ref)
+        self.assertTrue(synthesis["accepted"])
+        self.assertEqual(synthesis["case_ids"], ["case-1"])
+        # The bulk receipt is bound to the dispatched pilot and acquisition.
+        bulk_receipt = require_run(self.store, self.ref("art-br", "rev-br"), purpose="extraction")
+        self.assertEqual(set(bulk_receipt), set(workflow.RECEIPT_KEYS))
+
+    def test_important_audit_pauses_exact_batch_until_new_batch(self):
+        src, acquisition_ref = self._acquire()
+        self._config_and_report(src)
+        pilot_ref = self._pilot()
+        batch_ref, cases = self._bulk_case(pilot_ref, acquisition_ref)
+        # A paused (important-error) audit of this exact batch permanently pauses it.
+        self.workflow.propose(
+            "audit", {"batch_ref": batch_ref, "checks": {"case-1": self._check(important_error=True)}},
+            artifact_id="art-audit-bad", revision_id="rev-audit-bad",
+            rights=self.rights("art-audit-bad", "rev-audit-bad"),
+        )
+        clean = self.workflow.propose(
+            "audit", {"batch_ref": batch_ref, "checks": {"case-1": self._check(important_error=False)}},
+            artifact_id="art-audit-clean", revision_id="rev-audit-clean",
+            rights=self.rights("art-audit-clean", "rev-audit-clean"),
+        )
+        self.approve("art-audit-clean", "rev-audit-clean", workflow.GATE_KIND, workflow.GATE_OUTPUTS)
+        with self.assertRaises(workflow.ExtractionWorkflowError):
+            self.workflow.require_for_synthesis(clean)
+        # A corrected NEW batch with a clean audit is accepted.
+        batch2 = self.workflow.propose(
+            "batch",
+            {"config_ref": self.config_ref, "pilot_ref": pilot_ref, "acquisition_ref": acquisition_ref,
+             "cases": cases, "seed": "seed-2"},
+            artifact_id="art-batch2", revision_id="rev-batch2", rights=self.rights("art-batch2", "rev-batch2"),
+        )
+        self.approve("art-batch2", "rev-batch2", workflow.GATE_KIND, workflow.GATE_BATCH)
+        audit2 = self.workflow.propose(
+            "audit", {"batch_ref": batch2, "checks": {"case-1": self._check(important_error=False)}},
+            artifact_id="art-audit2", revision_id="rev-audit2", rights=self.rights("art-audit2", "rev-audit2"),
+        )
+        self.approve("art-audit2", "rev-audit2", workflow.GATE_KIND, workflow.GATE_OUTPUTS)
+        synthesis = self.workflow.require_for_synthesis(audit2)
+        self.assertTrue(synthesis["accepted"])
+
+    def test_presend_revalidates_revoked_pilot(self):
+        src, acquisition_ref = self._acquire()
+        self._config_and_report(src)
+        pilot_ref = self._pilot()
+        bulk_hosted = self._hosted(
+            purpose="extraction", artifact_id="art-hb", revision_id="rev-hb", acquisition_ref=acquisition_ref
+        )
+        kwargs = dict(
+            store=self.store, registry=self.registry, activation_token=self.token,
+            hosted_ref=bulk_hosted, purpose="extraction", mode="bulk", config_ref=self.config_ref,
+            report_refs=[self.report_ref], extraction_ref=None,
+            acquisition_ref=acquisition_ref, pilot_ref=pilot_ref,
+        )
+        runner._revalidate_before_send(**kwargs)  # approved pilot passes
+        self.approve("art-pilot", "rev-pilot", workflow.GATE_KIND, workflow.GATE_PILOT, decision="rejected")
+        with self.assertRaises(ExtractionAuthorizationError):
+            runner._revalidate_before_send(**kwargs)  # revoked pilot is caught pre-send
+
+    def test_bulk_source_not_in_manifest_membership_blocked(self):
+        src, acquisition_ref = self._acquire()
+        self._config_and_report(src)
+        pilot_ref = self._pilot()
+        # A second, unrelated report whose original source is NOT in the manifest.
+        other = self.put_source(acq_manifest._jats("999"))
+        parsed = ParsingRepository(self.store).parse_stored_document(
+            other, report_artifact_id="art-other", report_revision_id="rev-other",
+            rights=self.rights("art-other", "rev-other"),
+        )
+        hosted = self._put(
+            "art-hother", "report", "rev-hother",
+            _hosted_document(self.config_ref, [parsed["report_ref"]], acquisition_ref=acquisition_ref),
+            dependencies=[self.config_ref, parsed["report_ref"], other, acquisition_ref],
+        )
+        self.approve("art-hother", "rev-hother", workflow.GATE_KIND, runner.hosted_use_gate_id("extraction"))
+        before = self.transport.call_count
+        with self.assertRaises(ExtractionAuthorizationError):
+            self._execute(
+                purpose="extraction", mode="bulk", request_id="b-run-other",
+                artifact_id="art-bor", revision_id="rev-bor", hosted_ref=self.ref_of(hosted),
+                pilot_ref=pilot_ref, report_refs=[parsed["report_ref"]],
+            )
+        self.assertEqual(self.transport.call_count, before)
 
 
 if __name__ == "__main__":

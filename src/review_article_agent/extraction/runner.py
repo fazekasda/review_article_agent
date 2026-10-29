@@ -423,15 +423,27 @@ def _load_run_receipt(store, ref: object):
 # --------------------------------------------------------------------------- #
 def _report_passages(report: dict) -> list[dict]:
     artifact_id = report["report_ref"]["artifact_id"]
+    report_ref = dict(report["report_ref"])
+    report_ref_string = canonical_json(report_ref).decode("utf-8")
+    source_ref = dict(report["source_ref"])
     out: list[dict] = []
     for passage in report["payload"]["passages"]:
+        original_id = passage["passage_id"]
         out.append(
             {
-                "passage_id": f"{artifact_id}:{passage['passage_id']}",
+                "passage_id": f"{artifact_id}:{original_id}",
                 "source_key": artifact_id,
                 "text": passage["text"],
                 "raw_text": passage.get("raw_text"),
                 "section_path": list(passage.get("section_path", [])),
+                "report_ref": report_ref_string,
+                "source_ref": source_ref,
+                "locator": {
+                    "report_ref": report_ref,
+                    "source_ref": source_ref,
+                    "passage_id": original_id,
+                    "section_path": list(passage.get("section_path", [])),
+                },
             }
         )
     # Every declared structural asset (table/figure/supplement handle) is surfaced
@@ -452,9 +464,47 @@ def _report_passages(report: dict) -> list[dict]:
                 "asset_ids": [f"{artifact_id}:{asset_id}:{index}"],
                 "asset_kind": asset.get("kind"),
                 "section_path": [],
+                "report_ref": report_ref_string,
+                "source_ref": source_ref,
+                "locator": {
+                    "report_ref": report_ref,
+                    "source_ref": source_ref,
+                    "asset_id": f"{artifact_id}:{asset_id}:{index}",
+                },
             }
         )
     return out
+
+
+def _check_source_keys(raw: dict, passages: list[dict]) -> None:
+    """Every declared ``source_key`` must belong to an actually-read report.
+
+    The schema treats ``source_records.report_ref`` as an opaque string, so this
+    binds each model ``source_key`` to the exact verified report ref the runner
+    read (and rejects an unknown key even when it carries no findings), and, when
+    a ``report_ref`` is declared, requires it to be that exact report ref string.
+    """
+    actual: dict[str, str] = {}
+    for passage in passages:
+        key = passage.get("source_key")
+        if key is not None:
+            actual.setdefault(key, passage.get("report_ref"))
+    records = raw.get("source_records")
+    if not isinstance(records, list) or not records:
+        raise ExtractionRunnerError("source_records: must declare at least one report")
+    for record in records:
+        if not isinstance(record, dict):
+            raise ExtractionRunnerError("source_records: an entry is malformed")
+        key = record.get("source_key")
+        if key not in actual:
+            raise ExtractionRunnerError(
+                "source_records: declares a source_key that is not a read report"
+            )
+        declared = record.get("report_ref")
+        if declared is not None and declared != actual[key]:
+            raise ExtractionRunnerError(
+                "source_records: report_ref does not match the read report"
+            )
 
 
 def _derive_material(store, report_refs: list[dict], *, config: dict):
@@ -517,7 +567,14 @@ def _derive_material(store, report_refs: list[dict], *, config: dict):
 # Deterministic instructions + material (shared by execute and read)
 # --------------------------------------------------------------------------- #
 def _assemble_material(passages: list[dict]) -> str:
-    lines = ["[original passages]"]
+    sources: dict[str, str] = {}
+    for passage in passages:
+        if passage.get("source_key") is not None:
+            sources.setdefault(passage["source_key"], passage.get("report_ref") or "")
+    lines = ["[declared sources]"]
+    for key in sorted(sources):
+        lines.append(f"[source {key}] report_ref={sources[key]}")
+    lines.append("[original passages]")
     for passage in passages:
         section = "/".join(passage.get("section_path") or [])
         header = "[passage {pid}] source_key={sk} section={section}".format(
@@ -683,37 +740,82 @@ def _require_config(store, config_ref, workflow):
         ) from exc
 
 
-def _require_acquired(store, acquisition_ref) -> None:
+def _bare_ref(ref) -> dict:
+    return {key: ref[key] for key in ("project_id", "artifact_id", "revision_id")}
+
+
+def _triple(ref) -> tuple:
+    return (ref["project_id"], ref["artifact_id"], ref["revision_id"])
+
+
+def _require_acquired(store, acquisition_ref, source_refs) -> None:
+    """Require an acquired manifest AND that the digested sources are its roster.
+
+    The manifest being complete is not enough: every ORIGINAL source about to be
+    digested must be a ``use_full_text`` entry's ``source_ref`` (or a declared
+    required-asset source), so an unrelated acquired corpus cannot authorize an
+    arbitrary document's digestion.
+    """
     if acquisition_ref is None:
         raise ExtractionAuthorizationError(
             "acquisition: bulk extraction requires an acquired manifest reference"
         )
     try:
-        AcquisitionRepository(store).require_acquired(at_ref=acquisition_ref)
+        acquired = AcquisitionRepository(store).require_acquired(at_ref=acquisition_ref)
     except ManifestNotAcquiredError as exc:
         raise ExtractionAuthorizationError(
             "acquisition: the referenced manifest is not currently acquired"
         ) from exc
+    allowed: set[str] = set()
+    for entry in acquired["payload"]["entries"]:
+        if entry.get("disposition") == "use_full_text" and entry.get("source_ref"):
+            allowed.add(canonical_json(_bare_ref(entry["source_ref"])))
+        for asset in entry.get("required_assets") or []:
+            if asset.get("source_ref"):
+                allowed.add(canonical_json(_bare_ref(asset["source_ref"])))
+    wanted = {canonical_json(_bare_ref(ref)) for ref in source_refs}
+    if not wanted or not wanted <= allowed:
+        raise ExtractionAuthorizationError(
+            "acquisition: the sources to be digested are not in the acquired "
+            "manifest's use_full_text roster"
+        )
 
 
 def _revalidate_before_send(
     store, *, registry, activation_token, hosted_ref, purpose, mode,
-    config_ref, report_refs, extraction_ref, acquisition_ref,
+    config_ref, report_refs, extraction_ref, acquisition_ref, pilot_ref,
 ):
     """Point-in-time revalidation immediately before the POST (no lock over network).
 
-    The exact config current bytes/gate, the original sources' current bytes and
-    hosted rights, and (in bulk mode) the acquired manifest are all re-derived, so
-    an input edited between material derivation and the reserve cannot be digested.
+    One nested transaction re-derives the exact config current bytes/gate, the
+    original sources' current bytes and hosted rights, the upstream quality
+    extraction receipt, and (in bulk mode) the approved pilot and the acquired
+    manifest's source membership -- so an input, a revoked pilot, or a revised
+    config edited between material derivation and the reserve cannot be digested.
     """
-    workflow = ExtractionWorkflowRepository(store)
-    _derive_material(store, report_refs, config=_require_config(store, config_ref, workflow))
-    _assert_gate_satisfied(
-        store, hosted_ref["artifact_id"], HOSTED_USE_GATE_KIND, hosted_use_gate_id(purpose)
-    )
-    _assert_token_active(registry, store, activation_token)
-    if mode == "bulk":
-        _require_acquired(store, acquisition_ref)
+    with _NestedStore(store).transaction():
+        workflow = ExtractionWorkflowRepository(store)
+        config = _require_config(store, config_ref, workflow)
+        _passages, source_refs = _derive_material(store, report_refs, config=config)
+        if purpose == "quality":
+            upstream = require_run(store, extraction_ref, purpose="extraction")
+            if canonical_json(upstream["config_ref"]) != canonical_json(config_ref):
+                raise ExtractionAuthorizationError(
+                    "quality: the upstream extraction was run under a different config"
+                )
+            if upstream["source_refs"] != source_refs or upstream["report_refs"] != report_refs:
+                raise ExtractionAuthorizationError(
+                    "quality: the upstream extraction used different material"
+                )
+        if mode == "bulk":
+            if pilot_ref is None:
+                raise ExtractionAuthorizationError("bulk: an approved pilot reference is required")
+            require_pilot(store, pilot_ref, config_ref=config_ref)
+            _require_acquired(store, acquisition_ref, source_refs)
+        _assert_gate_satisfied(
+            store, hosted_ref["artifact_id"], HOSTED_USE_GATE_KIND, hosted_use_gate_id(purpose)
+        )
+        _assert_token_active(registry, store, activation_token)
 
 
 # --------------------------------------------------------------------------- #
@@ -731,6 +833,7 @@ def _classify_result(result, *, purpose, config, passages, instructions_sha256, 
                 extraction_schema.validate_extraction(
                     raw, passages=passages, appraisal_dimensions=config["appraisal_dimensions"]
                 )
+                _check_source_keys(raw, passages)
             else:
                 extraction_workflow.validate_quality(raw)
         except ReviewAgentError:
@@ -887,7 +990,7 @@ def _verify_receipt(store, ref, *, purpose) -> dict:
     verified = _verify_durable_evidence(
         store, ref=ref, payload=payload, purpose=purpose, config=config, config_ref=config_ref,
         model_map=model_map, plan=plan, expected_inputs=expected_inputs, extraction_ref=extraction_ref,
-        passages=passages,
+        passages=passages, source_refs=source_refs,
     )
 
     receipt = {
@@ -922,23 +1025,42 @@ def _verify_receipt_dependencies(store, ref, config_ref, report_refs, extraction
     live = [d for d in revision.dependencies if d.role != "version_of"]
     if any(d.role != "derived_from" for d in live):
         raise ExtractionReceiptError("run: the receipt has a non-derived dependency")
-    expected = {(config_ref["artifact_id"], config_ref["revision_id"])}
-    expected |= {(r["artifact_id"], r["revision_id"]) for r in report_refs}
+    expected = {_triple(config_ref)}
+    expected |= {_triple(r) for r in report_refs}
     if extraction_ref is not None:
-        expected.add((extraction_ref["artifact_id"], extraction_ref["revision_id"]))
+        expected.add(_triple(extraction_ref))
     if acquisition_ref is not None:
-        expected.add((acquisition_ref["artifact_id"], acquisition_ref["revision_id"]))
-    expected |= {(r["artifact_id"], r["revision_id"]) for r in source_refs}
-    actual = {(d.artifact_id, d.revision_id) for d in live}
+        expected.add(_triple(acquisition_ref))
+    expected |= {_triple(r) for r in source_refs}
+    actual = {(d.project_id, d.artifact_id, d.revision_id) for d in live}
+    if any(d.project_id != store.project_id for d in live):
+        raise ExtractionReceiptError("run: the receipt has a cross-project dependency")
     if actual != expected or len(live) != len(actual):
         raise ExtractionReceiptError(
             "run: the receipt dependency closure is not the exact declared material"
         )
 
 
+def _task_scope(purpose, mode, artifact_id, revision_id, pilot_ref, acquisition_ref):
+    scope = [EXTRACTION_STAGE, purpose, mode, f"receipt={artifact_id}:{revision_id}"]
+    if pilot_ref is not None:
+        scope.append(f"pilot={pilot_ref['artifact_id']}:{pilot_ref['revision_id']}")
+    if acquisition_ref is not None:
+        scope.append(f"acquisition={acquisition_ref['artifact_id']}:{acquisition_ref['revision_id']}")
+    return scope
+
+
+def _scope_tokens(task) -> dict:
+    try:
+        scope = json.loads(task.canonical.decode("utf-8")).get("scope", [])
+    except (ValueError, UnicodeError):
+        scope = []
+    return {token.split("=", 1)[0]: token.split("=", 1)[1] for token in scope if "=" in token}
+
+
 def _verify_durable_evidence(
     store, *, ref, payload, purpose, config, config_ref, model_map, plan,
-    expected_inputs, extraction_ref, passages,
+    expected_inputs, extraction_ref, passages, source_refs,
 ):
     runtime = RuntimeRepository(store)
     dispatch = RuntimeDispatchRepository(store)
@@ -965,6 +1087,31 @@ def _verify_durable_evidence(
     if dict(task.target) != config_ref:
         raise ExtractionReceiptError("run: the task target is not the config revision")
 
+    # The declared purpose/mode/receipt/pilot/acquisition must be exactly what was
+    # dispatched (pinned in the task scope); none may be silently substituted.
+    if payload["outcome"] != "completed" or payload["mode"] not in MODES:
+        raise ExtractionReceiptError("run: the outcome/mode is not a completed run")
+    try:
+        scope = json.loads(task.canonical.decode("utf-8")).get("scope", [])
+    except (ValueError, UnicodeError):
+        scope = []
+    tokens = _scope_tokens(task)
+    if purpose not in scope or payload["mode"] not in scope:
+        raise ExtractionReceiptError("run: the task scope does not match the receipt purpose/mode")
+    if tokens.get("receipt") != f"{ref['artifact_id']}:{ref['revision_id']}":
+        raise ExtractionReceiptError("run: the receipt identity is not pinned in the task scope")
+    if payload["mode"] == "bulk":
+        if payload["pilot_ref"] is None or payload["acquisition_ref"] is None:
+            raise ExtractionReceiptError("run: a bulk receipt must declare its pilot and acquisition")
+        if tokens.get("pilot") != f"{payload['pilot_ref']['artifact_id']}:{payload['pilot_ref']['revision_id']}":
+            raise ExtractionReceiptError("run: the declared pilot is not the dispatched pilot")
+        if tokens.get("acquisition") != f"{payload['acquisition_ref']['artifact_id']}:{payload['acquisition_ref']['revision_id']}":
+            raise ExtractionReceiptError("run: the declared acquisition is not the dispatched acquisition")
+        require_pilot(store, payload["pilot_ref"], config_ref=config_ref)
+        _require_acquired(store, payload["acquisition_ref"], source_refs)
+    elif payload["pilot_ref"] is not None or payload["acquisition_ref"] is not None:
+        raise ExtractionReceiptError("run: a pilot receipt must not declare bulk authority")
+
     expected_canonical = canonical_json(expected_inputs)
     actual_canonical = canonical_json([dict(entry) for entry in task.input_refs])
     if actual_canonical != expected_canonical:
@@ -974,7 +1121,7 @@ def _verify_durable_evidence(
     if payload["input_digest"] != input_digest or dispatch_record.input_digest != input_digest:
         raise ExtractionReceiptError("run: the recomputed input digest does not match")
     version_digest = _version_digest(purpose, model_map)
-    if payload["version_digest"] != version_digest:
+    if payload["version_digest"] != version_digest or dispatch_record.version_digest != version_digest:
         raise ExtractionReceiptError("run: the recomputed version digest does not match")
     if payload["request_sha256"] != plan.request_sha256 or payload["instructions_sha256"] != plan.instructions_sha256:
         raise ExtractionReceiptError("run: the recomputed request/instruction identities do not match")
@@ -1019,6 +1166,7 @@ def _verify_durable_evidence(
         extraction_schema.validate_extraction(
             raw_output, passages=passages, appraisal_dimensions=config["appraisal_dimensions"]
         )
+        _check_source_keys(raw_output, passages)
     else:
         extraction_workflow.validate_quality(raw_output)
 
@@ -1037,7 +1185,7 @@ def _verify_durable_evidence(
 # --------------------------------------------------------------------------- #
 # Receipt target precheck + atomic persistence
 # --------------------------------------------------------------------------- #
-def _precheck_receipt_target(store, artifact_id, revision_id, rights) -> None:
+def _precheck_receipt_target(store, artifact_id, revision_id, rights, request_id) -> None:
     """Validate the caller's receipt ids/rights BEFORE any paid dispatch is sent."""
     artifact_id = _require_identifier(artifact_id, "artifact_id")
     revision_id = _require_identifier(revision_id, "revision_id")
@@ -1055,11 +1203,24 @@ def _precheck_receipt_target(store, artifact_id, revision_id, rights) -> None:
         raise ExtractionRunnerError(
             "rights: the supplied rights record does not bind the receipt revision"
         ) from exc
-    if validated["operations"].get("storage") != "allowed":
+    if validated["derived_status"] != "valid":
+        raise ExtractionRunnerError("rights: the supplied rights record is not valid")
+    operations = validated["operations"]
+    if operations.get("storage") != "allowed":
+        raise ExtractionRunnerError("rights: the supplied rights do not permit storage")
+    privacy = validated["privacy"]
+    if privacy.get("denial") is not False or privacy.get("confidentiality") == "unknown":
         raise ExtractionRunnerError("rights: the supplied rights do not permit storage")
     existing = ArtifactRepository(store).get_artifact(artifact_id)
     if existing is not None and existing.kind != "report":
         raise ExtractionRunnerError("artifact_id: already exists with a different kind")
+    # A NEW request may not target an already-stored receipt revision (replay is
+    # allowed: it observes the recorded dispatch instead of writing).
+    if RuntimeDispatchRepository(store).get_dispatch_by_request(request_id) is None:
+        if ArtifactRepository(store).get_revision(artifact_id, revision_id) is not None:
+            raise ExtractionRunnerError(
+                "receipt: the target revision already exists for a new request"
+            )
 
 
 def _receipt_payload(*, purpose, config_ref, report_refs, source_refs, extraction_ref, acquisition_ref,
@@ -1154,7 +1315,7 @@ def execute_run(
     _assert_token_active(registry, store, activation_token)
 
     # The receipt target is validated BEFORE any paid dispatch can happen.
-    _precheck_receipt_target(store, artifact_id, revision_id, rights)
+    _precheck_receipt_target(store, artifact_id, revision_id, rights, request_id)
 
     workflow = ExtractionWorkflowRepository(store)
     config_ref = _require_same_project_ref(store, config_ref, "config_ref")
@@ -1190,7 +1351,7 @@ def execute_run(
         if pilot_ref is None:
             raise ExtractionAuthorizationError("bulk: an approved pilot reference is required")
         require_pilot(store, pilot_ref, config_ref=config_ref)
-        _require_acquired(store, acquisition_ref)
+        _require_acquired(store, acquisition_ref, source_refs)
 
     plan, model_map = _build_plan(purpose=purpose, config=config, passages=passages, upstream_raw=None if upstream_run is None else upstream_run["raw_output"])
     role_configuration = _role_configuration(purpose, model_map)
@@ -1206,10 +1367,11 @@ def execute_run(
         role=PURPOSE_ROLES[purpose],
         target={"project_id": store.project_id, "artifact_id": config_ref["artifact_id"], "revision_id": config_ref["revision_id"]},
         input_refs=input_refs,
-        # The receipt identity is pinned into the task scope: a replay with different
-        # artifact/revision ids under the same request_id conflicts instead of
-        # returning an unrelated receipt.
-        scope=[EXTRACTION_STAGE, purpose, mode, f"receipt={artifact_id}:{revision_id}"],
+        # The receipt identity and the exact bulk authority are pinned into the task
+        # scope: a replay with different artifact/revision ids conflicts instead of
+        # returning an unrelated receipt, and the read seam can bind the declared
+        # pilot/acquisition to what was actually dispatched.
+        scope=_task_scope(purpose, mode, artifact_id, revision_id, pilot_ref, acquisition_ref),
         prompt_version=PROMPT_VERSION,
         size_limit=TASK_SIZE_LIMIT,
         step_limit=1,
@@ -1235,7 +1397,7 @@ def execute_run(
     _revalidate_before_send(
         store, registry=registry, activation_token=activation_token, hosted_ref=hosted_ref,
         purpose=purpose, mode=mode, config_ref=config_ref, report_refs=report_refs,
-        extraction_ref=extraction_ref, acquisition_ref=acquisition_ref,
+        extraction_ref=extraction_ref, acquisition_ref=acquisition_ref, pilot_ref=pilot_ref,
     )
 
     result = runtime_extraction.execute_extraction(plan, api_key=api_key, transport=transport)
@@ -1274,14 +1436,16 @@ def _verify_hosted_dependencies(store, hosted_ref, config_ref, report_refs, extr
     revision = ArtifactRepository(store).get_revision(hosted_ref["artifact_id"], hosted_ref["revision_id"])
     if revision is None:
         raise ExtractionHostedUseError("hosted-use: the pinned revision is missing")
-    edges = {(d.artifact_id, d.revision_id) for d in revision.dependencies}
-    expected = {(config_ref["artifact_id"], config_ref["revision_id"])}
-    expected |= {(r["artifact_id"], r["revision_id"]) for r in report_refs}
+    if any(d.project_id != store.project_id for d in revision.dependencies):
+        raise ExtractionHostedUseError("hosted-use: the revision has a cross-project dependency")
+    edges = {(d.project_id, d.artifact_id, d.revision_id) for d in revision.dependencies}
+    expected = {_triple(config_ref)}
+    expected |= {_triple(r) for r in report_refs}
     if extraction_ref is not None:
-        expected.add((extraction_ref["artifact_id"], extraction_ref["revision_id"]))
+        expected.add(_triple(extraction_ref))
     if acquisition_ref is not None:
-        expected.add((acquisition_ref["artifact_id"], acquisition_ref["revision_id"]))
-    expected |= {(r["artifact_id"], r["revision_id"]) for r in source_refs}
+        expected.add(_triple(acquisition_ref))
+    expected |= {_triple(r) for r in source_refs}
     if not expected <= edges:
         raise ExtractionHostedUseError("hosted-use: the revision does not pin its declared rights closure")
 
