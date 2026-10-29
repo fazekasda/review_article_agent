@@ -174,6 +174,19 @@ class StatementTests(unittest.TestCase):
         with self.assertRaises(SynthesisError):
             validate_synthesis(payload, cases=synthesis_example_cases())
 
+    def test_declared_missing_context_blocks_proposed_and_rejects_approved(self):
+        # A repository acceptance path checks ``blocked`` rather than trusting the
+        # in-band status, so a proposed statement missing applicable context must
+        # itself be blocked.
+        payload = synthesis_example_payload()
+        payload["statements"][0]["applicability"]["species"] = {"state": "missing", "value": None}
+        result = validate_synthesis(payload, cases=synthesis_example_cases())
+        self.assertTrue(result["statements"][0]["blocked"])
+        self.assertIn("missing_applicable_context", result["statements"][0]["blocking_reasons"])
+        payload["statements"][0]["status"] = "approved"
+        with self.assertRaises(SynthesisError):
+            validate_synthesis(payload, cases=synthesis_example_cases())
+
     def test_proposed_claim_with_missing_original_context_is_blocked(self):
         cases = synthesis_example_cases()
         for finding in cases[0]["extraction"]["findings"]:

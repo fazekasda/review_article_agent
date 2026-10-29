@@ -524,7 +524,13 @@ def _validate_statements(value: object, findings_by_key: dict) -> list:
         if context_mismatch and classification == "reported_evidence":
             blocking_reasons.append("context_mismatch")
         declared_missing = [field for field in CONTEXT_FIELDS if declared[field]["state"] in ("missing", "unknown")]
-        if status == "approved" and (blocking_reasons or declared_missing):
+        if declared_missing:
+            # Always surface declared missing/unknown applicable context as a
+            # blocking reason, for proposed as well as approved statements, so a
+            # repository that checks ``blocked`` (rather than trusting the in-band
+            # status) cannot accept a statement missing applicable context.
+            blocking_reasons.append("missing_applicable_context")
+        if status == "approved" and blocking_reasons:
             raise _fail(
                 f"{label} is approved but has unresolved applicable-context issues"
             )
