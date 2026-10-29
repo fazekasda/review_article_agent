@@ -1,28 +1,37 @@
-"""In-process CLI tests for the ``drafting`` command group (Step 11, S11-CLI-BASE).
+"""In-process CLI tests for the ``drafting`` command group (Step 11, S11-CLI).
 
 Covers ``src/review_article_agent/cli/drafting.py`` over the integrated
-``SectionWorkspaceRepository`` and ``DraftingPackageRepository``:
+``SectionWorkspaceRepository``, ``DraftingPackageRepository``, and
+``DraftingWorkflowRepository``:
 
 * the ``drafting`` group is registered on the top-level parser (and its
-  ``propose``/``show``/``package`` subcommands enforce their required options;
-  only the ``workspace`` kind is a valid choice today);
-* ``drafting propose`` writes one inert per-section workspace revision from
+  ``propose``/``show``/``package``/``accepted``/``status`` subcommands enforce
+  their required options; ``workspace`` and ``blueprint`` are the valid kinds
+  today, while ``draft`` is not yet integrated);
+* ``drafting propose --kind workspace`` writes one inert workspace revision from
   explicit ids and an explicit caller rights record -- no authority flag is set;
-* ``drafting show`` reads one exact workspace revision -- a safe structural
-  summary by default (never the private runtime session/model pins) and the
-  private payload only with ``--content``; ``--historical`` reads a non-current
-  revision without live-gate authority;
+* ``drafting propose --kind blueprint`` writes one inert blueprint revision and
+  names its exact owner gate (``artifact_revision`` / ``drafting.blueprint``);
+* ``drafting show`` reads one exact revision -- a safe structural summary by
+  default (never the private session/model pins nor the blueprint evidence) and
+  the private payload only with ``--content``; ``--historical`` reads a
+  non-current revision without live-gate authority;
 * ``drafting package`` assembles one approved section's package -- safe counts
-  by default (never the raw source excerpts/evidence) and the full package only
-  with ``--content``;
+  by default, the full package only with ``--content``;
+* ``drafting accepted`` requires **this blueprint's own** named owner gate
+  (read-only; it never approves) -- safe counts and the exact gate ids by
+  default, the full private envelope only with ``--content``;
+* ``drafting status`` reads one current blueprint's structured status
+  (``stale``/``reasons``/``pending``/non-export) with no raw content;
 * the CLI delegates to the repositories (it never fabricates a runtime mapping or
   creates a session), forwarding the exact refs/args;
 * a missing/malformed reference fails with a static ``validation`` error that
   never echoes the requested id.
 
-The approved chain and the synthetic planner/writer runtime mappings come from
-the real integrated fixtures in :mod:`test_drafting_workspace` (which itself
-inherits the accepted Step 09/10 evidence + synthesis seams). No model, network,
+The approved chain, the synthetic planner/writer runtime mappings, the blueprint
+content, and the owner-gate approval come from the real integrated fixtures in
+:mod:`test_drafting_workflow` (which inherits the accepted Step 09/10 seams and
+the mocked controlling-tty owner-authorization seam). No model, network,
 provider, session, or runner call is made.
 
 Run::
@@ -48,16 +57,24 @@ if str(_TESTS) not in sys.path:
 
 import review_article_agent.cli.drafting as cli_drafting  # noqa: E402
 import review_article_agent.cli.main as cli_main  # noqa: E402
+from review_article_agent.drafting.package import DraftingPackageRepository  # noqa: E402
+from review_article_agent.drafting.workflow import (  # noqa: E402
+    GATE_ID,
+    GATE_KIND,
+)
 from review_article_agent.storage import Registry  # noqa: E402
+from test_drafting_workflow import blueprint_content  # noqa: E402
 from test_drafting_workspace import WorkspaceBase  # noqa: E402
 
-#: A private value carried only in the runtime mapping pin (never by default).
+#: Private values carried only in the runtime mapping pin (never by default).
 _SECRET_SESSION = "ses_planner_1"
 _SECRET_MODEL = "deepseek/v4.1-flash"
+#: A raw blueprint claim text (never emitted by default).
+_SECRET_CLAIM_TEXT = "Compound Z did not reduce tumor volume in mice."
 
 
 class DraftingCliBase(WorkspaceBase):
-    """Drafting workspace fixture plus a registry the CLI can open it through."""
+    """Drafting fixture plus a registry the CLI can open it through."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -83,13 +100,15 @@ class DraftingCliBase(WorkspaceBase):
         path.write_text(json.dumps(data), encoding="utf-8")
         return str(path)
 
-    def cli_propose(self, payload: dict, *, artifact_id: str, revision: str,
+    def cli_propose(self, kind: str, payload: dict, *, artifact_id: str, revision: str,
                     parent: str | None = None, expect: int = 0) -> dict:
-        payload_file = self.write_json("ws-input.json", payload)
-        rights = self.write_json("ws-rights.json", self.rights(artifact_id, revision))
+        payload_file = self.write_json(f"{kind}-input.json", payload)
+        rights = self.write_json(
+            f"{kind}-rights.json", self.rights(artifact_id, revision)
+        )
         args = [
             "drafting", "propose", "--project", self.project_id,
-            "--kind", "workspace", "--input-file", payload_file, "--rights-file", rights,
+            "--kind", kind, "--input-file", payload_file, "--rights-file", rights,
             "--artifact-id", artifact_id, "--revision-id", revision,
         ]
         if parent is not None:
@@ -101,6 +120,28 @@ class DraftingCliBase(WorkspaceBase):
         planner = self.planner_mapping()
         writer = self.writer_mapping()
         return self.payload(outline_ref, planner=planner, writer=writer), outline_ref
+
+    def make_workspace(self, outline_ref, *, section_id="sec1", artifact_id="ws",
+                       revision="ws-r1"):
+        return self.workspace.propose(
+            self.payload(
+                outline_ref, section_id=section_id,
+                planner=self.planner_mapping(), writer=self.writer_mapping(),
+            ),
+            artifact_id=artifact_id, revision_id=revision,
+            rights=self.rights(artifact_id, revision),
+        )
+
+    def blueprint_payload(self, workspace_ref, *, section_id="sec1"):
+        ws = self.workspace.read(workspace_ref)["result"]
+        package = DraftingPackageRepository(self.store).build(
+            ws["outline_ref"], section_id
+        )
+        finding_key = package["evidence"][0]["finding_key"]
+        return {
+            "workspace_ref": workspace_ref,
+            "content": blueprint_content(section_id=section_id, finding_key=finding_key),
+        }
 
     def assert_non_authorizing(self, data: dict) -> None:
         self.assertFalse(data["authorizes_execution"])
@@ -120,19 +161,38 @@ class ParserRegistrationTest(DraftingCliBase):
             ]
         )
         self.assertEqual(parsed.drafting_command, "package")
+        accepted = parser.parse_args(
+            ["drafting", "accepted", "--artifact-id", "a", "--revision-id", "r"]
+        )
+        self.assertEqual(accepted.drafting_command, "accepted")
+        status = parser.parse_args(
+            ["drafting", "status", "--kind", "blueprint",
+             "--artifact-id", "a", "--revision-id", "r"]
+        )
+        self.assertEqual(status.drafting_command, "status")
+        # blueprint is a valid propose/show kind now
+        parser.parse_args(
+            ["drafting", "propose", "--kind", "blueprint", "--input-file", "f",
+             "--rights-file", "r", "--artifact-id", "a", "--revision-id", "rev"]
+        )
         with self.assertRaises(cli_main.CliUsageError):
             parser.parse_args(["drafting", "show"])  # required options missing
         with self.assertRaises(cli_main.CliUsageError):
-            # only the workspace kind is integrated today
-            parser.parse_args(["drafting", "propose", "--kind", "blueprint"])
+            # only workspace/blueprint are integrated today
+            parser.parse_args(["drafting", "propose", "--kind", "draft"])
+        with self.assertRaises(cli_main.CliUsageError):
+            parser.parse_args(
+                ["drafting", "status", "--kind", "draft",
+                 "--artifact-id", "a", "--revision-id", "r"]
+            )
         # the group alone is a usage error, not an internal failure
         self.assertEqual(self._run("drafting")[0], cli_main.EXIT_USAGE)
 
 
-class ProposeShowTest(DraftingCliBase):
+class WorkspaceProposeShowTest(DraftingCliBase):
     def test_propose_inert_and_show_privacy_and_content_opt_in(self):
         payload, outline_ref = self.workspace_fixture()
-        proposed = self.cli_propose(payload, artifact_id="ws", revision="ws-r1")
+        proposed = self.cli_propose("workspace", payload, artifact_id="ws", revision="ws-r1")
         self.assertEqual(proposed["ref"]["artifact_id"], "ws")
         self.assertEqual(proposed["kind"], "workspace")
         self.assertFalse(proposed["private_content_included"])
@@ -165,7 +225,7 @@ class ProposeShowTest(DraftingCliBase):
 
     def test_show_historical_flag_reads_without_current_authority(self):
         payload, _outline_ref = self.workspace_fixture()
-        self.cli_propose(payload, artifact_id="ws", revision="ws-r1")
+        self.cli_propose("workspace", payload, artifact_id="ws", revision="ws-r1")
         historical = self.cli(
             "drafting", "show", "--project", self.project_id,
             "--kind", "workspace", "--artifact-id", "ws", "--revision-id", "ws-r1",
@@ -205,6 +265,140 @@ class PackageTest(DraftingCliBase):
         self.assert_non_authorizing(full)
 
 
+class BlueprintProposeShowTest(DraftingCliBase):
+    def test_blueprint_propose_show_privacy_gate_and_historical(self):
+        _s, _f, outline_ref = self.approved_chain()
+        ws_ref = self.make_workspace(outline_ref)
+        proposed = self.cli_propose(
+            "blueprint", self.blueprint_payload(ws_ref),
+            artifact_id="bp", revision="bp-r1",
+        )
+        self.assertEqual(proposed["ref"]["artifact_id"], "bp")
+        self.assertEqual(proposed["kind"], "blueprint")
+        self.assertEqual(proposed["gate_kind"], GATE_KIND)
+        self.assertEqual(proposed["gate_id"], GATE_ID)
+        self.assertFalse(proposed["private_content_included"])
+        self.assert_non_authorizing(proposed)
+
+        show = self.cli(
+            "drafting", "show", "--project", self.project_id,
+            "--kind", "blueprint", "--artifact-id", "bp", "--revision-id", "bp-r1",
+        )
+        self.assertEqual(show["section_id"], "sec1")
+        self.assertEqual(show["gate_kind"], GATE_KIND)
+        self.assertEqual(show["gate_id"], GATE_ID)
+        self.assertEqual(show["paragraph_count"], 1)
+        self.assertEqual(show["intent_count"], 1)
+        self.assertEqual(show["claim_count"], 1)
+        self.assertEqual(show["pending"], ["source_checks", "origin_tracing"])
+        self.assertTrue(show["current"])
+        self.assertFalse(show["private_content_included"])
+        self.assertNotIn("payload", show)
+        self.assert_non_authorizing(show)
+        blob = json.dumps(show)
+        self.assertNotIn(_SECRET_CLAIM_TEXT, blob)
+        self.assertNotIn(_SECRET_SESSION, blob)
+        self.assertNotIn("package", show)
+
+        content = self.cli(
+            "drafting", "show", "--project", self.project_id,
+            "--kind", "blueprint", "--artifact-id", "bp", "--revision-id", "bp-r1",
+            "--content",
+        )
+        self.assertTrue(content["private_content_included"])
+        self.assertIn(_SECRET_CLAIM_TEXT, json.dumps(content))
+        self.assert_non_authorizing(content)
+
+        historical = self.cli(
+            "drafting", "show", "--project", self.project_id,
+            "--kind", "blueprint", "--artifact-id", "bp", "--revision-id", "bp-r1",
+            "--historical",
+        )
+        self.assertFalse(historical["current"])
+        self.assertEqual(historical["gate_kind"], GATE_KIND)
+        self.assert_non_authorizing(historical)
+
+
+class AcceptedTest(DraftingCliBase):
+    def _make_blueprint(self):
+        _s, _f, outline_ref = self.approved_chain()
+        ws_ref = self.make_workspace(outline_ref)
+        return self.cli_propose(
+            "blueprint", self.blueprint_payload(ws_ref),
+            artifact_id="bp", revision="bp-r1",
+        )["ref"]
+
+    def test_accepted_requires_own_gate_then_reads_approved(self):
+        ref = self._make_blueprint()
+        # Not approved yet: the own-gate requirement fails closed.
+        error = self.cli(
+            "drafting", "accepted", "--project", self.project_id,
+            "--artifact-id", "bp", "--revision-id", "bp-r1",
+            expect=cli_main.EXIT_VALIDATION,
+        )
+        self.assertEqual(error["error"]["category"], "validation")
+        self.assertNotIn("bp-r1", json.dumps(error))
+        self.assertNotIn("Traceback", json.dumps(error))
+
+        # Record the human approval out-of-band (real owner-gate flow).
+        self.approve_ref(ref, GATE_KIND, GATE_ID)
+
+        approved = self.cli(
+            "drafting", "accepted", "--project", self.project_id,
+            "--artifact-id", "bp", "--revision-id", "bp-r1",
+        )
+        self.assertTrue(approved["blueprint_approved"])
+        self.assertEqual(approved["gate_kind"], GATE_KIND)
+        self.assertEqual(approved["gate_id"], GATE_ID)
+        self.assertEqual(approved["blueprint_ref"], ref)
+        self.assertEqual(approved["section_id"], "sec1")
+        self.assertEqual(approved["claim_count"], 1)
+        self.assertEqual(approved["pending"], ["source_checks", "origin_tracing"])
+        self.assertFalse(approved["private_content_included"])
+        self.assertNotIn("blueprint", approved)
+        self.assert_non_authorizing(approved)
+
+        full = self.cli(
+            "drafting", "accepted", "--project", self.project_id,
+            "--artifact-id", "bp", "--revision-id", "bp-r1", "--content",
+        )
+        self.assertTrue(full["private_content_included"])
+        self.assertIn(_SECRET_CLAIM_TEXT, json.dumps(full))
+        self.assert_non_authorizing(full)
+
+
+class StatusTest(DraftingCliBase):
+    def test_status_reports_stale_then_not_stale(self):
+        _s, _f, outline_ref = self.approved_chain()
+        ws_ref = self.make_workspace(outline_ref)
+        ref = self.cli_propose(
+            "blueprint", self.blueprint_payload(ws_ref),
+            artifact_id="bp", revision="bp-r1",
+        )["ref"]
+
+        stale = self.cli(
+            "drafting", "status", "--project", self.project_id,
+            "--kind", "blueprint", "--artifact-id", "bp", "--revision-id", "bp-r1",
+        )
+        self.assertTrue(stale["stale"])
+        self.assertTrue(stale["reasons"])
+        self.assertEqual(stale["gate_kind"], GATE_KIND)
+        self.assertEqual(stale["gate_id"], GATE_ID)
+        self.assertEqual(stale["pending"], ["source_checks", "origin_tracing"])
+        self.assertTrue(stale["provisional"])
+        self.assertFalse(stale["authorizes_export"])
+        self.assert_non_authorizing(stale)
+
+        self.approve_ref(ref, GATE_KIND, GATE_ID)
+        fresh = self.cli(
+            "drafting", "status", "--project", self.project_id,
+            "--kind", "blueprint", "--artifact-id", "bp", "--revision-id", "bp-r1",
+        )
+        self.assertFalse(fresh["stale"])
+        self.assertEqual(fresh["reasons"], [])
+        self.assert_non_authorizing(fresh)
+
+
 class ErrorRedactionTest(DraftingCliBase):
     def test_missing_workspace_revision_is_static_validation_error(self):
         self.workspace_fixture()
@@ -219,6 +413,18 @@ class ErrorRedactionTest(DraftingCliBase):
         self.assertNotIn("no-such-artifact", blob)
         self.assertNotIn("no-such-rev", blob)
         self.assertNotIn("Traceback", blob)
+
+    def test_missing_blueprint_revision_is_static_validation_error(self):
+        self.approved_chain()
+        error = self.cli(
+            "drafting", "show", "--project", self.project_id,
+            "--kind", "blueprint", "--artifact-id", "no-such-bp",
+            "--revision-id", "no-such-rev",
+            expect=cli_main.EXIT_VALIDATION,
+        )
+        self.assertEqual(error["error"]["category"], "validation")
+        self.assertNotIn("no-such-bp", json.dumps(error))
+        self.assertNotIn("Traceback", json.dumps(error))
 
     def test_package_missing_outline_is_static_validation_error(self):
         self.approved_chain()
@@ -236,8 +442,8 @@ class ErrorRedactionTest(DraftingCliBase):
 class DelegationTest(DraftingCliBase):
     """The CLI delegates to the repositories; it never fabricates a mapping."""
 
-    def test_propose_and_read_delegate_exact_arguments(self):
-        payload, outline_ref = self.workspace_fixture()
+    def test_workspace_propose_and_read_delegate_exact_arguments(self):
+        payload, _outline_ref = self.workspace_fixture()
         recorded: dict = {}
 
         class FakeWorkspace:
@@ -292,6 +498,87 @@ class DelegationTest(DraftingCliBase):
         self.assertEqual(recorded["read"]["ref"], {
             "project_id": self.project_id, "artifact_id": "ws", "revision_id": "ws-r1",
         })
+
+    def test_blueprint_propose_read_accepted_status_delegate(self):
+        payload, _outline_ref = self.workspace_fixture()
+        recorded: dict = {}
+
+        class FakeWorkflow:
+            def __init__(self, store):
+                self.store = store
+
+            def propose(self, kind, payload, *, artifact_id, revision_id, rights,
+                        parent_revision_id=None):
+                recorded["propose"] = {
+                    "kind": kind, "payload": payload, "artifact_id": artifact_id,
+                    "revision_id": revision_id, "rights": rights,
+                    "parent_revision_id": parent_revision_id,
+                }
+                return {
+                    "project_id": self.store.project_id,
+                    "artifact_id": artifact_id, "revision_id": revision_id,
+                }
+
+            def read(self, ref, kind="blueprint", *, current=True):
+                recorded["read"] = {"ref": ref, "kind": kind, "current": current}
+                return {
+                    "result": {
+                        "section_id": "sec1", "paragraphs": [],
+                        "pending": ["source_checks", "origin_tracing"],
+                    }
+                }
+
+            def require_blueprint(self, ref):
+                recorded["accepted"] = ref
+                return {
+                    "blueprint_ref": ref, "gate_kind": GATE_KIND, "gate_id": GATE_ID,
+                    "approved": True, "input": {}, "workspace": {}, "package": {},
+                    "result": {"section_id": "sec1", "paragraphs": [], "pending": []},
+                }
+
+            def status(self, ref, kind="blueprint"):
+                recorded["status"] = {"ref": ref, "kind": kind}
+                return {
+                    "blueprint_ref": ref, "gate_kind": GATE_KIND, "gate_id": GATE_ID,
+                    "stale": False, "reasons": [], "pending": [],
+                    "provisional": True, "authorizes_export": False,
+                }
+
+        payload_file = self.write_json("bp-input.json", payload)
+        rights_file = self.write_json("bp-rights.json", self.rights("bp", "bp-r1"))
+        with mock.patch.object(cli_drafting, "DraftingWorkflowRepository", FakeWorkflow):
+            self.cli(
+                "drafting", "propose", "--project", self.project_id,
+                "--kind", "blueprint", "--input-file", payload_file,
+                "--rights-file", rights_file, "--artifact-id", "bp",
+                "--revision-id", "bp-r1",
+            )
+            self.cli(
+                "drafting", "show", "--project", self.project_id,
+                "--kind", "blueprint", "--artifact-id", "bp",
+                "--revision-id", "bp-r1", "--historical",
+            )
+            self.cli(
+                "drafting", "accepted", "--project", self.project_id,
+                "--artifact-id", "bp", "--revision-id", "bp-r1",
+            )
+            self.cli(
+                "drafting", "status", "--project", self.project_id,
+                "--kind", "blueprint", "--artifact-id", "bp",
+                "--revision-id", "bp-r1",
+            )
+
+        self.assertEqual(recorded["propose"]["kind"], "blueprint")
+        self.assertEqual(recorded["propose"]["payload"], payload)
+        self.assertEqual(recorded["propose"]["artifact_id"], "bp")
+        self.assertEqual(recorded["read"]["kind"], "blueprint")
+        self.assertEqual(recorded["read"]["current"], False)
+        self.assertEqual(recorded["read"]["ref"]["revision_id"], "bp-r1")
+        self.assertEqual(recorded["accepted"], {
+            "project_id": self.project_id, "artifact_id": "bp", "revision_id": "bp-r1",
+        })
+        self.assertEqual(recorded["status"]["kind"], "blueprint")
+        self.assertEqual(recorded["status"]["ref"]["artifact_id"], "bp")
 
     def test_package_delegates_exact_outline_ref_and_section(self):
         _s, _f, outline_ref = self.approved_chain()
