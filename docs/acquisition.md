@@ -39,7 +39,7 @@ Source anchors (read these for exact field spellings and bounds):
 | Local `inspect` (validation, optional PDF inspector) and read-only `impact` | Integrated CLI. |
 | Revision-specific manifest `propose/show/status/history/require` and blocker `queue` | Integrated CLI. |
 | Exact named human gate `artifact_revision` / `acquisition.complete` | Integrated through the existing `gate prepare`/`gate confirm` (see §6). |
-| Atomic explicit folder-batch import (`read_folder_batch` + `import_batch`) | **Library only.** No folder CLI is wired yet. |
+| Atomic explicit folder-batch import (`read_folder_batch` + `import_folder_batch`) | **Library only.** No folder CLI is wired yet. |
 | Official full-text acquisition (`AcquisitionExecutor`, two fixed official XML endpoints) | **Library only**, with per-GET `before_attempt`/`after_attempt` journal seams. Worker/job integration is **pending**; no job or CLI command retrieves from a source. Do not treat any job as complete. |
 
 Everything exercised so far was run through fixtures and local files. All app
@@ -57,9 +57,14 @@ upload; those paths are **unrun** against real providers.
 * The legacy PMC `oa.fcgi` service is **not** used. There is no mirror discovery,
   no captcha/paywall bypass, and no arbitrary-URL fetch. Unofficial acquisition
   is a **manual queue plus local import** path only.
-* **Terms are human references, not legal truth.** A `terms_ref`/`checked_at`
-  pair in a rights record records what a person says they checked; the software
-  does not verify it and it is not a legal determination.
+* **Terms are human references, not legal truth.** A canonical `RightsRecord`
+  (C03) records, per operation, `basis.<operation>.evidence` with `ref` and
+  `provenance` strings, plus `recorded_at`. The executor's `terms_evidence`
+  argument (`terms_ref` and `checked_at` per operation) is a **separate**
+  caller input that is passed *alongside* the `RightsRecord`; `terms_ref` must
+  equal the record's evidence `ref` for that operation. `terms_ref`/`checked_at`
+  are not canonical rights fields. Neither is verified by the software, and
+  neither is a legal determination.
 * **`adapter_version` / `source_version` name the endpoint adapter, not an
   edition.** `document_version` is always explicitly
   `{"status": "unknown", ...}`: no published-vs-preprint edition evidence is
@@ -81,12 +86,17 @@ and is validated against its **exact subject**:
 | `missing` source rights | `--rights-file` | A pre-acquisition `subject_artifact_ref` for `--artifact-id` (no revision exists). |
 | `missing` occurrence | `--occurrence-rights-file` | Same occurrence subject as for `import`. |
 
-Bytes are stored only if the source rights allow **acquisition** *and*
+The acquisition import wrapper writes **new** bytes only if the source rights allow **acquisition** *and*
 **storage** (checked separately), the record is the latest `record_revision` for
 its `rights_id`, and no privacy denial is recorded. Acquisition, storage,
 transfer, and redistribution stay independent: `unknown` storage stores **no**
 bytes (use `missing`), and free-to-read, storage, and hosted transfer are never
-merged. A rights record that names another subject, a superseded revision, or a
+merged. This is a property of the acquisition wrapper/executor, not of the generic store:
+the foundation `ArtifactRepository` validates storage only, so project bytes are
+not globally proved acquisition-authorized or currently rights-valid, and
+backups keep historical bytes after a later supersession (see
+[`storage.md`](storage.md) §8). New operations and gates block on supersession;
+retention is not a fresh legal or redistribution approval. A rights record that names another subject, a superseded revision, or a
 changed record that cannot authorize reuse of an existing source fails closed
 with a static message.
 
@@ -109,9 +119,11 @@ review-article-agent acquisition import ./paper.xml \
 
 * One import is atomic: source revision, rights, artifact rows and the typed
   `acquisition_import_occurrence` record commit in one transaction.
-* **Occurrence is not a revision.** Each call records an immutable occurrence
-  (a `report` artifact whose id is derived from the `request_id`), an honest
-  **proposal** that authorizes no use.
+* **Occurrence is not a new source document revision.** Each call records the
+  physical import event as its own immutable `report` revision (the artifact id
+  is derived from the `request_id`), an honest **proposal** that authorizes no
+  use. A duplicate-bytes import adds an occurrence revision but **no** new source
+  revision.
 * **Exact-byte duplicates, same artifact only.** Equal bytes inside the same
   document artifact reuse the earlier source revision and add a new occurrence;
   equal bytes in a *different* artifact are never merged. Alternate versions are
@@ -190,8 +202,9 @@ pages yielded text, a bounded private preview, and identifiers found only when
 exactly one distinct value exists. It does **not** choose a scientific parser
 and does not claim the file is the intended paper or complete; Step 07 owns
 scientific parsing, locators, and fidelity. Without `pypdf` it reports
-`unavailable` explicitly. It runs in an isolated child process (empty
-environment, new session) with a wall-clock timeout (at most 120 s), CPU,
+`unavailable` explicitly. It runs in an isolated child process (`python -I`, no shell, a minimal
+credential-free environment of only `PYTHONIOENCODING=utf-8`, no inheritance of
+the parent environment, working directory `/`, new session) with a wall-clock timeout (at most 120 s), CPU,
 address-space and file-size limits, page and text caps, and a 256 KiB reply
 cap. The inspector is a **diagnostic**; it is not wired into the manifest gate,
 and the CLI makes no automatic wrong-paper or completeness claim from it.
@@ -301,7 +314,7 @@ a replay-key `request_id`, source and occurrence/report rights, and per-operatio
 `terms_evidence`; identifiers and URLs come only from the frozen corpus. Highlights:
 
 * Resolver authorization is **derived from the validated canonical rights
-  record**, never from a caller flag. Source bytes are retained only where
+  record**, never from a caller flag. The executor retains **new** source bytes only where
   acquisition **and** storage are allowed and no privacy veto exists; unknown
   storage stores metadata only. Transfer and redistribution are independent and
   are not granted by this path.

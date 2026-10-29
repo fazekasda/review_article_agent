@@ -609,7 +609,16 @@ reports from the pinned freeze and corpus), not by the generic backup verifier.
 A verified snapshot is a storage-integrity statement, never an acquisition,
 rights, approval, or scientific one.
 
-Source bytes appear in a snapshot only where acquisition and storage rights
-allowed them (and no privacy denial existed); an unknown storage right stores
-metadata only. A snapshot is a **private** copy, never a source publication or
-redistribution package. See [`acquisition.md`](acquisition.md).
+**Source bytes and rights.** The acquisition import wrapper and executor write
+*new* source bytes only when the exact source rights allow acquisition **and**
+storage with no privacy denial; unknown storage stores metadata only. That is a
+property of those operations, not of the store. The generic foundation
+`ArtifactRepository` historically validates **storage** only, so a project's
+bytes are **not** globally proved to be acquisition-authorized or currently
+rights-valid. Backups retain historical source bytes even if a later rights
+revision supersedes the rights, and backup/restore does not remove them. New
+acquisition operations and gates (manifest, `require`, executor reuse) block on
+supersession, but historical retention plus a backup is **not** a fresh legal or
+redistribution approval. There is no workaround and no silent acceptance. A
+snapshot is a **private** copy, never a source publication or redistribution
+package. See [`acquisition.md`](acquisition.md).
