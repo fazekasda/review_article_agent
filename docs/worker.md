@@ -1,4 +1,4 @@
-# Worker runtime safety contract (Step 03, with a bounded Step 05 discovery addition)
+# Worker runtime safety contract (Step 03, with bounded Step 05 discovery and Step 06 retrieval additions)
 
 > Scope: a concise **runtime safety contract reference** for the integrated Step 03 foundation and
 > engine — the detached-worker launcher, the owner-authenticated local control transport, the durable
@@ -28,6 +28,14 @@
 > [`implementation/handoffs/05-discovery.md`](implementation/handoffs/05-discovery.md)); no
 > scientific validation, completeness, review/writer, or later-step feature is implemented or
 > claimed.
+>
+> **Step 06 addition (bounded, implemented MVP).** On top of that unchanged foundation, the worker
+> also schedules **owner-controlled official full-text retrieval** jobs through the existing
+> `discovery_submit` op with `mode=acquire` (one `acquisition_fulltext` job) over the integrated
+> acquisition executor, with a durable GET journal and the public `acquisition retrieve id|run|show`
+> CLI. §13 states the exact authority, fences, and limits; no scientific parsing/screening/digestion
+> is implemented (Step 07+), and the final latest-head suite is pending the coordinator
+> ([handoff](implementation/handoffs/06-acquisition.md)).
 > Authority: [`implementation/03-durable-worker.md`](implementation/03-durable-worker.md),
 > [`decisions/001-runtime-language.md`](decisions/001-runtime-language.md),
 > [`decisions/002-step01-contracts-and-policies.md`](decisions/002-step01-contracts-and-policies.md),
@@ -435,3 +443,46 @@ and required by `discovery freeze require`).
   [`tests/test_cli_discovery_reports.py`](../tests/test_cli_discovery_reports.py) —
   worker discovery dispatch/replay/restart, submission route validation, and the
   discovery CLI surfaces.
+
+## 13. Owner-controlled official retrieval jobs (Step 06 addition)
+
+This section extends §1–§12 without weakening them. It documents the **only**
+worker surface that retrieves official full text: the `acquire` mode over the
+existing `discovery_submit` op. The Step 06 CLI spellings are in
+[`cli.md`](cli.md) §16; the value layers and limits are in
+[`acquisition.md`](acquisition.md) §7. Step 06 is an **implemented MVP**; evidence
+and honest limits are in the
+[handoff](implementation/handoffs/06-acquisition.md).
+
+- **One mode, exact parameters, logical key.** `discovery_submit`
+  (`mode=acquire`) strictly and **purely** validates and canonicalises the
+  caller's parameters (freeze ref, candidate id, source/occurrence/report rights
+  and revision ids, `terms_evidence`, optional `parent_revision_id`/
+  `transport_options`) into the immutable `JobRepository` parameters of one
+  `acquisition_fulltext` job under the caller's `request_id`. No authority flag,
+  URL, actor, or source byte is ever accepted. It returns a **queued admission
+  only**; completion is observed later with `job status`/`job attach`.
+- **Delegation.** [`worker/acquisition.py`](../src/review_article_agent/worker/acquisition.py)
+  forwards exactly those parameters to `AcquisitionExecutor.acquire` (E1) on the
+  executor's own thread/store, with the durable job request id as the only replay
+  key; the official endpoints remain the two fixed allowlisted ones (no mirrors,
+  no redirects). The root `pause`/`resume`/`cancel`/`switch`/`drain`/`reconcile`
+  lifecycle controls (§7) apply unchanged.
+- **Durable GET journal and captured lease.** A may-have-dispatched mark is
+  persisted under the registry write guard **before** every GET and safe metadata
+  after it; every write is fenced by the **captured original dispatch token** (not
+  the project's current token), and the *before* write re-reads the durable
+  job/attempt/fence and paused/cancelled state **inside the same write
+  transaction**, so no GET can be admitted once a pause/cancel has committed. No
+  store connection or lock is held across network work.
+- **Honest outcome, no silent re-send.** The safe accepted-result projection keeps
+  only refs, status, counts, and validation state (never bytes, URLs, identifiers,
+  rights, or terms); `authorizing=false` and
+  `eligibility="eligibility_not_assessed"` always hold. A proven existing result is
+  replayed with **zero** I/O; an `interrupted`/ambiguous outcome is never silently
+  re-sent, and resuming needs a new `request_id`.
+- **Safety tests (Step 06 addition)**:
+  [`tests/test_acquisition_worker.py`](../tests/test_acquisition_worker.py) and
+  [`tests/test_cli_acquisition_retrieval.py`](../tests/test_cli_acquisition_retrieval.py)
+  (10 CLI tests, one a real owned detached worker writing `manual_required` with
+  zero GET).

@@ -948,7 +948,7 @@ categories are added to `classify_error()` and this table.
 * The packaged console script and the absence of an invented license are checked
   by building a wheel offline in `tests/test_cli.py`.
 
-## 16. Acquisition — `acquisition` (Step 06 addition, partial)
+## 16. Acquisition — `acquisition` (Step 06 addition, MVP)
 
 The root `acquisition` group is the integrated **local** Step 06 surface over
 [`acquisition/imports.py`](../src/review_article_agent/acquisition/imports.py),
@@ -958,11 +958,12 @@ The root `acquisition` group is the integrated **local** Step 06 surface over
 and [`acquisition/impact.py`](../src/review_article_agent/acquisition/impact.py)
 (implemented in [`cli/acquisition.py`](../src/review_article_agent/cli/acquisition.py)
 and [`cli/acquisition_manifest.py`](../src/review_article_agent/cli/acquisition_manifest.py)).
-Every command is local: no network, provider, model, or approval call, and none
-retrieves from an official source. **Step 06 is not complete**; the official
-acquisition executor is library-only, and job/CLI retrieval and a folder-batch
-CLI are not available. Semantics, rights binding, P3 handling, and bounds are in
-[`acquisition.md`](acquisition.md).
+Most commands are local readbacks or local writes; `acquisition retrieve run`
+submits one detached **official** retrieval job (queued admission only) and
+`acquisition retrieve show` performs a verified readback that issues no request.
+Step 06 is an **implemented MVP**; semantics, rights binding, P3 handling, and
+bounds are in [`acquisition.md`](acquisition.md) and the
+[handoff](implementation/handoffs/06-acquisition.md).
 
 | Command (exact `--help` spellings) | Purpose |
 | --- | --- |
@@ -978,6 +979,10 @@ CLI are not available. Semantics, rights binding, P3 handling, and bounds are in
 | `acquisition manifest history [--artifact-id ID] [--project ID]` | Every manifest revision, newest first (safe summaries). |
 | `acquisition manifest require [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Succeeds only while the exact named gate `artifact_revision`/`acquisition.complete` currently makes acquisition complete. An acquisition prerequisite only. |
 | `acquisition queue --freeze-artifact-id ID --freeze-revision-id ID [--artifact-id ID] [--project ID]` | Read-only blocker queue for the exact frozen roster; works before any manifest exists. |
+| `acquisition folder import ROOT --entries-file PATH [--project ID] [--max-files N] [--max-total-bytes N]` | Atomic explicit folder-batch import of exactly the files named in `--entries-file`; all-or-nothing, a proposal only. |
+| `acquisition retrieve id --request-id ID [--project ID]` | Print the deterministic report and occurrence artifact ids for a request id (read-only; prepares the exact rights). |
+| `acquisition retrieve run --request-id ID --request-file PATH [--project ID] [--timeout SECONDS]` | Submit one exact acquire job from strict JSON; returns the queued admission only, never completion. |
+| `acquisition retrieve show --request-id ID [--project ID] [--content]` | Verified stored-report readback (safe summary; `--content` is the private opt-in); issues no request. |
 
 Notes:
 

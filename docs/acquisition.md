@@ -1,13 +1,16 @@
-# Acquisition reference — local import, manifest, human gate, and library execution (Step 06, partial)
+# Acquisition reference — local import, manifest, human gate, and official retrieval (Step 06, implemented MVP)
 
-> **Status: partial reference for what is integrated at base `dbe613a`.** Step 06
-> is **not complete**. This document describes only the local acquisition CLI, the
-> libraries behind it, and the official-acquisition **library executor**. The
-> background-job integration of the executor, any job/CLI command that retrieves
-> from an official source, and any folder-batch CLI are **pending other work** and
-> are **not described as available**. A later documentation task will cover the
-> actual jobs and the Step 06 handoff. No command here is a scientific,
-> screening, seed, pilot, or hosted-use authorization.
+> **Status: reference for the Step 06 acquisition MVP, implemented at base
+> `5b61ccfe039210763c1e64868ba79dc38a70eb0c`.** The local acquisition CLI, the
+> libraries behind it, the atomic folder-batch import CLI, and the detached
+> official full-text retrieval job with its public `acquisition retrieve
+> id|run|show` CLI are all integrated. The final latest-head full suite and
+> retained-suite rollup are **pending the coordinator's verification run**; no CI
+> is configured. Scientific parsing/screening/digestion are **Step 07+**. Evidence
+> and honest limits are in
+> [`implementation/handoffs/06-acquisition.md`](implementation/handoffs/06-acquisition.md).
+> No command here is a scientific, screening, seed, pilot, or hosted-use
+> authorization, and no human approval is invented.
 
 Acceptance criteria and deliverables are those of
 [`implementation/06-acquisition.md`](implementation/06-acquisition.md), unchanged.
@@ -39,8 +42,8 @@ Source anchors (read these for exact field spellings and bounds):
 | Local `inspect` (validation, optional PDF inspector) and read-only `impact` | Integrated CLI. |
 | Revision-specific manifest `propose/show/status/history/require` and blocker `queue` | Integrated CLI. |
 | Exact named human gate `artifact_revision` / `acquisition.complete` | Integrated through the existing `gate prepare`/`gate confirm` (see §6). |
-| Atomic explicit folder-batch import (`read_folder_batch` + `import_folder_batch`) | **Library only.** No folder CLI is wired yet. |
-| Official full-text acquisition (`AcquisitionExecutor`, two fixed official XML endpoints) | **Library only**, with per-GET `before_attempt`/`after_attempt` journal seams. Worker/job integration is **pending**; no job or CLI command retrieves from a source. Do not treat any job as complete. |
+| Atomic explicit folder-batch import (`read_folder_batch` + `import_folder_batch`) | Integrated CLI (`acquisition folder import`). |
+| Official full-text acquisition (`AcquisitionExecutor`, two fixed official XML endpoints) with per-GET `before_attempt`/`after_attempt` journal seams | Integrated; retrieval runs as a detached job (`discovery_submit` `mode=acquire`, task kind `acquisition_fulltext`) with the public `acquisition retrieve id\|run\|show` CLI. |
 
 Everything exercised so far was run through fixtures and local files. All app
 calls and tests ran **without** live source retrieval, paid/hosted calls, or
@@ -153,7 +156,7 @@ likewise returns status/checks/reasons by default and reveals identifiers and a
 text preview only with `--content`. Error messages are static and never echo a
 path, id, title, DOI, source byte, or exception text.
 
-### 3.4 Library: atomic folder batch (CLI not yet wired)
+### 3.4 Atomic folder batch (library + `acquisition folder import` CLI)
 
 `acquisition.folders.read_folder_batch` and `acquisition.batches` import an
 **explicit manifest** of relative paths below one root. There is no directory
@@ -305,7 +308,7 @@ history and is bounded by `MAX_GATE_SNAPSHOT_ENTRIES = 10000`
 roster, `gate prepare` can **block**; there is no hidden truncation, and no
 10k-scale operation was run (Step 15 scale testing is unrun).
 
-## 7. Official acquisition executor (library only)
+## 7. Official acquisition executor and the detached retrieval job
 
 `AcquisitionExecutor.acquire(freeze_ref, candidate_id, ...)` in
 [`execution.py`](../src/review_article_agent/acquisition/execution.py) acquires
@@ -325,10 +328,16 @@ a replay-key `request_id`, source and occurrence/report rights, and per-operatio
   `manual_required`, or `interrupted`.
 * **Fencing and journals.** Before every GET the executor re-asserts activation,
   the freeze, and `stop_requested()`, then calls `before_attempt`. After every
-  dispatched GET it calls `after_attempt` with bounded metadata. These seams are
-  where the future worker will persist a checkpoint; **worker integration is
-  pending** and no job is claimed complete. Direct library use without a journal
-  can lose the observations of a call whose local commit is rejected.
+  dispatched GET it calls `after_attempt` with bounded metadata. The detached
+  `acquire` job persists its checkpoint through these seams: a may-have-dispatched
+  mark before each GET under the registry write guard, and safe metadata after;
+  the send admission is linearized with pause/cancel under the **captured** lease,
+  and no lock is held across network work. The public CLI `acquisition retrieve
+  id|run|show` (strict request JSON; `run` returns a **queued admission only**,
+  never completion; `show` is a verified safe readback with an explicit private
+  `--content` opt-in) drives it; see [`cli.md`](cli.md) §16 and
+  [`worker.md`](worker.md) §13. Direct library use without a journal can lose the
+  observations of a call whose local commit is rejected.
 * An `interrupted` report is durable; resuming needs a **new** `request_id`.
 * Bounds: two sources maximum, at most 5 attempts each (default 3), response cap
   16 MiB default (64 MiB ceiling), timeout default 30 s (300 s ceiling).
@@ -337,7 +346,11 @@ a replay-key `request_id`, source and occurrence/report rights, and per-operatio
 ## 8. Explicit non-claims
 
 * No source retrieval, paid/hosted call, or upload was run live; all evidence is
-  fixtures and local files.
+  fixtures and local files. No 10k-scale operation was run.
 * No claim of literature completeness, screening eligibility, or scientific
   correctness from any acquisition result.
-* Job/CLI retrieval, folder CLI, and the Step 06 handoff are pending.
+* Scientific parsing, screening, and digestion are **Step 07+**. The global
+  cross-artifact exact-byte guard (`cross_artifact_duplicate`, `matching_refs`,
+  explicit canonical-target retry, no automatic identity merge/catalog) is
+  required Step 06 behavior (C01 §6.1 R1) integrated by a **separate parallel
+  slice**, not evidenced by the `dbe613a` checkpoint.
