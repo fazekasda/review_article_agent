@@ -124,6 +124,15 @@ from review_article_agent.storage.backup import (  # noqa: E402
 from review_article_agent.storage.human_approvals import (  # noqa: E402
     HumanApprovalRepository,
 )
+from review_article_agent.runtime.ipc import WorkerIPCClient  # noqa: E402
+
+import os  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+
+import test_step05_core_acceptance as core_mod  # noqa: E402
+from test_discovery_worker import DiscoveryWorkerBase, _req  # noqa: E402
+from review_article_agent.discovery.lead_runner import hosted_use_gate_id  # noqa: E402
 
 _CHECKED_AT = "2026-10-28T00:00:00+00:00"
 _SECOND_CORPUS = "discovery.corpus.2"
@@ -765,6 +774,239 @@ class InjectionCannotExpandAuthorityTest(LibraryAcceptanceBase):
         stored = self.freeze.get(self.ref(revision.artifact_id, revision.revision_id))
         self.assertFalse(stored["payload"]["authorizing"])
         self.assertFalse(stored["payload"]["completeness_claimed"])
+
+
+# --------------------------------------------------------------------------- #
+# 10. REAL detached worker process (real IPC/kernel/SQLite/job state/thread
+#     executor; the ONLY external transport is an in-process stub)
+# --------------------------------------------------------------------------- #
+class RealProcessAcceptanceTest(DiscoveryWorkerBase):
+    """Drive a real detached worker process built by ``step05_process_fixture``.
+
+    The fixture constructs a :class:`WorkerEngine` with fake discovery/lead
+    transports and a synthetic API key; every other boundary (owner control
+    socket, kernel peer-credential verification, SQLite job/attempt state, the
+    single-slot thread executor) is the production implementation. No live,
+    paid, or provider call is made; the fake lead transport records each POST to
+    a durable counter file so a restart can be proven to never re-POST.
+    """
+
+    # -- process helpers ----------------------------------------------------- #
+    def _put_with_rights(
+        self, artifact_id, kind, revision_id, document, rights, *, dependencies=()
+    ):
+        self.artifact_repo.create_artifact(artifact_id, kind=kind)
+        return self.artifact_repo.import_revision(
+            artifact_id=artifact_id,
+            content=document,
+            origin_locator="import:synthetic",
+            rights=rights,
+            revision_id=revision_id,
+            dependencies=list(dependencies),
+        )
+
+    def _start(self, *, counter=None):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(SRC), str(TESTS), env.get("PYTHONPATH", "")]
+        )
+        env["RAA_FIXTURE_LEAD_MODEL"] = core_mod._MODEL_ID
+        if counter is not None:
+            env["RAA_FIXTURE_LEAD_COUNTER"] = str(counter)
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(TESTS / "step05_process_fixture.py"),
+                "--data-dir",
+                str(self.data_dir),
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(self._reap, proc)
+        client = WorkerIPCClient(str(self.data_dir), io_timeout=5.0)
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            try:
+                client.request(_req("status"))
+                return proc, client
+            except Exception:
+                time.sleep(0.05)
+        _out, err = proc.communicate(timeout=5)
+        self.fail(
+            "fixture worker did not become ready; stderr="
+            + err.decode("utf-8", "replace")
+        )
+
+    @staticmethod
+    def _reap(proc: subprocess.Popen) -> None:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    def _poll_state(self, client, job_id, terminal, *, timeout=20.0):
+        deadline = time.monotonic() + timeout
+        state = None
+        while time.monotonic() < deadline:
+            try:
+                res = client.request(
+                    _req("job_status", project_id=self.project_id, job_id=job_id)
+                )
+            except Exception:
+                time.sleep(0.05)
+                continue
+            if not res.get("ok"):
+                time.sleep(0.05)
+                continue
+            state = res["job"]["state"]
+            if state in terminal:
+                return res["job"]
+            time.sleep(0.05)
+        return None
+
+    def _stop(self, client, proc) -> None:
+        try:
+            client.request(_req("stop"))
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+    # -- tests --------------------------------------------------------------- #
+    def test_detach_and_reconnect_does_not_cancel_authorized_import_job(self):
+        plan_ref = self.build_plan(
+            comp=[{"source": "regulatory", "mode": "metadata_import", "rationale": "opt-in"}]
+        )
+        self.approve_plan(plan_ref)
+        self.registry.activate_execution(self.project_id)
+
+        proc, client = self._start()
+        res = client.request(
+            _req(
+                "discovery_submit",
+                project_id=self.project_id,
+                request_id="proc-import-1",
+                mode="metadata_import",
+                parameters={
+                    "plan_ref": plan_ref,
+                    "source": "regulatory",
+                    "records": [
+                        {"source": "regulatory", "source_id": "R-1", "pmid": "111", "title": "a"}
+                    ],
+                    "origin_locator": "note:synthetic",
+                    "observed_at": _OBSERVED_AT,
+                },
+            )
+        )
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["queued"])
+        job_id = res["job"]["job_id"]
+
+        # Detach: this control client holds no server-side connection state, so a
+        # fresh client simply reconnects to the same running worker.
+        time.sleep(0.15)
+        client2 = WorkerIPCClient(str(self.data_dir), io_timeout=5.0)
+
+        job = self._poll_state(client2, job_id, {"completed", "failed", "waiting_human"})
+        self.assertIsNotNone(job, "the detached job never reached a terminal state")
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["accepted_result"]["result_kind"], "discovery_observation")
+
+        # The exact local observation is durable, with NO provider attempt.
+        observations = self._observations()
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].attempt_count, 0)
+        self.assertEqual(observations[0].record_count, 1)
+
+        self._stop(client2, proc)
+
+    def test_restart_never_blind_reposts_lead_with_durable_post_counter(self):
+        brief_revision = self._put_with_rights(
+            "a-brief",
+            "report",
+            "rev-brief",
+            self._env(
+                "discovery_brief",
+                {"objective": "o", "starting_hypothesis": "h", "questions": []},
+            ),
+            core_mod._rights(self.project_id, "a-brief", "rev-brief"),
+        )
+        self.assertEqual(brief_revision.revision_id, "rev-brief")
+        brief_ref = self.ref("a-brief", "rev-brief")
+        batch_doc = core_mod._hosted_use_document(
+            "interview", core_mod._config_map(), [brief_ref]
+        )
+        self._put_with_rights(
+            "a-batch",
+            "report",
+            "rev-batch",
+            batch_doc,
+            core_mod._rights(self.project_id, "a-batch", "rev-batch"),
+            dependencies=[brief_ref],
+        )
+        batch_ref = self.ref("a-batch", "rev-batch")
+        self.approve("a-batch", "rev-batch", "batch", hosted_use_gate_id("interview"))
+        self.registry.activate_execution(self.project_id)
+
+        counter = self.tmp / "lead_post_counter.txt"
+        proc, client = self._start(counter=counter)
+        res = client.request(
+            _req(
+                "discovery_submit",
+                project_id=self.project_id,
+                request_id="proc-lead-1",
+                mode="lead",
+                parameters={
+                    "batch_ref": batch_ref,
+                    "credential_env": "OPENROUTER_API_KEY",
+                },
+            )
+        )
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+
+        job = self._poll_state(client, job_id, {"completed", "failed", "waiting_human"})
+        self.assertIsNotNone(job)
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["accepted_result"]["result_kind"], "discovery_lead")
+        lead = job["accepted_result"]["result"]
+        self.assertEqual(lead["status"], "completed")
+        self.assertEqual(lead["cost_state"], "known")
+        self.assertIsNotNone(lead["dispatch_id"])
+        # Exactly one POST was made; the credential is never in the projection.
+        self.assertEqual(counter.read_text(encoding="utf-8").count("post"), 1)
+        self.assertNotIn("sk-or", json.dumps(job))
+
+        # Kill ONLY our own child, then restart the same data dir.
+        proc.kill()
+        proc.wait(timeout=10)
+        proc2, client2 = self._start(counter=counter)
+
+        # The standing accepted local result is proven on the same fence; a
+        # restart never re-POSTs (the durable counter stays at exactly one).
+        restarted = self._poll_state(
+            client2, job_id, {"completed", "failed", "waiting_human"}
+        )
+        self.assertIsNotNone(restarted)
+        self.assertEqual(restarted["state"], "completed")
+        self.assertEqual(
+            restarted["accepted_result"]["result"]["dispatch_id"], lead["dispatch_id"]
+        )
+        self.assertEqual(counter.read_text(encoding="utf-8").count("post"), 1)
+
+        self._stop(client2, proc2)
 
 
 if __name__ == "__main__":  # pragma: no cover
