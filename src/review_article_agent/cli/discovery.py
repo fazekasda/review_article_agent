@@ -50,10 +50,14 @@ D1 acceptance criteria 1 and 2; the personal-CLI baseline; the existing
   the stored runtime proposal text/metadata (no new call). A diagnostic outcome
   is never displayed as a successful lead proposal.
 
-What this module is **not** (later Step 05 work):
+What this module is **not**:
 
-* No ``query``/``seed``/``expand``/lead-submission/report/freeze command exists
-  here; those are a later CLI slice on the integrated base.
+* The discovery **background-job** submission/inspection surface
+  (``search``/``expand`` jobs, ``lead configure``/``run``) and the reporting/
+  freeze groups live in the addon :mod:`review_article_agent.cli.discovery_jobs`,
+  which extends this group's parser and dispatch through the narrow hooks
+  :func:`build_discovery_parser` and :func:`dispatch_discovery`. This module stays
+  the owner of the context/corpus/lead-readback surface only.
 * No network call, no provider/model call, no approval, no execution, and no
   scientific validation is performed or claimed.
 
@@ -374,6 +378,15 @@ def build_discovery_parser(sub: "argparse._SubParsersAction") -> None:
     )
     p_lead_content.add_argument("--request-id", required=True, metavar="ID")
     p_lead_content.add_argument("--project", metavar="ID")
+
+    # -- addon groups (search/expand jobs; lead configure/run) -------------- #
+    # Imported lazily so this module has no top-level cycle with the addon, which
+    # imports this module's own curated helpers. The addon extends the existing
+    # ``lead`` group (never a duplicate) and is the later CLI slices' extension
+    # point.
+    from . import discovery_jobs as _job_commands
+
+    _job_commands.build_discovery_jobs_parser(disc_sub, lead_sub)
 
 
 # --------------------------------------------------------------------------- #
@@ -1059,10 +1072,17 @@ def dispatch_discovery(args: argparse.Namespace, ctx: Any) -> object | None:
     ``argparse`` already prevents); the caller turns that into a usage error.
     """
     group = DISCOVERY_COMMANDS.get(args.discovery_command)
-    if group is None:
+    if group is not None:
+        leaf = getattr(args, _DISCOVERY_LEAF_DESTS[args.discovery_command], None)
+        handler = group.get(leaf)
+        if handler is not None:
+            return handler(args, ctx)
+    # The addon (search/expand jobs, lead configure/run) is consulted only when
+    # this module's own map does not already own the leaf command, so a later CLI
+    # slice can extend the group without changing its lifecycle readbacks here.
+    from . import discovery_jobs as _job_commands
+
+    addon = _job_commands.dispatch_discovery_jobs(args)
+    if addon is None:
         return None
-    leaf = getattr(args, _DISCOVERY_LEAF_DESTS[args.discovery_command], None)
-    handler = group.get(leaf)
-    if handler is None:
-        return None
-    return handler(args, ctx)
+    return addon(args, ctx)
