@@ -326,6 +326,12 @@ def build_acquisition_parser(sub: "argparse._SubParsersAction") -> None:
 
     build_folder_parsers(acq_sub)
 
+    # Step 06 C4 addon (detached official retrieval: id/run/show); same lazy-import
+    # reason (the addon imports this module for its shared helpers).
+    from .acquisition_retrieval import build_retrieval_parsers
+
+    build_retrieval_parsers(acq_sub)
+
 
 # --------------------------------------------------------------------------- #
 # shared helpers
@@ -685,6 +691,10 @@ def dispatch_acquisition(args: argparse.Namespace, ctx: Any) -> object | None:
         from .acquisition_folders import dispatch_folder
 
         return dispatch_folder(args, ctx)
+    if command == "retrieve":
+        from .acquisition_retrieval import dispatch_retrieval
+
+        return dispatch_retrieval(args, ctx)
     if command == "occurrence":
         handler = _OCCURRENCE_COMMANDS.get(
             getattr(args, "acquisition_occurrence_command", None)
