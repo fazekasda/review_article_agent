@@ -36,12 +36,13 @@ from __future__ import annotations
 import json
 
 from ..domain.errors import ReviewAgentError
-from ..domain.records import canonical_json, validate_ref
+from ..domain.records import RecordValidationError, canonical_json, validate_ref
 from ..extraction.workflow import (
     ExtractionWorkflowRepository,
     ExtractionWorkflowError,
 )
 from ..parsing.repository import _NestedStore
+from ..runtime.gates import MAX_GATE_SNAPSHOT_ENTRIES
 from ..storage.artifacts import ArtifactRepository, DependencyRef, sha256_digest
 from ..storage.human_approvals import HumanApprovalRepository
 from .schema import (
@@ -131,12 +132,6 @@ class SynthesisWorkflowRepository:
     def _ref(self, ref):
         return validate_ref(ref, self.store.project_id)
 
-    def _verify_revision_bytes(self, artifact_id, revision_id):
-        rev = self.artifacts.get_revision(artifact_id, revision_id)
-        require(rev is not None)
-        data = self.artifacts.read_content(artifact_id, revision_id)
-        require(sha256_digest(data) == rev.content_sha256 and len(data) == rev.byte_size)
-
     def _dependencies(self, kind, input_payload):
         if kind == "synthesis":
             return [input_payload["audit_ref"]]
@@ -193,37 +188,81 @@ class SynthesisWorkflowRepository:
             synthesis = self.require_synthesis(input_payload["synthesis_ref"])
             return validate_framework(input_payload["content"], synthesis=synthesis)
         if kind == "outline":
-            synthesis = self.require_synthesis(input_payload["synthesis_ref"])
-            framework = self.require_framework(input_payload["framework_ref"])
+            synthesis_ref = self._ref(input_payload["synthesis_ref"])
+            framework_ref = self._ref(input_payload["framework_ref"])
+            synthesis = self.require_synthesis(synthesis_ref)
+            framework = self.require_framework(framework_ref)
+            # An outline must not combine a framework from one accepted synthesis
+            # with a different accepted synthesis (overlapping finding ids would
+            # otherwise be trusted).  The framework's own exact synthesis
+            # dependency must equal the outline's, canonically.
+            framework_synthesis_ref = canonical_json(
+                self._ref(self._read(framework_ref, "framework")["input"]["synthesis_ref"])
+            )
+            require(
+                framework_synthesis_ref == canonical_json(synthesis_ref),
+                "outline framework and synthesis are from different accepted syntheses",
+            )
             return validate_outline(input_payload["content"], framework=framework, synthesis=synthesis)
         raise SynthesisWorkflowError("unknown synthesis proposal kind")
 
     # -- impact -------------------------------------------------------------- #
     def _dependent_outlines(self, kind, parent_ref):
-        """Integrity-checked historical outlines that depend on ``parent_ref``."""
+        """Integrity-checked historical outlines that depend on ``parent_ref``.
+
+        Each stored ``synthesis_outline`` revision is decoded and its exact
+        dependency ref is verified.  A detected integrity failure, an
+        undecodable document, a malformed payload, or a foreign/invalid
+        dependency ref on matching synthesis-outline history **fails closed**
+        (a static :class:`SynthesisWorkflowError`), so a corrupt or foreign
+        stored outline can never silently erase a recorded impact.  A
+        verified-decode document that is not a synthesis outline (a generic
+        outline of another document type) is ignored.  The scan is bounded by
+        :data:`MAX_GATE_SNAPSHOT_ENTRIES` distinct synthesis-outline revisions.
+        """
         link_key = "synthesis_ref" if kind == "synthesis" else "framework_ref"
         target = canonical_json(self._ref(parent_ref))
         found = []
+        scanned = 0
         for artifact in self.artifacts.list_artifacts():
             if artifact.kind != "outline":
                 continue
             for revision in self.artifacts.list_revisions(artifact.artifact_id):
+                stored = self.artifacts.get_revision(artifact.artifact_id, revision.revision_id)
+                if stored is None:
+                    raise SynthesisWorkflowError("a stored outline revision is missing")
+                data = self.artifacts.read_content(artifact.artifact_id, revision.revision_id)
+                if (
+                    sha256_digest(data) != stored.content_sha256
+                    or len(data) != stored.byte_size
+                ):
+                    raise SynthesisWorkflowError("a stored outline revision fails content integrity")
                 try:
-                    self._verify_revision_bytes(artifact.artifact_id, revision.revision_id)
-                    doc = json.loads(
-                        self.artifacts.read_content(artifact.artifact_id, revision.revision_id)
-                    )
-                except (ValueError, UnicodeDecodeError, SynthesisWorkflowError):
-                    continue
+                    doc = json.loads(data)
+                except (ValueError, UnicodeDecodeError):
+                    raise SynthesisWorkflowError("a stored outline revision is not decodable") from None
                 if not isinstance(doc, dict) or doc.get("document_type") != "synthesis_outline":
+                    # Verified decode of a non-synthesis generic outline: ignored.
                     continue
+                scanned += 1
+                require(
+                    scanned <= MAX_GATE_SNAPSHOT_ENTRIES,
+                    "synthesis outline history exceeds the scan bound",
+                )
                 payload = doc.get("payload")
-                if not isinstance(payload, dict) or "input" not in payload:
-                    continue
+                if not isinstance(payload, dict) or not isinstance(payload.get("input"), dict):
+                    raise SynthesisWorkflowError("a stored synthesis outline has a malformed payload")
+                input_payload = payload["input"]
+                if link_key not in input_payload:
+                    raise SynthesisWorkflowError(
+                        "a stored synthesis outline is missing its dependency ref"
+                    )
                 try:
-                    linked = self._ref(payload["input"][link_key])
-                except Exception:  # noqa: BLE001 - malformed history is skipped
-                    continue
+                    linked = self._ref(input_payload[link_key])
+                except RecordValidationError:
+                    raise SynthesisWorkflowError(
+                        "a stored synthesis outline carries a foreign or invalid dependency ref"
+                    ) from None
                 if canonical_json(linked) == target:
                     found.append(
                         {
@@ -256,18 +295,27 @@ class SynthesisWorkflowRepository:
         old_result = old_payload.get("result") or {}
         if kind == "framework":
             changed_concepts = _changed_ids(old_result.get("concepts", []), new_result["concepts"], "concept_id")
-            changed_relationships = _changed_ids(
+            direct_relationships = _changed_ids(
                 old_result.get("relationships", []), new_result["relationships"], "relationship_id"
             )
             changed_statements = set()
-            # Indirect relationship -> concept endpoint dependencies.
+            old_rels = old_result.get("relationships", [])
+            new_rels = new_result["relationships"]
+            # A changed concept affects every relationship that names it (old or
+            # new), so a section depending only on that relationship is flagged.
+            touching = {}
             endpoints = {}
-            for source in (old_result.get("relationships", []), new_result["relationships"]):
-                for rel in source:
-                    endpoints.setdefault(rel["relationship_id"], set()).update(
-                        {rel["from_concept"], rel["to_concept"]}
-                    )
-            for relationship_id in changed_relationships:
+            for rel in list(old_rels) + list(new_rels):
+                touching.setdefault(rel["from_concept"], set()).add(rel["relationship_id"])
+                touching.setdefault(rel["to_concept"], set()).add(rel["relationship_id"])
+                endpoints.setdefault(rel["relationship_id"], set()).update(
+                    {rel["from_concept"], rel["to_concept"]}
+                )
+            changed_relationships = set(direct_relationships)
+            for concept_id in changed_concepts:
+                changed_relationships |= touching.get(concept_id, set())
+            # A changed relationship flags the sections of its concept endpoints.
+            for relationship_id in direct_relationships:
                 changed_concepts = changed_concepts | endpoints.get(relationship_id, set())
             global_changed = any(
                 canonical_json(old_result.get(field)) != canonical_json(new_result.get(field))
@@ -283,25 +331,56 @@ class SynthesisWorkflowRepository:
                 canonical_json(old_result.get(field)) != canonical_json(new_result.get(field))
                 for field in ("memo", "gaps", "limitations", "independence", "correlation_groups")
             )
+        elif kind == "outline":
+            changed_sections = _changed_ids(
+                old_result.get("sections", []), new_result["sections"], "section_id"
+            )
+            global_changed = canonical_json(old_result.get("title")) != canonical_json(new_result["title"])
+            all_section_ids = [section["section_id"] for section in new_result["sections"]]
+            if global_changed:
+                affected_sections = {section_id: ["global_change"] for section_id in all_section_ids}
+                unaffected_sections = []
+            else:
+                affected_sections = {section_id: ["section_changed"] for section_id in sorted(changed_sections)}
+                unaffected_sections = sorted(set(all_section_ids) - changed_sections)
+            return {
+                "schema_version": 1,
+                "kind": "outline",
+                "parent_ref": self._ref(parent_ref),
+                "changed": {"sections": sorted(changed_sections)},
+                "global_changed": bool(global_changed),
+                "dependent_outlines": [],
+                "affected_sections": affected_sections,
+                "unaffected_sections": unaffected_sections,
+                "stale_gates": [GATE_OUTLINE],
+                "note": _IMPACT_NOTE,
+            }
         else:
-            raise SynthesisWorkflowError("impact is only defined for synthesis/framework edits")
+            raise SynthesisWorkflowError("impact is only defined for synthesis/framework/outline edits")
 
         dependent = []
         for entry in self._dependent_outlines(kind, parent_ref):
-            affected = self._affected_sections(
-                entry["result"], changed_concepts, changed_relationships, changed_statements
-            )
             all_sections = [
                 section["section_id"]
                 for section in (entry["result"] or {}).get("sections", [])
             ]
+            if global_changed:
+                # A global framework/synthesis change conservatively flags every
+                # dependent section; nothing is labelled unaffected.
+                affected = {section_id: {"global_change"} for section_id in all_sections}
+                unaffected = []
+            else:
+                affected = self._affected_sections(
+                    entry["result"], changed_concepts, changed_relationships, changed_statements
+                )
+                unaffected = sorted(set(all_sections) - set(affected))
             dependent.append(
                 {
                     "outline_ref": entry["outline_ref"],
                     "affected_sections": {
                         section_id: sorted(reasons) for section_id, reasons in sorted(affected.items())
                     },
-                    "unaffected_sections": sorted(set(all_sections) - set(affected)),
+                    "unaffected_sections": unaffected,
                 }
             )
 

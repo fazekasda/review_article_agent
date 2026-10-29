@@ -25,6 +25,8 @@ from test_extraction_workflow import (  # noqa: E402
 )
 
 from review_article_agent.domain.records import RecordValidationError  # noqa: E402
+from review_article_agent.synthesis import workflow as synthesis_workflow  # noqa: E402
+from review_article_agent.synthesis.schema import validate_outline  # noqa: E402
 from review_article_agent.synthesis.workflow import (  # noqa: E402
     GATE_FRAMEWORK,
     GATE_FRAMEWORK_KIND,
@@ -35,6 +37,7 @@ from review_article_agent.synthesis.workflow import (  # noqa: E402
     SynthesisWorkflowError,
     SynthesisWorkflowRepository,
 )
+from unittest import mock  # noqa: E402
 
 _CASE = "c1"
 _FINDING = _CASE + ":F1"
@@ -86,10 +89,11 @@ class SynthesisBase(WorkflowBase):
 
     # -- payload builders ----------------------------------------------------- #
     @staticmethod
-    def synthesis_content(*, statement_status="proposed", statement_id="S-1"):
+    def synthesis_content(*, statement_status="proposed", statement_id="S-1",
+                          memo="Compound Z effect from the accepted evidence."):
         return {
             "schema_version": 1,
-            "memo": "Compound Z effect from the accepted evidence.",
+            "memo": memo,
             "statements": [
                 {
                     "statement_id": statement_id,
@@ -109,15 +113,16 @@ class SynthesisBase(WorkflowBase):
 
     @staticmethod
     def framework_content(*, c1_definition="Compound Z tumor-volume effect.",
-                          r1_directionality="shared-study reports constrain the effect"):
-        return {
+                          r1_directionality="shared-study reports constrain the effect",
+                          criteria_support="accepted finding keys", limitations=None):
+        content = {
             "schema_version": 1,
             "title": "Compound Z framework",
             "contribution": "Organizes the accepted evidence without forcing a novel framework.",
             "criteria": {
                 "contribution": "adds an organizing relationship",
                 "admission": "definition, role, support, counterevidence, limits",
-                "support": "accepted finding keys",
+                "support": criteria_support,
                 "revision": "changed definitions reopen dependent sections",
             },
             "concepts": [
@@ -146,43 +151,51 @@ class SynthesisBase(WorkflowBase):
                 }
             ],
         }
+        if limitations is not None:
+            content["limitations"] = limitations
+        return content
 
     @staticmethod
-    def outline_content():
+    def outline_content(*, title="Compound Z outline", sec2_title="Evidence and correlation",
+                        sec1_title="Background"):
         return {
             "schema_version": 1,
-            "title": "Compound Z outline",
+            "title": title,
             "sections": [
-                {"section_id": "sec1", "order": 1, "title": "Background",
+                {"section_id": "sec1", "order": 1, "title": sec1_title,
                  "concept_dependencies": ["C1"]},
-                {"section_id": "sec2", "order": 2, "title": "Evidence and correlation",
-                 "concept_dependencies": ["C2"], "relationship_dependencies": ["R1"],
-                 "statement_dependencies": ["S-1"]},
+                # sec2 depends ONLY on the relationship (no concept dependency), so
+                # a changed C1 that R1 names must still flag it.
+                {"section_id": "sec2", "order": 2, "title": sec2_title,
+                 "relationship_dependencies": ["R1"]},
+                {"section_id": "sec3", "order": 3, "title": "Evidence detail",
+                 "concept_dependencies": ["C2"], "statement_dependencies": ["S-1"]},
             ],
         }
 
     # -- proposal helpers ----------------------------------------------------- #
-    def put_synthesis(self, audit_ref, *, revision="syn-r1", parent=None, **content_kw):
+    def put_synthesis(self, audit_ref, *, artifact_id="syn", revision="syn-r1", parent=None, **content_kw):
         return self.synth.propose(
             "synthesis", {"audit_ref": audit_ref, "content": self.synthesis_content(**content_kw)},
-            artifact_id="syn", revision_id=revision, rights=self.rights("syn", revision),
+            artifact_id=artifact_id, revision_id=revision, rights=self.rights(artifact_id, revision),
             parent_revision_id=parent,
         )
 
-    def put_framework(self, synthesis_ref, *, revision="fw-r1", parent=None, **content_kw):
+    def put_framework(self, synthesis_ref, *, artifact_id="fw", revision="fw-r1", parent=None, **content_kw):
         return self.synth.propose(
             "framework",
             {"synthesis_ref": synthesis_ref, "content": self.framework_content(**content_kw)},
-            artifact_id="fw", revision_id=revision, rights=self.rights("fw", revision),
+            artifact_id=artifact_id, revision_id=revision, rights=self.rights(artifact_id, revision),
             parent_revision_id=parent,
         )
 
-    def put_outline(self, synthesis_ref, framework_ref, *, revision="out-r1", parent=None):
+    def put_outline(self, synthesis_ref, framework_ref, *, artifact_id="out", revision="out-r1",
+                    parent=None, **content_kw):
         return self.synth.propose(
             "outline",
             {"synthesis_ref": synthesis_ref, "framework_ref": framework_ref,
-             "content": self.outline_content()},
-            artifact_id="out", revision_id=revision, rights=self.rights("out", revision),
+             "content": self.outline_content(**content_kw)},
+            artifact_id=artifact_id, revision_id=revision, rights=self.rights(artifact_id, revision),
             parent_revision_id=parent,
         )
 
@@ -340,9 +353,12 @@ class ImpactTests(SynthesisBase):
         self.assertEqual(len(impact["dependent_outlines"]), 1)
         entry = impact["dependent_outlines"][0]
         self.assertEqual(entry["outline_ref"], outline_ref)
-        self.assertIn("sec1", entry["affected_sections"])
-        self.assertNotIn("sec2", entry["affected_sections"])
-        self.assertIn("sec2", entry["unaffected_sections"])
+        # sec1 depends on C1; sec2 depends ONLY on R1, whose endpoint is C1.
+        self.assertIn("concept:C1", entry["affected_sections"]["sec1"])
+        self.assertEqual(entry["affected_sections"]["sec2"], ["relationship:R1"])
+        # sec3 depends on C2 only and is genuinely unaffected.
+        self.assertIn("sec3", entry["unaffected_sections"])
+        self.assertNotIn("sec3", entry["affected_sections"])
         self.assertEqual(impact["stale_gates"], [GATE_FRAMEWORK, GATE_OUTLINE])
         # The framework change stales the dependent outline gate.
         with self.assertRaises(Exception):
@@ -355,6 +371,18 @@ class ImpactTests(SynthesisBase):
             "Compound Z tumor-volume effect.",
         )
 
+    def test_concept_change_flags_relationship_only_section(self):
+        # A section with relationship_dependencies ['R1'] and NO concept deps
+        # must be flagged when a concept C1 named by R1's endpoint changes.
+        synthesis_ref, framework_ref, outline_ref = self.approved_chain()
+        edited = self.put_framework(
+            synthesis_ref, revision="fw-r2", parent="fw-r1",
+            c1_definition="A second revised C1 definition.",
+        )
+        entry = self._impact_of(edited, "framework")["dependent_outlines"][0]
+        self.assertEqual(entry["outline_ref"], outline_ref)
+        self.assertEqual(entry["affected_sections"]["sec2"], ["relationship:R1"])
+
     def test_relationship_edit_flags_indirect_concept_endpoints(self):
         synthesis_ref, framework_ref, outline_ref = self.approved_chain()
         edited = self.put_framework(
@@ -365,10 +393,40 @@ class ImpactTests(SynthesisBase):
         self.assertIn("R1", impact["changed"]["relationships"])
         entry = impact["dependent_outlines"][0]
         self.assertEqual(entry["outline_ref"], outline_ref)
-        # sec2 depends directly on R1; sec1 depends on the C1 endpoint (indirect).
+        # sec2 depends directly on R1; sec1/sec3 depend on the C1/C2 endpoints.
         self.assertIn("relationship:R1", entry["affected_sections"]["sec2"])
-        self.assertIn("concept:C2", entry["affected_sections"]["sec2"])
         self.assertIn("concept:C1", entry["affected_sections"]["sec1"])
+        self.assertIn("concept:C2", entry["affected_sections"]["sec3"])
+
+    def test_global_criteria_change_flags_all_sections(self):
+        # Only criteria change (same concepts/relationships): conservatively flag
+        # every dependent section with a global reason; claim none unaffected.
+        synthesis_ref, framework_ref, outline_ref = self.approved_chain()
+        edited = self.put_framework(
+            synthesis_ref, revision="fw-r2", parent="fw-r1",
+            criteria_support="a materially revised support criterion",
+        )
+        impact = self._impact_of(edited, "framework")
+        self.assertTrue(impact["global_changed"])
+        self.assertEqual(impact["changed"]["concepts"], [])
+        self.assertEqual(impact["changed"]["relationships"], [])
+        entry = impact["dependent_outlines"][0]
+        self.assertEqual(entry["outline_ref"], outline_ref)
+        self.assertEqual(entry["unaffected_sections"], [])
+        for section_id in ("sec1", "sec2", "sec3"):
+            self.assertEqual(entry["affected_sections"][section_id], ["global_change"])
+
+    def test_global_limitations_change_flags_all_sections(self):
+        synthesis_ref, framework_ref, outline_ref = self.approved_chain()
+        edited = self.put_framework(
+            synthesis_ref, revision="fw-r2", parent="fw-r1",
+            limitations=_known("applies to mouse tumor models only"),
+        )
+        impact = self._impact_of(edited, "framework")
+        self.assertTrue(impact["global_changed"])
+        entry = impact["dependent_outlines"][0]
+        self.assertEqual(entry["unaffected_sections"], [])
+        self.assertEqual(entry["affected_sections"]["sec2"], ["global_change"])
 
     def test_statement_edit_flags_synthesis_statement_sections(self):
         synthesis_ref, framework_ref, outline_ref = self.approved_chain()
@@ -384,20 +442,148 @@ class ImpactTests(SynthesisBase):
         self.assertIn("S-1", impact["changed"]["statements"])
         entry = impact["dependent_outlines"][0]
         self.assertEqual(entry["outline_ref"], outline_ref)
-        self.assertIn("statement:S-1", entry["affected_sections"]["sec2"])
+        self.assertIn("statement:S-1", entry["affected_sections"]["sec3"])
+        self.assertIn("sec1", entry["unaffected_sections"])
+
+    # -- outline edit impact ------------------------------------------------- #
+    def test_outline_edit_creates_revision_impact_and_old_stays_immutable(self):
+        synthesis_ref, framework_ref, outline_ref = self.approved_chain()
+        self.synth.require_outline(outline_ref)
+        # Edit sec2's title and order (revision 2).
+        edited = self.put_outline(
+            synthesis_ref, framework_ref, revision="out-r2", parent="out-r1",
+            sec2_title="Revised evidence and correlation",
+        )
+        impact = self._impact_of(edited, "outline")
+        self.assertEqual(impact["parent_ref"], outline_ref)
+        self.assertIn("sec2", impact["changed"]["sections"])
+        self.assertFalse(impact["global_changed"])
+        self.assertEqual(impact["stale_gates"], [GATE_OUTLINE])
+        self.assertIn("sec2", impact["affected_sections"])
+        self.assertIn("sec1", impact["unaffected_sections"])
+        # The edited outline must be re-approved before it is accepted.
+        with self.assertRaises(SynthesisWorkflowError):
+            self.synth.require_outline(edited)
+        self.approve_ref(edited, GATE_OUTLINE_KIND, GATE_OUTLINE)
+        self.assertEqual(self.synth.require_outline(edited)["kind"], "outline")
+        # The old revision is preserved and still readable historically.
+        old = self.synth.read(outline_ref, "outline", current=False)
+        self.assertEqual(old["result"]["sections"][1]["title"], "Evidence and correlation")
+
+    def test_outline_title_edit_is_global(self):
+        synthesis_ref, framework_ref, outline_ref = self.approved_chain()
+        edited = self.put_outline(
+            synthesis_ref, framework_ref, revision="out-r2", parent="out-r1",
+            title="A retitled Compound Z outline",
+        )
+        impact = self._impact_of(edited, "outline")
+        self.assertTrue(impact["global_changed"])
+        self.assertEqual(impact["unaffected_sections"], [])
+        for section_id in ("sec1", "sec2", "sec3"):
+            self.assertEqual(impact["affected_sections"][section_id], ["global_change"])
+
+
+class RefEqualityAndFailClosedTests(SynthesisBase):
+    def _two_syntheses_one_framework(self):
+        audit_ref, _batch = self.accepted_audit()
+        synthesis_a = self.put_synthesis(audit_ref, artifact_id="synA", revision="synA-r1", memo="memo A")
+        self.approve_ref(synthesis_a, GATE_SYNTHESIS_KIND, GATE_SYNTHESIS)
+        synthesis_b = self.put_synthesis(audit_ref, artifact_id="synB", revision="synB-r1", memo="memo B")
+        self.approve_ref(synthesis_b, GATE_SYNTHESIS_KIND, GATE_SYNTHESIS)
+        framework_a = self.put_framework(synthesis_a, artifact_id="fwA", revision="fwA-r1")
+        self.approve_ref(framework_a, GATE_FRAMEWORK_KIND, GATE_FRAMEWORK)
+        return synthesis_a, synthesis_b, framework_a
+
+    def test_outline_cannot_mix_two_accepted_syntheses(self):
+        synthesis_a, synthesis_b, framework_a = self._two_syntheses_one_framework()
+        # Both syntheses and the framework are individually accepted, but the
+        # framework belongs to synthesis A while the outline names synthesis B.
+        with self.assertRaises(SynthesisWorkflowError):
+            self.put_outline(synthesis_b, framework_a, artifact_id="out", revision="out-r1")
+        # The matching combination is accepted.
+        outline_ref = self.put_outline(synthesis_a, framework_a, artifact_id="out", revision="out-r1")
+        self.approve_ref(outline_ref, GATE_OUTLINE_KIND, GATE_OUTLINE)
+        self.assertEqual(self.synth.require_outline(outline_ref)["kind"], "outline")
+
+    def test_require_outline_revalidates_ref_equality_for_generic_import(self):
+        synthesis_a, synthesis_b, framework_a = self._two_syntheses_one_framework()
+        # A generically imported outline whose stored result is genuine but whose
+        # named synthesis (B) differs from the framework's synthesis (A).
+        framework_result = self.synth.require_framework(framework_a)
+        content = self.outline_content()
+        stored_result = validate_outline(
+            content, framework=framework_result, synthesis=self.synth.require_synthesis(synthesis_b)
+        )
+        envelope = {
+            "schema_version": 1,
+            "document_type": "synthesis_outline",
+            "payload": {
+                "input": {"synthesis_ref": synthesis_b, "framework_ref": framework_a, "content": content},
+                "result": stored_result,
+                "impact": None,
+            },
+        }
+        self.artifacts.create_artifact("generic-out", kind="outline", created_by="import")
+        revision = self.artifacts.import_revision(
+            artifact_id="generic-out", revision_id="generic-out-r1", content=envelope,
+            origin_locator="import:synthetic", rights=self.rights("generic-out", "generic-out-r1"),
+            dependencies=[synthesis_b, framework_a], acquired_by="import",
+        )
+        ref = {"project_id": self.project_id, "artifact_id": revision.artifact_id,
+               "revision_id": revision.revision_id}
+        with self.assertRaises(SynthesisWorkflowError):
+            self.synth.require_outline(ref)
+
+    def test_foreign_ref_in_outline_history_fails_closed_on_impact(self):
+        synthesis_ref, framework_ref, outline_ref = self.approved_chain()
+        # A stored synthesis-outline revision whose framework ref is foreign.
+        foreign = {"project_id": "OTHER", "artifact_id": framework_ref["artifact_id"],
+                   "revision_id": framework_ref["revision_id"]}
+        envelope = {
+            "schema_version": 1,
+            "document_type": "synthesis_outline",
+            "payload": {
+                "input": {"synthesis_ref": synthesis_ref, "framework_ref": foreign,
+                          "content": self.outline_content()},
+                "result": None,
+                "impact": None,
+            },
+        }
+        self.artifacts.create_artifact("foreign-out", kind="outline", created_by="import")
+        self.artifacts.import_revision(
+            artifact_id="foreign-out", revision_id="foreign-out-r1", content=envelope,
+            origin_locator="import:synthetic", rights=self.rights("foreign-out", "foreign-out-r1"),
+            dependencies=[synthesis_ref], acquired_by="import",
+        )
+        # A framework edit scans synthesis-outline history and must fail closed
+        # rather than silently erasing the impact.
+        with self.assertRaises(SynthesisWorkflowError):
+            self.put_framework(synthesis_ref, revision="fw-r2", parent="fw-r1",
+                               c1_definition="revised")
+
+    def test_outline_scan_bound_is_enforced(self):
+        synthesis_ref, framework_ref, outline_ref = self.approved_chain()
+        # A second historical outline revision so the scan sees two.
+        self.put_outline(synthesis_ref, framework_ref, revision="out-r2", parent="out-r1",
+                         sec2_title="second")
+        with mock.patch.object(synthesis_workflow, "MAX_GATE_SNAPSHOT_ENTRIES", 1):
+            with self.assertRaises(SynthesisWorkflowError):
+                self.put_framework(synthesis_ref, revision="fw-r2", parent="fw-r1",
+                                   c1_definition="revised")
 
 
 # --------------------------------------------------------------------------- #
 # Integration: extend the real runner / fake-transport end-to-end fixture.
 # --------------------------------------------------------------------------- #
-from test_extraction_runner import (  # noqa: E402
-    FullFlowIntegrationTest,
-    _FakeTransport,
-    workflow as extraction_workflow,
-)
+# Imported as a *module* (not bound as a class attribute) so unittest discovery
+# in this file does not re-run the giant fixture's own full-flow cases; this
+# module contributes only its one synthesis integration case below.
+import test_extraction_runner as extraction_runner  # noqa: E402
+
+extraction_workflow = extraction_runner.workflow
 
 
-class SynthesisOverRealRunnerTest(FullFlowIntegrationTest):
+class SynthesisOverRealRunnerTest(extraction_runner.FullFlowIntegrationTest):
     """Prove the real Step 09 receipt/outputs gate is consumed by synthesis.
 
     This class *extends* ``FullFlowIntegrationTest`` (it does not replicate the
