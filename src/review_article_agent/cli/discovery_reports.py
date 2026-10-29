@@ -376,10 +376,14 @@ def build_discovery_reports_parser(disc_sub: "argparse._SubParsersAction") -> No
         )
         if name in ("show",):
             p.add_argument("--revision-id", metavar="ID")
+        if name in ("show", "require"):
             p.add_argument(
                 "--content",
                 action="store_true",
-                help="explicitly return the private, non-authorizing validated document",
+                help=(
+                    "explicitly return the private, non-authorizing validated "
+                    "document and exact candidate roster"
+                ),
             )
         if name == "require":
             p.add_argument(
@@ -951,7 +955,15 @@ def discovery_freeze_history(args: argparse.Namespace, ctx: Any) -> dict[str, ob
 
 
 def discovery_freeze_require(args: argparse.Namespace, ctx: Any) -> dict[str, object]:
-    """``discovery freeze require`` -- the selection only under an active freeze."""
+    """``discovery freeze require`` -- the selection only under an active freeze.
+
+    :meth:`FreezeRepository.require_frozen` is always consulted, on **both** output
+    paths, so the exact named gate must be currently active before anything is
+    returned. The default is a **safe summary** (exact corpus ref, included count,
+    decision, active approval) that never dumps the candidate roster; ``--content``
+    is the explicit opt-in that additionally returns the private validated decision
+    document and the exact included candidate ids.
+    """
     project_id = _resolve_store_project_id(ctx, args.project)
     store = _open_verified_store(ctx, project_id)
     try:
@@ -962,15 +974,29 @@ def discovery_freeze_require(args: argparse.Namespace, ctx: Any) -> dict[str, ob
             raise _freeze_error(exc) from exc
     finally:
         store.close()
-    return {
+    summary = {
         "frozen": True,
         "decision": _decision_summary(document),
         "corpus_ref": dict(document["payload"]["corpus"]["ref"]),
-        "included_candidate_ids": list(document["included_candidate_ids"]),
-        "authorizes_execution": False,
-        "authorizes_export": False,
-        "scientific_validation": False,
+        "included_count": len(document["included_candidate_ids"]),
     }
+    if args.content:
+        summary.update(
+            {
+                "private": True,
+                "non_authorizing": True,
+                "document": document,
+                "included_candidate_ids": list(document["included_candidate_ids"]),
+            }
+        )
+    summary.update(
+        {
+            "authorizes_execution": False,
+            "authorizes_export": False,
+            "scientific_validation": False,
+        }
+    )
+    return summary
 
 
 # --------------------------------------------------------------------------- #

@@ -588,17 +588,59 @@ class FreezeCliTest(ReportsCliBase):
         corpus_ref, _cov, _p, snapshot, args = self._setup()
         self.cli(*args)
         self.approve(DEFAULT_FREEZE_ARTIFACT_ID, "frz-cli-1", FREEZE_GATE_KIND, FREEZE_GATE_ID)
-        out = self.cli("discovery", "freeze", "require", "--project", self.project_id)
-        self.assertTrue(out["frozen"])
         expected = sorted(
             c["candidate_id"] for c in snapshot["candidates"] if c["resolved"]
         )
-        self.assertEqual(sorted(out["included_candidate_ids"]), expected)
+        # Default: safe summary only -- exact count/ref, no candidate-id roster.
+        out = self.cli("discovery", "freeze", "require", "--project", self.project_id)
+        self.assertTrue(out["frozen"])
+        self.assertEqual(out["included_count"], len(expected))
+        self.assertEqual(out["corpus_ref"], corpus_ref)
+        self.assertNotIn("included_candidate_ids", out)
+        self.assertNotIn("document", out)
+        blob = json.dumps(out)
+        for cid in expected:
+            self.assertNotIn(cid, blob)
+        # Explicit --content opt-in returns the exact roster + private document.
+        content = self.cli(
+            "discovery", "freeze", "require", "--project", self.project_id, "--content"
+        )
+        self.assertTrue(content["private"])
+        self.assertTrue(content["non_authorizing"])
+        self.assertFalse(content["authorizes_execution"])
+        self.assertEqual(sorted(content["included_candidate_ids"]), expected)
+        self.assertIn("entry_reviews", content["document"]["payload"])
         # status reports an active freeze.
         status = self.cli("discovery", "freeze", "status", "--project", self.project_id)
         self.assertEqual(status["current_decision"]["decision"], "freeze")
         self.assertTrue(status["current_decision"]["approval"]["satisfies_named_gate"])
         self.assertEqual(status["last_frozen_corpus"]["included_count"], len(expected))
+
+    def test_require_default_hides_ids_and_content_still_requires_active_freeze(self):
+        # An unapproved proposal blocks *both* the default and the --content path.
+        corpus_ref, _cov, _p, snapshot, args = self._setup(
+            rev="frz-req-un", request_id="frz-req-un-req"
+        )
+        self.cli(*args)
+        self.cli("discovery", "freeze", "require", "--project", self.project_id, expect=2)
+        self.cli(
+            "discovery", "freeze", "require", "--project", self.project_id,
+            "--content", expect=2,
+        )
+        # A stale freeze (moved coverage head) blocks either path too.
+        corpus_ref2, coverage_ref, plan_ref, snapshot2, args2 = self._setup(
+            rev="frz-req-stale", request_id="frz-req-stale-req"
+        )
+        self.cli(*args2)
+        self.approve(
+            DEFAULT_FREEZE_ARTIFACT_ID, "frz-req-stale", FREEZE_GATE_KIND, FREEZE_GATE_ID
+        )
+        self.record_coverage(corpus_ref2, plan_ref, request_id="cov-req-2")
+        self.cli("discovery", "freeze", "require", "--project", self.project_id, expect=2)
+        self.cli(
+            "discovery", "freeze", "require", "--project", self.project_id,
+            "--content", expect=2,
+        )
 
     def test_wrong_gate_rejected_and_stale_never_authorize(self):
         # Wrong gate id.
@@ -723,6 +765,7 @@ class FlagSurfaceTest(ReportsCliBase):
         self.assertIn("--entry-reviews-file", self._help("discovery", "freeze", "propose", "--help"))
         self.assertIn("--accept-coverage-limitations", self._help("discovery", "freeze", "propose", "--help"))
         self.assertIn("--require-active", self._help("discovery", "freeze", "require", "--help"))
+        self.assertIn("--content", self._help("discovery", "freeze", "require", "--help"))
 
     def test_existing_discovery_commands_preserved(self):
         # The CLI1A job groups and the parent lifecycle readbacks still parse.
