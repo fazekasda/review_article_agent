@@ -122,7 +122,11 @@ from .context import (
 from .europepmc import EuropePMCClient
 from .pubmed import PubMedClient
 from .records import MetadataRecord, SearchPage, SearchResult
-from .transport import DiscoveryTransport, http_get
+from .transport import (
+    DiscoveryRequestInterrupted,
+    DiscoveryTransport,
+    http_get,
+)
 
 __all__ = [
     "QUERY_FINGERPRINT_SCHEMA_VERSION",
@@ -205,6 +209,9 @@ class DiscoveryExecutionBlockedError(DiscoveryExecutionError):
 
 _M_BLOCKED_PLAN = (
     "the exact approved discovery plan is not current and approved; execution blocked"
+)
+_M_INTERRUPTED_DRAIN = (
+    "execution is draining for this project; further provider requests are stopped"
 )
 _M_BLOCKED_STATE = (
     "execution is not active for this project or the activation token is stale; blocked"
@@ -401,38 +408,68 @@ class DiscoveryExecutor:
             raise DiscoveryExecutionBlockedError(_M_BLOCKED_PLAN)
         return revision.content_sha256
 
-    def _assert_active(self) -> None:
+    def _assert_active(self, *, interrupt_on_draining: bool = False) -> None:
         """Fail-closed unless execution is ``active`` for this exact project.
 
         Reads the durable activation under the registry lock for the duration of
         the check only; it never holds the lock across network work. A wrong
-        project, a stale/unknown token, a ``draining``/paused state, or an
-        unreadable activation is blocked.
+        project, a stale/unknown token, or an unreadable activation is blocked.
+
+        Before an **actual** attempt (``interrupt_on_draining=True``) a matched
+        but ``draining`` activation for this exact project/token raises the opt-in
+        :class:`~review_article_agent.discovery.transport.DiscoveryRequestInterrupted`
+        instead of the hard block: no request is sent, yet the already-observed
+        pages of an in-flight search are preserved as an explicit partial result
+        (the shared transport turns it into a failed page with no fabricated
+        attempt). Every other non-active state stays a hard
+        :class:`DiscoveryExecutionBlockedError`.
         """
         try:
             activation = self._registry.activation()
         except Exception as exc:  # noqa: BLE001 - any registry failure is fail-closed
             raise DiscoveryExecutionBlockedError(_M_BLOCKED_STATE) from exc
         token = self._token
+        token_ok = isinstance(token, str) and bool(token)
+        matches_project = activation.active_project_id == self._project_id
+        matches_token = token_ok and secrets.compare_digest(
+            activation.activation_token or "", token
+        )
+        if activation.state == "active" and matches_project and matches_token:
+            return
         if (
-            activation.state != "active"
-            or activation.active_project_id != self._project_id
-            or not isinstance(token, str)
-            or not token
-            or not secrets.compare_digest(activation.activation_token or "", token)
+            interrupt_on_draining
+            and activation.state == "draining"
+            and matches_project
+            and matches_token
         ):
-            raise DiscoveryExecutionBlockedError(_M_BLOCKED_STATE)
+            raise DiscoveryRequestInterrupted(_M_INTERRUPTED_DRAIN)
+        raise DiscoveryExecutionBlockedError(_M_BLOCKED_STATE)
 
     def _guard(self, plan_ref: dict | None) -> None:
-        """Revalidate the exact plan (when any) *and* the activation.
+        """Revalidate the exact plan (when any) *and* the active activation.
 
-        Called immediately before every low-level HTTP attempt and again after a
-        response and before persisting, so changed scope or a pause/drain stops
-        further attempts and never accepts a result under stale scope.
+        Called immediately before **every** low-level HTTP attempt, so changed
+        scope or a pause/drain stops further attempts. Only an ``active``
+        activation permits a real attempt; a matched ``draining`` one raises the
+        opt-in interrupt so already-observed pages survive.
         """
         if plan_ref is not None:
             self._approved_plan(plan_ref)
-        self._assert_active()
+        self._assert_active(interrupt_on_draining=True)
+
+    def _guard_completion(self, plan_ref: dict | None) -> None:
+        """Revalidate the exact approved plan before accepting a received result.
+
+        The activation is **not** re-checked here: the fenced persist below uses
+        the same token with ``allow_draining=True``, so a drain that began *after*
+        the last request cannot discard an observation already received (no
+        network happens after this point). A missing/stale/superseded/changed plan
+        is still a hard :class:`DiscoveryExecutionBlockedError`, so a post-network
+        scope change can never accept a scientific-workflow result — the outcome
+        stays inert provenance and the caller escalates.
+        """
+        if plan_ref is not None:
+            self._approved_plan(plan_ref)
 
     def _build_transport(self, plan_ref: dict | None):
         """A fresh transport whose every attempt re-runs the guard first.
@@ -458,9 +495,18 @@ class DiscoveryExecutor:
             raise DiscoveryExecutionError(_M_STORE) from exc
 
     def _persist(self, repo: DiscoveryRepository, derived_request_id: str, result):
-        """Record the observation under the fenced registry write guard."""
+        """Record the observation under the fenced registry write guard.
+
+        This is the **completion** commit: it uses the same project/token with
+        ``allow_draining=True`` so a drain that began after the last request still
+        commits the already-received observation (reconciliation-only; no new
+        request is made here). A stale/unknown token or a different project is
+        still refused by the registry guard.
+        """
         try:
-            with self._registry.execution_write_guard(self._token, self._project_id):
+            with self._registry.execution_write_guard(
+                self._token, self._project_id, allow_draining=True
+            ):
                 return repo.record_search(
                     request_id=derived_request_id, result=result
                 )
@@ -538,8 +584,9 @@ class DiscoveryExecutor:
 
         transport = self._build_transport(ref)
         result = self._run_adapter(source, transport, query, page_size, max_pages)
-        # Revalidate scope after the response and before accepting it.
-        self._guard(ref)
+        # Revalidate the approved scope after the response; a drain that began
+        # mid-search still commits the received observation (drain-allowed fence).
+        self._guard_completion(ref)
         return self._persist(repo, derived, result)
 
     # -- bounded exploratory seed search ------------------------------------- #
@@ -583,7 +630,7 @@ class DiscoveryExecutor:
 
         transport = self._build_transport(None)
         result = self._run_adapter(source, transport, query, page_size, max_pages)
-        self._guard(None)
+        self._guard_completion(None)
         return self._persist(repo, derived, result)
 
     # -- approved complementary metadata import ------------------------------ #
@@ -649,7 +696,7 @@ class DiscoveryExecutor:
             return replay
 
         result = self._import_result(source, materialized, origin_locator, observed_at)
-        self._guard(ref)
+        self._guard_completion(ref)
         return self._persist(repo, derived, result)
 
     def _materialize_records(self, records, source: str) -> tuple[MetadataRecord, ...]:

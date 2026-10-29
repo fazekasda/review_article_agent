@@ -63,6 +63,7 @@ from ..discovery.execution import (
     query_fingerprint,
 )
 from ..discovery.records import MetadataRecord
+from ..discovery.transport import DiscoveryRequestInterrupted
 from ..domain.errors import ReviewAgentError
 from ..domain.records import (
     RecordValidationError,
@@ -171,6 +172,7 @@ _M_BAD_TIME = "observed_at must be an RFC 3339 UTC instant"
 _M_BAD_LOCATOR = "origin_locator must be a bounded non-empty opaque locator"
 _M_TOO_LARGE = "the discovery parameters exceed the control-transport byte bound"
 _M_BAD_TRANSPORT = "the low-level discovery transport must be callable"
+_M_INTERRUPTED = "the discovery job was stopped before the next provider request"
 
 
 # --------------------------------------------------------------------------- #
@@ -206,12 +208,18 @@ class DiscoveryJobStopped(Exception):
 # Transport guard
 # --------------------------------------------------------------------------- #
 class AttemptCounter:
-    """A shared, single-writer counter of real low-level provider attempts."""
+    """A shared, single-writer counter/flag for one discovery dispatch.
 
-    __slots__ = ("value",)
+    ``value`` counts **real** low-level provider attempts. ``interrupted`` is set
+    when the job-level stop check refused an attempt, so the caller can label a
+    returned partial result as an explicit interruption rather than a natural end.
+    """
+
+    __slots__ = ("value", "interrupted")
 
     def __init__(self) -> None:
         self.value = 0
+        self.interrupted = False
 
 
 def guard_transport(
@@ -223,18 +231,29 @@ def guard_transport(
     """Wrap ``base`` so the durable job's held state is checked per attempt.
 
     The S1 executor already rechecks the approved plan and the execution
-    activation around every attempt; this adds the **job-level** stop check
-    (paused/cancelled/draining), raising :class:`DiscoveryJobStopped` *before* any
-    real provider call. ``max_response_bytes`` and ``timeout`` are read from the
-    adapter request and forwarded unchanged; unsafe provider URLs are rejected
-    earlier by the adapter's fixed endpoint allowlist, so no URL is trusted here.
+    activation before every real attempt; this adds the **job-level** stop check
+    (paused/cancelled/draining). ``max_response_bytes`` and ``timeout`` are read
+    from the adapter request and forwarded unchanged; unsafe provider URLs are
+    rejected earlier by the adapter's fixed endpoint allowlist, so no URL is
+    trusted here.
+
+    When at least one real attempt has already been made, a stop raises the
+    opt-in :class:`~review_article_agent.discovery.transport.DiscoveryRequestInterrupted`
+    (never a worker-specific type): the shared transport turns it into a failed
+    page with **no fabricated attempt**, so the provider adapter keeps the pages
+    already observed and the S1 completion path can commit the partial
+    observation. With no attempt yet there is nothing to preserve, so a hard
+    :class:`DiscoveryJobStopped` aborts the dispatch cleanly (no empty result).
     """
     if not callable(base) or not callable(stop_requested):
         raise DiscoveryJobValidationError("bad_type", _M_BAD_TRANSPORT)
 
     def lowlevel(url: str, *, timeout: float, max_response_bytes: int) -> Any:
         if stop_requested():
-            raise DiscoveryJobStopped()
+            counter.interrupted = True
+            if counter.value == 0:
+                raise DiscoveryJobStopped()
+            raise DiscoveryRequestInterrupted(_M_INTERRUPTED)
         counter.value += 1
         return base(url, timeout=timeout, max_response_bytes=max_response_bytes)
 
@@ -463,8 +482,10 @@ def observation_metadata(job: Any, record: Any) -> dict[str, Any]:
         "result_bytes": record.result_bytes,
         "page_count": record.page_count,
         "record_count": record.record_count,
+        "attempt_count": record.attempt_count,
         "complete": record.complete,
         "stop_reason": record.stop_reason,
+        "failure": record.failure,
         "binding": {},
     }
     binding = meta["binding"]

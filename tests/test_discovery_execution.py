@@ -472,7 +472,7 @@ class ExecuteQueryRevalidationTest(ExecBase):
         self.assertEqual(fake.calls, 1)  # page 2 never issued
         self.assertEqual(self.rows(), [])
 
-    def test_drain_between_retries_stops_further_attempts(self) -> None:
+    def test_drain_between_retries_stops_further_attempts_and_keeps_partial(self) -> None:
         plan_ref = self.build_plan()
         self.approve_plan(plan_ref)
         token = self._token
@@ -482,10 +482,51 @@ class ExecuteQueryRevalidationTest(ExecBase):
                 self.registry.begin_drain(token)
 
         fake = _FakeLowlevel([(429, b""), (200, _epmc_page("1"))], on_call=on_call)
-        with self.assertRaises(DiscoveryExecutionBlockedError):
-            self.executor(transport=fake).execute_query(plan_ref, 0, request_id="req-1")
+        # A drain after the first attempt stops the retry before its HTTP request;
+        # the received (failed) page is still committed as an explicit partial
+        # observation under the drained token (allow_draining reconciliation).
+        record = self.executor(transport=fake).execute_query(
+            plan_ref, 0, request_id="req-1"
+        )
         self.assertEqual(fake.calls, 1)  # retry refused before its HTTP attempt
-        self.assertEqual(self.rows(), [])
+        self.assertFalse(record.complete)
+        self.assertEqual(record.stop_reason, "failure")
+        self.assertEqual(record.failure, "attempts_exhausted")
+        self.assertEqual(record.attempt_count, 1)  # the one real attempt
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].run_id, record.run_id)
+
+    def test_drain_between_pages_preserves_observed_page(self) -> None:
+        # A drain after page 1 stops page 2's HTTP attempt (the pre-attempt guard
+        # is active-only) yet the already-observed page 1 is preserved: the opt-in
+        # interrupt yields an explicit partial result and the completion path
+        # commits it under the drained token.
+        plan_ref = self.build_plan(queries=[
+            {"source": "europepmc", "query": "asthma", "page_size": 1, "max_pages": 2}
+        ])
+        self.approve_plan(plan_ref)
+        token = self._token
+
+        def on_call(index):
+            if index == 0:
+                self.registry.begin_drain(token)
+
+        fake = _FakeLowlevel(
+            [(200, _epmc_page("1", hit_count=2, next_cursor="C1"))], on_call=on_call
+        )
+        record = self.executor(transport=fake).execute_query(
+            plan_ref, 0, request_id="req-drain-page"
+        )
+        self.assertEqual(fake.calls, 1)  # page 2 refused before its HTTP attempt
+        self.assertFalse(record.complete)
+        self.assertEqual(record.stop_reason, "failure")
+        self.assertEqual(record.failure, "attempts_exhausted")
+        self.assertEqual([r.source_id for r in record.result.records], ["MED:1"])
+        self.assertEqual(record.attempt_count, 1)  # only the real page-1 attempt
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].run_id, record.run_id)
 
     def test_scope_change_after_response_not_accepted(self) -> None:
         plan_ref = self.build_plan()

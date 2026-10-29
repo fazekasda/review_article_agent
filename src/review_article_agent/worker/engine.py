@@ -102,7 +102,7 @@ from ..discovery.execution import (
     DiscoveryExecutionBlockedError,
     DiscoveryExecutionError,
 )
-from ..discovery.transport import http_get
+from ..discovery.transport import DiscoveryRequestInterrupted, http_get
 from ..domain.errors import ProjectConflict, ReviewAgentError
 from ..domain.records import validate_identifier
 from ..runtime.dispatch import (
@@ -1630,6 +1630,19 @@ class WorkerEngine:
                 repo, project_id, job, attempt, attempts=counter.value, reason="stopped"
             )
             return
+        except DiscoveryRequestInterrupted:
+            # The opt-in interrupt is normally swallowed by the shared transport
+            # (a failed page with no fabricated attempt); if it ever reaches here
+            # there is no partial result to commit, so record an honest outcome.
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=counter.value,
+                reason="interrupted",
+            )
+            return
         except DiscoveryExecutionBlockedError:
             held = self._discovery_is_held(repo, project_id, job_id)
             self._discovery_fail(
@@ -1670,6 +1683,11 @@ class WorkerEngine:
             # The S1 observation is durably recorded; a restart proves it via
             # replay. Do not fabricate a local receipt here.
             return
+        # Label an interrupted partial explicitly: the job was stopped before its
+        # next request, so the recorded observation is incomplete. The accepted
+        # result preserves any held (paused/cancelled) scheduling state.
+        if counter.interrupted or self._discovery_is_held(repo, project_id, job_id):
+            self._wait_reasons[job_id] = "discovery_interrupted"
 
     def _discovery_fail(
         self,

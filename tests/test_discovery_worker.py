@@ -48,7 +48,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from review_article_agent.discovery import execution as ex  # noqa: E402
-from review_article_agent.discovery.transport import TransportResponse  # noqa: E402
+from review_article_agent.discovery.transport import (  # noqa: E402
+    DiscoveryRequestInterrupted,
+    DiscoveryTransport,
+    TransportResponse,
+)
 from review_article_agent.runtime import owner_auth  # noqa: E402
 from review_article_agent.runtime.gates import prepare_gate_snapshot  # noqa: E402
 from review_article_agent.runtime.ipc import WorkerIPCClient  # noqa: E402
@@ -658,6 +662,44 @@ class ApprovalGateTest(DiscoveryWorkerBase):
         self.assertEqual(self._observations(), [])
         self.assertEqual(self._job(engine, job_id)["state"], "waiting_human")
 
+    def test_post_network_plan_change_cannot_accept_result(self) -> None:
+        # Page 1 is received; a pinned dependency is amended while the provider
+        # call is in flight, so the completion path revalidates the (now stale)
+        # plan and refuses to accept the observation: precise unknown, no hidden
+        # successful job.
+        first_called, release = threading.Event(), threading.Event()
+
+        def on_call(n: int) -> None:
+            if n == 1:
+                first_called.set()
+                release.wait(timeout=10.0)
+
+        fake = _FakeTransport([(200, _epmc_page("1"))], on_call=on_call)
+        engine = self.engine(fake)
+        plan_ref = self.build_plan()
+        self.approve_plan(plan_ref)
+        res = self._submit(
+            engine, request_id="postnet", mode="query",
+            parameters={"plan_ref": plan_ref, "query_index": 0},
+        )
+        job_id = res["job"]["job_id"]
+        engine.tick()
+        try:
+            self.assertTrue(first_called.wait(timeout=10.0))
+            self._put("a-brief", "report", "rev-briefZ", self._env("discovery_brief", {
+                "objective": "amended-during-call", "starting_hypothesis": "h",
+                "questions": [],
+            }), parent="rev-brief")
+        finally:
+            release.set()
+        self._drive(engine)
+        self.assertEqual(fake.calls, 1)
+        self.assertEqual(self._observations(), [])  # no observation accepted
+        job = self._job(engine, job_id)
+        self.assertNotEqual(job["state"], "completed")
+        self.assertIn(job["state"], {"waiting_human", "reconciliation_required"})
+        self.assertTrue(job["outcome_unresolved"])
+
 
 # --------------------------------------------------------------------------- #
 # Detached control: non-blocking ticking + one serial executor
@@ -753,76 +795,153 @@ class DetachedControlTest(DiscoveryWorkerBase):
 # Pause / cancel / drain between attempts
 # --------------------------------------------------------------------------- #
 class StopBetweenAttemptsTest(DiscoveryWorkerBase):
-    def _blocking_fake(self, first_called, release):
-        def on_call(_n: int) -> None:
-            first_called.set()
-            release.wait(timeout=10.0)
+    """A stop mid-query preserves the observed page and issues no further request.
 
-        # A retryable status would trigger up to DEFAULT_MAX_ATTEMPTS attempts.
-        return _FakeTransport([(429, b"")], on_call=on_call)
+    The job stop uses the shared transport's opt-in interrupt: the shared
+    ``DiscoveryTransport`` records a failed page with **no fabricated attempt** and
+    the provider adapter keeps the pages already observed, so the partial
+    observation is committed and the held (paused/cancelled) job state is preserved
+    per ``JobRepository`` semantics.
+    """
 
-    def test_pause_between_attempts_stops_network(self) -> None:
+    def _two_page_plan(self):
+        return self.build_plan(queries=[
+            {"source": "europepmc", "query": "asthma AND review",
+             "page_size": 1, "max_pages": 2},
+        ])
+
+    def _page_one_fake(self, first_called, release):
+        """One real page-1 call (2 hits, advancing cursor) then the test's stop."""
+
+        def on_call(n: int) -> None:
+            if n == 1:
+                first_called.set()
+                release.wait(timeout=10.0)
+
+        return _FakeTransport(
+            [(200, _epmc_page("31452104", hit_count=2, next_cursor="C1"))],
+            on_call=on_call,
+        )
+
+    def _start_two_page(self, request_id):
         first_called, release = threading.Event(), threading.Event()
-        fake = self._blocking_fake(first_called, release)
+        fake = self._page_one_fake(first_called, release)
         engine = self.engine(fake)
-        plan_ref = self.build_plan()
+        plan_ref = self._two_page_plan()
         self.approve_plan(plan_ref)
         res = self._submit(
-            engine, request_id="pause-run", mode="query",
+            engine, request_id=request_id, mode="query",
             parameters={"plan_ref": plan_ref, "query_index": 0},
         )
         job_id = res["job"]["job_id"]
         engine.tick()
-        self.assertTrue(first_called.wait(timeout=10.0))
-        self.assertTrue(engine.handle(_req("pause", project_id=self.project_id))["ok"])
-        release.set()
-        self._drive(engine)
-        self.assertEqual(fake.calls, 1)
-        self.assertEqual(self._observations(), [])
-        self.assertEqual(self._job(engine, job_id)["state"], "paused")
+        self.assertTrue(first_called.wait(timeout=10.0), "page 1 never started")
+        return engine, fake, job_id, release
 
-    def test_cancel_between_attempts_stops_network(self) -> None:
-        first_called, release = threading.Event(), threading.Event()
-        fake = self._blocking_fake(first_called, release)
-        engine = self.engine(fake)
-        plan_ref = self.build_plan()
-        self.approve_plan(plan_ref)
-        res = self._submit(
-            engine, request_id="cancel-run", mode="query",
-            parameters={"plan_ref": plan_ref, "query_index": 0},
-        )
-        job_id = res["job"]["job_id"]
-        engine.tick()
-        self.assertTrue(first_called.wait(timeout=10.0))
-        cancelled = engine.handle(
-            _req("cancel", project_id=self.project_id, job_id=job_id)
-        )
-        self.assertTrue(cancelled["ok"])
-        release.set()
-        self._drive(engine)
-        self.assertEqual(fake.calls, 1)
-        self.assertEqual(self._observations(), [])
-        self.assertEqual(self._job(engine, job_id)["state"], "cancelled")
+    def _assert_partial_preserved(self, engine, fake, job_id, expected_state):
+        self.assertEqual(fake.calls, 1)  # no second-page request
+        rows = self._observations()
+        self.assertEqual(len(rows), 1)
+        # The successully observed page 1 and its one real attempt are retained.
+        self.assertEqual([r.source_id for r in rows[0].result.records], ["MED:31452104"])
+        self.assertEqual(rows[0].attempt_count, 1)
+        self.assertFalse(rows[0].complete)
+        self.assertEqual(rows[0].stop_reason, "failure")
+        self.assertEqual(rows[0].failure, "attempts_exhausted")
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], expected_state)
+        self.assertEqual(job["attempts_total"], 1)
+        accepted = job["accepted_result"]["result"]
+        self.assertEqual(accepted["record_count"], 1)
+        self.assertEqual(accepted["attempt_count"], 1)
+        self.assertFalse(accepted["complete"])
+        self.assertEqual(accepted["stop_reason"], "failure")
+        self.assertEqual(job["wait_reason"], "discovery_interrupted")
 
-    def test_drain_between_attempts_stops_network(self) -> None:
-        first_called, release = threading.Event(), threading.Event()
-        fake = self._blocking_fake(first_called, release)
-        engine = self.engine(fake)
-        plan_ref = self.build_plan()
-        self.approve_plan(plan_ref)
-        res = self._submit(
-            engine, request_id="drain-run", mode="query",
-            parameters={"plan_ref": plan_ref, "query_index": 0},
-        )
-        job_id = res["job"]["job_id"]
-        engine.tick()
-        self.assertTrue(first_called.wait(timeout=10.0))
-        self.assertTrue(engine.handle(_req("drain", project_id=self.project_id))["ok"])
-        release.set()
+    def test_pause_before_second_page_preserves_first_page(self) -> None:
+        engine, fake, job_id, release = self._start_two_page("pause-2page")
+        try:
+            self.assertTrue(
+                engine.handle(_req("pause", project_id=self.project_id))["ok"]
+            )
+        finally:
+            release.set()
         self._drive(engine)
-        self.assertEqual(fake.calls, 1)
-        self.assertEqual(self._observations(), [])
-        self.assertNotEqual(self._job(engine, job_id)["state"], "completed")
+        self._assert_partial_preserved(engine, fake, job_id, "paused")
+        # The paused partial is stable: another tick adds no new observation.
+        engine.tick()
+        self.assertEqual(len(self._observations()), 1)
+
+    def test_cancel_before_second_page_preserves_first_page(self) -> None:
+        engine, fake, job_id, release = self._start_two_page("cancel-2page")
+        try:
+            cancelled = engine.handle(
+                _req("cancel", project_id=self.project_id, job_id=job_id)
+            )
+            self.assertTrue(cancelled["ok"])
+        finally:
+            release.set()
+        self._drive(engine)
+        self._assert_partial_preserved(engine, fake, job_id, "cancelled")
+
+    def test_drain_before_second_page_preserves_first_page_and_allows_switch(self) -> None:
+        engine, fake, job_id, release = self._start_two_page("drain-2page")
+        try:
+            self.assertTrue(
+                engine.handle(_req("drain", project_id=self.project_id))["ok"]
+            )
+        finally:
+            release.set()
+        self._drive(engine)
+        # Drain pauses the project's jobs; the partial observation is still
+        # recorded exactly once and the held state is respected.
+        self._assert_partial_preserved(engine, fake, job_id, "paused")
+        self.assertEqual(len(self._observations()), 1)
+        # The drain response quiesced the project, so another project can switch.
+        switched = engine.handle(_req("switch", project_id=self.other_id))
+        self.assertTrue(switched["ok"])
+        self.assertEqual(
+            self.registry.activation().active_project_id, self.other_id
+        )
+
+    def test_guard_transport_uses_optin_interrupt_after_a_real_attempt(self) -> None:
+        # A stop with no attempt yet aborts hard (nothing to preserve); after a
+        # real attempt it raises the shared opt-in interrupt so the pages already
+        # observed survive — with no fabricated attempt for the refused request.
+        counter = discovery_jobs.AttemptCounter()
+        stopped = {"v": False}
+        base_calls = {"n": 0}
+
+        def base(url, *, timeout, max_response_bytes):
+            base_calls["n"] += 1
+            return TransportResponse(status=200, body=b"{}")
+
+        transport = discovery_jobs.guard_transport(
+            base, stop_requested=lambda: stopped["v"], counter=counter
+        )
+        stopped["v"] = True
+        with self.assertRaises(discovery_jobs.DiscoveryJobStopped):
+            transport("https://example.invalid", timeout=1.0, max_response_bytes=10)
+        self.assertEqual(base_calls["n"], 0)
+
+        stopped["v"] = False
+        self.assertEqual(
+            transport(
+                "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                timeout=1.0, max_response_bytes=10,
+            ).status,
+            200,
+        )
+        self.assertEqual(counter.value, 1)
+
+        stopped["v"] = True
+        wrapped = DiscoveryTransport(transport=transport, sleep=lambda _s: None)
+        result = wrapped.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure, "attempts_exhausted")
+        self.assertEqual(result.attempts, ())  # no fabricated attempt
+        self.assertEqual(base_calls["n"], 1)
+        self.assertTrue(counter.interrupted)
 
 
 # --------------------------------------------------------------------------- #
@@ -849,9 +968,9 @@ class RestartRecoveryTest(DiscoveryWorkerBase):
         finally:
             store.close()
 
-    def _prepare(self, request_id):
+    def _prepare(self, request_id, *, queries=None):
         engine = self.engine(_FakeTransport([(200, _epmc_page("1"))]))
-        plan_ref = self.build_plan()
+        plan_ref = self.build_plan(queries=queries)
         self.approve_plan(plan_ref)
         res = self._submit(
             engine, request_id=request_id, mode="query",
@@ -862,6 +981,35 @@ class RestartRecoveryTest(DiscoveryWorkerBase):
         # Stop the first engine (no future was ever started).
         engine.close()
         return job_id
+
+    def _commit_partial(self, job_id) -> int:
+        """Commit a *partial* observation (page 1 ok, page 2 interrupted) with no accept."""
+        token = self.registry.activation().activation_token
+        store = ProjectStore.open_at(
+            paths.app_dir_for(str(self.root)), expected_project_id=self.project_id
+        )
+        calls = {"n": 0}
+        try:
+            repo = JobRepository(store)
+            job = repo.get(job_id)
+            attempt = repo.begin_attempt(job_id, dispatch_kind="local")
+            repo.record_checkpoint(
+                attempt.attempt_id, discovery_jobs.predispatch_checkpoint("query")
+            )
+
+            def transport(url, *, timeout, max_response_bytes):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return TransportResponse(
+                        status=200,
+                        body=_epmc_page("31452104", hit_count=2, next_cursor="C1"),
+                    )
+                raise DiscoveryRequestInterrupted("stop before page 2")
+
+            discovery_jobs.dispatch(store, self.registry, token, job, transport)
+        finally:
+            store.close()
+        return calls["n"]
 
     def test_restart_with_standing_observation_completes_same_fence(self) -> None:
         job_id = self._prepare("restart-known")
@@ -914,6 +1062,36 @@ class RestartRecoveryTest(DiscoveryWorkerBase):
         self.assertEqual(job["state"], "completed")
         self.assertEqual(job["attempts_total"], 1)  # reused the same identity
         self.assertEqual(fake2.calls, 1)
+
+    def test_restart_replays_saved_partial_row_without_io(self) -> None:
+        # A partial (page 1 ok, page 2 interrupted) observation was durably
+        # committed but the job was never accepted (a crash). A fresh engine must
+        # prove it by replay: no provider I/O, no duplicate row, same fence.
+        queries = [
+            {"source": "europepmc", "query": "asthma AND review",
+             "page_size": 1, "max_pages": 2},
+        ]
+        job_id = self._prepare("restart-partial", queries=queries)
+        self.assertEqual(self._commit_partial(job_id), 2)  # 1 real page + 1 refused
+        rows = self._observations()
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0].complete)
+        self.assertEqual(rows[0].record_count, 1)
+        self.assertEqual(rows[0].attempt_count, 1)
+
+        fake2 = _FakeTransport([(200, _epmc_page("999"))])
+        engine2 = self.engine(fake2, registry=Registry(self.data_dir))
+        engine2.reconcile_startup()
+        self._drive(engine2)
+        self.assertEqual(fake2.calls, 0)  # replayed, no I/O
+        self.assertEqual(len(self._observations()), 1)  # no duplicate
+        job = self._job(engine2, job_id)
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["attempts_total"], 1)
+        accepted = job["accepted_result"]["result"]
+        self.assertEqual(accepted["run_id"], rows[0].run_id)
+        self.assertFalse(accepted["complete"])
+        self.assertEqual(accepted["record_count"], 1)
 
 
 # --------------------------------------------------------------------------- #
