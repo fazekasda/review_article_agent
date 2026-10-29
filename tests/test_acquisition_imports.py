@@ -465,6 +465,154 @@ class ReadValidationTest(Base):
         self.assertEqual(caught.exception.code, "occurrence_invalid")
 
 
+class LatestRightsBindingTest(Base):
+    def snapshot(self):
+        return {t: self.count(t) for t in ("artifact", "revision", "rights_record", "dependency")}
+
+    def dup(self, request_id="req-2"):
+        return self.do_import(
+            request_id, revision="src-2",
+            src_rights=rights(self.pid, "doc-a", "src-2", rights_id="fresh"),
+        )
+
+    def test_latest_record_binding_another_source_cannot_authorize_reuse(self) -> None:
+        self.do_import("req-1")
+        self.do_import("other", artifact="doc-b", revision="b1", content=b"other")
+        # same rights_id chain, newer revision, but it now binds a DIFFERENT source
+        self.artifacts.store_rights_record(
+            rights(self.pid, "doc-b", "b1", rights_id="R-src-1", record_revision=2)
+        )
+        before = self.snapshot()
+        with self.assertRaises(AssetImportConflictError) as caught:
+            self.dup()
+        self.assertEqual(caught.exception.code, "rights_conflict")
+        self.assertEqual(self.snapshot(), before)
+        self.assertIsNone(self.imports.find_request("req-2"))
+
+    def test_latest_same_source_allowed_revision_is_pinned_not_stale_original(self) -> None:
+        first = self.do_import("req-1")
+        self.artifacts.store_rights_record(
+            rights(self.pid, "doc-a", "src-1", rights_id="R-src-1", record_revision=2)
+        )
+        result = self.dup()
+        self.assertEqual(result["disposition"], "duplicate_bytes_of_existing_revision")
+        self.assertEqual(result["source_ref"], first["source_ref"])
+        occ = self.imports.get_occurrence(result["occurrence_ref"])
+        self.assertEqual(occ.source_rights_ref.record_revision, 2)
+
+    def test_latest_same_source_revision_that_denies_or_unknowns_fails_closed(self) -> None:
+        self.do_import("req-1")
+        cases = (
+            {"privacy": {"personal_data": False, "confidentiality": "public", "denial": True}},
+            {"ops": {"storage": "unknown"}},
+            {"ops": {"acquisition": "not_allowed"}},
+        )
+        for offset, change in enumerate(cases, start=2):
+            self.artifacts.store_rights_record(
+                rights(self.pid, "doc-a", "src-1", rights_id="R-src-1",
+                       record_revision=offset, **change)
+            )
+            before = self.snapshot()
+            with self.assertRaises(AssetImportConflictError) as caught:
+                self.dup(f"req-{offset}")
+            self.assertEqual(caught.exception.code, "rights_conflict")
+            self.assertEqual(self.snapshot(), before)
+        self.assertEqual(len(self.artifacts.list_revisions("doc-a")), 1)
+
+    def test_replay_stays_read_only_after_latest_rights_change(self) -> None:
+        self.do_import("req-1")
+        dup = self.dup()
+        self.artifacts.store_rights_record(
+            rights(self.pid, "doc-a", "src-1", rights_id="R-src-1", record_revision=2,
+                   privacy={"personal_data": False, "confidentiality": "public",
+                            "denial": True})
+        )
+        occ = self.imports.get_occurrence(dup["occurrence_ref"])
+        before = self.snapshot()
+        replay = self.imports.import_asset(
+            artifact_id="doc-a", content=b"%PDF synthetic one",
+            origin_locator="file:///a/one.pdf",
+            rights=rights(self.pid, "doc-a", "src-2", rights_id="fresh"),
+            revision_id="src-2", request_id="req-2",
+            occurrence_revision_id=occ.occurrence_ref.revision_id,
+            occurrence_rights=self.artifacts.get_rights_record(occ.occurrence_rights_ref),
+        )
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(self.snapshot(), before)
+
+
+class ForgedRecordTest(Base):
+    def forge(self, occurrence_ref, transform):
+        """Rewrite stored occurrence content (hash/size kept consistent)."""
+        import json
+
+        from review_article_agent.domain.records import canonical_json
+        from review_article_agent.storage.artifacts import sha256_digest
+
+        conn = self.store.connection
+        for trigger in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall():
+            conn.execute(f"DROP TRIGGER {trigger['name']}")
+        artifact, revision = occurrence_ref["artifact_id"], occurrence_ref["revision_id"]
+        row = conn.execute(
+            "SELECT content FROM revision WHERE artifact_id = ? AND revision_id = ?",
+            (artifact, revision),
+        ).fetchone()
+        raw = transform(bytes(row["content"]).decode("utf-8"), json, canonical_json)
+        data = raw.encode("utf-8")
+        conn.execute(
+            "UPDATE revision SET content = ?, content_sha256 = ?, byte_size = ? "
+            "WHERE artifact_id = ? AND revision_id = ?",
+            (data, sha256_digest(data), len(data), artifact, revision),
+        )
+
+    def assert_invalid(self, ref):
+        with self.assertRaises(AssetImportError) as caught:
+            self.imports.get_occurrence(ref)
+        self.assertEqual(caught.exception.code, "occurrence_invalid")
+
+    def test_bool_versions_rejected(self) -> None:
+        first = self.do_import("req-1")
+        self.forge(first["occurrence_ref"],
+                   lambda t, j, c: t.replace('"schema_version":1', '"schema_version":true'))
+        self.assert_invalid(first["occurrence_ref"])
+
+    def test_bool_record_version_rejected(self) -> None:
+        first = self.do_import("req-1")
+        self.forge(first["occurrence_ref"],
+                   lambda t, j, c: t.replace('"record_version":1', '"record_version":true'))
+        self.assert_invalid(first["occurrence_ref"])
+
+    def test_noncanonical_and_duplicate_key_content_rejected(self) -> None:
+        first = self.do_import("req-1")
+        second = self.do_import("req-2", artifact="doc-b", revision="b1", content=b"other")
+        self.forge(first["occurrence_ref"],
+                   lambda t, j, c: j.dumps(j.loads(t), indent=2))  # same data, noncanonical
+        self.assert_invalid(first["occurrence_ref"])
+        self.forge(second["occurrence_ref"],
+                   lambda t, j, c: t[:-1] + ',"payload":{}}')  # duplicate key
+        self.assert_invalid(second["occurrence_ref"])
+
+    def test_pinned_rights_naming_another_source_rejected_on_read(self) -> None:
+        self.do_import("req-1")
+        self.do_import("other", artifact="doc-b", revision="b1", content=b"other")
+        dup = self.do_import(
+            "req-2", revision="src-2",
+            src_rights=rights(self.pid, "doc-a", "src-2", rights_id="fresh"),
+        )
+        self.assertEqual(self.imports.get_occurrence(dup["occurrence_ref"]).disposition,
+                         "duplicate_bytes_of_existing_revision")
+
+        def point_at_other(text, j, c):
+            doc = j.loads(text)
+            doc["payload"]["source_rights_ref"] = {
+                "project_id": self.pid, "rights_id": "R-b1", "record_revision": 1,
+            }
+            return c(doc).decode("utf-8")
+
+        self.forge(dup["occurrence_ref"], point_at_other)
+        self.assert_invalid(dup["occurrence_ref"])
+
+
 class BackupRestartTest(Base):
     def test_backup_and_restart_preserve_occurrences(self) -> None:
         first = self.do_import("req-1")

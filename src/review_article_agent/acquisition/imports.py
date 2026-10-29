@@ -194,6 +194,15 @@ _PAYLOAD_KEYS = frozenset(
 )
 
 
+def _no_duplicate_keys(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+
 class _NestedStore:
     """Adapt a store so ``ArtifactRepository`` writes nest as SAVEPOINTs.
 
@@ -614,15 +623,26 @@ class AssetImportRepository:
             raise _fail("rights_superseded")
         # The exact existing source must still be authorized by its LATEST rights.
         latest_existing = self._latest_rights(existing.rights_ref.rights_id)
+        # It must bind THIS exact stored source (project/artifact/revision): a newer
+        # record that names another subject, or is malformed, never authorizes reuse.
+        exact = {
+            "kind": "source_revision", "project_id": self.project_id,
+            "artifact_id": existing.artifact_id, "revision_id": existing.revision_id,
+        }
         try:
-            validated_latest = validate_rights_record(latest_existing, self.project_id)
+            validated_latest = validate_rights_record(
+                latest_existing, self.project_id, subject=exact
+            )
         except RecordValidationError:
             raise _fail("rights_conflict") from None
         try:
             _require_allows_source(validated_latest)
         except AssetImportError:
             raise _fail("rights_conflict") from None
-        pin = existing.rights_ref
+        # Pin the LATEST applicable record, never the stale original pin.
+        pin = RightsRef(
+            self.project_id, validated_latest["rights_id"], validated_latest["record_revision"]
+        )
         if subject["revision_id"] == existing.revision_id:
             pin = ref  # supplied record binds the exact existing source: store + pin it
         elif subject["revision_id"] == proposed_revision_id:
@@ -748,12 +768,18 @@ class AssetImportRepository:
         if sha256_digest(raw) != revision.content_sha256 or len(raw) != revision.byte_size:
             raise bad
         try:
-            envelope = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, ValueError):
+            envelope = json.loads(
+                raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys
+            )
+            # Only the exact canonical encoding written by this module is accepted.
+            if canonical_json(envelope) != raw:
+                raise bad
+        except (UnicodeError, ValueError, RecordValidationError):
             raise bad from None
         if (
             not isinstance(envelope, dict)
             or set(envelope) != {"schema_version", "document_type", "payload"}
+            or type(envelope["schema_version"]) is not int
             or envelope["schema_version"] != 1
             or envelope["document_type"] != OCCURRENCE_DOCUMENT_TYPE
             or not isinstance(envelope["payload"], dict)
@@ -789,6 +815,7 @@ class AssetImportRepository:
         project = self.project_id
         if (
             p["record_type"] != OCCURRENCE_DOCUMENT_TYPE
+            or type(p["record_version"]) is not int
             or p["record_version"] != OCCURRENCE_RECORD_VERSION
             or p["proposal_only"] is not True
             or p["authorizes_use"] is not False
@@ -868,6 +895,13 @@ class AssetImportRepository:
         if sha256_digest(self._repo.read_content(artifact_id, source.revision_id)) != sha:
             raise ValueError
         if self._rights_ref(p["source_revision_rights_ref"]) != source.rights_ref:
+            raise ValueError
+        # The rights record this occurrence pins must bind the EXACT stored source.
+        pinned = self._repo.get_rights_record(src_rights)
+        if pinned["subject"] != {
+            "kind": "source_revision", "project_id": project,
+            "artifact_id": artifact_id, "revision_id": source.revision_id,
+        }:
             raise ValueError
         stored = tuple(
             sorted(
