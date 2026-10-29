@@ -1,65 +1,25 @@
 # Handoff — step 07: parsing, evidence assets, and reference structure
 
-**Status: partial (scoped parsing MVP); not fully validated.** S7-CORE (`c235075`/`314589a`), S7-STORE
-(`ace293b`) and S7-CLI (`e39f91c`, this task) are integrated on `task/step07-cli` from base `ace293b`: a
-stdlib XML-first structural core, a durable report repository, and a personal `parsing` CLI. The step-07
-index row is **not ticked** — an MVP only; no overall completion or combined result is claimed and no
-human-adjudicated benchmark was run. Baseline: `docs/implementation/07-parsing.md` (deliverables lines
-9-12, AC lines 16-22), `docs/specification.md` (immutable revisions; normalized text a separate
-revision; distinct rights; no self-approval; failed evidence → human action), predecessor
-`handoffs/06-acquisition.md`. **S7-CLI only** — core, repository, storage and acquisition were not edited.
+**Status: partial parsing MVP; step-07 row NOT ticked.** Integrated on this branch: S7-CORE `c235075` + repair `314589a`, S7-STORE `ace293b` + storage-atomicity/fail-closed-unknown-parser fix `ba760a1`, S7-CLI `ae18e9b`. Stdlib XML-first structural core + durable report repository + personal `parsing` CLI. No overall completion or scientific claim. Sources: `docs/implementation/07-parsing.md` (deliverables 9-12, AC 16-22), `docs/specification.md`, `handoffs/06-acquisition.md`.
 
-## Files and interfaces changed
+## Modules, features, API
+- `parsing/core.py`: `parse_document(data)` → immutable report payload; JATS/TEI structural passages/references/assets, citation-marker links, explicit unresolved/malformed state; XML structural text supported.
+- `parsing/repository.py`: `ParsingRepository` (`parse_stored_document`, `read_report`, `make_passage_locator`, `resolve_passage`); immutable raw + separate normalized/derived revisions, atomic rights-bound writes, historical locators + current parser/freshness check (`parser_version_unverified` on unknown parser).
+- `parsing/locator.py`, `parsing/pdf_adapter.py` (diagnostic only).
+- CLI `parsing` group (`cli/parsing.py`): `parse`/`show`/`locator`/`resolve`; safe summaries by default, private content only with `--content`.
 
-- `src/review_article_agent/cli/parsing.py` (new): root `parsing` group — `parse`/`show`/`locator`/`resolve`.
-  Safe summaries by default; private passages/captions/section-headings/raw markers only with `--content`.
-- `src/review_article_agent/cli/main.py`: routing, category exit codes and error-message integration
-  for `ParsingControlError` (small, uniform diff).
-- `tests/test_cli_parsing.py` (new): 5 combined CLI tests.
-- `handoffs/07-parsing.md` (this file) + one annotated step-07 index line.
+## Tests (new, focused)
+- `tests/test_parsing_core.py` + `tests/test_parsing_repository.py` = 36; `tests/test_cli_parsing.py` = 5 → **41 passed** (combined coordinator run). Full baseline **3079 passed**; final full combined run in progress — result in the PR.
 
-## Acceptance criteria → evidence (CLI/MVP scope)
-
-- AC16 (resolve after restart; detect changed deps): parse → restart → `resolve` hits the exact report.
-- AC19 (unresolved/malformed links fail that passage): a `ref9` passage reports `unresolved_count=1`;
-  markers only with `--content`.
-- AC20 (no correctness/exclusion claim): outputs carry `authorizes_scientific_processing=false`,
-  `excludes_candidate=false`.
-- AC21 (failed parse → human action): malformed XML → `rejected`, `human_action_required=true`.
-- AC22 (raw immutable, normalized separate): S7-STORE invariant; CLI reads only exact stored ids.
-
-## Verification
-
-- `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_cli_parsing.py'` → **5 tests, OK**;
-  `-p 'test_parsing*.py'` → **35, OK**; `tests.test_cli tests.test_cli_acquisition` → **41, OK**.
-- `git diff --check` clean; `compileall` clean; `parsing`/`parse`/`resolve` `--help` smoke OK.
-- **Not run:** full `test_*.py` suite (real detached-worker smoke exceeds the 2-minute default), live retrieval, any real-network run.
-
-## Constraints and known limitations
-
-- **XML/JATS/TEI supported.** PDF, OCR, full-text extraction, table cells and visual/figure
-  interpretation are **unsupported → human review**.
-- **Synthetic fixtures only** (self-authored JATS); **not** a representative human-adjudicated
-  scientific benchmark. No scientific correctness, completeness, originality, screening or extraction
-  is claimed.
-- No network/model/provider/approval call; no auto approvals; no new deps. Stdlib Python (PSF). An
-  existing optional `pypdf` (BSD-3) PDF *diagnostic* is Step 06 only; no model weights. Local CPU, bounded
-  input (≤32 MiB). CLI ~500 lines (> soft 300-line guide) for the 4-subcommand surface + privacy/errors.
+## Partial MVP / not ticked
+- PDF extraction/OCR/visual/table-cell interpretation **unsupported → human review**; synthetic self-authored XML/TEI fixtures only, no representative human-adjudicated benchmark. XML structural text is supported; PDF full-text extraction is unsupported.
+- Stdlib Python (PSF); optional `pypdf` (BSD-3) PDF diagnostic, no weights; ≤32 MiB local input; no live trials/network/model/approval; no migration, no new deps, no hosted calls.
 
 ## Copyable usage
-
 ```bash
-export PYTHONPATH=src
-raa() { local d="$1"; shift; python3 -m review_article_agent.cli --data-dir "$d" "$@"; }
-raa ./state parsing parse --project "$PID" --source-artifact-id art-src \
-  --source-revision-id rev-src --report-artifact-id art-rep \
-  --report-revision-id rev-rep --rights-file report-rights.json
-raa ./state parsing show --project "$PID" --report-artifact-id art-rep \
-  --report-revision-id rev-rep [--content]
-raa ./state parsing locator --project "$PID" --report-artifact-id art-rep \
-  --report-revision-id rev-rep --passage-id p0002 [--content]
-raa ./state parsing resolve --project "$PID" --locator-file locator.json [--content]
+export PYTHONPATH=src; P="python3 -m review_article_agent.cli --data-dir ./state parsing"
+$P parse --project "$PID" --source-artifact-id art-src --source-revision-id rev-src --report-artifact-id art-rep --report-revision-id rev-rep --rights-file report-rights.json
+$P show --report-artifact-id art-rep --report-revision-id rev-rep [--content]
+$P locator --report-artifact-id art-rep --report-revision-id rev-rep --passage-id p0002 [--content]
+$P resolve --locator-file locator.json [--content]
 ```
-
-Next (not this task): coordinator full-suite + docs-head run, an authorized PDF/XML benchmark, and human
-adjudication before any scientific claim. Do not tick step 07 until its full AC set is validated. Temp store only.
