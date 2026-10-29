@@ -23,8 +23,9 @@
 > **local, zero-HTTP** observation of a caller-supplied record file; and (`lead`) **one** guarded
 > direct-lead `POST` per durable job. §12 states their exact authority,
 > fences, and limits; nothing in §1–§11 is weakened, and the direct-lead route leaves the existing
-> app-owned OpenCode **production block unchanged**. Step 05 **implementation is integrated with
-> final acceptance pending** (see [`implementation/handoffs/05-discovery.md`](implementation/handoffs/05-discovery.md)); no
+> app-owned OpenCode **production block unchanged**. Step 05 is **complete as a scoped discovery
+> workflow** (final full combined check passed at head `f3d97fe`; see
+> [`implementation/handoffs/05-discovery.md`](implementation/handoffs/05-discovery.md)); no
 > scientific validation, completeness, review/writer, or later-step feature is implemented or
 > claimed.
 > Authority: [`implementation/03-durable-worker.md`](implementation/03-durable-worker.md),
@@ -246,7 +247,7 @@ provider with no real egress:
   credential, and cost controls of §12; a `metadata_import` job issues **zero HTTP** and records only
   a caller-supplied local observation. They still make **no** scientific-validation, completeness,
   deduplication, coverage, freeze, or review/writer claim, and no exactly-once external-request or
-  billing claim; Step 05 implementation is integrated with final acceptance pending.
+  billing claim; Step 05 is complete as a scoped discovery workflow (verified at head `f3d97fe`).
 
 ## 11. Ownership map, safety tests, and verification
 
@@ -279,8 +280,8 @@ This section extends §1–§11 without weakening them. It documents the **only*
 worker surface that issues real provider/lead I/O: the `discovery_submit` op and
 the single serial discovery executor. The Step 05 CLI spellings are in
 [`cli.md`](cli.md) §12; the discovery value layers and their exact limits are in
-[`discovery.md`](discovery.md). Step 05 implementation is **integrated** with
-**final acceptance pending**
+[`discovery.md`](discovery.md). Step 05 is **complete as a scoped discovery
+workflow** (final full combined check passed at head `f3d97fe`)
 ([handoff](implementation/handoffs/05-discovery.md)); nothing here is a scientific
 workflow, a completion, or an approval.
 

@@ -33,6 +33,19 @@ execute a real project search or a hosted transfer. The user retains PR
 review/merge; Step 05 remains **in progress** and unchecked in
 [`docs/implementation/README.md`](../implementation/README.md).
 
+**Current status amendment (2026-10-29).** The 2026-10-28 statement above that
+Step 05 was *in progress and unchecked* is **preserved unchanged** as it stood at
+creation. As of 2026-10-29 the **scoped Step 05 discovery workflow is complete and
+verified**: Step 05 is now ticked `[x]` in
+[`docs/implementation/README.md`](../implementation/README.md), and the final full
+combined check passed at head `f3d97fe` (**2,920 tests, no skips**; 29 contract
+checks) — see the
+[Step 05 handoff](../implementation/handoffs/05-discovery.md). This amendment adds
+**no** decision content: it authorizes **no** paid call, **no** real project
+search, and **no** hosted transfer, and makes **no** scientific claim (no study
+identity, eligibility, extraction, topic completeness, or review-writer
+capability).
+
 ## Context and constraints
 
 - **Step authority:** [`docs/implementation/05-discovery.md`](../implementation/05-discovery.md)
@@ -209,7 +222,7 @@ separately reviewable.
 
 - **Unblocked direction.** Step 05 discovery (D-1…D-4) and the direct lead route
   (D-5) now have a recorded user-approved direction grounded in the base
-  implementation; Step 05 itself remains **partial/in-progress** (no criterion is
+  implementation; Step 05 itself **at creation** remained **partial/in-progress** (no criterion is
   marked met by this record).
 - **Historical record preserved.** ADR [`001`](001-runtime-language.md) and
   [`002`](002-step01-contracts-and-policies.md) are **unchanged**; this record
@@ -227,11 +240,15 @@ separately reviewable.
   link added here and in the specification crosslink. This record adds narrative
   and a status/crosslink only; it changes **no** checker fixture, test, schema,
   contract, enum, policy, or numeric threshold.
-- **Frozen checkpoint (not final-head evidence).** The currently verified frozen
-  checkpoint is `6ec58ea` (Python 3.14.4): **2,772 tests** (2,557 core + 20
+- **Historical frozen checkpoint (not final-head evidence).** At the time this
+  record was written the verified frozen checkpoint was `6ec58ea` (Python 3.14.4):
+  **2,772 tests** (2,557 core + 20
   scripts + 79 python spike + 51 mock-Jev + 7 mock-integration + 58 TypeScript),
-  **29 contract checks**, and `tsc`/`compileall`/`diffcheck` all clean. This is a
-  **frozen checkpoint**, not final-head evidence; per-suite detail lives in the
+  **29 contract checks**, and `tsc`/`compileall`/`diffcheck` all clean. That
+  checkpoint **predates** the E0/E1/E1B/E2 acceptance suites and the report/freeze
+  CLI; it is **historical, not final-head evidence**. The **current** verified run
+  is the `f3d97fe` full combined check (2,920 tests; see the *Current status
+  amendment* above and the Step 05 handoff). Per-suite detail lives in the
   Step 05 handoff, not here. All claims in this record are scoped to mechanisms
   actually tested in this repository, never to literature/topic coverage.
 - **Cost/rights honesty.** No paid call was authorized or made by this record; a

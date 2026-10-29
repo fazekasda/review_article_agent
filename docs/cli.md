@@ -679,7 +679,10 @@ It is implemented by [`cli/discovery.py`](../src/review_article_agent/cli/discov
 [`cli/discovery_reports.py`](../src/review_article_agent/cli/discovery_reports.py)
 (report/freeze readbacks and proposals). It stores **proposals only**, records
 **no** approval, and makes **no** scientific-validation, completeness,
-deduplication, coverage, or freeze claim. Exact field spellings, bounds, and library APIs are in
+deduplication, coverage, or freeze claim. **Step 05 is complete as a scoped
+discovery workflow** (final full combined check passed at head `f3d97fe`; see the
+[Step 05 handoff](implementation/handoffs/05-discovery.md)); this group is not a
+review writer. Exact field spellings, bounds, and library APIs are in
 [`discovery.md`](discovery.md); this section documents the CLI surface only.
 
 ### 12.1 Commands (exact `--help` spellings)

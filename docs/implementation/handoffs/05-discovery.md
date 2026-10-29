@@ -1,15 +1,15 @@
 # Handoff — step 05: reproducible discovery and corpus freeze
 
-**Status: implementation INTEGRATED; FINAL ACCEPTANCE PENDING — Step 05 stays
-UNCHECKED in [`docs/implementation/README.md`](../README.md).** Every deliverable
-D1–D4 and acceptance criterion AC1–AC7 below is now realised by integrated
-source and tests on this branch's base `ec9c32d`. What remains is **verification
-and release work only** — the E2 full-CLI-chain case, a final frozen-HEAD
-full-suite run, and the PR/merge — not any deferred feature. The E1B adversarial
-cases are now **integrated** (§5.2).
-Nothing here is a scientific claim: no study identity, eligibility, primary
-support, evidence extraction, coverage, completeness, review, or review-writer
-capability is asserted.
+**Status: COMPLETE for the scoped Step 05 discovery workflow — Step 05 is ticked
+`[x]` in [`docs/implementation/README.md`](../README.md).** All four deliverables
+D1–D4 and all seven acceptance criteria AC1–AC7 are realised by integrated source
+and tests, and the final full combined check **passed** at the exact
+source/test/docs head `f3d97fe` (§5.2). This is the scoped **discovery workflow**
+only: no study identity, eligibility, primary support, evidence extraction,
+topic/literature completeness, review, or review-writer capability is asserted.
+Final delivery (PR/check-rollup link) and user review/merge are **release
+actions**, not a step criterion; this handoff is updated **after** that verified
+run, so it does **not** claim a full-suite run on its own docs commit (§5.2).
 
 ## 1. Scope, base revisions, and authority
 
@@ -22,9 +22,10 @@ capability is asserted.
   and the [policy register](../../contracts/03-policy-decisions.md) (`POL-OPS-COVERAGE`,
   `POL-OPS-TRACE`, `POL-OPS-SECONDARY`); the [direct-lead exception (decision 003)](../../decisions/003-step05-discovery-and-direct-lead.md).
 - **Contracts:** [C01](../../contracts/01-identities.md), [C02](../../contracts/02-gates-and-runtime.md), [C03](../../contracts/03-policy-decisions.md).
-- **This branch:** `task/step05-completion-handoff`; starting HEAD **`e15b5b4`**
-  (`e15b5b417a4d41342e1f24ab52fd4f3beb92b1fd`). This task changes
-  **documentation only** (see §6).
+- **This branch:** `task/step05-completion-handoff`; starting HEAD **`00d1b24`**
+  (`00d1b24e5d0bd907fa582f01124f43757160c8cf`, the merge of the approved
+  integration `f3d97fe`). This finalization task changes **documentation only**
+  (see §6) on top of that merged code/tests.
 
 ## 2. Historical foundation (preserved anchors, superseded status)
 
@@ -41,11 +42,11 @@ measured evidence is kept only as history, not as the current claim.
   observation repository. Targeted run **252 discovery tests OK**; full combined
   run **2,357 tests** (log `/tmp/opencode/search-records-combined.log`).
 
-Those counts are historical. The frozen checkpoint below (§5.1) verified only
-the code present at its own head `6ec58ea`; it **predates** the E1/E1B acceptance
-suites, the CLI1A report/freeze CLI, and later fixes, so those additions have
-their **own separate selective-run evidence** (§5.2) and are **not** covered by
-that checkpoint.
+Those counts are historical. The frozen checkpoint `6ec58ea` (§5.1) verified only
+the code present at its own head; it **predates** the E0/E1/E1B/E2 acceptance
+suites, the CLI1B report/freeze CLI, and later fixes, so those additions have
+their **own separate evidence** (§5.2) and are **not** covered by that checkpoint.
+The **current** last full combined run is the `f3d97fe` run in §5.2.
 
 ## 3. Deliverables → integrated source and named tests
 
@@ -53,7 +54,7 @@ that checkpoint.
 | --- | --- | --- |
 | **D1** — brief/interview artifacts, seed search + individual approvals, framing challenge, provisional scope map, rubric/search-plan approval | [`discovery/context.py`](../../../src/review_article_agent/discovery/context.py) (typed envelopes, `require_approved_context`, `seed_context`), [`discovery/execution.py`](../../../src/review_article_agent/discovery/execution.py) (`seed_search`, always provisional) | [`test_discovery_context.py`](../../../tests/test_discovery_context.py)::`StaticValidationTest`/`ReadContextTest`/`SeedContextTest`/`PlanApprovalTest`; [`test_step05_core_acceptance.py`](../../../tests/test_step05_core_acceptance.py)::`SeedApprovalGateTest`/`PlanAmendmentTest`; [`test_step05_acceptance.py`](../../../tests/test_step05_acceptance.py)::`InjectionCannotExpandAuthorityTest`. Gates: seed `artifact_revision`/`discovery.seed.<artifact_id>`; plan `protocol`/`discovery.plan`. |
 | **D2** — PubMed and Europe PMC adapters plus complementary sources ratified in the project plan | [`discovery/pubmed.py`](../../../src/review_article_agent/discovery/pubmed.py), [`discovery/europepmc.py`](../../../src/review_article_agent/discovery/europepmc.py), [`discovery/citations.py`](../../../src/review_article_agent/discovery/citations.py); ratified complementary sources via `DiscoveryExecutor.import_metadata` | [`test_discovery_pubmed.py`](../../../tests/test_discovery_pubmed.py), [`test_discovery_europepmc.py`](../../../tests/test_discovery_europepmc.py), [`test_discovery_citations.py`](../../../tests/test_discovery_citations.py); `test_step05_core_acceptance.py`::`MetadataImportTest` |
-| **D3** — query runs, identity reconciliation, citation expansion, coverage report, explicit freeze/search-again decision | [`discovery/execution.py`](../../../src/review_article_agent/discovery/execution.py) (`execute_query`), [`discovery/serialization.py`](../../../src/review_article_agent/discovery/serialization.py), [`storage/discovery.py`](../../../src/review_article_agent/storage/discovery.py), [`discovery/reconciliation.py`](../../../src/review_article_agent/discovery/reconciliation.py), [`discovery/candidates.py`](../../../src/review_article_agent/discovery/candidates.py), [`discovery/expansion.py`](../../../src/review_article_agent/discovery/expansion.py), [`discovery/reporting.py`](../../../src/review_article_agent/discovery/reporting.py), [`discovery/freeze.py`](../../../src/review_article_agent/discovery/freeze.py); `discovery report\|freeze` CLI | [`test_discovery_execution.py`](../../../tests/test_discovery_execution.py), [`test_discovery_serialization.py`](../../../tests/test_discovery_serialization.py), [`test_discovery_store.py`](../../../tests/test_discovery_store.py), [`test_discovery_reconciliation.py`](../../../tests/test_discovery_reconciliation.py), [`test_discovery_candidates.py`](../../../tests/test_discovery_candidates.py), [`test_discovery_expansion.py`](../../../tests/test_discovery_expansion.py), [`test_discovery_reporting.py`](../../../tests/test_discovery_reporting.py), [`test_discovery_freeze.py`](../../../tests/test_discovery_freeze.py), [`test_cli_discovery_reports.py`](../../../tests/test_cli_discovery_reports.py); E0/E1 acceptance. Gate: `artifact_revision`/`discovery.freeze`. |
+| **D3** — query runs, identity reconciliation, citation expansion, coverage report, explicit freeze/search-again decision | [`discovery/execution.py`](../../../src/review_article_agent/discovery/execution.py) (`execute_query`), [`discovery/serialization.py`](../../../src/review_article_agent/discovery/serialization.py), [`storage/discovery.py`](../../../src/review_article_agent/storage/discovery.py), [`discovery/reconciliation.py`](../../../src/review_article_agent/discovery/reconciliation.py), [`discovery/candidates.py`](../../../src/review_article_agent/discovery/candidates.py), [`discovery/expansion.py`](../../../src/review_article_agent/discovery/expansion.py), [`discovery/reporting.py`](../../../src/review_article_agent/discovery/reporting.py), [`discovery/freeze.py`](../../../src/review_article_agent/discovery/freeze.py); `discovery report\|freeze` CLI | [`test_discovery_execution.py`](../../../tests/test_discovery_execution.py), [`test_discovery_serialization.py`](../../../tests/test_discovery_serialization.py), [`test_discovery_store.py`](../../../tests/test_discovery_store.py), [`test_discovery_reconciliation.py`](../../../tests/test_discovery_reconciliation.py), [`test_discovery_candidates.py`](../../../tests/test_discovery_candidates.py), [`test_discovery_expansion.py`](../../../tests/test_discovery_expansion.py), [`test_discovery_reporting.py`](../../../tests/test_discovery_reporting.py), [`test_discovery_freeze.py`](../../../tests/test_discovery_freeze.py), [`test_cli_discovery_reports.py`](../../../tests/test_cli_discovery_reports.py); E0/E1/E2 acceptance. Gate: `artifact_revision`/`discovery.freeze`. |
 | **D4** — bounded network retries/rate handling and project cost/work reporting | [`discovery/transport.py`](../../../src/review_article_agent/discovery/transport.py) (bounded retries, allowlist, size cap, per-instance pacing), [`discovery/reporting.py`](../../../src/review_article_agent/discovery/reporting.py) (cumulative work + known/estimated/unknown monetary view) | [`test_discovery_transport.py`](../../../tests/test_discovery_transport.py); `test_discovery_reporting.py`::`MonetaryTests`/`SourceReconstructionTests`/`MetadataImportProvenanceTests`; `test_cli_discovery_reports.py` |
 
 The **detached job surface** that drives D3 is [`worker/discovery.py`](../../../src/review_article_agent/worker/discovery.py)
@@ -61,42 +62,69 @@ The **detached job surface** that drives D3 is [`worker/discovery.py`](../../../
 [`test_discovery_job_routes.py`](../../../tests/test_discovery_job_routes.py),
 [`test_cli_discovery_jobs.py`](../../../tests/test_cli_discovery_jobs.py).
 
-## 4. Acceptance criteria — integrated, final acceptance pending
+## 4. Acceptance criteria — all PASSED (verified at `f3d97fe`)
 
-Each criterion is realised in integrated source/tests; the step-level
-**acceptance decision** (frozen-HEAD full run + E2 + PR) is what remains.
+Each criterion is realised in integrated source/tests and was exercised by the
+full combined run at `f3d97fe` (§5.2). A candidate grouping is a **review**
+grouping of publication identifiers, **never** a study-identity or
+study-independence claim; a model output is a **proposal**, never an authorization.
 
-| AC | Status | Integrated evidence |
+| AC | Status | Actual named tests / gates |
 | --- | --- | --- |
-| **1** Seed abstracts stay provisional; an unapproved seed cannot become accepted context | **Integrated** | `seed_context`/`require_approved_context` require the exact per-seed named gate; a seed's `abstract_context` stays `provisional` with or without approval (`test_discovery_context.py`::`SeedContextTest`; `test_step05_core_acceptance.py`::`SeedApprovalGateTest`). |
-| **2** Broad searches cannot run against an unapproved scope/query plan; a substantive change produces an approval request | **Integrated** | `execute_query` is pinned to the exact approved plan and fails closed (zero I/O) otherwise; plan amendments invalidate stale gates (`ExecuteQueryGateTest`; E0 `PlanAmendmentTest`; E1 `StaleApprovalTest`). |
-| **3** Reconstruct exact queries, timestamps, contributing sources, failures, counts, and dedup decisions from records | **Integrated** | Lossless codec + schema-11 observation store + reconciliation + report `SourceReconstructionTests` reconstruct exact observations and explicit dedup/conflict decisions from durable rows. |
-| **4** Fixtures cover pagination, overlap, missing IDs, partial failures, incremental reruns without duplicate candidates | **Integrated** | Adapter fixture suites (pagination/overlap/missing/partial) plus the cumulative ledger (`CumulativeDedupTests`; E0 `CumulativeCorpusTest`/`CorpusConflictTest`). |
-| **5** Known-relevant set + forward/backward expansion expose explicit coverage gaps; reporting never claims absolute completeness | **Integrated** | `test_discovery_reporting.py`::`KnownRelevantTests`/`CitationTests`; `test_discovery_expansion.py`; E1 `ExplicitGapsTest`/`NoForcedCompletenessTest`. |
-| **6** Human approval freezes a specific corpus revision; later imports/searches do not mutate it silently | **Integrated** | `FreezeAuthorityTests`/`CorpusFreezeImmutabilityTests`; E1 `IntegratedFreezeAuthorityTest`/`LaterWorkImmutabilityTest`/`SearchAgainTest`. |
-| **7** Live smoke small/documented/separate; no arbitrary cap truncation hidden as complete | **Integrated** | Adapters return explicit `page_limit`/`failure`, never `complete`, at any budget/window boundary (`test_discovery_pubmed.py`::`HardLimitTests`; `test_discovery_europepmc.py`::`BoundsTests`); the live observations/smoke are separately documented (§5.3) and are distinct from the deterministic fixtures. |
+| **1** Seed abstracts stay provisional; an unapproved seed cannot become accepted context | **PASSED** | `seed_context`/`require_approved_context` require the exact per-seed named gate; a seed's `abstract_context` stays `provisional` with or without approval (`test_discovery_context.py`::`SeedContextTest`; `test_step05_core_acceptance.py`::`SeedApprovalGateTest`; `test_step05_acceptance.py`::`InjectionCannotExpandAuthorityTest`). |
+| **2** Broad searches cannot run against an unapproved scope/query plan; a substantive change produces an approval request | **PASSED** | `execute_query` is pinned to the exact approved plan and fails closed (zero I/O) otherwise; plan amendments invalidate stale gates (`test_discovery_execution.py`::`ExecuteQueryGateTest`; E0 `PlanAmendmentTest`; E1 `StaleApprovalTest`; E2 `NegativeGateTest`). |
+| **3** Reconstruct exact queries, timestamps, contributing sources, failures, counts, and dedup decisions from records | **PASSED** | Lossless codec + schema-11 observation store + reconciliation + report `SourceReconstructionTests` reconstruct exact observations and explicit dedup/conflict decisions from durable rows (`test_discovery_serialization.py`; `test_discovery_store.py`; `test_discovery_reconciliation.py`; `test_discovery_reporting.py`::`SourceReconstructionTests`). |
+| **4** Fixtures cover pagination, overlap, missing IDs, partial failures, incremental reruns without duplicate candidates | **PASSED** | Adapter fixture suites (pagination/overlap/missing/partial) plus the cumulative ledger (`test_discovery_pubmed.py`; `test_discovery_europepmc.py`; `CumulativeDedupTests`; E0 `CumulativeCorpusTest`/`CorpusConflictTest`). |
+| **5** Known-relevant set + forward/backward expansion expose explicit coverage gaps; reporting never claims absolute completeness | **PASSED** | `test_discovery_reporting.py`::`KnownRelevantTests`/`CitationTests`; `test_discovery_expansion.py`; E1 `ExplicitGapsTest`/`NoForcedCompletenessTest`; E2 `NoForcedCompletenessTest`/`FullChainTest`. |
+| **6** Human approval freezes a specific corpus revision; later imports/searches do not mutate it silently | **PASSED** | `test_discovery_freeze.py`::`FreezeAuthorityTests`/`CorpusFreezeImmutabilityTests`; E1 `IntegratedFreezeAuthorityTest`/`LaterWorkImmutabilityTest`/`SearchAgainTest`; E2 `FullChainTest`/`LaterWorkTest`/`SearchAgainTest`/`NegativeGateTest`. |
+| **7** Live smoke small/documented/separate; no arbitrary cap truncation hidden as complete | **PASSED** | Adapters return explicit `page_limit`/`failure`, never `complete`, at any budget/window boundary (`test_discovery_pubmed.py`::`HardLimitTests`; `test_discovery_europepmc.py`::`BoundsTests`); the live smoke is separate from the deterministic fixtures and from the 3 `webfetch` contract observations (§5.3). |
+
+**Boundary facts kept explicit throughout:** a **source candidate/publication is
+not a study** (grouping is by exact identifier only); a **model proposal is not
+an authorization**; an **unknown integrity status is never clean** (an `include`
+review requires all four statuses known); and **no scientific/eligibility/
+extraction/full-review-writer claim** is made.
 
 ## 5. Verification
 
-### 5.1 Frozen checkpoint (last full combined run)
+### 5.1 Historical frozen checkpoint (superseded)
 
-The last **full frozen combined** run is at `VERIFIED_END_SHA=6ec58ea`
-(`6ec58ea2877ac9cc9edb86c7b60e98b2601c7ad2`), a **frozen checkpoint, not the
-current HEAD**, log `/tmp/opencode/step05-pre-final-checks.log`: Python
-**3.14.4**, **2,557 core tests in 295.874 s**, **20 scripts**, **79 Python
-retained spikes**, **51 live-Jev mock**, **7 integration mock**, **58
-TypeScript** — **2,772 tests total, no skips**; **29 contract-doc checks**;
+A **historical** frozen combined run (kept for provenance, superseded by §5.2) is
+at `VERIFIED_END_SHA=6ec58ea`
+(`6ec58ea2877ac9cc9edb86c7b60e98b2601c7ad2`), log
+`/tmp/opencode/step05-pre-final-checks.log`: Python **3.14.4**, **2,557 core
+tests in 295.874 s**, **20 scripts**, **79 Python retained spikes**, **51
+live-Jev mock**, **7 integration mock**, **58 TypeScript** — **2,772 tests, no
+skips**; **29 contract-doc checks**; `tsc --noEmit`, `compileall -q src tests`,
+`git diff --check` clean. It predates the E0/E1/E1B/E2 acceptance suites and the
+report/freeze CLI, so it is **historical, not the current claim**.
+
+### 5.2 Current final full combined run (at `f3d97fe`)
+
+The **current last full combined run** was executed at the exact source/test/docs
+head **`f3d97fe`** (`f3d97fe666dcee7c0ff78954c6a235068ace9392`; log
+`/tmp/opencode/step05-completion-checks.log`, read to verify —
+`VERIFIED_START_SHA=f3d97fe` … `VERIFIED_END_SHA=f3d97fe`, `ALL CHECKS PASSED`):
+Python **3.14.4**, **2,705 core tests in 331.015 s**, **20 scripts**, **79
+Python retained spikes**, **51 live-Jev mock**, **7 integration mock**, **58
+TypeScript** — **2,920 tests total, no skips**; **29 contract-doc checks**;
 `tsc --noEmit`, `compileall -q src tests`, `git diff --check` all clean.
 Pre-existing SQLite/subprocess/unclosed-file `ResourceWarning`s are disclosed,
-not failures. **Python 3.11 is declared (`requires-python >=3.11`) but
-untested.**
+not failures. The full suite includes the **34 integration-acceptance cases**:
+**E0 12 + E1 11 + E1B 3 + E2 8**. **Python 3.11 (`requires-python >=3.11`) and
+live lead-**model** validation remain unrun; no actual paid app call or upload was
+made.** This verified run is at `f3d97fe`, **before** this finalization docs
+update; the coordinator will run all checks against the exact final docs head once
+integrated, and the exact-head/check rollup is recorded in the PR.
 
-### 5.2 Commits after the checkpoint and the current base
+Commit map for the run and its layers:
 
-- **E0** core acceptance ([`test_step05_core_acceptance.py`](../../../tests/test_step05_core_acceptance.py)): `a6d21fb` (in the frozen run above).
-- **E1** integrated final acceptance: integrated `a7d1cd9` (library half) and
-  `752d359` (real-process half); source-equivalent `3eccfeb`/`f2a3ad2`. Adds
-  [`test_step05_acceptance.py`](../../../tests/test_step05_acceptance.py) — **9
+- **E0** core acceptance (12 cases,
+  [`test_step05_core_acceptance.py`](../../../tests/test_step05_core_acceptance.py)):
+  `a6d21fb` (present in the historical §5.1 run and the current §5.2 run).
+- **E1** integrated final acceptance (11 cases): integrated `a7d1cd9` (library
+  half) and `752d359` (real-process half); source-equivalent `3eccfeb`/`f2a3ad2`.
+  Adds [`test_step05_acceptance.py`](../../../tests/test_step05_acceptance.py) — **9
   library scenarios + 2 real owned-process scenarios** (real detached worker:
   detach/reconnect of an authorized metadata-import job with zero provider
   attempts; restart proves a standing accepted result on the same fence and a
@@ -104,19 +132,27 @@ untested.**
 - **DOC1** (`cb6e964`), **DOC2** (`3131031`): discovery/CLI/worker doc
   reconciliation.
 - **CLI1A** (`c325b22`): discovery background-job CLI. **CLI1B** (`9085241`,
-  fix `e15b5b4`): `discovery report`/`freeze` readbacks (§6).
-- **E1B** adversarial J1 admission/interruption seams: **integrated at `630545c`**
-  (source-equivalent `8939db5`). Adds `tests/test_step05_job_adversarial.py` (not
-  present in this checkout until `630545c` is integrated) with three cases:
-  `ExpansionInterruptionAdversarialTest` (stale corpus /
-  drained token stops further I/O mid-expansion),
-  `ReservedUnsentLeadBoundaryTest` (drained before POST never sends and retains
-  its reserve), and `RealProcessKillDuringPostTest` (kill during the first fake
-  POST before response never re-posts). The combined **E0 + E1 + E1B** suite
-  reported **26 tests passed** at `630545c`.
-- **The CLI1B integration at `e15b5b4`** has only a **selective 84-test** run
-  recorded by the coordinator, **not** a full-HEAD suite. A final frozen-HEAD
-  full-suite run is **pending** (§8), and E2 (full CLI chain) is still running.
+  fix `e15b5b4`): the `discovery report`/`freeze` readbacks (§6).
+- **E1B** adversarial J1 admission/interruption seams (3 cases): integrated
+  `630545c` (source-equivalent `8939db5`), now **present** in this checkout as
+  [`test_step05_job_adversarial.py`](../../../tests/test_step05_job_adversarial.py)
+  — `ExpansionInterruptionAdversarialTest` (stale corpus / drained token stops
+  further I/O mid-expansion), `ReservedUnsentLeadBoundaryTest` (drained before
+  POST never sends and retains its reserve), and `RealProcessKillDuringPostTest`
+  (a **real owned process** killed during the first fake POST before a response
+  never re-sends). The earlier E0+E1+E1B subset reported 26 tests at `630545c`.
+- **E2** CLI end-to-end discovery acceptance (8 cases): integrated `f3d97fe`
+  (source-equivalent `4e17b96`), present as
+  [`test_step05_cli_acceptance.py`](../../../tests/test_step05_cli_acceptance.py) —
+  the actual CLI/owner-IPC chain `query` job → `corpus ingest` → both-direction
+  real `expand` job → `report create --expansion-job-id` → `freeze propose` →
+  genuine human **owner-capability** gate → `freeze require` (exact count /
+  private `--content`); later work keeps the frozen roster; wrong/stale/rejected/
+  generic gates fail; `search_again` keeps history; no topic-completeness claim.
+  Classes: `FullChainTest`, `LaterWorkTest`, `SearchAgainTest`, `NegativeGateTest`,
+  `FakeInstructionAndPrivacyTest`, `NoForcedCompletenessTest`.
+- The **CLI1B integration at `e15b5b4`** had only a **selective 84-test** run at
+  the time; that gap is now closed by the full §5.2 run at `f3d97fe`.
 
 ### 5.3 Authorized live observations (separate from deterministic results)
 
@@ -139,9 +175,8 @@ worker's own deterministic usage is not an application-model smoke).
 
 ### 5.4 Not run / not claimed
 
-Python 3.11; any paid app/model call, upload, or live lead-model validation; the
-final frozen-HEAD full-suite run; the E2 full-CLI-chain case (§8). **No
-CI is configured**, so no CI-green claim is made and the PR checks must be
+Python 3.11; any paid app/model call or upload; live lead-**model** validation.
+**No CI is configured**, so no CI-green claim is made; the PR check rollup must be
 inspected at PR time.
 
 ## 6. Files, interfaces, migrations, compatibility
@@ -225,25 +260,26 @@ inspected at PR time.
 - **Open decisions:** complementary-source ratification per project; scientific
   candidate identity beyond exact-identifier grouping; date-partitioned paging.
 
-## 8. Next actions and commits (scoped; not done here)
+## 8. Remaining release actions and commits
 
-1. **E2** — full CLI-chain acceptance case (in progress; do not claim done).
-2. **Final frozen-HEAD full-suite run** on the frozen base, and **PR checks**
-   inspection (no CI is configured).
-3. **User review and merge**; the coordinator owns the PR and the README
-   checkbox (which **stays unchecked until 1–2 pass**).
-4. **Step 06** (full-text acquisition, imports, reconciliation) is **not
-   implemented**.
+The scoped Step 05 discovery workflow is **complete and verified** (§5.2). What
+remains is **release/delivery only**:
 
-The **E1B** adversarial cases are **integrated** (`630545c`, source `8939db5`;
-three cases in `tests/test_step05_job_adversarial.py`; combined E0+E1+E1B **26
-tests passed**) and are no longer pending; **E2** and the final frozen-HEAD run
-remain.
+1. **Final PR delivery** — open/land the PR and record the exact final-head check
+   rollup in it (the coordinator owns the PR and will run all checks against the
+   exact final docs head once integrated; no CI is configured, so no CI-green
+   claim).
+2. **User review and merge** — the user owns review/merge; merging is a release
+   action, not a criterion for the Step 05 checkbox.
+3. **Step 06** (full-text acquisition, imports, and reconciliation) is **not
+   implemented**. Live lead-**model** validation and Python 3.11 remain unrun.
 
-Evidence log paths: frozen checkpoint `/tmp/opencode/step05-pre-final-checks.log`;
-historical `/tmp/opencode/search-records-combined.log`,
+Evidence log paths: current full run
+`/tmp/opencode/step05-completion-checks.log` (`f3d97fe`); historical
+`/tmp/opencode/step05-pre-final-checks.log` (`6ec58ea`),
+`/tmp/opencode/search-records-combined.log`,
 `/tmp/opencode/step05-combined-all-checks.log`. Key commits: this docs base
-`ec9c32d`; CLI1B `9085241`/`e15b5b4`; E1B `630545c` (source `8939db5`); E1
-`a7d1cd9`/`752d359` (source `3eccfeb`/`f2a3ad2`);
-E0 `a6d21fb`; frozen checkpoint `6ec58ea`. No secrets, licensed full text, or
-raw provider payloads are included here.
+`00d1b24` (merge of `f3d97fe`); E2 `f3d97fe` (source `4e17b96`); E1B `630545c`
+(source `8939db5`); CLI1B `9085241`/`e15b5b4`; E1 `a7d1cd9`/`752d359` (source
+`3eccfeb`/`f2a3ad2`); E0 `a6d21fb`; historical checkpoint `6ec58ea`. No secrets,
+licensed full text, or raw provider payloads are included here.

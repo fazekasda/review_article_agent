@@ -1,7 +1,8 @@
 # Discovery core, metadata adapters, durable observations, and CLI (Step 05)
 
-**Status: core library and personal discovery CLI implemented; Step 05
-implementation integrated — final acceptance and PR pending.** This document
+**Status: complete for the scoped Step 05 discovery workflow** (core library +
+personal discovery CLI implemented and verified; final full combined check passed
+at head `f3d97fe`, 2,920 tests, no skips). This document
 describes the implemented
 [Step 05](implementation/05-discovery.md) layers: (1) a bounded, stdlib-only
 public-metadata transport and provider adapters; (2) a lossless versioned codec
@@ -12,10 +13,10 @@ candidate ledger, bounded bidirectional citation expansion, a deterministic
 coverage/work/monetary report, an exact human-approved freeze/search-again record,
 and a revision-scoped hosted lead-proposal runner; and (4) the **`discovery` CLI
 group** that submits/inspects these as detached background jobs. The
-criterion-by-criterion status and the remaining final-acceptance/PR work remain in
+criterion-by-criterion status and the final-head check rollup remain in
 the [Step 05 handoff](implementation/handoffs/05-discovery.md).
 
-**Current completion state.** The report/freeze **CLI** groups are now
+**Current completion state.** The report/freeze **CLI** groups are
 **integrated** (`discovery report create|show` and `discovery freeze
 propose|status|show|history|require`); this document documents both their library
 API and their CLI flags below. The `context`/`corpus`/`lead status|content`

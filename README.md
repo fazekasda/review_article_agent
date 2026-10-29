@@ -42,8 +42,9 @@ scientific feature, production model run, or **scientific validation is claimed*
 Step 04 is **complete as a restricted runtime**: its full local verification passed
 at `c1f927b` (**2,105 tests, no skips**; see the
 [Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)).
-Step 05 (reproducible discovery and corpus freeze) now has its **core library
-implemented plus a personal discovery CLI**: a bounded, stdlib-only public-metadata
+Step 05 (reproducible discovery and corpus freeze) is now **complete as a scoped
+discovery workflow**, with its **core library and personal discovery CLI**
+implemented and verified: a bounded, stdlib-only public-metadata
 transport and provider adapters; a lossless codec and schema-11 observation
 repository; a typed context read-and-gate layer; an approved-plan/seed/metadata
 import execution library; a durable cumulative candidate ledger; bounded
@@ -52,12 +53,15 @@ an exact human-approved freeze/search-again record; and a live-capable,
 separately-authorized direct lead-proposal runner (implemented but **unrun/not
 authorized** here; the existing app-owned OpenCode production block is unchanged).
 The `discovery` CLI group submits and inspects these as **detached background
-jobs**, including the integrated `report create|show` and `freeze
-propose|status|show|history|require` readbacks. Step 05 **implementation is
-integrated**; **final acceptance and PR are pending** (the E2 full-CLI-chain case,
-a final frozen-HEAD run, and the PR) — see the
+jobs**, including `report create|show` and `freeze
+propose|status|show|history|require`. The final full combined check passed at the
+exact source/test/docs head `f3d97fe` (**2,920 tests, no skips**; 29 contract
+checks; `tsc`/`compileall`/`diffcheck` clean) — see the
 [Step 05 handoff](docs/implementation/handoffs/05-discovery.md) and the
-[discovery API/limits](docs/discovery.md).
+[discovery API/limits](docs/discovery.md). This is **not** a review writer: no
+study identity, eligibility, extraction, topic/literature completeness, or
+review-writer capability is claimed; final PR delivery and user review/merge are
+release actions.
 
 ## Getting started (local core only)
 
@@ -169,7 +173,7 @@ criterion-by-criterion status is in the
 - [Step 02 handoff (complete, local foundation)](docs/implementation/handoffs/02-project-foundation.md)
 - [Step 03 handoff (complete, synthetic detached worker)](docs/implementation/handoffs/03-durable-worker.md)
 - [Step 04 handoff (complete, restricted runtime)](docs/implementation/handoffs/04-agent-runtime.md)
-- [Step 05 handoff (integrated — final acceptance/PR pending)](docs/implementation/handoffs/05-discovery.md)
+- [Step 05 handoff (complete — scoped discovery workflow)](docs/implementation/handoffs/05-discovery.md)
 - [Discovery core, adapters, codec, CLI, and limits (Step 05)](docs/discovery.md)
 - [Step 02 CLI contract](docs/cli.md)
 - [Step 02 storage contract](docs/storage.md)
@@ -194,15 +198,15 @@ execution and no scientific approval, step 03 is a synthetic detached worker wit
 model, provider, or scientific approval, and step 04 is a **restricted** runtime
 whose only model transport is a loopback fixture — no scientific autonomous
 workflow, production paid generation, hosted transfer, scientific feature, or
-scientific validation is implemented or claimed. Step 05 has its **core library
+scientific validation is implemented or claimed. Step 05 is **complete as a
+scoped discovery workflow** with its **core library
 and personal discovery CLI implemented** — a bounded public-metadata transport,
 provider adapters, a lossless schema-11 observation repository, a typed context
 read-and-gate layer, an approved-plan/seed/import execution library, a cumulative
 candidate ledger, bounded citation expansion, a coverage/work/monetary report, an
 exact human-approved freeze/search-again record, and a live-capable hosted
 lead-proposal runner, surfaced through the `discovery` CLI (see the
-[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); its
-**implementation is integrated** and **final acceptance and PR are pending** (the
-E2 full-CLI-chain case, a final frozen-HEAD run, and the PR — no CI is
-configured). No scientific feature, production paid
+[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); the final full
+combined check passed at the head `f3d97fe` (**2,920 tests, no skips**), and final
+PR delivery and user review/merge are release actions. No scientific feature, production paid
 generation, upload, or scientific validation is implemented or claimed.
