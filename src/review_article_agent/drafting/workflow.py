@@ -243,6 +243,7 @@ def _render_markdown(result):
         lines.append(f"## {section['order']}. {section['title']}")
         lines.append("")
         for paragraph in section["paragraphs"]:
+            rendered = []
             for sentence in paragraph["sentences"]:
                 line = sentence["text"]
                 keys = sentence.get("citation_keys") or []
@@ -252,8 +253,12 @@ def _render_markdown(result):
                 annotations.extend(sentence.get("warnings") or [])
                 if annotations:
                     line += " (" + "; ".join(annotations) + ")"
-                lines.append(line)
-                lines.append("")
+                rendered.append(line)
+            # One approved paragraph stays one Markdown paragraph: its sentences
+            # are joined with a single space, and a blank line separates only
+            # consecutive paragraphs (never two sentences of the same paragraph).
+            lines.append(" ".join(rendered))
+            lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
 

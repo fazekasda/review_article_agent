@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import copy
 import json
+import unittest
 
 import test_drafting_package as _drafting_package  # noqa: E402
 from test_drafting_workflow import (  # noqa: E402
@@ -61,6 +62,7 @@ from review_article_agent.drafting.workflow import (  # noqa: E402
     KINDS,
     DraftingWorkflowError,
     DraftingWorkflowRepository,
+    _render_markdown,
 )
 from review_article_agent.drafting.workspace import (  # noqa: E402
     PLANNER_ROLE,
@@ -872,6 +874,66 @@ class DraftOverRealRunnerTest(_drafting_package.DraftingOverRealRunnerTest):
         # The real verified receipt's per-passage source ref feeds the package.
         self.assertFalse(package["evidence"][0]["original_passage"]["source_ref_fallback"])
         self.assertEqual(package["evidence"][0]["citation_keys"], [citation_key(self.project_id, self.cands["111"])])
+
+
+class MarkdownRendererTests(unittest.TestCase):
+    """Pure renderer unit test: approved paragraph structure is preserved.
+
+    No store setup: ``_render_markdown`` is exercised directly.  Two sentences of
+    one approved paragraph must stay one Markdown paragraph (joined with a single
+    space), while a second paragraph is separated by a blank line; the provisional
+    header, the citation markers, and the derived attribution labels are retained.
+    """
+
+    def test_paragraph_breaks_preserved_with_citations_and_labels(self):
+        result = {
+            "sections": [
+                {
+                    "order": 1,
+                    "title": "Background",
+                    "paragraphs": [
+                        {
+                            "paragraph_id": "P1",
+                            "sentences": [
+                                {"text": "First sentence.", "citation_keys": ["cit_a"],
+                                 "labels": [], "warnings": []},
+                                {"text": "Second sentence.", "citation_keys": ["cit_b"],
+                                 "labels": ["secondary account"], "warnings": []},
+                            ],
+                        },
+                        {
+                            "paragraph_id": "P2",
+                            "sentences": [
+                                {"text": "Third sentence.", "citation_keys": [],
+                                 "labels": ["author proposal"],
+                                 "warnings": ["author_proposal"]},
+                            ],
+                        },
+                    ],
+                }
+            ]
+        }
+        markdown = _render_markdown(result)
+
+        # Provisional marker and section heading are retained.
+        self.assertIn("# PROVISIONAL MANUSCRIPT ASSEMBLY", markdown)
+        self.assertIn("source checks", markdown.lower())
+        self.assertIn("origin tracing", markdown.lower())
+        self.assertIn("## 1. Background", markdown)
+
+        blocks = markdown.rstrip("\n").split("\n\n")
+        p1 = "First sentence. [cit_a] Second sentence. [cit_b] (secondary account)"
+        p2 = "Third sentence. (author proposal; author_proposal)"
+        # The two sentences of P1 stay in ONE paragraph block (no blank line).
+        self.assertIn(p1, blocks)
+        self.assertNotIn("\n", p1)
+        # The second paragraph is a separate block.
+        self.assertIn(p2, blocks)
+        # Neither sentence was split into its own paragraph.
+        self.assertNotIn("First sentence. [cit_a]", blocks)
+        self.assertNotIn("Second sentence. [cit_b] (secondary account)", blocks)
+        # Blocks are ordered P1 then P2.
+        self.assertLess(blocks.index(p1), blocks.index(p2))
 
 
 if __name__ == "__main__":
