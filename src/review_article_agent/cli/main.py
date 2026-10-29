@@ -142,6 +142,11 @@ from .parsing import (
     dispatch_parsing,
 )
 from .screening import build_screening_parser, dispatch_screening
+from .extraction import (
+    ExtractionControlError,
+    build_extraction_parser,
+    dispatch_extraction,
+)
 
 PROG = "review-article-agent"
 
@@ -287,6 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_acquisition_parser(sub)
     build_parsing_parser(sub)
     build_screening_parser(sub)
+    build_extraction_parser(sub)
 
     return parser
 
@@ -1026,6 +1032,13 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
         return result
     if args.command == "screening":
         return dispatch_screening(args, ctx)
+    if args.command == "extraction":
+        result = dispatch_extraction(args, ctx)
+        if result is None:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(
+                f"unknown extraction command {args.extraction_command!r}"
+            )
+        return result
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -1106,6 +1119,17 @@ _DISCOVERY_CATEGORY_EXITS = {
 #: ``parsing`` raises :class:`ParsingControlError` with a curated, value-free
 #: message; a validation failure records no report revision.
 _PARSING_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+
+
+#: Extraction workflow proposal/read/synthesis error categories mapped to the
+#: CLI's stable exit codes. ``extraction`` raises :class:`ExtractionControlError`
+#: with a curated, value-free message; a failure records no revision and
+#: authorizes nothing.
+_EXTRACTION_CATEGORY_EXITS = {
     "validation": EXIT_VALIDATION,
     "conflict": EXIT_CONFLICT,
     "storage": EXIT_STORAGE,
@@ -1195,6 +1219,8 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
         return exc.category, _DISCOVERY_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, ParsingControlError):
         return exc.category, _PARSING_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, ExtractionControlError):
+        return exc.category, _EXTRACTION_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1239,6 +1265,9 @@ def _error_message(exc: BaseException, category: str) -> str:
         return str(exc)
     if isinstance(exc, ParsingControlError):
         # Authored in ``cli.parsing``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, ExtractionControlError):
+        # Authored in ``cli.extraction``; a static, curated, value-free message.
         return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):
