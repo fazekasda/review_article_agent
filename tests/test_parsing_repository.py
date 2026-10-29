@@ -259,6 +259,15 @@ class RestartAndStalenessTests(ParsingRepositoryTestBase):
             passage = next(p for p in historical["payload"]["passages"] if p["passage_id"] == "p0002")
             self.assertIn("Treatment improved", passage["text"])
 
+            # a later append (rev-rep2) is itself readable as the current head:
+            # the parent append is persisted and resolvable, not just the old one
+            latest = pr.read_report(
+                {"project_id": pid, "artifact_id": "art-rep", "revision_id": "rev-rep2"}
+            )
+            self.assertEqual(latest["source_ref"]["revision_id"], "rev-src")
+            self.assertTrue(latest["verifiable"])
+            self.assertEqual(repo.current_revision("art-rep").revision_id, "rev-rep2")
+
 
 class TamperTests(ParsingRepositoryTestBase):
     def test_parser_version_and_text_tamper(self):
@@ -298,11 +307,21 @@ class TamperTests(ParsingRepositoryTestBase):
             )
             record = pr.read_report(bad_parser_ref)
             self.assertTrue(record["parser_version_changed"])
+            self.assertFalse(record["verifiable"])
             loc = dict(make_locator(bumped, "p0002"))
             loc["report_ref"] = dict(bad_parser_ref)
             loc["source_ref"] = dict(src_ref)
             resolved = pr.resolve_passage(loc)
-            self.assertEqual(resolved["status"], "resolved")
+            # an unknown parser/normalization version this build cannot reproduce
+            # is explicitly UNVERIFIED, never asserted as a resolved source/text
+            # match unsupported by reproducibility...
+            self.assertEqual(resolved["status"], "unverified")
+            self.assertFalse(resolved["historical_resolved"])
+            self.assertFalse(resolved["verifiable"])
+            self.assertIn("parser_version_unverified", resolved["reasons"])
+            # ...while its metadata and current diff stay exposed.
+            self.assertEqual(resolved["parser_version"], "step07-jats-tei/0")
+            self.assertEqual(resolved["source_ref"], src_ref)
             self.assertIn("parser_version_changed", resolved["current"]["reasons"])
 
 
@@ -354,6 +373,38 @@ class SourceFailureTests(ParsingRepositoryTestBase):
                 src_ref, report_artifact_id="art-r5", report_revision_id="rev-r5",
                 rights=_rights(pid, "art-r5", "rev-r5"),
             )
+            # the rights re-check runs inside the write transaction, so a blocked
+            # source leaves no report artifact behind
+            self.assertIsNone(repo.get_artifact("art-r5"))
+
+
+class AtomicWriteTests(ParsingRepositoryTestBase):
+    def test_invalid_report_rights_rolls_back_artifact_and_revision(self):
+        with self.new_store() as store:
+            pid = store.project_id
+            src_ref, repo = self.add_document(store, "art-src", JATS_BYTES, "rev-src")
+            pr = ParsingRepository(store)
+
+            # (a) report rights that deny privacy cannot authorize storage
+            denied = _rights(
+                pid, "art-rep", "rev-rep",
+                privacy={"personal_data": False, "confidentiality": "public", "denial": True},
+            )
+            self.assert_code(
+                "report_payload_invalid", pr.parse_stored_document, src_ref,
+                report_artifact_id="art-rep", report_revision_id="rev-rep", rights=denied,
+            )
+            self.assertIsNone(repo.get_artifact("art-rep"))
+            self.assertEqual(repo.list_revisions("art-rep"), [])
+
+            # (b) report rights whose subject binds a different revision
+            mismatched = _rights(pid, "art-rep2", "rev-other")
+            self.assert_code(
+                "report_payload_invalid", pr.parse_stored_document, src_ref,
+                report_artifact_id="art-rep2", report_revision_id="rev-rep2", rights=mismatched,
+            )
+            self.assertIsNone(repo.get_artifact("art-rep2"))
+            self.assertEqual(repo.list_revisions("art-rep2"), [])
 
 
 class InvalidGenericReportTests(ParsingRepositoryTestBase):

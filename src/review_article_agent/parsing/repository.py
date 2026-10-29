@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
+from contextlib import contextmanager
 
 from ..domain.errors import ReviewAgentError
 from ..domain.records import (
@@ -101,6 +103,45 @@ def _current_versions(fmt: str) -> tuple[str, str]:
     return PARSER_VERSION, NORMALIZATION_VERSION
 
 
+class _NestedStore:
+    """Adapt a store so ``ArtifactRepository`` writes nest as SAVEPOINTs.
+
+    The caller owns one outer ``ProjectStore.transaction`` (``BEGIN IMMEDIATE``);
+    each inner repository write becomes a savepoint, so a report artifact and its
+    revision are committed together or not at all.  ``ProjectStore.transaction``
+    itself cannot nest, hence this adapter.
+    """
+
+    def __init__(self, store) -> None:
+        self._store = store
+
+    @property
+    def project_id(self) -> str:
+        return self._store.project_id
+
+    @property
+    def connection(self):
+        return self._store.connection
+
+    @contextmanager
+    def transaction(self):
+        conn = self._store.connection
+        if not conn.in_transaction:
+            with self._store.transaction():
+                yield conn
+            return
+        name = "sp_" + uuid.uuid4().hex
+        conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+            raise
+        else:
+            conn.execute(f"RELEASE {name}")
+
+
 class ParsingRepository:
     """Parse stored documents into durable report revisions, and read them back.
 
@@ -120,7 +161,7 @@ class ParsingRepository:
 
     def __init__(self, store) -> None:
         self._store = store
-        self._repo = ArtifactRepository(store)
+        self._repo = ArtifactRepository(_NestedStore(store))
 
     @property
     def project_id(self) -> str:
@@ -153,8 +194,9 @@ class ParsingRepository:
         if report_artifact_id == src["artifact_id"]:
             raise _err("report_overwrites_source")
 
+        # Parse outside the write transaction: the source bytes are immutable and
+        # pure parsing must not hold the database lock.
         source_bytes, revision = self._load_document_source(src)
-        self._assert_source_allows_derivative(revision)
         chosen = self._choose_format(format, source_bytes, revision)
         if chosen == "pdf":
             result = parse_pdf(source_bytes, inspector=inspector)
@@ -165,19 +207,27 @@ class ParsingRepository:
         envelope = {"schema_version": SCHEMA_VERSION, "document_type": REPORT_DOCUMENT_TYPE, "payload": result}
         deps = [DependencyRef(src["project_id"], src["artifact_id"], src["revision_id"], "derived_from")]
         try:
-            self._repo.create_artifact(report_artifact_id, kind="report", created_by="agent")
-            stored = self._repo.import_revision(
-                artifact_id=report_artifact_id,
-                revision_id=report_revision_id,
-                content=envelope,
-                origin_locator=f"parsing:{src['artifact_id']}/{src['revision_id']}",
-                rights=rights,
-                dependencies=deps,
-                acquired_by="agent",
-                parent_revision_id=parent_revision_id,
-            )
+            # One outer BEGIN IMMEDIATE transaction: re-check the exact source's
+            # LATEST rights (serialized, so they cannot be revoked between the
+            # check and the write) and create the report artifact + revision
+            # together.  A failure rolls back to no new artifact or revision.
+            with self._store.transaction():
+                self._assert_source_allows_derivative(src)
+                self._repo.create_artifact(report_artifact_id, kind="report", created_by="agent")
+                stored = self._repo.import_revision(
+                    artifact_id=report_artifact_id,
+                    revision_id=report_revision_id,
+                    content=envelope,
+                    origin_locator=f"parsing:{src['artifact_id']}/{src['revision_id']}",
+                    rights=rights,
+                    dependencies=deps,
+                    acquired_by="agent",
+                    parent_revision_id=parent_revision_id,
+                )
         except ArtifactConflictError as exc:
             raise _err("report_overwrites_source") from exc
+        except ParsingRepositoryError:
+            raise
         except (RecordValidationError, ReviewAgentError) as exc:
             raise _err("report_payload_invalid") from exc
 
@@ -249,15 +299,28 @@ class ParsingRepository:
             differences.append("parser_version_changed")
         if record["normalization_version"] != current_norm:
             differences.append("normalization_version_changed")
+
+        # A report produced by a parser/normalization version this build cannot
+        # reproduce cannot be asserted as a resolved source/text match; it is
+        # explicitly unverified while its metadata and current diff stay visible.
+        verifiable = record["verifiable"]
+        status = base["status"] if verifiable else "unverified"
+        reasons = list(base["reasons"])
+        if not verifiable:
+            reasons.append("parser_version_unverified")
         return {
             "passage_id": base["passage_id"],
-            "status": base["status"],
-            "reasons": base["reasons"],
-            "locator_ok": base["locator_ok"],
+            "status": status,
+            "reasons": reasons,
+            "locator_ok": base["locator_ok"] and verifiable,
+            "verifiable": verifiable,
             "citation_check": base["citation_check"],
             "report_ref": dict(record["report_ref"]),
             "source_ref": dict(record["source_ref"]),
-            "historical_resolved": base["status"] == "resolved",
+            "parser_version": record["parser_version"],
+            "normalization_version": record["normalization_version"],
+            "format": record["format"],
+            "historical_resolved": status == "resolved",
             "current": {
                 "source_head": source_head,
                 "report_head": report_head,
@@ -292,14 +355,20 @@ class ParsingRepository:
             raise _err("source_content_hash_mismatch")
         return data, revision
 
-    def _assert_source_allows_derivative(self, revision) -> None:
+    def _assert_source_allows_derivative(self, src: dict) -> None:
         """Require the source's *latest* rights to still permit derivatives.
 
-        Follows the existing latest-rights convention: fail closed if the exact
-        source revision is not bound by the newest record for its ``rights_id``,
-        or if privacy denial is set, or if storage is not ``allowed``.  No
+        Run **inside** the write transaction (after ``BEGIN IMMEDIATE``), so the
+        latest-rights decision is serialized against any concurrent rights change
+        and cannot be revoked between this check and the report write.  Follows
+        the existing latest-rights convention: fail closed if the exact source
+        revision is not bound by the newest record for its ``rights_id``, or if
+        privacy denial is set, or if storage is not ``allowed``.  No
         hosted-transfer/network approval is required or granted.
         """
+        revision = self._repo.get_revision(src["artifact_id"], src["revision_id"])
+        if revision is None:
+            raise _err("source_not_found")
         rights_id = revision.rights_ref.rights_id
         row = self._store.connection.execute(
             "SELECT MAX(record_revision) AS newest FROM rights_record WHERE project_id = ? AND rights_id = ?",
@@ -309,7 +378,7 @@ class ParsingRepository:
             raise _err("source_rights_blocked")
         record = self._repo.get_rights_record(RightsRef(self.project_id, rights_id, row["newest"]))
         exact = {"kind": "source_revision", "project_id": self.project_id,
-                 "artifact_id": revision.artifact_id, "revision_id": revision.revision_id}
+                 "artifact_id": src["artifact_id"], "revision_id": src["revision_id"]}
         try:
             validated = validate_rights_record(record, self.project_id, subject=exact)
         except RecordValidationError as exc:
@@ -347,13 +416,13 @@ class ParsingRepository:
             raise _err("report_source_hash_mismatch")
         fmt = payload["format"]
         current_parser, current_norm = _current_versions(fmt)
-        if (
+        reproducible = (
             fmt != "pdf"
             and payload["parser_version"] == PARSER_VERSION
             and payload["normalization_version"] == NORMALIZATION_VERSION
-        ):
-            if parse_document(source_bytes, source_digest=payload["source"]["sha256"]) != payload:
-                raise _err("report_payload_mismatch")
+        )
+        if reproducible and parse_document(source_bytes, source_digest=payload["source"]["sha256"]) != payload:
+            raise _err("report_payload_mismatch")
         return {
             "project_id": self.project_id,
             "report_ref": dict(ref),
@@ -366,6 +435,7 @@ class ParsingRepository:
             "status": payload["status"],
             "human_action_required": payload["human_action_required"],
             "excludes_candidate": payload["excludes_candidate"],
+            "verifiable": reproducible,
             "parser_version_changed": payload["parser_version"] != current_parser,
             "normalization_version_changed": payload["normalization_version"] != current_norm,
             "payload": payload,
