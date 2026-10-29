@@ -136,6 +136,11 @@ from .discovery import (
     build_discovery_parser,
     dispatch_discovery,
 )
+from .parsing import (
+    ParsingControlError,
+    build_parsing_parser,
+    dispatch_parsing,
+)
 
 PROG = "review-article-agent"
 
@@ -279,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_gates_parser(sub)
     build_discovery_parser(sub)
     build_acquisition_parser(sub)
+    build_parsing_parser(sub)
 
     return parser
 
@@ -1009,6 +1015,13 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
                 f"unknown acquisition command {args.acquisition_command!r}"
             )
         return result
+    if args.command == "parsing":
+        result = dispatch_parsing(args, ctx)
+        if result is None:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(
+                f"unknown parsing command {args.parsing_command!r}"
+            )
+        return result
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -1079,6 +1092,16 @@ _GATE_CATEGORY_EXITS = {
 #: stable exit codes. ``discovery`` raises :class:`DiscoveryControlError` with a
 #: curated, value-free message; a validation failure records no revision.
 _DISCOVERY_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+
+
+#: Parsing report/locator error categories mapped to the CLI's stable exit codes.
+#: ``parsing`` raises :class:`ParsingControlError` with a curated, value-free
+#: message; a validation failure records no report revision.
+_PARSING_CATEGORY_EXITS = {
     "validation": EXIT_VALIDATION,
     "conflict": EXIT_CONFLICT,
     "storage": EXIT_STORAGE,
@@ -1166,6 +1189,8 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
         return exc.category, _DISCOVERY_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, AcquisitionControlError):
         return exc.category, _DISCOVERY_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, ParsingControlError):
+        return exc.category, _PARSING_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1207,6 +1232,9 @@ def _error_message(exc: BaseException, category: str) -> str:
         return str(exc)
     if isinstance(exc, AcquisitionControlError):
         # Authored in ``cli.acquisition``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, ParsingControlError):
+        # Authored in ``cli.parsing``; a static, curated, value-free message.
         return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):
