@@ -49,20 +49,30 @@ What this module **is not**
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from ..discovery.candidates import CandidateRepository
+from ..discovery.context import (
+    PLAN_GATE_ID,
+    PROTOCOL_GATE_KIND,
+    require_approved_context,
+)
 from ..discovery.execution import (
     MAX_IMPORT_RECORDS,
     MAX_ORIGIN_LOCATOR_CHARS,
     PLAN_QUERY_SOURCES,
     SEED_MAX_PAGES,
     SEED_MAX_RECORDS,
+    DiscoveryExecutionError,
     DiscoveryExecutor,
     query_fingerprint,
 )
-from ..discovery.records import MetadataRecord
+from ..discovery.expansion import CitationNode, ExpansionLimits, expand_citations
+from ..discovery.records import SOURCE_EUROPEPMC, MetadataRecord
 from ..discovery.transport import DiscoveryRequestInterrupted
 from ..domain.errors import ReviewAgentError
 from ..domain.records import (
@@ -76,18 +86,28 @@ __all__ = [
     "MODE_QUERY",
     "MODE_SEED",
     "MODE_METADATA_IMPORT",
+    "MODE_EXPAND",
+    "MODE_LEAD",
     "DISCOVERY_MODES",
     "TASK_KIND_QUERY",
     "TASK_KIND_SEED",
     "TASK_KIND_IMPORT",
+    "TASK_KIND_EXPAND",
+    "TASK_KIND_LEAD",
     "DISCOVERY_TASK_KINDS",
     "MODE_PARAMETER_KEYS",
+    "LEAD_CREDENTIAL_ENV",
+    "RESULT_KIND_OBSERVATION",
+    "RESULT_KIND_EXPANSION",
+    "RESULT_KIND_LEAD",
     "MAX_DISCOVERY_PARAMETERS_BYTES",
+    "MAX_EXPAND_ROOTS",
     "PREDISPATCH_PHASE",
     "DiscoveryJobError",
     "DiscoveryJobValidationError",
     "DiscoveryJobStopped",
     "AttemptCounter",
+    "ReplayedOutcome",
     "guard_transport",
     "mode_for_task_kind",
     "task_kind_for_mode",
@@ -95,34 +115,55 @@ __all__ = [
     "predispatch_checkpoint",
     "is_predispatch_checkpoint",
     "observation_metadata",
+    "accepted_result",
+    "status_projection",
+    "result_kind_for_mode",
+    "lead_outcome_accepted",
     "validate_submission",
     "dispatch",
+    "dispatch_expand",
+    "dispatch_lead",
     "replay_only",
+    "persisted_expansion_report",
 ]
 
 # --------------------------------------------------------------------------- #
 # Protocol vocabulary
 # --------------------------------------------------------------------------- #
-#: The three supported operation modes (one durable job task kind each).
+#: The five supported operation modes (one durable job task kind each).
 MODE_QUERY = "query"
 MODE_SEED = "seed"
 MODE_METADATA_IMPORT = "metadata_import"
+MODE_EXPAND = "expand"
+MODE_LEAD = "lead"
 
 #: Every accepted discovery mode.
-DISCOVERY_MODES = (MODE_QUERY, MODE_SEED, MODE_METADATA_IMPORT)
+DISCOVERY_MODES = (MODE_QUERY, MODE_SEED, MODE_METADATA_IMPORT, MODE_EXPAND, MODE_LEAD)
 
 #: Durable job task kinds (the existing ``JobRepository`` accepts these strings).
 TASK_KIND_QUERY = "discovery_query"
 TASK_KIND_SEED = "discovery_seed"
 TASK_KIND_IMPORT = "discovery_import"
+TASK_KIND_EXPAND = "discovery_expand"
+TASK_KIND_LEAD = "discovery_lead"
 
 #: Every discovery job task kind.
-DISCOVERY_TASK_KINDS = frozenset({TASK_KIND_QUERY, TASK_KIND_SEED, TASK_KIND_IMPORT})
+DISCOVERY_TASK_KINDS = frozenset(
+    {
+        TASK_KIND_QUERY,
+        TASK_KIND_SEED,
+        TASK_KIND_IMPORT,
+        TASK_KIND_EXPAND,
+        TASK_KIND_LEAD,
+    }
+)
 
 _MODE_BY_TASK_KIND = {
     TASK_KIND_QUERY: MODE_QUERY,
     TASK_KIND_SEED: MODE_SEED,
     TASK_KIND_IMPORT: MODE_METADATA_IMPORT,
+    TASK_KIND_EXPAND: MODE_EXPAND,
+    TASK_KIND_LEAD: MODE_LEAD,
 }
 _TASK_KIND_BY_MODE = {mode: kind for kind, mode in _MODE_BY_TASK_KIND.items()}
 
@@ -133,7 +174,20 @@ MODE_PARAMETER_KEYS: dict[str, frozenset[str]] = {
     MODE_METADATA_IMPORT: frozenset(
         {"plan_ref", "source", "records", "origin_locator", "observed_at"}
     ),
+    MODE_EXPAND: frozenset({"plan_ref", "corpus_ref", "roots"}),
+    MODE_LEAD: frozenset({"batch_ref", "credential_env"}),
 }
+
+#: The one, fixed environment-variable name a hosted-lead job may name.
+LEAD_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
+
+#: Safe job-accepted-result kinds, one per result family.
+RESULT_KIND_OBSERVATION = "discovery_observation"
+RESULT_KIND_EXPANSION = "discovery_expansion"
+RESULT_KIND_LEAD = "discovery_lead"
+
+#: Technical bound on the number of explicit expansion roots.
+MAX_EXPAND_ROOTS = 10_000
 
 #: Hard bound on the persisted (canonical) parameters, matching the IPC request
 #: cap so a metadata payload can never exceed what the control socket accepts.
@@ -170,9 +224,22 @@ _M_BAD_RECORDS = "records are not strict MetadataRecord data for this source"
 _M_BAD_RECORD_BOUND = "the metadata import exceeds the permitted record bound"
 _M_BAD_TIME = "observed_at must be an RFC 3339 UTC instant"
 _M_BAD_LOCATOR = "origin_locator must be a bounded non-empty opaque locator"
+_M_BAD_CORPUS_REF = "corpus_ref must be an exact same-project revision reference"
+_M_BAD_ROOTS = "roots must be observed, distinct expandable native publication identities"
+_M_BAD_CREDENTIAL_ENV = "credential_env must name the one approved environment variable"
+_M_MISSING_CREDENTIAL = "the named hosted-lead credential is not available to the worker"
+_M_BAD_BATCH_REF = "batch_ref must be an exact same-project revision reference"
 _M_TOO_LARGE = "the discovery parameters exceed the control-transport byte bound"
 _M_BAD_TRANSPORT = "the low-level discovery transport must be callable"
 _M_INTERRUPTED = "the discovery job was stopped before the next provider request"
+_M_BLOCKED_PLAN = (
+    "the exact approved discovery plan is not current and approved; expansion blocked"
+)
+_M_BLOCKED_CORPUS = (
+    "the requested corpus snapshot is not the current, intact corpus; expansion blocked"
+)
+_M_UNOBSERVED_ROOT = "an expansion root is not an observed identity of the current corpus"
+_M_BAD_LIMITS = "the approved plan's expansion limits are not usable"
 
 
 # --------------------------------------------------------------------------- #
@@ -407,8 +474,12 @@ def validate_submission(
         }
     elif mode == MODE_SEED:
         canonical = _validate_seed(params)
-    else:
+    elif mode == MODE_METADATA_IMPORT:
         canonical = _validate_import(params, project_id)
+    elif mode == MODE_EXPAND:
+        canonical = _validate_expand(params, project_id)
+    else:
+        canonical = _validate_lead(params, project_id)
 
     _check_parameter_size(canonical)
     return canonical
@@ -457,6 +528,66 @@ def _validate_import(params: dict[str, Any], project_id: str) -> dict[str, Any]:
         "records": _validate_records(params["records"], source),
         "origin_locator": _validate_locator(params["origin_locator"]),
         "observed_at": _validate_utc_instant(params["observed_at"]),
+    }
+
+
+def _validate_root_item(item: object) -> tuple[str, str]:
+    if not isinstance(item, dict) or set(item) != {"source", "id"}:
+        raise _bad_value(_M_BAD_ROOTS)
+    source = item["source"]
+    native_id = item["id"]
+    if not isinstance(source, str) or not isinstance(native_id, str):
+        raise _bad_type(_M_BAD_ROOTS)
+    if _has_surrogate(source) or _has_surrogate(native_id):
+        raise _bad_value(_M_BAD_ROOTS)
+    try:
+        node = CitationNode(source, native_id)
+    except Exception:  # noqa: BLE001 - an unsafe identity is an explicit refusal
+        raise _bad_value(_M_BAD_ROOTS) from None
+    return node.source, node.id
+
+
+def _validate_roots(value: object) -> list[dict[str, str]]:
+    """Validate the roots as safe, distinct native publication identities.
+
+    Only the *shape* and the native-identity safety are enforced here; whether a
+    root is an **observed** candidate of the current corpus is a store-bound check
+    performed at dispatch time (still before any provider request). A duplicate
+    root is collapsed (order-preserving) rather than refused.
+    """
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, (list, tuple)):
+        raise _bad_type(_M_BAD_ROOTS)
+    if not value:
+        raise _bad_value(_M_BAD_ROOTS)
+    if len(value) > MAX_EXPAND_ROOTS:
+        raise _bad_value(_M_BAD_ROOTS)
+    roots: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in value:
+        source, native_id = _validate_root_item(item)
+        key = (source, native_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append({"source": source, "id": native_id})
+    return roots
+
+
+def _validate_expand(params: dict[str, Any], project_id: str) -> dict[str, Any]:
+    return {
+        "plan_ref": _validate_plan_ref(params["plan_ref"], project_id),
+        "corpus_ref": _validate_plan_ref(params["corpus_ref"], project_id),
+        "roots": _validate_roots(params["roots"]),
+    }
+
+
+def _validate_lead(params: dict[str, Any], project_id: str) -> dict[str, Any]:
+    credential_env = params["credential_env"]
+    if credential_env != LEAD_CREDENTIAL_ENV:
+        raise _bad_value(_M_BAD_CREDENTIAL_ENV)
+    return {
+        "batch_ref": _validate_plan_ref(params["batch_ref"], project_id),
+        "credential_env": LEAD_CREDENTIAL_ENV,
     }
 
 
@@ -516,10 +647,366 @@ def observation_metadata(job: Any, record: Any) -> dict[str, Any]:
     return meta
 
 
+def result_kind_for_mode(mode: str | None) -> str:
+    """The accepted-result kind of one discovery mode."""
+    if mode == MODE_EXPAND:
+        return RESULT_KIND_EXPANSION
+    if mode == MODE_LEAD:
+        return RESULT_KIND_LEAD
+    return RESULT_KIND_OBSERVATION
+
+
+def accepted_result(job: Any, raw: Any) -> tuple[str, Any]:
+    """Project a dispatch outcome into ``(result_kind, safe_result)``.
+
+    A query/seed/import observation is reduced to value-free metadata; an
+    expansion report is stored as its **full** canonical mapping (bounded by the
+    report itself and read back explicitly by a later coverage reader); a hosted
+    lead outcome is stored as its safe status/dispatch mapping (never the API key
+    or the proposal text). Nothing here fabricates a scientific result.
+    """
+    mode = mode_for_task_kind(job.task_kind)
+    if mode == MODE_EXPAND:
+        return RESULT_KIND_EXPANSION, raw.to_mapping()
+    if mode == MODE_LEAD:
+        return RESULT_KIND_LEAD, dict(raw)
+    return RESULT_KIND_OBSERVATION, observation_metadata(job, raw)
+
+
+def _expansion_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """A bounded status projection of a saved expansion report (never the graph)."""
+    stops = result.get("stops")
+    reasons: list[str] = []
+    if isinstance(stops, list):
+        for stop in stops:
+            if isinstance(stop, dict) and isinstance(stop.get("reason"), str):
+                if stop["reason"] not in reasons:
+                    reasons.append(stop["reason"])
+    return {
+        "kind": RESULT_KIND_EXPANSION,
+        "mode": MODE_EXPAND,
+        "project_id": result.get("project_id"),
+        "request_id": result.get("request_id"),
+        "operation_fingerprint": (result.get("operation") or {}).get("fingerprint"),
+        "roots_count": len(result.get("roots") or []),
+        "limits": result.get("limits"),
+        "counts": result.get("counts"),
+        "guarantees": result.get("guarantees"),
+        "stop_reasons": reasons,
+        "report_sha256": hashlib.sha256(canonical_json(result)).hexdigest(),
+    }
+
+
+def _lead_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """A safe status/usage/cost projection of a saved hosted-lead outcome."""
+    return {
+        "kind": RESULT_KIND_LEAD,
+        "mode": MODE_LEAD,
+        "request_id": result.get("request_id"),
+        "status": result.get("status"),
+        "outcome": result.get("outcome"),
+        "dispatch_id": result.get("dispatch_id"),
+        "dispatch_state": result.get("dispatch_state"),
+        "task_id": result.get("task_id"),
+        "cost_state": result.get("cost_state"),
+        "cost_amount_usd": result.get("cost_amount_usd"),
+        "reserve_usd": result.get("reserve_usd"),
+        "actual_model": result.get("actual_model"),
+        "provider": result.get("provider"),
+        "response_id": result.get("response_id"),
+        "usage": result.get("usage"),
+        "http_status": result.get("http_status"),
+        "no_automatic_retry": result.get("no_automatic_retry"),
+    }
+
+
+def status_projection(result_kind: str, result: Any) -> Any:
+    """Bound a saved accepted result for ``job_status``/``job_list`` output.
+
+    A saved expansion graph may be very large, so status never dumps it: it shows
+    the mode, counts, stop reasons, limits and a report digest, while the **full**
+    mapping stays in ``JobRepository`` for an explicit later read. A hosted lead
+    outcome is reduced to safe status/usage/cost (no API key, no proposal text);
+    every other kind is returned as-is.
+    """
+    if not isinstance(result, dict):
+        return result
+    if result_kind == RESULT_KIND_EXPANSION:
+        return _expansion_summary(result)
+    if result_kind == RESULT_KIND_LEAD:
+        return _lead_summary(result)
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Expansion scope revalidation (store-bound; before any provider request)
+# --------------------------------------------------------------------------- #
+def _approved_expansion_plan(store: Any, plan_ref: object) -> dict[str, Any]:
+    """Read the exact approved current plan, or raise a fail-closed block."""
+    try:
+        return require_approved_context(
+            store,
+            plan_ref,
+            gate_kind=PROTOCOL_GATE_KIND,
+            gate_id=PLAN_GATE_ID,
+            expected_type="discovery_plan",
+        )
+    except Exception as exc:  # noqa: BLE001 - any refusal is a fail-closed block
+        raise DiscoveryExecutionError(_M_BLOCKED_PLAN) from exc
+
+
+def _current_corpus(store: Any, corpus_ref: object) -> dict[str, Any]:
+    """Read the exact current, intact, validated corpus snapshot, or raise."""
+    repo = CandidateRepository(store)
+    try:
+        snapshot = repo.get(corpus_ref)
+        current = repo.current(snapshot["artifact_id"])
+    except Exception as exc:  # noqa: BLE001 - a bad/stale corpus fails closed
+        raise DiscoveryExecutionError(_M_BLOCKED_CORPUS) from exc
+    if (
+        current is None
+        or current.get("artifact_id") != snapshot.get("artifact_id")
+        or current.get("revision_id") != snapshot.get("revision_id")
+    ):
+        raise DiscoveryExecutionError(_M_BLOCKED_CORPUS)
+    return snapshot
+
+
+def _observed_identity_sets(snapshot: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
+    """Return the corpus's observed ``native:europepmc``/``pmid``/``pmcid`` values."""
+    native: set[str] = set()
+    pmids: set[str] = set()
+    pmcids: set[str] = set()
+    for candidate in snapshot.get("candidates") or []:
+        for token in candidate.get("tokens") or []:
+            if not isinstance(token, list) or len(token) != 2:
+                continue
+            namespace, value = token
+            if namespace == f"native:{SOURCE_EUROPEPMC}":
+                native.add(value)
+            elif namespace == "pmid":
+                pmids.add(value)
+            elif namespace == "pmcid":
+                pmcids.add(value)
+    return native, pmids, pmcids
+
+
+def _require_observed_roots(roots: list[dict[str, str]], snapshot: dict[str, Any]) -> None:
+    """Fail closed unless every root names an observed candidate identity.
+
+    A root ``SOURCE:id`` is observed when the current corpus records it as a
+    provider-native ``native:europepmc`` token (the exact Europe PMC citation
+    locator), or as an asserted ``pmid`` (``MED:id``) / ``pmcid`` (``PMC:id``)
+    token. This is a known **API locator** binding, never a study-identity claim.
+    """
+    native, pmids, pmcids = _observed_identity_sets(snapshot)
+    for root in roots:
+        source, native_id = root["source"], root["id"]
+        observed = f"{source}:{native_id}" in native
+        if not observed and source == "MED":
+            observed = native_id in pmids
+        if not observed and source == "PMC":
+            observed = native_id in pmcids
+        if not observed:
+            raise DiscoveryExecutionError(_M_UNOBSERVED_ROOT)
+
+
+def _expansion_limits(plan_document: dict[str, Any]) -> ExpansionLimits:
+    """Build the exact limits from ``plan.payload.expansion`` (never a caller).
+
+    There is no caller override: the only accepted bounds are the approved plan's.
+    """
+    payload = plan_document.get("payload")
+    raw = payload.get("expansion") if isinstance(payload, dict) else None
+    try:
+        return ExpansionLimits(
+            max_hops=raw["max_hops"],
+            max_sources=raw["max_sources"],
+            max_requests=raw["max_requests"],
+            page_size=raw["page_size"],
+            max_pages=raw["max_pages"],
+        )
+    except Exception as exc:  # noqa: BLE001 - unusable limits fail closed
+        raise DiscoveryExecutionError(_M_BAD_LIMITS) from exc
+
+
+def _token_authorizes(registry: Any, project_id: str, token: str) -> bool:
+    """True only when ``token`` is this project's active, non-draining activation."""
+    if not isinstance(token, str) or token == "":
+        return False
+    try:
+        activation = registry.activation()
+    except Exception:  # noqa: BLE001 - unreadable activation fails closed
+        return False
+    return (
+        activation.state == "active"
+        and activation.active_project_id == project_id
+        and hmac.compare_digest(activation.activation_token or "", token)
+    )
+
+
+def _expand_before_request(
+    store: Any,
+    registry: Any,
+    token: str,
+    plan_ref: object,
+    corpus_ref: object,
+    roots: list[dict[str, str]],
+    job_held: Callable[[], bool] | None,
+) -> Callable[[Any], object]:
+    """A trusted guard that revalidates plan/corpus/roots/token/job before a request.
+
+    It runs before **every** real low-level attempt (through
+    :func:`~review_article_agent.discovery.expansion.expand_citations`); returning
+    ``False`` refuses the upcoming request and stops the traversal with an explicit
+    gap, so a changed plan, a superseded corpus, a withdrawn root, a lost
+    activation, or a paused/cancelled/draining job stops further provider I/O.
+    """
+
+    def before_request(_context: Any) -> object:
+        if job_held is not None and job_held():
+            return False
+        try:
+            plan_document = _approved_expansion_plan(store, plan_ref)
+            _expansion_limits(plan_document)
+            snapshot = _current_corpus(store, corpus_ref)
+            _require_observed_roots(roots, snapshot)
+        except Exception:  # noqa: BLE001 - any revalidation failure refuses the request
+            return False
+        return _token_authorizes(registry, store.project_id, token)
+
+    return before_request
+
+
+def _expand_roots(roots: list[dict[str, str]]) -> list[CitationNode]:
+    return [CitationNode(root["source"], root["id"]) for root in roots]
+
+
+def dispatch_expand(
+    store: Any,
+    registry: Any,
+    token: str,
+    job: Any,
+    transport: Any,
+    *,
+    job_held: Callable[[], bool] | None = None,
+) -> Any:
+    """Execute one bounded citation-expansion job; returns an ``ExpansionReport``.
+
+    The approved current plan and the current, intact corpus are revalidated
+    **before** the first attempt (so an unapproved/stale plan, a stale corpus, or
+    an unobserved root performs zero provider I/O), and again before every
+    subsequent low-level attempt through ``before_request``. The traversal limits
+    come only from ``plan.payload.expansion``. The report's per-relation
+    observations are persisted through the existing discovery store, so an exact
+    replay reuses them with no new provider request.
+    """
+    params = job.parameters if isinstance(job.parameters, dict) else {}
+    plan_ref = params["plan_ref"]
+    corpus_ref = params["corpus_ref"]
+    roots = list(params["roots"])
+    plan_document = _approved_expansion_plan(store, plan_ref)
+    snapshot = _current_corpus(store, corpus_ref)
+    _require_observed_roots(roots, snapshot)
+    limits = _expansion_limits(plan_document)
+    before_request = _expand_before_request(
+        store, registry, token, plan_ref, corpus_ref, roots, job_held
+    )
+    return expand_citations(
+        store,
+        _expand_roots(roots),
+        request_id=job.request_id,
+        limits=limits,
+        transport=transport,
+        before_request=before_request,
+    )
+
+
+def dispatch_lead(
+    store: Any,
+    registry: Any,
+    token: str,
+    job: Any,
+    *,
+    api_key: str | None,
+    lead_transport: Any = None,
+) -> dict[str, Any]:
+    """Execute one scoped hosted lead-proposal job (at most one POST).
+
+    Delegates to the revision-scoped runner
+    (:func:`~review_article_agent.discovery.lead_runner.execute_lead_proposal`),
+    which re-derives the approved batch, revalidates the exact named hosted-use
+    gate and every pinned source's rights, reserves on the **runtime dispatch
+    ledger** before the one POST, and returns a safe status/dispatch mapping. A
+    missing credential is refused here with **zero** POST.
+    """
+    from ..discovery.lead_runner import execute_lead_proposal
+
+    params = job.parameters if isinstance(job.parameters, dict) else {}
+    if not isinstance(api_key, str) or api_key == "":
+        raise DiscoveryExecutionError(_M_MISSING_CREDENTIAL)
+    return execute_lead_proposal(
+        store,
+        registry=registry,
+        activation_token=token,
+        batch_ref=params["batch_ref"],
+        request_id=job.request_id,
+        api_key=api_key,
+        transport=lead_transport,
+    )
+
+
+def persisted_expansion_report(store: Any, *, job_id: str | None = None, request_id: str | None = None):
+    """Return the full saved expansion mapping for a completed expand job, or None.
+
+    A thin, validating reader for a later coverage reader: it refuses anything
+    that is not a completed ``discovery_expand`` job whose accepted result is a
+    non-authorizing ``discovery_expansion`` report. It never treats a supplied
+    authoritative/authorizing flag as meaningful (the stored report always
+    carries ``completeness_claimed=False`` / ``verified_support=False``).
+    """
+    from ..runtime.jobs import JobRepository
+
+    repo = JobRepository(store)
+    job = None
+    if job_id is not None:
+        job = repo.get(job_id)
+    elif request_id is not None:
+        for candidate in repo.list():
+            if candidate.request_id == request_id:
+                job = candidate
+                break
+    if job is None or mode_for_task_kind(job.task_kind) != MODE_EXPAND:
+        return None
+    accepted = repo.accepted_result(job.job_id)
+    if accepted is None or accepted.result_kind != RESULT_KIND_EXPANSION:
+        return None
+    result = accepted.result
+    if not isinstance(result, dict):
+        return None
+    guarantees = result.get("guarantees")
+    if isinstance(guarantees, dict) and (
+        guarantees.get("completeness_claimed") is not False
+        or guarantees.get("verified_support") is not False
+    ):
+        return None
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # Dispatch through the S1 execution library
 # --------------------------------------------------------------------------- #
-def dispatch(store: Any, registry: Any, token: str, job: Any, transport: Any) -> Any:
+def dispatch(
+    store: Any,
+    registry: Any,
+    token: str,
+    job: Any,
+    transport: Any,
+    *,
+    job_held: Callable[[], bool] | None = None,
+    lead_api_key: str | None = None,
+    lead_transport: Any = None,
+) -> Any:
     """Execute one discovery job through the S1 API under ``token``.
 
     The exact job request id is the S1 replay key; the S1 library derives a
@@ -527,10 +1014,17 @@ def dispatch(store: Any, registry: Any, token: str, job: Any, transport: Any) ->
     index, and the query fingerprint, and revalidates the approved plan and the
     activation before every attempt. A provider failure is recorded by S1 as an
     explicit partial observation and returned; only an approval/activation
-    refusal or a local store fault raises.
+    refusal or a local store fault raises. ``expand`` and ``lead`` route to their
+    own bounded executors.
     """
     mode = mode_for_task_kind(job.task_kind)
     params = job.parameters if isinstance(job.parameters, dict) else {}
+    if mode == MODE_EXPAND:
+        return dispatch_expand(store, registry, token, job, transport, job_held=job_held)
+    if mode == MODE_LEAD:
+        return dispatch_lead(
+            store, registry, token, job, api_key=lead_api_key, lead_transport=lead_transport
+        )
     executor = DiscoveryExecutor(
         store, registry=registry, activation_token=token, transport=transport
     )
@@ -567,16 +1061,123 @@ def _replay_miss_transport(url: str, *, timeout: float, max_response_bytes: int)
     raise _ReplayMiss()
 
 
-def replay_only(store: Any, registry: Any, token: str, job: Any) -> Any | None:
-    """Return an existing observation for ``job`` without any provider I/O.
+@dataclass(frozen=True)
+class ReplayedOutcome:
+    """A durable outcome proven by replay, and whether it is a complete proof.
 
-    Uses the S1 replay short-circuit (identical caller key + plan binding). A
-    missing/rejected plan, a stale activation, an absent observation, or any
-    other refusal returns ``None``. A metadata import (a purely local, bounded
-    write) may (re)record its *identical* observation; the S1 replay still
-    returns the historical row unchanged on a repeat.
+    ``complete`` is ``False`` only for an expansion whose traversal needs a
+    provider request that was never persisted (an explicit missing remainder):
+    the caller must escalate that rather than accept a silent completion.
     """
+
+    result_kind: str
+    result: Any
+    complete: bool
+
+
+def _replay_expand(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutcome | None:
+    """Redrive an expansion from stored relations only; never a new request.
+
+    Every relation already persisted is reused verbatim. If any relation that the
+    traversal needs was never persisted (a crash mid-traversal), the read-only
+    repository refuses the write and the whole reconstruction fails closed: the
+    caller must escalate — a missing remainder is never a silent completion. No
+    low-level request is ever issued (a refusing ``before_request`` plus an
+    exploding transport back that up).
+    """
+    from ..storage.discovery import DiscoveryRepository
+
+    params = job.parameters if isinstance(job.parameters, dict) else {}
     try:
-        return dispatch(store, registry, token, job, _replay_miss_transport)
+        plan_document = _approved_expansion_plan(store, params["plan_ref"])
+        snapshot = _current_corpus(store, params["corpus_ref"])
+        _require_observed_roots(params["roots"], snapshot)
+        limits = _expansion_limits(plan_document)
+    except Exception:  # noqa: BLE001 - cannot reconstruct: not a proven outcome
+        return None
+
+    class _ReadOnlyRepository(DiscoveryRepository):
+        def record_search(self, *, request_id: str, result: Any) -> Any:  # type: ignore[override]
+            # A relation that was never persisted cannot be reconstructed and is
+            # never written from a replay.
+            raise _ReplayMiss()
+
+    def _refuse(_context: Any) -> object:
+        return False
+
+    def _explode(url: str, *, timeout: float, max_response_bytes: int) -> Any:
+        raise _ReplayMiss()
+
+    try:
+        report = expand_citations(
+            _ReadOnlyRepository(store),
+            _expand_roots(list(params["roots"])),
+            request_id=job.request_id,
+            limits=limits,
+            transport=_explode,
+            before_request=_refuse,
+        )
     except Exception:  # noqa: BLE001 - any failure means "not proven present"
         return None
+    return ReplayedOutcome(
+        result_kind=RESULT_KIND_EXPANSION,
+        result=report.to_mapping(),
+        complete=True,
+    )
+
+
+_LEAD_ACCEPTED_STATUSES = frozenset(
+    {"completed", "refused", "protocol_error", "oversized_output", "failed"}
+)
+
+
+def lead_outcome_accepted(mapping: object) -> bool:
+    """True when a hosted-lead outcome is a resolved, persistable lifecycle result."""
+    return isinstance(mapping, dict) and mapping.get("status") in _LEAD_ACCEPTED_STATUSES
+
+
+def _replay_lead(store: Any, job: Any) -> ReplayedOutcome | None:
+    """Read a saved hosted-lead outcome from durable rows (no credential needed).
+
+    A terminal accepted outcome is a complete proof; an ``unknown``/``submitted``
+    outcome is **not** (it must be escalated to a human, and is never re-sent).
+    """
+    from ..discovery.lead_runner import get_lead_outcome
+
+    try:
+        mapping = get_lead_outcome(store, job.request_id)
+    except Exception:  # noqa: BLE001 - not provable
+        return None
+    if mapping is None:
+        return None
+    status = mapping.get("status")
+    return ReplayedOutcome(
+        result_kind=RESULT_KIND_LEAD,
+        result=mapping,
+        complete=status in _LEAD_ACCEPTED_STATUSES,
+    )
+
+
+def replay_only(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutcome | None:
+    """Prove an existing durable outcome for ``job`` without any provider I/O.
+
+    Query/seed/import use the S1 replay short-circuit (identical caller key + plan
+    binding). Expansion reuses only persisted relations and never issues a request.
+    Hosted lead reads its durable outcome from the runtime ledger without needing a
+    credential. A missing/rejected plan, a stale activation, an absent observation,
+    or any other refusal returns ``None``.
+    """
+    mode = mode_for_task_kind(job.task_kind)
+    if mode == MODE_EXPAND:
+        return _replay_expand(store, registry, token, job)
+    if mode == MODE_LEAD:
+        return _replay_lead(store, job)
+    try:
+        record = dispatch(store, registry, token, job, _replay_miss_transport)
+    except Exception:  # noqa: BLE001 - any failure means "not proven present"
+        return None
+    return ReplayedOutcome(
+        result_kind=RESULT_KIND_OBSERVATION,
+        result=observation_metadata(job, record),
+        complete=True,
+    )

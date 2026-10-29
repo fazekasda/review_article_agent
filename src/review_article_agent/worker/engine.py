@@ -102,6 +102,7 @@ from ..discovery.execution import (
     DiscoveryExecutionBlockedError,
     DiscoveryExecutionError,
 )
+from ..discovery.lead_runner import HostedLeadError
 from ..discovery.transport import DiscoveryRequestInterrupted, http_get
 from ..domain.errors import ProjectConflict, ReviewAgentError
 from ..domain.records import validate_identifier
@@ -301,6 +302,8 @@ class WorkerEngine:
         registry: Registry | None = None,
         clock: Callable[[], float] | None = None,
         discovery_transport: Callable[..., Any] | None = None,
+        lead_transport: Callable[..., Any] | None = None,
+        lead_api_key: str | None = None,
     ) -> None:
         self._data_dir = os.path.abspath(os.fspath(data_dir))
         self._registry = registry if registry is not None else Registry(self._data_dir)
@@ -322,6 +325,13 @@ class WorkerEngine:
         if not callable(lowlevel):
             raise ValueError("discovery_transport must be a callable low-level transport")
         self._discovery_lowlevel = lowlevel
+        # Hosted lead: the default transport is the real direct-lead adapter (a
+        # single POST to the one documented endpoint); it is only ever used for an
+        # explicit, fully-guarded lead job. A test may inject a deterministic fake
+        # transport and/or an explicit key. The credential is read from the
+        # environment only at dispatch; it is never persisted.
+        self._lead_transport = lead_transport
+        self._lead_api_key = lead_api_key
         self._discovery_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="raa-discovery"
         )
@@ -528,7 +538,9 @@ class WorkerEngine:
         if accepted is not None:
             data["accepted_result"] = {
                 "result_kind": accepted.result_kind,
-                "result": accepted.result,
+                "result": discovery_jobs.status_projection(
+                    accepted.result_kind, accepted.result
+                ),
                 "fence": accepted.fence,
             }
         return data
@@ -1531,22 +1543,34 @@ class WorkerEngine:
         self, store: Any, repo: JobRepository, project_id: str, job: Job, attempt: Any
     ) -> bool:
         token = self._active_token(project_id)
-        observation = None
+        outcome = None
         if token is not None:
-            observation = discovery_jobs.replay_only(
-                store, self._registry, token, job
-            )
-        if observation is not None:
-            metadata = discovery_jobs.observation_metadata(job, observation)
+            outcome = discovery_jobs.replay_only(store, self._registry, token, job)
+        if outcome is not None:
+            if outcome.complete:
+                try:
+                    with self._write_guard(project_id, allow_draining=True):
+                        repo.accept_result(
+                            attempt.attempt_id,
+                            result_kind=outcome.result_kind,
+                            result=outcome.result,
+                        )
+                except (JobError, ReviewAgentError):
+                    return False
+                return True
+            # An explicit **missing remainder**: the traversal needs a provider
+            # request that was never persisted, so this is never a silent
+            # completion (and no new request is ever sent here). Escalate once;
+            # an already-escalated attempt is not re-escalated (no busy loop).
+            if attempt.state == "ambiguous":
+                return False
             try:
                 with self._write_guard(project_id, allow_draining=True):
-                    repo.accept_result(
-                        attempt.attempt_id,
-                        result_kind="discovery_observation",
-                        result=metadata,
-                    )
+                    repo.mark_ambiguous(attempt.attempt_id)
+                    repo.escalate_to_human(job.job_id)
             except (JobError, ReviewAgentError):
                 return False
+            self._wait_reasons[job.job_id] = "discovery_incomplete"
             return True
 
         predispatch = discovery_jobs.is_predispatch_checkpoint(attempt.checkpoint)
@@ -1613,6 +1637,11 @@ class WorkerEngine:
             )
             return
 
+        mode = discovery_jobs.mode_for_task_kind(job.task_kind)
+        if mode == discovery_jobs.MODE_LEAD:
+            self._run_lead_dispatch(store, repo, project_id, job, attempt, token)
+            return
+
         counter = AttemptCounter()
         transport = discovery_jobs.guard_transport(
             self._discovery_lowlevel,
@@ -1623,7 +1652,14 @@ class WorkerEngine:
         )
         try:
             record = discovery_jobs.dispatch(
-                store, self._registry, token, job, transport
+                store,
+                self._registry,
+                token,
+                job,
+                transport,
+                job_held=lambda: self._discovery_stop_requested(
+                    repo, project_id, job_id
+                ),
             )
         except DiscoveryJobStopped:
             self._discovery_fail(
@@ -1671,23 +1707,120 @@ class WorkerEngine:
             )
             return
 
-        metadata = discovery_jobs.observation_metadata(job, record)
+        result_kind, payload = discovery_jobs.accepted_result(job, record)
         try:
             with self._write_guard(project_id, allow_draining=True):
                 repo.accept_result(
                     attempt_id,
-                    result_kind="discovery_observation",
-                    result=metadata,
+                    result_kind=result_kind,
+                    result=payload,
                 )
         except (JobError, ReviewAgentError):
-            # The S1 observation is durably recorded; a restart proves it via
-            # replay. Do not fabricate a local receipt here.
+            # The underlying observation/report is durably recorded; a restart
+            # proves it via replay. Do not fabricate a local receipt here.
             return
         # Label an interrupted partial explicitly: the job was stopped before its
-        # next request, so the recorded observation is incomplete. The accepted
-        # result preserves any held (paused/cancelled) scheduling state.
+        # next request, so the recorded result is incomplete. The accepted result
+        # preserves any held (paused/cancelled) scheduling state.
         if counter.interrupted or self._discovery_is_held(repo, project_id, job_id):
             self._wait_reasons[job_id] = "discovery_interrupted"
+
+    def _run_lead_dispatch(
+        self,
+        store: Any,
+        repo: JobRepository,
+        project_id: str,
+        job: Job,
+        attempt: Any,
+        token: str,
+    ) -> None:
+        """Run one scoped hosted lead job (at most one POST) and record its lifecycle.
+
+        The credential is read from the **one** named environment variable at
+        dispatch (never scanned, never persisted). A missing credential, an
+        unapproved/stale batch, a denied rights record, or a cap block performs
+        **zero** POST. A completed/refused/protocol/oversized/failed outcome is
+        persisted as the job's safe accepted result; an ``unknown`` external
+        outcome keeps the reserve and the runtime occupancy and moves the job to
+        ``waiting_human`` — it is **never** re-POSTed on a retry or restart.
+        """
+        job_id = job.job_id
+        if self._discovery_stop_requested(repo, project_id, job_id):
+            self._discovery_fail(
+                repo, project_id, job, attempt, attempts=0, reason="stopped", escalate=False
+            )
+            return
+
+        api_key = self._lead_api_key
+        if api_key is None:
+            api_key = os.environ.get(discovery_jobs.LEAD_CREDENTIAL_ENV)
+        if not isinstance(api_key, str) or api_key == "":
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=0,
+                reason="credential_missing",
+                escalate=True,
+            )
+            return
+
+        try:
+            mapping = discovery_jobs.dispatch_lead(
+                store,
+                self._registry,
+                token,
+                job,
+                api_key=api_key,
+                lead_transport=self._lead_transport,
+            )
+        except (DiscoveryExecutionError, HostedLeadError, BudgetExceededError):
+            # A refusal raised strictly *before* any reserve/POST.
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=0,
+                reason="blocked",
+                escalate=True,
+            )
+            return
+        except BaseException:  # noqa: BLE001 - the POST may have happened: unknown
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=1,
+                reason="indeterminate",
+            )
+            return
+
+        if discovery_jobs.lead_outcome_accepted(mapping):
+            try:
+                with self._write_guard(project_id, allow_draining=True):
+                    repo.accept_result(
+                        attempt.attempt_id,
+                        result_kind=discovery_jobs.RESULT_KIND_LEAD,
+                        result=mapping,
+                    )
+            except (JobError, ReviewAgentError):
+                return
+            if self._discovery_is_held(repo, project_id, job_id):
+                self._wait_reasons[job_id] = "discovery_interrupted"
+            return
+
+        # An unknown/submitted external outcome: retain the reserve and the
+        # runtime occupancy, escalate to a human, and never re-POST.
+        try:
+            with self._write_guard(project_id, allow_draining=True):
+                repo.mark_ambiguous(attempt.attempt_id)
+                repo.escalate_to_human(job_id)
+        except (JobError, ReviewAgentError):
+            return
+        self._wait_reasons[job_id] = "discovery_lead_reconciliation_required"
 
     def _discovery_fail(
         self,
