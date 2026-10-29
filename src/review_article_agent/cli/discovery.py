@@ -24,9 +24,12 @@ D1 acceptance criteria 1 and 2; the personal-CLI baseline; the existing
   :class:`~review_article_agent.storage.artifacts.ArtifactRepository` revision
   (``report`` kind, or ``rubric`` for a ``discovery_rubric``). It returns the
   exact ref/digest/type **and** an ``approval_request`` describing the named gate
-  the new revision needs. It stores a **proposal only**: it records no approval,
-  fabricates no rights, accepts no actor/authentication flag, and never claims a
-  gate is satisfied unless the real
+  the new revision needs. An identical retry of a recorded logical import returns
+  the historical revision (and a divergent reuse of the request key conflicts),
+  reporting ``replayed`` plus a ``current``/``stale`` approval request, rather than
+  being re-treated as a stale amendment. It stores a **proposal only**: it
+  records no approval, fabricates no rights, accepts no actor/authentication flag,
+  and never claims a gate is satisfied unless the real
   :class:`~review_article_agent.storage.human_approvals.HumanApprovalRepository`
   says so. The existing ``gate prepare``/``gate confirm`` commands remain the only
   path that records a real human approval (on the controlling terminal).
@@ -561,13 +564,15 @@ def _validate_parent(
 
 
 def _approval_request(
-    store: Any, revision: Any, document: dict
+    store: Any, repo: Any, revision: Any, document: dict
 ) -> dict[str, object] | None:
-    """The named-gate approval request for a new seed/plan revision, or ``None``.
+    """The named-gate approval request for a seed/plan revision, or ``None``.
 
     Only a seed (its individual ``artifact_revision`` gate) and a plan (the
     combined ``protocol``/``discovery.plan`` gate) require an approval request. The
-    ``satisfied`` flag is the real repository's answer, never a fabricated claim.
+    ``satisfied`` flag is the real repository's answer, never a fabricated claim;
+    ``current``/``stale`` state whether the returned revision is still the
+    artifact's head, so a historical replay never claims the old gate is active.
     """
     document_type = document["document_type"]
     if document_type == "discovery_seed":
@@ -583,6 +588,8 @@ def _approval_request(
     satisfied = HumanApprovalRepository(store).named_gate_satisfied(
         revision.artifact_id, gate_kind=gate_kind, gate_id=gate_id
     )
+    head = repo.current_revision(revision.artifact_id)
+    is_current = head is not None and head.revision_id == revision.revision_id
     return {
         "gate_kind": gate_kind,
         "gate_id": gate_id,
@@ -590,6 +597,8 @@ def _approval_request(
         "revision_id": revision.revision_id,
         "impact_review": impact_review,
         "satisfied": bool(satisfied),
+        "current": bool(is_current),
+        "stale": not is_current,
         "authorizes_execution": False,
         "authorizes_export": False,
         "scientific_validation": False,
@@ -671,7 +680,13 @@ def _candidate_control_error(exc: CandidateError) -> DiscoveryControlError:
 
 
 def _corpus_summary(snapshot: dict) -> dict[str, object]:
-    """A safe corpus summary: counts and flags, never a title or token."""
+    """A safe corpus summary: counts and flags, never a title or token.
+
+    ``run_count`` is the **cumulative** number of runs the snapshot names; the
+    latest request's newly supplied set is reported separately as
+    ``input_run_count``. Metadata stays local only and is never scientific
+    context.
+    """
     candidates = snapshot["candidates"]
     unresolved_count = sum(1 for c in candidates if not c["resolved"])
     return {
@@ -684,7 +699,8 @@ def _corpus_summary(snapshot: dict) -> dict[str, object]:
         "schema_version": snapshot["schema_version"],
         "payload_version": snapshot["payload_version"],
         "request_id": snapshot["request_id"],
-        "run_count": len(snapshot["input_run_ids"]),
+        "run_count": len(snapshot["runs"]),
+        "input_run_count": len(snapshot["input_run_ids"]),
         "occurrence_count": len(snapshot["occurrences"]),
         "candidate_count": len(candidates),
         "conflict_count": len(snapshot["conflicts"]),
@@ -706,11 +722,15 @@ def discovery_context_import(
     """``discovery context import`` -- store one typed context revision (proposal).
 
     Steps: (1) strictly parse and statically validate the envelope, (2) strictly
-    parse the caller's explicit rights record, (3) from a verified store, validate
-    the parent reference and every referenced document at its exact expected
-    type/current revision (read-only), (4) derive the exact generic dependencies,
-    then (5) create the artifact and import one immutable revision. Nothing is
-    written before every validation passes.
+    parse the caller's explicit rights record, (3) derive the exact generic
+    dependencies, (4) **replay first**: if this exact artifact/revision is already
+    recorded, the trusted :meth:`ArtifactRepository.import_revision` replay path
+    runs before storage's head-freshness check, so an identical retry returns the
+    historical revision (and a divergent reuse of the request key conflicts)
+    without being re-treated as a stale amendment, and (5) for a genuinely new
+    revision only, validate the parent and every referenced document (read-only)
+    and the rights gate, then create the artifact and import one immutable
+    revision. Nothing is written before every applicable validation passes.
     """
     document = _read_strict_json_file(args.file, what="context document")
     try:
@@ -720,18 +740,39 @@ def discovery_context_import(
             _CATEGORY_VALIDATION, _CONTEXT_INVALID_MESSAGE
         ) from exc
     rights = _read_strict_json_file(args.rights_file, what="rights record")
+    dependencies = _dependencies_for(validated)
+    artifact_kind = _context_artifact_kind(validated)
 
     project_id = _resolve_project_id(ctx, args.project)
-    _validate_storage_rights(project_id, args.artifact_id, args.revision_id, rights)
     store = _open_verified_store(ctx, project_id)
     try:
         repo = ArtifactRepository(store)
-        _validate_parent(repo, args.artifact_id, args.parent_revision_id, validated)
-        _validate_referenced_documents(store, validated)
-        dependencies = _dependencies_for(validated)
-        artifact_kind = _context_artifact_kind(validated)
+        # Replay detection: storage's request-key (step 1) and explicit-id / dedup
+        # (step 2) replay both run *before* its head-freshness check (step 3). So
+        # when a revision for this exact id is already recorded, we must reach
+        # storage with the exact original parameters *before* our amendment /
+        # reference pre-checks — otherwise an identical retry (whose parent is no
+        # longer the head, or whose referenced input moved on) would be wrongly
+        # refused, or a duplicate would be written. Only a revision that is not
+        # already recorded can be a genuinely new write, for which the rights gate
+        # and the read-only pre-checks still apply.
         try:
-            repo.create_artifact(args.artifact_id, kind=artifact_kind)
+            replayed = (
+                repo.get_revision(args.artifact_id, args.revision_id) is not None
+            )
+        except RecordValidationError as exc:
+            raise DiscoveryControlError(
+                _CATEGORY_VALIDATION, _CONTEXT_INVALID_MESSAGE
+            ) from exc
+        if not replayed:
+            _validate_storage_rights(
+                project_id, args.artifact_id, args.revision_id, rights
+            )
+            _validate_parent(repo, args.artifact_id, args.parent_revision_id, validated)
+            _validate_referenced_documents(store, validated)
+        try:
+            if not replayed:
+                repo.create_artifact(args.artifact_id, kind=artifact_kind)
             revision = repo.import_revision(
                 artifact_id=args.artifact_id,
                 content=validated,
@@ -750,12 +791,16 @@ def discovery_context_import(
             raise DiscoveryControlError(
                 _CATEGORY_VALIDATION, _CONTEXT_RIGHTS_MESSAGE
             ) from exc
-        approval_request = _approval_request(store, revision, validated)
+        approval_request = _approval_request(store, repo, revision, validated)
+        # A request-key replay may resolve to a different recorded revision id;
+        # report a replay truthfully.
+        replayed = replayed or revision.revision_id != args.revision_id
     finally:
         store.close()
     return {
         "revision": _imported_revision_dict(revision, validated["document_type"]),
         "approval_request": approval_request,
+        "replayed": replayed,
     }
 
 

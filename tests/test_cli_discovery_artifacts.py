@@ -276,6 +276,10 @@ class DiscoveryCliTestCase(unittest.TestCase):
 
         return self.with_store(pid, _record)
 
+    def artifact_revisions(self, pid: str, artifact_id: str) -> list:
+        out = self.cli("artifact", "revisions", artifact_id, "--project", pid)
+        return out["revisions"]
+
     # -- discovery wrappers -------------------------------------------------- #
     def context_import(
         self,
@@ -607,6 +611,8 @@ class ContextRejectionTest(DiscoveryCliTestCase):
             expect=2,
         )
         self.assertEqual(err["error"]["category"], "validation")
+        # A rejected new input writes no revision.
+        self.assertEqual(self.artifact_revisions(pid, "a-seed"), [])
 
     def test_rights_mismatch_is_rejected_and_revision_not_written(self) -> None:
         pid = self.create_project()
@@ -654,12 +660,6 @@ class ContextRejectionTest(DiscoveryCliTestCase):
         )
         err = self.context_show(pid=pid, artifact_id="a-report", expect=2)
         self.assertEqual(err["error"]["category"], "validation")
-
-    def artifact_revisions(self, pid: str, artifact_id: str):
-        out = self.cli(
-            "artifact", "revisions", artifact_id, "--project", pid
-        )
-        return out["revisions"]
 
 
 # --------------------------------------------------------------------------- #
@@ -775,6 +775,219 @@ class PlanAmendmentTest(DiscoveryCliTestCase):
         self.assertIs(historical["historical"], True)
         self.assertIs(historical["authorizes_execution"], False)
 
+    def _amend_plan(self, pid, refs, *, revision_id, parent, impact_review, request_id):
+        return self.context_import(
+            pid=pid,
+            artifact_id="a-plan",
+            revision_id=revision_id,
+            document=_envelope("discovery_plan", _plan_payload(refs, impact_review=impact_review)),
+            parent=parent,
+            request_id=request_id,
+        )
+
+    def test_amended_import_retry_returns_same_historical_revision(self) -> None:
+        pid = self.create_project()
+        refs, _ = self.build_plan_fixture(pid)
+        self.context_import(
+            pid=pid,
+            artifact_id="a-plan",
+            revision_id="rev-plan",
+            document=_envelope("discovery_plan", _plan_payload(refs)),
+        )
+        plan_ref = self.ref(pid, "a-plan", "rev-plan")
+        impact = {
+            "previous_plan": plan_ref,
+            "affected": ["scope"],
+            "rationale": "broaden the scope",
+        }
+        first = self._amend_plan(
+            pid, refs, revision_id="rev-plan2", parent="rev-plan",
+            impact_review=impact, request_id="plan-amend-1",
+        )
+        self.assertIs(first["replayed"], False)
+
+        # Retrying the *exact same* logical import: the head has advanced to
+        # rev-plan2, so a naive amendment check would reject the old parent; the
+        # trusted replay path must instead return the historical revision.
+        retry = self._amend_plan(
+            pid, refs, revision_id="rev-plan2", parent="rev-plan",
+            impact_review=impact, request_id="plan-amend-1",
+        )
+        self.assertIs(retry["replayed"], True)
+        self.assertEqual(retry["revision"]["revision_id"], "rev-plan2")
+        self.assertEqual(
+            retry["revision"]["content_sha256"], first["revision"]["content_sha256"]
+        )
+        # No duplicate revision was written.
+        self.assertEqual(
+            [r["revision_id"] for r in self.artifact_revisions(pid, "a-plan")],
+            ["rev-plan", "rev-plan2"],
+        )
+        # The retry states current/stale truthfully and never claims the gate.
+        self.assertIs(retry["approval_request"]["current"], True)
+        self.assertIs(retry["approval_request"]["stale"], False)
+        self.assertIs(retry["approval_request"]["satisfied"], False)
+
+    def test_later_revision_then_retry_is_stale_historical_no_new_write(self) -> None:
+        pid = self.create_project()
+        refs, _ = self.build_plan_fixture(pid)
+        self.context_import(
+            pid=pid,
+            artifact_id="a-plan",
+            revision_id="rev-plan",
+            document=_envelope("discovery_plan", _plan_payload(refs)),
+        )
+        plan_ref = self.ref(pid, "a-plan", "rev-plan")
+        self._amend_plan(
+            pid, refs, revision_id="rev-plan2", parent="rev-plan",
+            impact_review={
+                "previous_plan": plan_ref,
+                "affected": ["scope"],
+                "rationale": "r",
+            },
+            request_id="plan-amend-1",
+        )
+        # A later amendment advances the head beyond the retried revision.
+        self._amend_plan(
+            pid, refs, revision_id="rev-plan3", parent="rev-plan2",
+            impact_review={
+                "previous_plan": self.ref(pid, "a-plan", "rev-plan2"),
+                "affected": ["scope"],
+                "rationale": "r2",
+            },
+            request_id="plan-amend-2",
+        )
+        retry = self._amend_plan(
+            pid, refs, revision_id="rev-plan2", parent="rev-plan",
+            impact_review={
+                "previous_plan": plan_ref,
+                "affected": ["scope"],
+                "rationale": "r",
+            },
+            request_id="plan-amend-1",
+        )
+        self.assertIs(retry["replayed"], True)
+        self.assertEqual(retry["revision"]["revision_id"], "rev-plan2")
+        self.assertIs(retry["approval_request"]["current"], False)
+        self.assertIs(retry["approval_request"]["stale"], True)
+        self.assertIs(retry["approval_request"]["satisfied"], False)
+        # No new write on the stale retry.
+        self.assertEqual(
+            [r["revision_id"] for r in self.artifact_revisions(pid, "a-plan")],
+            ["rev-plan", "rev-plan2", "rev-plan3"],
+        )
+
+    def test_retry_after_referenced_input_change_is_stale_historical(self) -> None:
+        pid = self.create_project()
+        refs, _ = self.build_plan_fixture(pid)
+        self.context_import(
+            pid=pid,
+            artifact_id="a-plan",
+            revision_id="rev-plan",
+            document=_envelope("discovery_plan", _plan_payload(refs)),
+        )
+        plan_ref = self.ref(pid, "a-plan", "rev-plan")
+        impact = {
+            "previous_plan": plan_ref,
+            "affected": ["scope"],
+            "rationale": "r",
+        }
+        self._amend_plan(
+            pid, refs, revision_id="rev-plan2", parent="rev-plan",
+            impact_review=impact, request_id="plan-amend-1",
+        )
+        # A referenced input (the brief) moves on to a new revision.
+        self.context_import(
+            pid=pid,
+            artifact_id="a-brief",
+            revision_id="rev-brief2",
+            document=_envelope("discovery_brief", _brief_payload("revised")),
+            parent="rev-brief",
+        )
+        # The retry must return the historical revision rather than failing on the
+        # now-stale referenced input.
+        retry = self._amend_plan(
+            pid, refs, revision_id="rev-plan2", parent="rev-plan",
+            impact_review=impact, request_id="plan-amend-1",
+        )
+        self.assertIs(retry["replayed"], True)
+        self.assertEqual(retry["revision"]["revision_id"], "rev-plan2")
+        # The revision is still the artifact's head (only an input moved on), so
+        # it is not head-stale, but the gate is still not satisfied.
+        self.assertIs(retry["approval_request"]["current"], True)
+        self.assertIs(retry["approval_request"]["stale"], False)
+        self.assertIs(retry["approval_request"]["satisfied"], False)
+        # A *new* revision that references the stale input is still refused (the
+        # replay shortcut applies to a recorded revision only).
+        err = self.context_import(
+            pid=pid,
+            artifact_id="a-plan",
+            revision_id="rev-plan4",
+            document=_envelope(
+                "discovery_plan",
+                _plan_payload(
+                    refs,
+                    impact_review={
+                        "previous_plan": self.ref(pid, "a-plan", "rev-plan2"),
+                        "affected": ["scope"],
+                        "rationale": "r3",
+                    },
+                ),
+            ),
+            parent="rev-plan2",
+            expect=2,
+        )
+        self.assertEqual(err["error"]["category"], "validation")
+        self.assertEqual(
+            [r["revision_id"] for r in self.artifact_revisions(pid, "a-plan")],
+            ["rev-plan", "rev-plan2"],
+        )
+
+    def test_divergent_request_replay_conflicts(self) -> None:
+        pid = self.create_project()
+        refs, _ = self.build_plan_fixture(pid)
+        self.context_import(
+            pid=pid,
+            artifact_id="a-plan",
+            revision_id="rev-plan",
+            document=_envelope("discovery_plan", _plan_payload(refs)),
+        )
+        plan_ref = self.ref(pid, "a-plan", "rev-plan")
+        self._amend_plan(
+            pid, refs, revision_id="rev-plan2", parent="rev-plan",
+            impact_review={
+                "previous_plan": plan_ref,
+                "affected": ["scope"],
+                "rationale": "original",
+            },
+            request_id="plan-amend-1",
+        )
+        # The same request key + revision id with different content is a conflict.
+        divergent = self.context_import(
+            pid=pid,
+            artifact_id="a-plan",
+            revision_id="rev-plan2",
+            document=_envelope(
+                "discovery_plan",
+                _plan_payload(
+                    refs,
+                    impact_review={
+                        "previous_plan": plan_ref,
+                        "affected": ["language"],
+                        "rationale": "different",
+                    },
+                ),
+            ),
+            parent="rev-plan",
+            request_id="plan-amend-1",
+            expect=3,
+        )
+        self.assertEqual(divergent["error"]["category"], "conflict")
+        self.assertEqual(
+            [r["revision_id"] for r in self.artifact_revisions(pid, "a-plan")],
+            ["rev-plan", "rev-plan2"],
+        )
+
 
 # --------------------------------------------------------------------------- #
 # corpus
@@ -846,6 +1059,27 @@ class CorpusTest(DiscoveryCliTestCase):
             pid=pid, revision_id="rev-c1", request_id="c-1", run_ids=[], expect=2
         )
         self.assertEqual(err["error"]["category"], "validation")
+
+    def test_corpus_incremental_ingest_reports_cumulative_run_count(self) -> None:
+        pid = self.create_project()
+        run_a = self.record_run(pid, "dsr_r1", (fx.record(),))
+        run_b = self.record_run(
+            pid, "dsr_r2", (fx.record(source_id="888888", pmid="888888", title="b"),)
+        )
+        self.corpus_ingest(
+            pid=pid, revision_id="rev-c1", request_id="c-1", run_ids=[run_a]
+        )
+        # A second, cumulative snapshot names both runs; the summary must report
+        # the cumulative count, not just the latest supplied set.
+        out = self.corpus_ingest(
+            pid=pid, revision_id="rev-c2", request_id="c-2", run_ids=[run_b]
+        )
+        self.assertEqual(out["corpus"]["run_count"], 2)
+        self.assertEqual(out["corpus"]["input_run_count"], 1)
+        # ``corpus show`` reads the current cumulative snapshot with the same count.
+        shown = self.cli("discovery", "corpus", "show", "--project", pid)["corpus"]
+        self.assertEqual(shown["run_count"], 2)
+        self.assertEqual(shown["input_run_count"], 1)
 
 
 # --------------------------------------------------------------------------- #
