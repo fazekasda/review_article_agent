@@ -1,6 +1,6 @@
 # Step 11 — section blueprints and evidence-grounded drafting
 
-Status: **PARTIAL — locally verified core; awaiting the final CLI `draft`/`assembly` adapter and the coordinator's combined verification.** Integrated baseline `847c386` (Step 10 merged). Authority: step document `11-drafting.md`; `docs/specification.md` workflow **13–14** (persistent per-section planner/writer workspace; approve sources and paragraph blueprints before drafting; draft from summaries **and** linked original evidence; do not invent data, conditions, citations, or consensus). All source/tests since `847c386` live under `src/review_article_agent/drafting/` and `tests/test_drafting_*`; **no `pyproject.toml` or `storage/` change — no storage migration and no new dependency**. No default model is selected; no live/paid model call, no new dispatch route, and the one-active-project execution boundary is unchanged (a local proposal never executes). **Not ticked**; no acceptance criterion is claimed as fully passed.
+Status: **complete as a locally verified MVP.** Full coordinator suite at exact code/test/docs head `78ca833` (`PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'`) passed **3,495 tests in 1600.277s, 7 skips** (all optional pypdf absent; existing non-fatal ResourceWarnings), plus the drafting backend suites **162 tests OK** (schema/workspace/package/workflow/drafts + `synthesis_schema` at `55e5a5a`) and the CLI drafting+synthesis suites **23 tests OK**, with 15 contract checks, 20 script tests, and `git diff --check 847c386..HEAD` clean. Integrated baseline `847c386` (Step 10 merged). Authority: step document `11-drafting.md`; `docs/specification.md` workflow **13–14** (persistent per-section planner/writer workspace; approve sources and paragraph blueprints before drafting; draft from summaries **and** linked original evidence; do not invent data, conditions, citations, or consensus). All source/tests since `847c386` live under `src/review_article_agent/drafting/` and `tests/test_drafting_*`; **no `pyproject.toml` or `storage/` change — no storage migration and no new dependency**. No default model is selected; no live/paid model call, no new dispatch route, and the one-active-project execution boundary is unchanged (a local proposal never executes). No CI workflows are configured. No scientific/live validation is claimed.
 
 ## Interfaces, gates, and CLI
 
@@ -9,7 +9,7 @@ Status: **PARTIAL — locally verified core; awaiting the final CLI `draft`/`ass
 - `drafting/package.py`: `DraftingPackageRepository.build(outline_ref, section_id)` reconstructs each finding's own verified passage/source plus readable summary; `citation_key(project_id, candidate_id)` = `cit_` + `sha256` of project+candidate identity only (never title/author/journal/year).
 - `drafting/workflow.py`: `DraftingWorkflowRepository.propose/read/require_blueprint/status`; `KINDS = ("blueprint","draft","assembly")`; own gate `artifact_revision`/`drafting.blueprint`; `_render_markdown` emits a `PROVISIONAL` assembly with per-sentence labels and corpus citation keys.
 - Payload structure (exact keys): workspace `(outline_ref, section_id, planner_mapping_id, writer_mapping_id)` → blueprint `(workspace_ref, content)` → draft `(blueprint_ref, content)` → assembly `(outline_ref, draft_refs)`.
-- `cli/drafting.py` (+ `cli/main.py`): local read/propose only — `drafting propose|show|package|accepted|status`; private-by-default with `--content` opt-in. Only `workspace`/`blueprint` kinds are registered; **`draft`/`assembly` kinds and the assembly command are deliberately pending**.
+- `cli/drafting.py` (+ `cli/main.py`): local read/propose only — `drafting propose|show --kind {workspace,blueprint,draft,assembly}`, `drafting status --kind {blueprint,draft,assembly}`, `drafting accepted` (blueprint gate only), and `drafting package`; an assembly is simply `propose --kind assembly` with an `{outline_ref, draft_refs}` input envelope (no separate `assemble` command). Private by default with `--content` opt-in; the assembly Markdown keeps the approved paragraph structure.
 
 ## Acceptance criteria (each pointer is an actual test method)
 
@@ -27,11 +27,11 @@ Status: **PARTIAL — locally verified core; awaiting the final CLI `draft`/`ass
 - Citation representation is deterministic: `cit_sha256(project_id + candidate_id)`, stable across revisions/sessions/reopenings and distinct across projects; identifiers-only from **verified frozen** corpus metadata (`_bibliographic_record`), never a model bibliography.
 - Draft text is constrained to the **exact approved atomic text** (a prose edit requires a blueprint revision/re-approval) to keep the MVP simple. Every history revision is inspectable and stale dependencies are explicit.
 
-## Verification (observed; not a combined run)
+## Verification (verified by the coordinator at `78ca833`)
 
-- This handoff's own focused run at `55e5a5a` (`PYTHONPATH=src:tests python3 -m unittest test_drafting_schema test_drafting_workspace test_drafting_package test_drafting_workflow test_drafting_drafts test_cli_drafting`) — **126 tests, OK, 0 failures/skips (1072.847s)**.
-- Suites recorded by the implementing sessions (overlapping; do not sum): schema+synthesis 90; workspace 24 (102.075s); package+schema 56 (65.705s); CLI-gates+synthesis 20 (92.384s); worker draft+blueprint 31 (716s at `8753f12`); repair targeted 3 (161s at `140c534`).
-- Contract checker `python3 scripts/check_contract_docs.py` — **15 checks ok, 0 failed**; `git diff --check` clean. **No CI workflows are configured** (count 0). **Final combined coordinator check is pending and is not invented here.**
+- Full suite `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` — **3,495 tests, OK, 7 skips (1600.277s)** (optional pypdf absent; existing non-fatal SQLite/subprocess ResourceWarnings).
+- Drafting backend suites (schema/workspace/package/workflow/drafts + `synthesis_schema`) — **162 tests OK** at `55e5a5a`; CLI drafting+synthesis — **23 tests OK**.
+- `python3 scripts/check_contract_docs.py` — **15 checks ok, 0 failed**; `python3 -m unittest scripts.test_check_contract_docs` — 20 tests OK; `git diff --check 847c386..HEAD` clean. **No CI workflows are configured** (count 0).
 
 ## Disclosures
 
