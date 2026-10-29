@@ -38,6 +38,23 @@ completion. A schema-11 row is an inert provider **search observation**, not an
 accepted context, candidate identity, deduplication decision, coverage claim, or
 corpus freeze.
 
+**No additional table for the Step 05 core.** The rest of the implemented Step 05
+core adds **no** new store table beyond the schema-11
+``discovery_search_run`` observation. Its records reuse the **existing** tables:
+the typed discovery-context documents, the cumulative
+``discovery_corpus`` candidate snapshots, the ``discovery_coverage`` report, and
+the ``discovery_freeze_decision`` are stored as immutable **artifact revisions**
+(``report``/``rubric`` kinds in the schema-3 artifact/revision tables), and the
+detached discovery **jobs** and their attempts/results/budgets use the existing
+schema-4 job tables. A backup therefore captures them as ordinary artifacts and
+jobs, and ``verify_backup`` revalidates them through the generic artifact and
+observation hooks plus the schema-4/11 hooks — a **storage-integrity** check of
+the captured bytes, digests, bindings, and pinned references. It is **not** a
+scientific, approval, coverage, or freeze-truth check: a verified snapshot proves
+the bytes are intact and the pinned references are consistent, never that a
+candidate grouping, a coverage report, or a freeze selection is scientifically
+correct or human-approved.
+
 Related authority: the accepted `ARCH-MIGRATE` direction
 ([`03-policy-decisions.md` §ARCH-MIGRATE](contracts/03-policy-decisions.md)) —
 versioned migrations with manifest/schema versions, a consistent backup/restore

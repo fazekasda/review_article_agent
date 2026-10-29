@@ -6,14 +6,22 @@
 The approving evidence is this user session `ses_e7b3b9218ffemc0KnkBRFIjSxv`
 (2026-10-28), against the source baseline merged
 `fb8260d0f48fa73bde1e0bc57ec119fbe24dcabb` (PR #8,
-`feat/step05-search-records`) and the code base reviewed at `f860429`. The user's
-opening instruction was **"Implement everithing remaind from step 05 at once"**;
-they then resolved four scope questions and one architecture question, reproduced
-verbatim below. This record captures the *architecture/scope direction* the user
-chose for Step 05 discovery and for the direct lead route. It is a
-**documentation-only** decision record: this task changes no product source, test,
-schema, contract, or policy, and it describes code already visible in the base
-revision.
+`feat/step05-search-records`). The user's opening instruction was **"Implement
+everithing remaind from step 05 at once"**; they then resolved four scope
+questions and one architecture question, reproduced verbatim below. This record
+captures the *architecture/scope direction* the user chose for Step 05 discovery
+and for the direct lead route. It is a **documentation-only** decision record:
+this task changes no product source, test, schema, contract, or policy, and it
+describes code already visible in the base revision.
+
+**Approval anchor — what was and was not reviewed.** The commit `f860429` is the
+**coordinator-inspected implementation snapshot** the direction was discussed
+against; it was **not** a user code review. The user approved the **behavioral and
+architecture direction** described here **verbally in this session**, not a
+line-by-line review of the code at `f860429`. This approval is therefore **not**
+approval of paid execution and **not** approval of project science: it does not
+authorize a paid model call, a real project search, or a hosted transfer, and it
+makes no scientific-validation claim.
 
 **What this approval is and is not.** It approves the described **technical
 direction and scope boundaries** for Step 05. It is **not** a scientific
@@ -49,7 +57,9 @@ review/merge; Step 05 remains **in progress** and unchecked in
   eligibility is **not** final authorization; a hosted transfer needs an
   out-of-band, route/purpose/revision-scoped authorization) and §5.5
   (provider/journal term verification is operation-scoped and gates hosted use).
-- **Base revision reviewed:** `f860429` (branch `task/step05-approved-decisions`).
+- **Implementation snapshot inspected:** `f860429` (branch
+  `task/step05-approved-decisions`) — a **coordinator-inspected** snapshot, not a
+  user code review (see the approval anchor above).
 - **Implementation actually present at the base (no new claim is made about any
   of it here):** the direct, single-shot, tool-free OpenRouter lead adapter
   [`runtime/lead.py`](../../src/review_article_agent/runtime/lead.py); the
@@ -95,15 +105,20 @@ For the architecture question the alternatives considered were:
   route with its own exact bounds, leaving the OpenCode production block intact.
 
 Documentation claim vs observed behavior: this record documents the direction and
-the boundaries; it makes **no** live/paid result claim. A tiny metadata-adapter
-smoke was run by the coordinator **separately**; exact counts are for the later
-final handoff, not invented here. Live model validation of the lead route remains
+the boundaries; it makes **no** live/paid result claim. A **tiny, separately
+authorized** public-metadata smoke was run by the coordinator: **3 transport-level
+webfetch contract observations**, **3 real search-adapter GET attempts** (PubMed
+**2** + Europe PMC **1**), and **2 citation-adapter GETs** — no paid app/model
+call, no upload, and no live lead validation. These counts scope only the tested
+transport/adapter mechanisms in this repository; they are **not** a claim of topic
+coverage or scientific validation. Live model validation of the lead route remains
 **unrun**.
 
 ## Decision
 
-**Accepted by the user, 2026-10-28, against source baseline `fb8260d` (reviewed at
-`f860429`).**
+**Accepted by the user, 2026-10-28, against source baseline `fb8260d` (direction
+discussed against the coordinator-inspected implementation snapshot `f860429`,
+which was not a user code review).**
 
 **Verbatim user selections (2026-10-28):**
 
@@ -212,10 +227,16 @@ separately reviewable.
   link added here and in the specification crosslink. This record adds narrative
   and a status/crosslink only; it changes **no** checker fixture, test, schema,
   contract, enum, policy, or numeric threshold.
+- **Frozen checkpoint (not final-head evidence).** The currently verified frozen
+  checkpoint is `6ec58ea` (Python 3.14.4): **2,772 tests** (2,557 core + 20
+  scripts + 79 python spike + 51 mock-Jev + 7 mock-integration + 58 TypeScript),
+  **29 contract checks**, and `tsc`/`compileall`/`diffcheck` all clean. This is a
+  **frozen checkpoint**, not final-head evidence; per-suite detail lives in the
+  Step 05 handoff, not here. All claims in this record are scoped to mechanisms
+  actually tested in this repository, never to literature/topic coverage.
 - **Cost/rights honesty.** No paid call was authorized or made by this record; a
-  tiny public metadata-adapter smoke was run by the coordinator **separately** and
-  its exact counts belong to the later final handoff. Live lead-model validation
-  remains **unrun**.
+  tiny public metadata-adapter smoke was run by the coordinator **separately** (see
+  the counts above). Live lead-model validation remains **unrun**.
 - **Conditions for revisiting.** A user decision to change the discovery scope,
   the source set, the lead route, or the execution boundary; a material baseline
   change; or evidence that an accepted boundary fails in practice. Each change is
@@ -242,6 +263,8 @@ separately reviewable.
   [`discovery/candidates.py`](../../src/review_article_agent/discovery/candidates.py),
   [`discovery/expansion.py`](../../src/review_article_agent/discovery/expansion.py).
 - Decision format: [`docs/implementation/decision-template.md`](../implementation/decision-template.md).
-- **Unresolved follow-up (not blockers):** the later final-handoff record of the
-  exact tiny-smoke counts; live lead-model validation (unrun); and the remaining
-  Step 05 criteria/work. No secrets and no licensed full text are included here.
+- **Unresolved follow-up (not blockers):** the per-suite breakdown and the final
+  completion handoff remain in the [Step 05 handoff](../implementation/handoffs/05-discovery.md);
+  live lead-model validation (unrun); and the remaining Step 05 criteria/work,
+  including the report/freeze CLI integration being built by a separate worker. No
+  secrets and no licensed full text are included here.
