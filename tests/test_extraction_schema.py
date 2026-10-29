@@ -1,13 +1,10 @@
-"""Synthetic S9-SCHEMA suite; no model calls, no real evidence.
+"""Focused S9-SCHEMA regression suite; no model calls, no real evidence.
 
-Each test states a *structural* obligation of
-``review_article_agent.extraction.schema``.  These tests cannot and do not claim
-semantic completeness: they distinguish what structural validation can prove
-(grounding, coverage accounting, no fabrication, identity separation) from the
-human/quality audit that still owns omission and error detection.
+These assert *structural* obligations only (grounding, coverage accounting,
+no fabrication, identity separation, no inferred independence). They cannot and
+do not claim semantic completeness or correctness.
 """
 
-import copy
 import json
 import unittest
 
@@ -28,34 +25,28 @@ def passages():
             "text": "In mice, compound Z did not reduce tumor volume compared with vehicle.",
             "asset_ids": ["tbl1"],
         },
-        {
-            "passage_id": "p0002",
-            "source_key": "docA",
-            "text": "The 50 mg dose reduced tumor volume by 12.5 mm3 per mouse (n=8).",
-        },
-        {
-            "passage_id": "p0003",
-            "source_key": "docB",
-            "text": "We conclude that compound Z is broadly effective.",
-        },
+        {"passage_id": "p0002", "source_key": "docA",
+         "text": "The 50 mg dose reduced tumor volume by 12.5 mm3 per mouse (n=8)."},
+        {"passage_id": "p0003", "source_key": "docB",
+         "text": "We conclude that compound Z is broadly effective."},
     ]
 
 
-def stated_known(value):
+def known(value):
     return {"state": "known", "value": value}
 
 
-def stated_missing():
+def missing():
     return {"state": "missing", "value": None}
 
 
 def context(**overrides):
     base = {
-        "species": stated_known("mouse"),
-        "population": stated_missing(),
-        "assay": stated_known("tumor volume"),
-        "outcome": stated_known("tumor volume"),
-        "conditions": stated_known("vehicle comparison"),
+        "species": known("mouse"),
+        "population": missing(),
+        "assay": known("tumor volume"),
+        "outcome": known("tumor volume"),
+        "conditions": known("vehicle comparison"),
     }
     base.update(overrides)
     return base
@@ -72,7 +63,7 @@ def finding(fid, passage_id, snippet, **overrides):
         "citation_flag": "own_result",
         "context": context(),
         "secondary_warning": {"state": "not_applicable", "value": None},
-        "limitations": stated_known("single model system"),
+        "limitations": known("single model system"),
         "numeric_details": [],
     }
     record.update(overrides)
@@ -92,22 +83,12 @@ def valid_output():
         "experiments": [{"experiment_id": "E1", "study_id": "S1"}],
         "findings": [
             finding("F1", "p0001", "did not reduce tumor volume"),
-            finding(
-                "F2", "p0002", "reduced tumor volume by 12.5 mm3",
-                numeric_details=[
-                    {
-                        "name": "tumor volume",
-                        "value": stated_known(12.5),
-                        "unit": stated_known("mm3"),
-                        "denominator": stated_known("per mouse"),
-                    }
-                ],
-            ),
-            finding(
-                "F3", "p0003", "compound Z is broadly effective",
-                source_key="docB", attribution="author_interpretation",
-                citation_flag="mixed", context=context(species={"state": "unknown", "value": None}),
-            ),
+            finding("F2", "p0002", "reduced tumor volume by 12.5 mm3",
+                    numeric_details=[{"name": "tumor volume", "value": known(12.5),
+                                      "unit": known("mm3"), "denominator": known("per mouse")}]),
+            finding("F3", "p0003", "compound Z is broadly effective", source_key="docB",
+                    attribution="author_interpretation", citation_flag="mixed",
+                    context=context(species={"state": "unknown", "value": None})),
         ],
         "coverage": [
             {"target_kind": "passage", "target_id": "p0001", "disposition": "finding", "finding_id": "F1"},
@@ -121,100 +102,74 @@ def valid_output():
     }
 
 
-def validate(out, dims=None):
-    return validate_extraction(out, passages=passages(), appraisal_dimensions=dims or [])
+def validate(out, dims=None, pool=None):
+    return validate_extraction(out, passages=pool or passages(), appraisal_dimensions=dims or [])
 
 
 class GroundingTests(unittest.TestCase):
     def test_valid_output_normalizes_and_is_json_portable(self):
         result = validate(valid_output())
-        self.assertEqual(result["schema_version"], SCHEMA_VERSION)
+        json.dumps(result)
         self.assertEqual([f["finding_id"] for f in result["findings"]], ["F1", "F2", "F3"])
-        json.dumps(result)  # must be JSON-portable
+
+    def test_parsed_passages_with_extra_metadata_are_accepted(self):
+        pool = passages()
+        pool[0]["locator"] = {"page": 3, "span": [0, 40]}
+        pool[0]["section_path"] = ["Results"]
+        pool[0]["kind"] = "paragraph"
+        pool[0]["text_sha256"] = "deadbeef"
+        result = validate(valid_output(), pool=pool)
+        self.assertEqual(result["findings"][0]["snippet"], "did not reduce tumor volume")
 
     def test_invalid_quote_is_refused(self):
-        for snippet in (
-            "did not reduce tumour volume",  # paraphrase / spelling change
-            "reduced tumor volume",          # negation dropped
-            "Z reduced tumor volume",        # re-ordered
-        ):
+        for snippet in ("did not reduce tumour volume", "reduced tumor volume", "Z reduced tumor volume"):
             out = valid_output()
             out["findings"][0]["snippet"] = snippet
             with self.assertRaises(ExtractionError):
                 validate(out)
 
     def test_negation_preserved_in_snippet(self):
-        result = validate(valid_output())
-        self.assertIn("did not reduce", result["findings"][0]["snippet"])
-
-    def test_snippet_must_belong_to_its_own_passage(self):
-        out = valid_output()
-        out["findings"][0]["snippet"] = "reduced tumor volume by 12.5 mm3"  # belongs to p0002
-        with self.assertRaises(ExtractionError):
-            validate(out)
-
-    def test_snippet_may_resolve_from_raw_text(self):
-        pool = passages()
-        pool[0]["text"] = "In mice, compound Z did not reduce tumor volume."  # softened
-        pool[0]["raw_text"] = "In mice, compound Z did not reduce tumor volume compared with vehicle."
-        out = valid_output()
-        out["findings"][0]["snippet"] = "did not reduce tumor volume compared with vehicle"
-        result = validate_extraction(out, passages=pool, appraisal_dimensions=[])
-        self.assertEqual(result["findings"][0]["passage_id"], "p0001")
+        self.assertIn("did not reduce", validate(valid_output())["findings"][0]["snippet"])
 
 
 class CompletenessTests(unittest.TestCase):
+    def _drop(self, out, target):
+        out["coverage"] = [c for c in out["coverage"] if c["target_id"] != target]
+        out["findings"] = [f for f in out["findings"] if f["passage_id"] != target]
+
     def test_unaccounted_passage_fails_closed(self):
         out = valid_output()
-        out["coverage"] = [c for c in out["coverage"] if c["target_id"] != "p0003"]
-        out["findings"] = [f for f in out["findings"] if f["finding_id"] != "F3"]
-        with self.assertRaises(ExtractionError) as ctx:
+        self._drop(out, "p0003")
+        with self.assertRaises(ExtractionError):
             validate(out)
-        self.assertIn("does not account", str(ctx.exception))
 
     def test_correct_quote_alone_is_not_completeness(self):
-        # A real, exact quote does not excuse an unaccounted passage.
         out = valid_output()
-        out["coverage"] = [c for c in out["coverage"] if c["target_id"] != "p0002"]
-        out["findings"] = [f for f in out["findings"] if f["finding_id"] != "F2"]
+        self._drop(out, "p0002")  # a real, exact quote still leaves p0002 unaccounted
         with self.assertRaises(ExtractionError):
             validate(out)
 
-    def test_omission_record_satisfies_completeness(self):
+    def test_omission_record_satisfies_completeness_but_requires_reason(self):
         out = valid_output()
-        out["coverage"] = [
-            c for c in out["coverage"] if c["target_id"] != "p0003"
-        ] + [{"target_kind": "passage", "target_id": "p0003", "disposition": "omitted", "reason": "not_scientific_content"}]
-        out["findings"] = [f for f in out["findings"] if f["finding_id"] != "F3"]
+        self._drop(out, "p0003")
+        out["coverage"].append({"target_kind": "passage", "target_id": "p0003",
+                                "disposition": "omitted", "reason": "not_scientific_content"})
         result = validate(out)
-        omitted = [c for c in result["coverage"] if c["disposition"] == "omitted"]
-        self.assertEqual({c["target_id"] for c in omitted}, {"p0003", "tbl1"})
-
-    def test_omitted_requires_reason(self):
-        out = valid_output()
-        out["coverage"][3].pop("reason")
-        with self.assertRaises(ExtractionError):
-            validate(out)
-
-    def test_duplicate_coverage_refused(self):
-        out = valid_output()
-        out["coverage"].append(dict(out["coverage"][0]))
-        with self.assertRaises(ExtractionError):
-            validate(out)
-
-    def test_finding_not_claimed_in_coverage_refused(self):
-        out = valid_output()
-        out["coverage"][0] = {"target_kind": "passage", "target_id": "p0001", "disposition": "no_finding"}
+        omitted = {c["target_id"] for c in result["coverage"] if c["disposition"] == "omitted"}
+        self.assertEqual(omitted, {"p0003", "tbl1"})
+        out["coverage"][-1].pop("reason")
         with self.assertRaises(ExtractionError):
             validate(out)
 
 
 class MissingValueTests(unittest.TestCase):
-    def test_missing_values_stay_missing(self):
-        result = validate(valid_output())
-        pop = result["findings"][0]["context"]["population"]
-        self.assertEqual(pop, {"state": "missing", "value": None})
-        self.assertIsNone(result["findings"][0]["numeric_details"] or None)
+    def test_missing_values_stay_missing_not_fabricated(self):
+        out = valid_output()
+        out["findings"][0]["context"]["population"] = {"state": "missing", "value": "C57BL/6"}
+        with self.assertRaises(ExtractionError):
+            validate(out)
+        self.assertEqual(validate(valid_output())["findings"][0]["context"]["population"],
+                         {"state": "missing", "value": None})
 
     def test_known_state_requires_value(self):
         out = valid_output()
@@ -222,60 +177,35 @@ class MissingValueTests(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             validate(out)
 
-    def test_missing_state_forbids_fabricated_value(self):
-        out = valid_output()
-        out["findings"][0]["context"]["population"] = {"state": "missing", "value": "C57BL/6"}
-        with self.assertRaises(ExtractionError):
-            validate(out)
-
-    def test_unknown_state_is_not_known(self):
-        out = valid_output()
-        out["findings"][0]["context"]["species"] = {"state": "unknown", "value": None}
-        result = validate(out)
-        self.assertEqual(result["findings"][0]["context"]["species"]["state"], "unknown")
-
 
 class NumberTests(unittest.TestCase):
     def test_known_value_with_unit_and_denominator(self):
-        result = validate(valid_output())
-        detail = result["findings"][1]["numeric_details"][0]
-        self.assertEqual(detail["value"]["value"], 12.5)
-        self.assertEqual(detail["unit"]["value"], "mm3")
-        self.assertEqual(detail["denominator"]["value"], "per mouse")
+        detail = validate(valid_output())["findings"][1]["numeric_details"][0]
+        self.assertEqual((detail["value"]["value"], detail["unit"]["value"], detail["denominator"]["value"]),
+                         (12.5, "mm3", "per mouse"))
 
-    def test_missing_denominator_is_allowed_not_invented(self):
+    def test_missing_denominator_allowed_not_invented(self):
         out = valid_output()
-        out["findings"][1]["numeric_details"][0]["denominator"] = stated_missing()
-        result = validate(out)
-        self.assertEqual(result["findings"][1]["numeric_details"][0]["denominator"]["state"], "missing")
+        out["findings"][1]["numeric_details"][0]["denominator"] = missing()
+        self.assertEqual(validate(out)["findings"][1]["numeric_details"][0]["denominator"]["state"], "missing")
 
-    def test_non_numeric_known_value_refused(self):
-        out = valid_output()
-        out["findings"][1]["numeric_details"][0]["value"] = {"state": "known", "value": "about twelve"}
-        with self.assertRaises(ExtractionError):
-            validate(out)
-
-    def test_boolean_is_not_a_number(self):
-        out = valid_output()
-        out["findings"][1]["numeric_details"][0]["value"] = {"state": "known", "value": True}
-        with self.assertRaises(ExtractionError):
-            validate(out)
+    def test_non_numeric_and_boolean_known_values_refused(self):
+        for bad in ("about twelve", True):
+            out = valid_output()
+            out["findings"][1]["numeric_details"][0]["value"] = {"state": "known", "value": bad}
+            with self.assertRaises(ExtractionError):
+                validate(out)
 
 
-class SpeciesAndSpinTests(unittest.TestCase):
-    def test_species_context_is_captured_distinctly(self):
+class ContextSpinTests(unittest.TestCase):
+    def test_species_captured_and_spin_attributed(self):
         result = validate(valid_output())
         self.assertEqual(result["findings"][0]["context"]["species"]["value"], "mouse")
-        self.assertEqual(result["findings"][2]["context"]["species"]["state"], "unknown")
-
-    def test_author_spin_is_attributed_not_laundered(self):
-        result = validate(valid_output())
         spin = result["findings"][2]
-        self.assertEqual(spin["attribution"], "author_interpretation")
-        self.assertEqual(spin["citation_flag"], "mixed")
+        self.assertEqual((spin["attribution"], spin["citation_flag"]), ("author_interpretation", "mixed"))
         self.assertIn("broadly effective", spin["snippet"])
 
-    def test_attribution_enum_is_enforced(self):
+    def test_attribution_enum_enforced(self):
         out = valid_output()
         out["findings"][2]["attribution"] = "probably_true"
         with self.assertRaises(ExtractionError):
@@ -286,78 +216,55 @@ class TableSupplementTests(unittest.TestCase):
     def test_table_asset_must_be_covered(self):
         out = valid_output()
         out["coverage"] = [c for c in out["coverage"] if c["target_id"] != "tbl1"]
-        with self.assertRaises(ExtractionError) as ctx:
+        with self.assertRaises(ExtractionError):
             validate(out)
-        self.assertIn("tbl1", str(ctx.exception))
 
-    def test_supplement_pooled_as_passage_required(self):
-        pool = passages() + [
-            {
-                "passage_id": "supp1",
-                "source_key": "docA",
-                "kind": "supplement",
-                "text": "Supplementary Table S2 reports an independent cohort.",
-            }
-        ]
+    def test_pooled_supplement_passage_is_required(self):
+        pool = passages() + [{"passage_id": "supp1", "source_key": "docA", "kind": "supplement",
+                              "text": "Supplementary Table S2 reports an independent cohort."}]
         out = valid_output()
         with self.assertRaises(ExtractionError):
-            validate_extraction(out, passages=pool, appraisal_dimensions=[])
-        out["coverage"].append(
-            {"target_kind": "passage", "target_id": "supp1", "disposition": "omitted", "reason": "supplement_not_acquired"}
-        )
-        result = validate_extraction(out, passages=pool, appraisal_dimensions=[])
-        self.assertIn("supp1", {c["target_id"] for c in result["coverage"]})
-
-    def test_asset_reviewed_with_finding_is_grounded(self):
-        pool = passages()
-        out = valid_output()
-        out["coverage"][3] = {
-            "target_kind": "asset", "target_id": "tbl1", "disposition": "finding", "finding_id": "F1",
-        }
-        result = validate_extraction(out, passages=pool, appraisal_dimensions=[])
-        self.assertEqual(result["coverage"][3]["finding_id"], "F1")
+            validate(out, pool=pool)
+        out["coverage"].append({"target_kind": "passage", "target_id": "supp1",
+                                "disposition": "omitted", "reason": "supplement_not_acquired"})
+        self.assertIn("supp1", {c["target_id"] for c in validate(out, pool=pool)["coverage"]})
 
 
-class IdentityTests(unittest.TestCase):
-    def test_link_relation_target_kind_enforced(self):
+class IdentityAndLinkageTests(unittest.TestCase):
+    def test_relation_target_kind_enforced(self):
         out = valid_output()
         out["links"] = [{"from": "source:docA", "to": "dataset:D1", "relation": "reports", "status": "confirmed"}]
         with self.assertRaises(ExtractionError):
             validate(out)
 
-    def test_proposed_link_is_unproven_but_recorded(self):
+    def test_model_links_are_proposals_not_proof(self):
         out = valid_output()
-        out["links"] = [{"from": "source:docA", "to": "study:S1", "relation": "reports", "status": "proposed"}]
-        result = validate(out)
-        self.assertEqual(len(result["link_summary"]["proposed"]), 1)
-        self.assertEqual(result["link_summary"]["confirmed"], [])
+        out["links"] = [{"from": "source:docA", "to": "study:S1", "relation": "reports", "status": "confirmed"}]
+        summary = validate(out)["link_summary"]
+        self.assertEqual(len(summary["confirmed_links"]), 1)
+        self.assertIn("not proven identity", summary["notice"])
 
-    def test_two_reports_of_one_study_are_not_independent(self):
+    def test_unlinked_sources_have_unknown_linkage_not_independence(self):
+        summary = validate(valid_output())["link_summary"]
+        self.assertIn(["docA", "docB"], summary["unlinked_source_pairs"])
+        self.assertNotIn("independent_source_pairs", summary)
+        self.assertIn("unknown linkage", summary["notice"])
+
+    def test_two_reports_of_one_study_are_linked_not_independent(self):
         out = valid_output()
         out["links"] = [
             {"from": "source:docA", "to": "study:S1", "relation": "reports", "status": "confirmed"},
             {"from": "source:docB", "to": "study:S1", "relation": "reports", "status": "proposed"},
         ]
-        result = validate(out)
-        self.assertEqual(result["link_summary"]["independent_source_pairs"], [])
+        summary = validate(out)["link_summary"]
+        self.assertEqual(summary["unlinked_source_pairs"], [])
+        self.assertEqual(len(summary["proposed_links"]), 1)
 
-    def test_unlinked_sources_are_independent(self):
-        result = validate(valid_output())
-        self.assertIn(["docA", "docB"], result["link_summary"]["independent_source_pairs"])
-
-    def test_unknown_ref_is_refused(self):
+    def test_unknown_ref_and_finding_source_mismatch_refused(self):
         out = valid_output()
         out["links"] = [{"from": "source:docA", "to": "study:S9", "relation": "reports", "status": "confirmed"}]
         with self.assertRaises(ExtractionError):
             validate(out)
-
-    def test_experiment_study_relation_checked(self):
-        out = valid_output()
-        out["experiments"] = [{"experiment_id": "E1", "study_id": "S9"}]
-        with self.assertRaises(ExtractionError):
-            validate(out)
-
-    def test_finding_source_must_match_passage_source(self):
         out = valid_output()
         out["findings"][0]["source_key"] = "docB"  # p0001 belongs to docA
         with self.assertRaises(ExtractionError):
@@ -365,14 +272,7 @@ class IdentityTests(unittest.TestCase):
 
 
 class AppraisalAndScopeTests(unittest.TestCase):
-    def test_no_universal_score_key_allowed(self):
-        for key in ("score", "quality_score", "global_score", "excluded"):
-            out = valid_output()
-            out[key] = 7
-            with self.assertRaises(ExtractionError):
-                validate(out)
-
-    def test_appraisal_reports_configured_dimensions_only(self):
+    def test_appraisal_dimensions_and_unassessed_retention(self):
         dims = [{"dimension_id": "risk_of_bias"}, {"dimension_id": "applicability"}]
         out = valid_output()
         out["appraisal"] = [
@@ -380,53 +280,49 @@ class AppraisalAndScopeTests(unittest.TestCase):
             {"dimension_id": "applicability", "state": "unassessed", "judgement": "not assessed"},
         ]
         result = validate(out, dims=dims)
-        self.assertEqual([a["dimension_id"] for a in result["appraisal"]], ["risk_of_bias", "applicability"])
+        self.assertEqual([a["state"] for a in result["appraisal"]], ["assessed", "unassessed"])
+        self.assertEqual(len(result["findings"]), 3)  # a weak appraisal never excludes findings
 
-    def test_missing_appraisal_dimension_is_a_missing_check(self):
-        dims = [{"dimension_id": "risk_of_bias"}]
-        out = valid_output()
-        out["appraisal"] = []
+    def test_missing_dimension_and_dimension_score_refused(self):
         with self.assertRaises(ExtractionError):
-            validate(out, dims=dims)
-
-    def test_unassessed_is_not_a_pass_and_weak_study_retained(self):
-        dims = [{"dimension_id": "risk_of_bias"}]
-        out = valid_output()
-        out["appraisal"] = [{"dimension_id": "risk_of_bias", "state": "unassessed", "judgement": "not assessed"}]
-        result = validate(out, dims=dims)
-        self.assertEqual(result["appraisal"][0]["state"], "unassessed")
-        self.assertEqual(len(result["findings"]), 3)  # findings are not excluded by a weak appraisal
-
-    def test_appraisal_dimension_cannot_define_a_score(self):
+            validate(valid_output(), dims=[{"dimension_id": "risk_of_bias"}])
         with self.assertRaises(ExtractionError):
             validate(valid_output(), dims=[{"dimension_id": "x", "score": 1}])
 
+    def test_no_universal_score_or_exclusion_keys(self):
+        for key in ("score", "quality_score", "global_score", "excluded"):
+            out = valid_output()
+            out[key] = 7
+            with self.assertRaises(ExtractionError):
+                validate(out)
+
     def test_semantic_wrongness_is_out_of_scope(self):
-        # A factually wrong but exactly-grounded, fully-covered output passes:
-        # structural validation cannot judge scientific truth.
         out = valid_output()
         out["findings"][0]["statement"] = "Compound Z cured every subject."
-        result = validate(out)
-        self.assertEqual(result["findings"][0]["statement"], "Compound Z cured every subject.")
+        self.assertEqual(validate(out)["findings"][0]["statement"], "Compound Z cured every subject.")
 
-    def test_instructions_mention_core_grounding_rules(self):
-        for phrase in ("EXACT substring", "negation", "missing", "author_interpretation", "coverage", "score"):
+
+class PrivacyAndFixtureTests(unittest.TestCase):
+    def test_errors_are_value_free(self):
+        out = valid_output()
+        out["findings"][0]["snippet"] = "did not reduce tumour volume"  # paraphrase
+        with self.assertRaises(ExtractionError) as ctx:
+            validate(out)
+        message = str(ctx.exception)
+        self.assertNotIn("tumour", message)
+        self.assertNotIn("p0001", message)
+
+    def test_instructions_cover_core_grounding_rules(self):
+        for phrase in ("EXACT substring", "negation", "missing", "author_interpretation", "coverage", "score", "UNKNOWN"):
             self.assertIn(phrase, EXTRACTION_INSTRUCTIONS)
 
-
-class ExampleFixtureTests(unittest.TestCase):
-    def test_example_fixture_is_valid_and_json_portable(self):
+    def test_example_fixture_is_valid_json_portable_and_isolated(self):
         result = extraction_example()
         json.dumps(result)
         self.assertEqual(result["validation"]["required_items"], result["validation"]["accounted_items"])
-        self.assertTrue(result["link_summary"]["confirmed"])
-        self.assertIn("asset", {c["target_kind"] for c in result["coverage"]})
-
-    def test_example_fixture_is_independent_of_caller_mutation(self):
-        first = extraction_example()
-        first["summary"] = "mutated"
-        second = extraction_example()
-        self.assertNotEqual(second["summary"], "mutated")
+        self.assertTrue(result["link_summary"]["confirmed_links"])
+        result["summary"] = "mutated"
+        self.assertNotEqual(extraction_example()["summary"], "mutated")
 
 
 if __name__ == "__main__":

@@ -1,41 +1,24 @@
 """Minimal, strict, JSON-portable extraction-evidence schema (Step 09, S9-SCHEMA).
 
-This module owns **one bounded outcome**: turn one untrusted, model-produced
-extraction document into a *normalized, structurally validated* mapping, or
-refuse it.  It is the schema/grounding gate only; it never calls a model, reads
-storage, resolves a workflow, or decides scientific truth.
+One bounded outcome: turn one untrusted, model-produced extraction document into
+a *normalized, structurally validated* mapping, or refuse it.  It never calls a
+model, reads storage, resolves a workflow, or decides scientific truth.
 
 Authority: ``docs/implementation/09-extraction.md`` deliverables 9-11 and
-acceptance criteria AC16-18, AC21-22; ``docs/specification.md`` scientific
-invariants (no extraction from summaries alone; missing data stays missing;
-separate source/study/dataset/experiment/result identities; no global quality
-score; direct observation vs author interpretation vs secondary; tables and
-supplements are inputs); ``docs/contracts/01-identities.md`` I4/I6/I8 and
-``EvidenceRecord`` vocabulary; ``docs/contracts/03-policy-decisions.md``
-POL-P2/POL-OPS-* (fail-closed missing checks, no invented numbers).
+AC16-18, AC21-22; ``docs/specification.md`` invariants (no extraction from
+summaries alone; missing data stays missing; separate source/study/dataset/
+experiment/result identities; no global quality score; tables/supplements are
+inputs); ``docs/contracts/01-identities.md`` I4/I6/I8; POL-P2/POL-OPS-*.
 
-What this module **is not**:
+Non-claims: it **cannot** prove scientific correctness or completeness (a
+human/quality audit still owns semantic omission/error detection); it invents no
+default, threshold, score, unit, or value (missing stays ``missing``/``unknown``
+with ``None``); it defines no exclusion semantics (a weak study is retained and
+universal score/exclusion keys are rejected).
 
-* It **cannot** prove scientific correctness or completeness.  A validated
-  extraction is only *structurally well-formed, grounded in exact original
-  snippets, and explicit about coverage/omissions*; a human/quality audit still
-  owns semantic omission and error detection.  Passing here is not a scientific
-  approval and never authorizes bulk digestion or synthesis.
-* It invents **no** scientific default, threshold, appraisal score, unit, or
-  value.  A missing value is carried as ``missing``/``unknown`` with ``None``;
-  it is never fabricated and never silently treated as a clean observation.
-* It defines no exclusion semantics: a weak study is retained with its
-  uncertainty.  Universal score/exclusion keys are rejected.
-
-Public API:
-
-* :data:`EXTRACTION_INSTRUCTIONS` -- the exact, trusted schema and grounding
-  guidance the runtime runner includes with the original passages.
-* :func:`validate_extraction` -- ``validate_extraction(output, *, passages,
-  appraisal_dimensions)`` returns a normalized/validated ``dict`` or raises
-  :class:`ExtractionError`.
-* :func:`extraction_example` -- a synthetic, reusable fixture mapping for
-  downstream workflow tests (never real evidence).
+Public API: :data:`EXTRACTION_INSTRUCTIONS` (trusted grounding guidance for the
+runner), :func:`validate_extraction`, :func:`extraction_example` (synthetic
+reusable fixture; never real evidence).
 """
 
 from __future__ import annotations
@@ -89,10 +72,19 @@ LINK_RELATIONS = (
     "same_dataset",
 )
 
-#: A proposed link is an *unproven* identity hypothesis; a confirmed link is an
-#: explicit assertion.  The absence of any link is the default and implies the
-#: records are independent (I6: reports of one dataset are not independent).
+#: Link status describes the *strength of the model's proposal only*.  Even a
+#: ``confirmed`` link is a model proposal: it cannot prove identity, and human
+#: appraisal is still required.  Absence of a link means linkage is **unknown**,
+#: never proven independence; only explicit proven metadata may assert
+#: independence (I6: reports of one dataset are not independent confirmation).
 LINK_STATUSES = ("proposed", "confirmed")
+
+#: Statement carried with every normalized result about link semantics.
+LINKAGE_NOTICE = (
+    "Source/study/dataset/experiment links are model proposals, not proven identity; "
+    "human appraisal is required. Unlinked records have unknown linkage and are never "
+    "reported as independent by absence of a link."
+)
 
 #: Entity-ref namespaces kept deliberately separate (AC22).
 REF_KINDS = ("source", "study", "dataset", "experiment", "finding")
@@ -164,7 +156,7 @@ DISTINCT IDENTITIES (do not conflate)
 - source_records: the document(s)/report(s) actually read; each has a unique source_key.
 - studies, datasets, experiments: separate identity namespaces with unique ids.
 - findings: result/finding ids in their own namespace, each tied to source_key + passage_id.
-- `links` express relations (reports -> study, uses_dataset -> dataset, describes_experiment -> experiment, same_study, same_dataset) with status proposed|confirmed. `proposed` is an unproven identity hypothesis and MUST NOT be presented as established. Absence of a link means the records are independent; multiple reports of one dataset are NOT independent confirmation.
+- `links` express relations (reports -> study, uses_dataset -> dataset, describes_experiment -> experiment, same_study, same_dataset) with status proposed|confirmed. Both are model proposals and neither proves identity; a human appraisal is still required. Absence of a link means linkage is UNKNOWN, never proven independence; only explicit proven metadata may assert independence. Multiple reports of one dataset or study are NOT independent confirmation.
 
 APPRAISAL
 - Report only the configured appraisal dimensions, each with a judgement; use state unassessed when not assessed. Do NOT output any numeric score or global quality rating. A weak study is retained with its limitations -- never excluded automatically.
@@ -187,10 +179,6 @@ def _require(condition: bool, message: str) -> None:
         raise _fail(message)
 
 
-def _is_plain_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
 def _is_number(value: object) -> bool:
     if isinstance(value, bool):
         return False
@@ -199,13 +187,23 @@ def _is_number(value: object) -> bool:
     return isinstance(value, float) and math.isfinite(value)
 
 
-def _keys(value: object, *, label: str, required: frozenset, optional: frozenset = frozenset()) -> dict:
+def _keys(
+    value: object,
+    *,
+    label: str,
+    required: frozenset,
+    optional: frozenset = frozenset(),
+    allow_extra: bool = False,
+) -> dict:
     _require(isinstance(value, dict), f"{label} must be a JSON object")
     present = set(value)
     missing = required - present
-    unknown = present - required - optional
+    # Required names are our own vocabulary; unknown names are caller-supplied and
+    # are never echoed (privacy: no untrusted identifiers in diagnostics).
     _require(not missing, f"{label} is missing required keys: {sorted(missing)}")
-    _require(not unknown, f"{label} has unknown keys: {sorted(unknown)}")
+    if not allow_extra:
+        unknown = present - required - optional
+        _require(not unknown, f"{label} has unknown keys")
     return value
 
 
@@ -264,14 +262,17 @@ def _index_passages(passages: object) -> tuple[dict, dict, set]:
     required: set = set()
     for index, raw in enumerate(pool):
         label = f"passages[{index}]"
+        # Passages are workflow-supplied parsed output (trusted provenance), not
+        # model output, so extra parsed metadata (locator, section_path, digests,
+        # ...) is accepted and ignored; only the keys below are read.
         item = _keys(
             raw,
             label=label,
             required=frozenset({"passage_id", "text"}),
-            optional=frozenset({"raw_text", "source_key", "kind", "asset_ids"}),
+            allow_extra=True,
         )
         passage_id = _identifier(item["passage_id"], label=f"{label}.passage_id")
-        _require(passage_id not in by_id, f"duplicate passage_id {passage_id!r}")
+        _require(passage_id not in by_id, "duplicate passage_id in passage pool")
         _require(isinstance(item["text"], str), f"{label}.text must be a string")
         source_key = item.get("source_key")
         if source_key is not None:
@@ -284,7 +285,7 @@ def _index_passages(passages: object) -> tuple[dict, dict, set]:
         assets = []
         for asset in asset_ids:
             aid = _identifier(asset, label=f"{label}.asset_ids[]")
-            _require(aid not in by_asset, f"duplicate asset id {aid!r}")
+            _require(aid not in by_asset, "duplicate asset id in passage pool")
             by_asset[aid] = passage_id
             assets.append(aid)
             required.add(("asset", aid))
@@ -321,7 +322,7 @@ def _validate_sources(value: object) -> dict[str, dict]:
             optional=frozenset({"label", "report_ref"}),
         )
         key = _identifier(item["source_key"], label=f"{label}.source_key")
-        _require(key not in out, f"duplicate source_key {key!r}")
+        _require(key not in out, "duplicate source_key in source_records")
         kind = _enum(item["source_kind"], label=f"{label}.source_kind", allowed=("document", "report"))
         label_value = item.get("label")
         if label_value is not None:
@@ -380,22 +381,21 @@ def _validate_findings(value: object, sources: dict, passages: dict, id_lists: d
             ),
         )
         finding_id = _identifier(item["finding_id"], label=f"{label}.finding_id")
-        _require(finding_id not in out, f"duplicate finding_id {finding_id!r}")
+        _require(finding_id not in out, "duplicate finding_id in findings")
         source_key = _identifier(item["source_key"], label=f"{label}.source_key")
-        _require(source_key in sources, f"{label}.source_key {source_key!r} is not declared in source_records")
+        _require(source_key in sources, f"{label}.source_key is not declared in source_records")
         passage_id = _identifier(item["passage_id"], label=f"{label}.passage_id")
-        _require(passage_id in passages, f"{label}.passage_id {passage_id!r} is not in the supplied passages")
+        _require(passage_id in passages, f"{label}.passage_id is not in the supplied passages")
         passage = passages[passage_id]
         if passage["source_key"] is not None:
             _require(
                 passage["source_key"] == source_key,
-                f"{label}.source_key {source_key!r} does not match the passage's source_key "
-                f"{passage['source_key']!r}",
+                f"{label}.source_key does not match the cited passage's source",
             )
         snippet = _string(item["snippet"], label=f"{label}.snippet")
         _require(
             _snippet_grounded(snippet, passage),
-            f"{label}.snippet is not an exact substring of passage {passage_id!r}",
+            f"{label}.snippet is not an exact substring of its passage",
         )
         statement = _string(item["statement"], label=f"{label}.statement")
         attribution = _enum(item["attribution"], label=f"{label}.attribution", allowed=ATTRIBUTIONS)
@@ -416,7 +416,7 @@ def _validate_findings(value: object, sources: dict, passages: dict, id_lists: d
             ref = item.get(field)
             if ref is not None:
                 ref = _identifier(ref, label=f"{label}.{field}")
-                _require(ref in id_lists[target], f"{label}.{field} {ref!r} is not declared in {plural}")
+                _require(ref in id_lists[target], f"{label}.{field} is not declared in {plural}")
                 refs[field] = ref
         out[finding_id] = {
             "finding_id": finding_id,
@@ -445,7 +445,7 @@ def _validate_id_records(value: object, *, label: str, id_field: str, optional: 
         item_label = f"{label}[{index}]"
         item = _keys(raw, label=item_label, required=frozenset({id_field}), optional=optional)
         identity = _identifier(item[id_field], label=f"{item_label}.{id_field}")
-        _require(identity not in out, f"duplicate {id_field} {identity!r}")
+        _require(identity not in out, f"duplicate {id_field} in {label}")
         record = {id_field: identity}
         for extra in optional:
             record[extra] = item.get(extra)
@@ -456,9 +456,9 @@ def _validate_id_records(value: object, *, label: str, id_field: str, optional: 
 
 
 def _ref_exists(ref: str, names: dict) -> bool:
-    _require(isinstance(ref, str) and ":" in ref, f"entity ref {ref!r} must be 'kind:id'")
+    _require(isinstance(ref, str) and ":" in ref, "entity ref must be 'kind:id'")
     kind, _, identity = ref.partition(":")
-    _require(kind in REF_KINDS, f"entity ref {ref!r} has unknown kind {kind!r}")
+    _require(kind in REF_KINDS, "entity ref has an unknown kind")
     return identity in names[kind]
 
 
@@ -472,8 +472,8 @@ def _validate_links(value: object, names: dict) -> list:
         to_ref = _string(item["to"], label=f"{label}.to")
         relation = _enum(item["relation"], label=f"{label}.relation", allowed=LINK_RELATIONS)
         status = _enum(item["status"], label=f"{label}.status", allowed=LINK_STATUSES)
-        _require(_ref_exists(from_ref, names), f"{label}.from {from_ref!r} is not a declared record")
-        _require(_ref_exists(to_ref, names), f"{label}.to {to_ref!r} is not a declared record")
+        _require(_ref_exists(from_ref, names), f"{label}.from is not a declared record")
+        _require(_ref_exists(to_ref, names), f"{label}.to is not a declared record")
         from_kind = from_ref.split(":", 1)[0]
         to_kind = to_ref.split(":", 1)[0]
         expected = {
@@ -485,7 +485,7 @@ def _validate_links(value: object, names: dict) -> list:
         }[relation]
         _require(
             (from_kind, to_kind) == expected,
-            f"{label}.relation {relation!r} requires {expected[0]}->{expected[1]}, got {from_kind}->{to_kind}",
+            f"{label}.relation does not match its source/target kinds",
         )
         out.append({"from": from_ref, "to": to_ref, "relation": relation, "status": status})
     return out
@@ -505,8 +505,8 @@ def _validate_appraisal(value: object, dimensions: tuple) -> list:
         for banned in ("score", "rating", "weight", "value"):
             _require(banned not in item, f"{label} must not carry a numeric '{banned}' (no universal score)")
         dimension_id = _identifier(item["dimension_id"], label=f"{label}.dimension_id")
-        _require(dimension_id in dimensions, f"{label}.dimension_id {dimension_id!r} is not an approved dimension")
-        _require(dimension_id not in by_id, f"duplicate appraisal for dimension {dimension_id!r}")
+        _require(dimension_id in dimensions, f"{label}.dimension_id is not an approved dimension")
+        _require(dimension_id not in by_id, "duplicate appraisal dimension")
         state = _enum(item["state"], label=f"{label}.state", allowed=APPRAISAL_STATES)
         judgement = _string(item["judgement"], label=f"{label}.judgement")
         rationale = item.get("rationale")
@@ -523,7 +523,7 @@ def _validate_appraisal(value: object, dimensions: tuple) -> list:
             "tool_applied": tool,
         }
     missing = set(dimensions) - set(by_id)
-    _require(not missing, f"appraisal is missing approved dimensions: {sorted(missing)}")
+    _require(not missing, "appraisal is missing approved dimension(s)")
     return [by_id[d] for d in dimensions]
 
 
@@ -568,18 +568,18 @@ def _validate_coverage(value: object, findings: dict, required: set) -> tuple[li
         target_kind = _enum(item["target_kind"], label=f"{label}.target_kind", allowed=("passage", "asset"))
         target_id = _identifier(item["target_id"], label=f"{label}.target_id")
         key = (target_kind, target_id)
-        _require(key in required, f"{label} references an unknown {target_kind} {target_id!r}")
-        _require(key not in covered, f"duplicate coverage for {target_kind} {target_id!r}")
+        _require(key in required, f"{label} references an unknown required item")
+        _require(key not in covered, "duplicate coverage entry")
         disposition = _enum(item["disposition"], label=f"{label}.disposition", allowed=COVERAGE_DISPOSITIONS)
         finding_id = item.get("finding_id")
         reason = item.get("reason")
         if disposition == "finding":
             finding_id = _identifier(finding_id, label=f"{label}.finding_id")
-            _require(finding_id in findings, f"{label}.finding_id {finding_id!r} is not a declared finding")
+            _require(finding_id in findings, f"{label}.finding_id is not a declared finding")
             if target_kind == "passage":
                 _require(
                     findings[finding_id]["passage_id"] == target_id,
-                    f"{label}.finding_id {finding_id!r} cites a different passage",
+                    f"{label}.finding_id cites a different passage",
                 )
             _require(reason is None, f"{label}.reason is only allowed when omitted")
         else:
@@ -594,21 +594,23 @@ def _validate_coverage(value: object, findings: dict, required: set) -> tuple[li
     # Every finding must be claimed by exactly one coverage entry (completeness).
     claimed = {entry["finding_id"] for entry in out if entry["disposition"] == "finding"}
     unclaimed = set(findings) - claimed
-    _require(not unclaimed, f"findings are not accounted in coverage: {sorted(unclaimed)}")
+    _require(not unclaimed, "some findings are not accounted in coverage")
     # Every required passage/asset id must be accounted (fail closed).
     missing = required - covered
-    _require(
-        not missing,
-        f"coverage does not account for {len(missing)} required item(s): "
-        f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}",
-    )
+    _require(not missing, f"coverage does not account for {len(missing)} required item(s)")
     return out, covered
 
 
 # --------------------------------------------------------------------------- #
-# Derived independence graph (I6)
+# Linkage summary (never an independence claim by absence)
 # --------------------------------------------------------------------------- #
-def _independence(source_keys: list, links: list) -> dict:
+def _link_summary(source_keys: list, links: list) -> dict:
+    """Group links by proposal strength and list sources with *unknown* linkage.
+
+    A link (proposed or confirmed) is a model proposal and cannot prove identity;
+    human appraisal is still required.  Sources not connected by any link have
+    **unknown** linkage -- this function never claims they are independent.
+    """
     parent: dict[str, str] = {}
 
     def find(node: str) -> str:
@@ -631,21 +633,18 @@ def _independence(source_keys: list, links: list) -> dict:
         find(node)
     for link in links:
         union(link["from"], link["to"])
-    components: dict[str, list] = {}
-    for key in source_keys:
-        components.setdefault(find(f"source:{key}"), []).append(key)
-    independent = []
+    unlinked = []
     ordered = sorted(source_keys)
     for i in range(len(ordered)):
         for j in range(i + 1, len(ordered)):
             a, b = ordered[i], ordered[j]
             if find(f"source:{a}") != find(f"source:{b}"):
-                independent.append([a, b])
+                unlinked.append([a, b])
     return {
-        "confirmed": [dict(link) for link in links if link["status"] == "confirmed"],
-        "proposed": [dict(link) for link in links if link["status"] == "proposed"],
-        "independent_source_pairs": independent,
-        "components": sorted(components.values(), key=lambda group: group[0]),
+        "confirmed_links": [dict(link) for link in links if link["status"] == "confirmed"],
+        "proposed_links": [dict(link) for link in links if link["status"] == "proposed"],
+        "unlinked_source_pairs": unlinked,
+        "notice": LINKAGE_NOTICE,
     }
 
 
@@ -656,8 +655,11 @@ def validate_extraction(output, *, passages, appraisal_dimensions):
     """Validate and normalize one untrusted extraction document.
 
     ``passages`` is the pool for a single paper plus its linked supplements;
-    each entry is a parsed passage mapping ``{passage_id, text, ...}`` and may
-    additionally carry ``raw_text``, ``source_key``, ``kind``, and ``asset_ids``.
+    each entry is a workflow-supplied parsed passage mapping.  Only
+    ``passage_id`` and ``text`` are required; ``raw_text``, ``source_key`` and
+    ``asset_ids`` are read when present, and any other parsed metadata
+    (locator, section_path, digests, ...) is accepted and ignored -- the model
+    never sees this pool, so no projection step is needed.
     ``appraisal_dimensions`` is the workflow-approved list of dimension
     descriptors ``{dimension_id, ...}``; an empty list means no appraisal is
     configured (and ``appraisal`` must then be empty/absent).
@@ -694,7 +696,7 @@ def validate_extraction(output, *, passages, appraisal_dimensions):
         if experiment.get("study_id") is not None:
             _require(
                 experiment["study_id"] in studies,
-                f"experiments: study_id {experiment['study_id']!r} is not declared in studies",
+                "experiments: a declared study_id is not in studies",
             )
     names["study"] = set(studies)
     names["dataset"] = set(datasets)
@@ -725,7 +727,7 @@ def validate_extraction(output, *, passages, appraisal_dimensions):
         "appraisal": appraisal,
         "omissions": omissions,
         "limitations": limitations,
-        "link_summary": _independence(sorted(sources), links),
+        "link_summary": _link_summary(sorted(sources), links),
         "validation": {
             "scope": VALIDATION_SCOPE,
             "required_items": len(required),
@@ -742,7 +744,7 @@ def _dimension_ids(appraisal_dimensions) -> tuple:
         label = f"appraisal_dimensions[{index}]"
         _require(isinstance(raw, dict), f"{label} must be a JSON object")
         dimension_id = _identifier(raw.get("dimension_id"), label=f"{label}.dimension_id")
-        _require(dimension_id not in seen, f"duplicate appraisal dimension {dimension_id!r}")
+        _require(dimension_id not in seen, "duplicate appraisal dimension")
         _require("score" not in raw, f"{label} must not define a numeric score")
         seen.append(dimension_id)
     return tuple(seen)
@@ -752,8 +754,8 @@ def extraction_example():
     """Return a synthetic, reusable normalized example for workflow tests.
 
     It is deliberately fictional and demonstrates grounding, a missing numeric
-    detail, an `author_interpretation`, a proposed (unproven) link, and a
-    coverage omission -- never real evidence and never a correctness claim.
+    detail, an `author_interpretation`, a model-proposed link, and a coverage
+    omission -- never real evidence and never a correctness claim.
     """
     passages = [
         {
