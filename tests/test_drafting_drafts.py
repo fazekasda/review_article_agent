@@ -32,6 +32,7 @@ Run::
 
 from __future__ import annotations
 
+import copy
 import json
 
 import test_drafting_package as _drafting_package  # noqa: E402
@@ -67,6 +68,7 @@ from review_article_agent.drafting.workspace import (  # noqa: E402
     SectionWorkspaceRepository,
 )
 from review_article_agent.extraction import workflow as extraction_workflow  # noqa: E402
+from review_article_agent.storage.artifacts import DependencyRef  # noqa: E402
 
 
 def _role_config():
@@ -399,12 +401,13 @@ class AssemblyBase(DraftBase):
         )
         return bp_ref, d_ref
 
-    def propose_assembly(self, outline_ref, draft_refs, *, artifact_id="asm", revision="asm-r1"):
+    def propose_assembly(self, outline_ref, draft_refs, *, artifact_id="asm", revision="asm-r1",
+                         parent=None):
         return self.wf.propose(
             "assembly",
             {"outline_ref": outline_ref, "draft_refs": draft_refs},
             artifact_id=artifact_id, revision_id=revision,
-            rights=self.rights(artifact_id, revision),
+            rights=self.rights(artifact_id, revision), parent_revision_id=parent,
         )
 
 
@@ -601,6 +604,107 @@ class AssemblyLabelTests(AssemblyBase):
         self.assertEqual(
             result["citations"][expected_key]["citation_key"], expected_key
         )
+
+
+class AssemblyLineageTests(AssemblyBase):
+    def _import_assembly(self, payload, *, artifact_id="asm-forged", revision="asm-forged-r1"):
+        """Import an assembly envelope through the generic import path.
+
+        The exact dependency edges are computed from the envelope (as the normal
+        writer would), so the standard ``_read`` integrity/dependency checker runs
+        -- this does **not** rewrite canonical integrity metadata.
+        """
+        context = payload["context"]
+        draft_refs = [self.wf._ref(ref) for ref in payload["input"]["draft_refs"]]
+        deps = [
+            DependencyRef(**ref, role="derived_from")
+            for ref in self.wf._assembly_dependencies(context, draft_refs, payload["drafts"])
+        ]
+        self.artifacts.create_artifact(artifact_id, kind="report", created_by="import")
+        rev = self.artifacts.import_revision(
+            artifact_id=artifact_id, revision_id=revision,
+            content={
+                "schema_version": 1,
+                "document_type": ASSEMBLY_DOCUMENT_TYPE,
+                "payload": payload,
+            },
+            origin_locator="import:synthetic",
+            rights=self.rights(artifact_id, revision),
+            dependencies=deps, acquired_by="import",
+        )
+        return {
+            "project_id": self.project_id,
+            "artifact_id": rev.artifact_id,
+            "revision_id": rev.revision_id,
+        }
+
+    def test_forged_self_consistent_snapshot_rejected_current_and_historical(self):
+        _s, _f, outline_ref = self.two_section_chain()
+        _bp1, d1 = self.approved_section_draft(outline_ref, "sec1", n=1)
+        _bp2, d2 = self.approved_section_draft(outline_ref, "sec2", n=2)
+        a_ref = self.propose_assembly(outline_ref, [d1, d2])
+
+        stored = self.wf._read_assembly(a_ref, current=False)
+        forged = copy.deepcopy(stored)
+        # Alter an embedded draft's readable text and rebuild a *self-consistent*
+        # result from the forged snapshots (so the normal integrity/dependency
+        # checker still accepts the document).
+        forged["drafts"][0]["draft"]["result"]["paragraphs"][0]["sentences"][0][
+            "text"
+        ] = "Fabricated prose that no approved blueprint ever produced."
+        forged["result"] = self.wf._assemble(forged["context"], forged["drafts"])
+        forged_ref = self._import_assembly(forged)
+
+        # The generic checker accepts the internally consistent forged document...
+        self.wf._read_assembly(forged_ref, current=False)
+        # ...but the live/historical re-derivation refuses it because the embedded
+        # snapshot is not the actual referenced immutable draft.
+        with self.assertRaises(DraftingWorkflowError):
+            self.wf.read(forged_ref, "assembly", current=True)
+        with self.assertRaises(DraftingWorkflowError):
+            self.wf.read(forged_ref, "assembly", current=False)
+
+    def test_parent_update_and_outline_order_and_historical_stability(self):
+        synthesis_ref, _f, outline_ref = self.two_section_chain()
+        _bp1, d1 = self.approved_section_draft(outline_ref, "sec1", n=1)
+        _bp2, d2 = self.approved_section_draft(outline_ref, "sec2", n=2)
+
+        # r1 with a REVERSED caller order: the stored snapshot order is outline.
+        a1 = self.propose_assembly(outline_ref, [d2, d1], revision="asm-r1")
+        env1 = self.wf.read(a1, "assembly")
+        self.assertEqual(
+            [e["draft"]["blueprint"]["section_id"] for e in env1["drafts"]],
+            ["sec1", "sec2"],
+        )
+        self.assertEqual(
+            [s["section_id"] for s in env1["result"]["sections"]], ["sec1", "sec2"]
+        )
+
+        # r2 is an allowed parent update on the same logical assembly artifact.
+        a2 = self.propose_assembly(
+            outline_ref, [d1, d2], revision="asm-r2", parent="asm-r1"
+        )
+        env2 = self.wf.read(a2, "assembly")
+        self.assertEqual(env2["input"]["draft_refs"], [d1, d2])
+        # The old revision is no longer the current head but stays inspectable.
+        with self.assertRaises(DraftingWorkflowError):
+            self.wf.read(a1, "assembly", current=True)
+        self.assertEqual(self.wf.read(a1, "assembly", current=False), env1)
+
+        # A global (framework) change stales both current reads, yet every
+        # historical revision stays inspectable and unchanged.
+        self.put_framework(
+            synthesis_ref, revision="fw-r2", parent="fw-r1",
+            c1_definition="A revised Compound Z definition.",
+        )
+        with self.assertRaises(DraftingWorkflowError):
+            self.wf.read(a2, "assembly", current=True)
+        self.assertEqual(self.wf.read(a1, "assembly", current=False), env1)
+        self.assertEqual(self.wf.read(a2, "assembly", current=False), env2)
+        report = self.wf.status(a2, "assembly")
+        self.assertTrue(report["stale"])
+        self.assertTrue(report["provisional"])
+        self.assertFalse(report["authorizes_export"])
 
 
 class DraftOverRealRunnerTest(_drafting_package.DraftingOverRealRunnerTest):

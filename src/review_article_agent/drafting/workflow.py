@@ -639,6 +639,39 @@ class DraftingWorkflowRepository:
         )
 
     # -- assembly re-derivation ---------------------------------------------- #
+    def _ordered_assembly_drafts(self, context, drafts):
+        """Return ``(section, entry)`` pairs in approved outline order.
+
+        The caller's order is deliberately discarded: the canonical order is
+        derived from the approved outline.  Every approved outline section must be
+        covered by exactly one draft, with no duplicate, missing, or foreign
+        section; the returned list is the normalized, immutable snapshot order that
+        is stored in the envelope.
+        """
+        sections = context["outline"]["sections"]
+        outline_ids = [section["section_id"] for section in sections]
+        require(
+            len(outline_ids) == len(set(outline_ids)),
+            "the approved outline has duplicate section ids",
+        )
+        by_section = {}
+        for entry in drafts:
+            section_id = entry["draft"]["blueprint"]["section_id"]
+            require(
+                section_id not in by_section,
+                "the assembly has more than one draft for one approved section",
+            )
+            by_section[section_id] = entry
+        require(
+            set(by_section) == set(outline_ids),
+            "the assembly must cover exactly the approved outline sections "
+            "(no missing or foreign section)",
+        )
+        return [
+            (section, by_section[section["section_id"]])
+            for section in sorted(sections, key=lambda s: s["order"])
+        ]
+
     def _assemble(self, context, drafts):
         """Return the normalized assembly result for one context and draft set.
 
@@ -648,45 +681,22 @@ class DraftingWorkflowRepository:
         attribution/proposal labels are derived from the schema metadata; citations
         are the stable verified-corpus records of each draft's approved package.
         """
-        outline = context["outline"]
-        sections = outline["sections"]
-        outline_ids = [section["section_id"] for section in sections]
-        require(
-            len(outline_ids) == len(set(outline_ids)),
-            "the approved outline has duplicate section ids",
-        )
-        by_section = {}
-        for entry in drafts:
+        citations = {}
+        all_warnings = set()
+        ordered_sections = []
+        for section, entry in self._ordered_assembly_drafts(context, drafts):
             draft = entry["draft"]
-            section_id = draft["blueprint"]["section_id"]
+            package = draft["package"]
             require(
-                section_id not in by_section,
-                "the assembly has more than one draft for one approved section",
-            )
-            require(
-                canonical_json(draft["package"]["outline_ref"])
+                canonical_json(package["outline_ref"])
                 == canonical_json(context["outline_ref"]),
                 "a section draft belongs to a different outline revision",
             )
             require(
-                canonical_json(draft["package"]["framework_ref"])
+                canonical_json(package["framework_ref"])
                 == canonical_json(context["framework_ref"]),
                 "a section draft belongs to a different framework revision",
             )
-            by_section[section_id] = entry
-        require(
-            set(by_section) == set(outline_ids),
-            "the assembly must cover exactly the approved outline sections "
-            "(no missing or foreign section)",
-        )
-
-        citations = {}
-        all_warnings = set()
-        ordered_sections = []
-        for section in sorted(sections, key=lambda s: s["order"]):
-            entry = by_section[section["section_id"]]
-            draft = entry["draft"]
-            package = draft["package"]
             paragraphs = []
             for paragraph in draft["result"]["paragraphs"]:
                 sentences = []
@@ -747,9 +757,31 @@ class DraftingWorkflowRepository:
         result["markdown"] = _render_markdown(result)
         return result
 
-    def _rederive_assembly_current(self, payload):
-        """Re-derive the current approved context/drafts and the assembly result."""
+    def _require_assembly_outline_identity(self, payload):
+        """Require the stored context outline to be the same project/ref as input."""
         outline_ref = self._ref(payload["input"]["outline_ref"])
+        require(
+            canonical_json(self._ref(payload["context"]["outline_ref"]))
+            == canonical_json(outline_ref),
+            "the stored assembly context outline does not match its input outline",
+        )
+        return outline_ref
+
+    def _stored_drafts_by_ref(self, payload):
+        """Index the stored draft entries by their exact same-project ref."""
+        stored = {}
+        for entry in payload["drafts"]:
+            stored[canonical_json(self._ref(entry["draft_ref"]))] = entry
+        return stored
+
+    def _rederive_assembly_current(self, payload):
+        """Re-derive the current approved context/drafts and the assembly result.
+
+        Each stored draft snapshot is compared **exactly** to the actual
+        referenced immutable draft (re-read current) -- a forged, internally
+        self-consistent embedded snapshot is refused rather than inspected as real.
+        """
+        outline_ref = self._require_assembly_outline_identity(payload)
         try:
             context = SynthesisWorkflowRepository(self._nested).require_for_blueprints(
                 outline_ref
@@ -760,10 +792,17 @@ class DraftingWorkflowRepository:
             context == payload["context"],
             "the current approved outline context does not match the stored snapshot",
         )
+        stored = self._stored_drafts_by_ref(payload)
         drafts = []
         for ref in payload["input"]["draft_refs"]:
             ref = self._ref(ref)
-            drafts.append({"draft_ref": ref, "draft": self.read(ref, "draft", current=True)})
+            actual = {"draft_ref": ref, "draft": self.read(ref, "draft", current=True)}
+            require(
+                stored.get(canonical_json(ref)) == actual,
+                "the stored assembly draft snapshot does not match the referenced "
+                "immutable draft",
+            )
+            drafts.append(actual)
         result = self._assemble(context, drafts)
         require(
             result == payload["result"],
@@ -773,12 +812,21 @@ class DraftingWorkflowRepository:
     def _rederive_assembly_historical(self, payload):
         """Re-validate a historical assembly against its stored snapshot.
 
-        The stored outline context and stored draft envelopes are re-assembled
-        (no live approval); each stored draft is also re-read via
-        ``read(current=False)`` so its history stays inspectable.
+        Each stored draft snapshot is compared **exactly** to the actual
+        referenced immutable draft re-read via ``read(current=False)`` (draft
+        history + stored snapshot, no live approval), so a forged internally
+        self-consistent embedded snapshot is refused.  The stored outline context
+        and the verified draft envelopes are then re-assembled.
         """
-        for ref in payload["input"]["draft_refs"]:
-            self.read(ref, "draft", current=False)
+        self._require_assembly_outline_identity(payload)
+        for entry in payload["drafts"]:
+            ref = self._ref(entry["draft_ref"])
+            actual = self.read(ref, "draft", current=False)
+            require(
+                actual == entry["draft"],
+                "the stored assembly draft snapshot does not match the referenced "
+                "immutable draft",
+            )
         result = self._assemble(payload["context"], payload["drafts"])
         require(
             result == payload["result"],
@@ -1163,14 +1211,15 @@ class DraftingWorkflowRepository:
         Consumes the exact current approved outline context and exactly one
         *current valid* draft per approved outline section (no duplicate, missing,
         or foreign section and no mixed outline/framework revision).  The section
-        order is derived from the outline, never the caller's ``draft_refs`` order.
+        order is derived from the outline, never the caller's ``draft_refs`` order,
+        and the stored draft snapshots are canonically normalized to that order.
         The result stores the exact draft dependencies and a normalized
         Markdown-plus-structured manuscript with stable verified-corpus citations.
+        On an edit (``parent_revision_id`` is given) the parent is validated via
+        its historical assembly read; the new revision may advance to a **new
+        current revision of the same logical outline artifact** but may not switch
+        the logical outline identity.  No assembly is auto-approved.
         """
-        require(
-            parent_revision_id is None,
-            "a manuscript assembly has no edit parent; propose a new revision",
-        )
         with self._nested.transaction():
             require(
                 isinstance(payload, dict)
@@ -1198,10 +1247,30 @@ class DraftingWorkflowRepository:
             for ref in draft_refs:
                 draft = self.read(ref, "draft", current=True)
                 drafts.append({"draft_ref": ref, "draft": draft})
-            result = self._assemble(context, drafts)
+            # Canonical normalize to the approved outline order ONCE, and store it
+            # in that order (never the caller's order).
+            ordered_drafts = [
+                entry for _section, entry in self._ordered_assembly_drafts(context, drafts)
+            ]
+            result = self._assemble(context, ordered_drafts)
+            if parent_revision_id is not None:
+                parent_ref = {
+                    "project_id": self.store.project_id,
+                    "artifact_id": artifact_id,
+                    "revision_id": parent_revision_id,
+                }
+                parent = self._read_assembly(parent_ref, current=False)
+                parent_outline_ref = self._ref(parent["context"]["outline_ref"])
+                require(
+                    parent_outline_ref["artifact_id"]
+                    == context["outline_ref"]["artifact_id"],
+                    "an edit may not switch the logical outline identity",
+                )
             deps = [
                 DependencyRef(**ref, role="derived_from")
-                for ref in self._assembly_dependencies(context, draft_refs, drafts)
+                for ref in self._assembly_dependencies(
+                    context, draft_refs, ordered_drafts
+                )
             ]
             self.artifacts.create_artifact(
                 artifact_id, kind=ARTIFACT_KIND, created_by="user"
@@ -1216,14 +1285,14 @@ class DraftingWorkflowRepository:
                     "payload": {
                         "input": payload,
                         "context": context,
-                        "drafts": drafts,
+                        "drafts": ordered_drafts,
                         "result": result,
                     },
                 },
                 dependencies=deps,
                 origin_locator="drafting:assembly",
                 acquired_by="user",
-                parent_revision_id=None,
+                parent_revision_id=parent_revision_id,
             )
         return {
             "project_id": self.store.project_id,
