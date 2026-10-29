@@ -3,15 +3,18 @@
 import copy
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from test_acquisition_manifest import ManifestBase
 from review_article_agent.parsing import ParsingRepository
 from review_article_agent.acquisition.manifest import ManifestNotAcquiredError
 from review_article_agent.cli.screening import dispatch_screening
+from review_article_agent.domain.errors import StoreError
 from review_article_agent.parsing.core import NORMALIZATION_VERSION, PARSER_VERSION
 from review_article_agent.runtime.jev import MODEL
 from review_article_agent.screening import ScreeningError, ScreeningRepository
 from review_article_agent.screening.workflow import classify, questions
+from review_article_agent.storage.store import ProjectStore
 
 
 def config():
@@ -147,6 +150,54 @@ class WorkflowTests(ManifestBase):
         self.approve_ref(pilot, "pilot", "screening.pilot")
         with self.assertRaises(ScreeningError):
             self.screening.require_pilot(pilot)
+
+    def test_exclusion_validation_is_one_read_transaction(self):
+        """A late failed audit cannot commit between the scan and the return.
+
+        The hook fires on the second batch read (the coordinator's repro point:
+        the first batch read happens while validating the audit, the second
+        after the permanent-pause scan). With a single BEGIN IMMEDIATE read
+        transaction the independent connection is locked out; without it the
+        late audit commits and the stale decision is returned.
+        """
+        batch = self.make_batch()
+        audit = self.put("audit", self.audit_input(batch))
+        self.approve_ref(audit, "exclusion_set", "screening.exclusions")
+        late = ProjectStore.open_at(self.app_dir, expected_project_id=self.project_id)
+        self.addCleanup(late.close)
+        late.connection.execute("PRAGMA busy_timeout = 0")
+        late_screening = ScreeningRepository(late)
+        original = ScreeningRepository._read
+        reads = {"batch": 0}
+        outcome = {}
+
+        def hooked(repo, ref, kind):
+            value = original(repo, ref, kind)
+            if repo is self.screening and kind == "batch":
+                reads["batch"] += 1
+                if reads["batch"] == 2:
+                    try:
+                        late_screening.propose(
+                            "audit", self.audit_input(batch, True),
+                            artifact_id="late-audit", revision_id="late-audit-r1",
+                            rights=self.rights("late-audit", "late-audit-r1"))
+                    except StoreError as exc:  # BEGIN IMMEDIATE was locked out
+                        outcome["error"] = exc
+                    else:
+                        outcome["error"] = None
+            return value
+
+        with mock.patch.object(ScreeningRepository, "_read", hooked):
+            self.assertEqual(self.screening.require_exclusions(audit), ["paper1"])
+        # The independent writer could not commit inside the validation unit.
+        self.assertIsNotNone(outcome.get("error"))
+        # Once the read transaction ended, the same writer persists the audit and
+        # the next validation sees it (no caching, no mixed snapshot).
+        late_screening.propose(
+            "audit", self.audit_input(batch, True), artifact_id="late-audit",
+            revision_id="late-audit-r1", rights=self.rights("late-audit", "late-audit-r1"))
+        with self.assertRaises(ScreeningError):
+            self.screening.require_exclusions(audit)
 
     def test_false_exclusion_permanently_pauses_exact_batch(self):
         batch = self.make_batch()

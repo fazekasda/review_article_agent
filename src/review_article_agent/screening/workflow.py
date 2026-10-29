@@ -277,25 +277,33 @@ class ScreeningRepository:
                 "guarantee": "sampled_audit_not_completeness"}
 
     def require_exclusions(self, ref):
-        audit = self._read(ref, "audit")
-        require(self._audit(audit["input"]) == audit and not audit["paused"])
-        self._approved(ref, "exclusion_set", "screening.exclusions")
-        # An observed false exclusion permanently pauses that exact batch.
-        # Correct the inputs and create a new batch, then re-audit it.
-        for artifact in self.artifacts.list_artifacts():
-            if artifact.kind != "report":
-                continue
-            for revision in self.artifacts.list_revisions(artifact.artifact_id):
-                try:
-                    doc = json.loads(self.artifacts.read_content(artifact.artifact_id, revision.revision_id))
-                except (ValueError, UnicodeDecodeError):
+        # The whole check is one point-in-time read transaction. BEGIN
+        # IMMEDIATE (when this call owns the unit of work; a SAVEPOINT when a
+        # caller already opened one) starts before the first read and holds
+        # SQLite's write lock, so another connection cannot commit a new audit
+        # or approval revision between the scan and the returned batch. This is
+        # authorization for the caller's decision only: a writer that acts on
+        # it must revalidate inside its own transaction.
+        with _NestedStore(self.store).transaction():
+            audit = self._read(ref, "audit")
+            require(self._audit(audit["input"]) == audit and not audit["paused"])
+            self._approved(ref, "exclusion_set", "screening.exclusions")
+            # An observed false exclusion permanently pauses that exact batch.
+            # Correct the inputs and create a new batch, then re-audit it.
+            for artifact in self.artifacts.list_artifacts():
+                if artifact.kind != "report":
                     continue
-                if isinstance(doc, dict) and doc.get("document_type") == "screening_audit":
-                    previous = doc.get("payload", {})
-                    if previous.get("input", {}).get("batch_ref") == audit["input"]["batch_ref"]:
-                        require(not previous.get("paused", True))
-        batch = self._read(audit["input"]["batch_ref"], "batch")
-        return batch["proposed_exclusion_ids"]
+                for revision in self.artifacts.list_revisions(artifact.artifact_id):
+                    try:
+                        doc = json.loads(self.artifacts.read_content(artifact.artifact_id, revision.revision_id))
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if isinstance(doc, dict) and doc.get("document_type") == "screening_audit":
+                        previous = doc.get("payload", {})
+                        if previous.get("input", {}).get("batch_ref") == audit["input"]["batch_ref"]:
+                            require(not previous.get("paused", True))
+            batch = self._read(audit["input"]["batch_ref"], "batch")
+            return batch["proposed_exclusion_ids"]
 
     def read(self, ref, kind):
         payload = self._read(ref, kind)
