@@ -60,15 +60,23 @@ def questions(config):
     return result
 
 
-def classify(config, response, *, context_ready=True):
-    """Preserve raw typed probabilities; errors/uncertainty always retain."""
+def _classify_and_observe(config, response, *, context_ready=True):
+    """Return the machine decision and the validated response model identity.
+
+    The observed identity is the model the response envelope actually reported
+    after :func:`validate_response`; it is ``None`` when the response (or every
+    answer) could not be validated. Failure/refusal/malformed/unknown responses
+    are therefore retained as ``uncertain`` and never contribute a model
+    identity a pilot could use to authorize a later bulk run.
+    """
     definitions = questions(config)
     decisions = []
     try:
         validated = validate_response(response, definitions)
         outcomes = [validated.outcomes[q.question_id] for q in definitions]
     except JevError:
-        return {"label": "uncertain", "reason": "classifier_failure", "decisions": []}
+        return {"label": "uncertain", "reason": "classifier_failure", "decisions": []}, None
+    observed_model = validated.model
     labels = []
     for rule, outcome in zip(config["questions"], outcomes):
         p = outcome.answer.probability if outcome.answer else None
@@ -85,7 +93,12 @@ def classify(config, response, *, context_ready=True):
     label = "uncertain" if not context_ready or "uncertain" in labels else (
         "proposed_exclusion" if "proposed_exclusion" in labels else "retain")
     return {"label": label, "reason": "missing_context" if not context_ready else "rubric_mapping",
-            "decisions": decisions}
+            "decisions": decisions}, observed_model
+
+
+def classify(config, response, *, context_ready=True):
+    """Preserve raw typed probabilities; errors/uncertainty always retain."""
+    return _classify_and_observe(config, response, context_ready=context_ready)[0]
 
 
 class ScreeningRepository:
@@ -163,12 +176,18 @@ class ScreeningRepository:
         except ScreeningError:
             request = None
             ready = False
+        machine, observed_model = _classify_and_observe(config, item["response"], context_ready=ready)
+        # ``model`` is the requested/pinned config model; ``observed_model`` is
+        # the identity the validated response actually reported. They are kept
+        # separate so a dated snapshot never silently stands in for the base
+        # alias (or vice versa).
         return {"id": item["id"], "report_ref": item["report_ref"], "source_ref": report["source_ref"],
                 "locator": locator, "input_sha256": sha256_digest(text.encode()),
                 "request_sha256": sha256_digest(canonical_json(request)) if request else None,
-                "model": config["model"], "parser": report["parser_version"],
+                "model": config["model"], "observed_model": observed_model,
+                "parser": report["parser_version"],
                 "response_provenance": "imported_unverified_dispatch",
-                "machine": classify(config, item["response"], context_ready=ready)}
+                "machine": machine}
 
     def _cases(self, config, cases):
         require(isinstance(cases, list) and 1 <= len(cases) <= 10000)
@@ -209,8 +228,19 @@ class ScreeningRepository:
         config = self._config(payload["config_ref"])
         pilot = self.require_pilot(payload["pilot_ref"])
         require(pilot["input"]["config_ref"] == payload["config_ref"])
+        # The pilot pins the concrete validated response identity it observed. A
+        # pilot with no usable observation, or with mixed snapshots, cannot
+        # authorize a bulk run at all (fail closed; re-pilot required).
+        observed = {c["observed_model"] for c in pilot["cases"] if c["observed_model"] is not None}
+        require(len(observed) == 1)
+        pinned_model = next(iter(observed))
         acquired = AcquisitionRepository(self.store).require_acquired(at_ref=payload["acquisition_ref"])
         cases = self._cases(config, payload["cases"])
+        # Every bulk observation that reported a model must exactly match the
+        # pilot identity (base alias and dated snapshot are distinct strings). A
+        # retained failure/refusal/malformed observation has no identity to
+        # compare and stays uncertain, never a negative label.
+        require(all(c["observed_model"] in (None, pinned_model) for c in cases))
         # Ordinary corpus growth is not a dependency of the pilot itself.
         sources = [e["source_ref"] for e in acquired["payload"]["entries"] if e["disposition"] == "use_full_text"]
         require(all(c["source_ref"] in sources for c in cases))

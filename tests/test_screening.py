@@ -166,6 +166,78 @@ class WorkflowTests(ManifestBase):
         with self.assertRaises(ScreeningError):
             self.put("pilot", bad, revision="pilot-r2", parent="pilot-r1")
 
+    # -- S8-R1: validated response model identity is pinned by the pilot ------ #
+    def _second_case(self):
+        passages = ParsingRepository(self.store).read_report(self.report)["payload"]["passages"]
+        return {"id": "paper2", "report_ref": self.report,
+                "passage_id": passages[0]["passage_id"], "response": response(0.1)}
+
+    def test_pilot_pins_observed_model_and_same_model_batch_passes(self):
+        batch = self.make_batch()
+        pilot = self.screening.read(self.pilot, "pilot")
+        self.assertEqual(pilot["cases"][0]["observed_model"], MODEL)
+        result = self.screening.read(batch, "batch")
+        self.assertEqual(result["cases"][0]["observed_model"], MODEL)
+
+    def test_dated_snapshot_drift_fails_closed(self):
+        scenarios = [
+            (MODEL, MODEL + "-20261014"),                     # base pilot -> dated batch
+            (MODEL + "-20261014", MODEL),                     # dated pilot -> base batch
+            (MODEL + "-20261014", MODEL + "-20261015"),       # dated snapshot drift
+        ]
+        for index, (pilot_model, batch_model) in enumerate(scenarios):
+            with self.subTest(pilot=pilot_model, batch=batch_model):
+                payload = copy.deepcopy(self.pilot_input)
+                payload["cases"][0]["response"]["model"] = pilot_model
+                pilot = self.put("pilot", payload, artifact="drift-pilot-%d" % index,
+                                 revision="drift-pilot-%d-r1" % index)
+                self.approve_ref(pilot, "pilot", "screening.pilot")
+                batch_input = copy.deepcopy(self.batch_input())
+                batch_input["pilot_ref"] = pilot
+                batch_input["cases"][0]["response"]["model"] = batch_model
+                with self.assertRaises(ScreeningError):
+                    self.put("batch", batch_input, artifact="drift-batch-%d" % index,
+                             revision="drift-batch-%d-r1" % index)
+
+    def test_mixed_pilot_models_cannot_authorize_batch(self):
+        payload = copy.deepcopy(self.pilot_input)
+        payload["cases"][0]["response"]["model"] = MODEL + "-20261014"
+        second = self._second_case()
+        second["response"]["model"] = MODEL + "-20261015"
+        payload["cases"].append(second)
+        payload["adjudications"]["paper2"] = dict(payload["adjudications"]["paper1"])
+        pilot = self.put("pilot", payload, revision="pilot-r2", parent="pilot-r1")
+        self.approve_ref(pilot, "pilot", "screening.pilot")
+        batch_input = copy.deepcopy(self.batch_input())
+        batch_input["pilot_ref"] = pilot
+        batch_input["cases"][0]["response"]["model"] = MODEL + "-20261014"
+        with self.assertRaises(ScreeningError):
+            self.put("batch", batch_input, revision="batch-r2")
+
+    def test_pilot_without_usable_model_cannot_authorize_batch(self):
+        payload = copy.deepcopy(self.pilot_input)
+        payload["cases"][0]["response"] = {**response(0.1), "model": "other/model"}
+        payload["adjudications"]["paper1"]["label"] = "retain"
+        pilot = self.put("pilot", payload, revision="pilot-r2", parent="pilot-r1")
+        self.approve_ref(pilot, "pilot", "screening.pilot")
+        batch_input = copy.deepcopy(self.batch_input())
+        batch_input["pilot_ref"] = pilot
+        with self.assertRaises(ScreeningError):
+            self.put("batch", batch_input, revision="batch-r2")
+        self.assertIsNone(self.artifacts.get_artifact("batch"))
+
+    def test_failure_observation_is_retained_in_batch(self):
+        second = self._second_case()
+        second["response"] = {**response(0.1), "model": "not-jev"}
+        self.approve_ref(self.pilot, "pilot", "screening.pilot")
+        batch_input = copy.deepcopy(self.batch_input())
+        batch_input["cases"].append(second)
+        batch = self.put("batch", batch_input)
+        result = self.screening.read(batch, "batch")
+        failed = next(c for c in result["cases"] if c["id"] == "paper2")
+        self.assertEqual(failed["machine"]["label"], "uncertain")
+        self.assertIsNone(failed["observed_model"])
+
 
 if __name__ == "__main__":
     unittest.main()
