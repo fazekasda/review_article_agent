@@ -47,6 +47,29 @@ purpose that is separate from any execution role; the **writer** uses the existi
 the **same** project (the app owns their creation; this module never creates,
 dispatches, or executes a session). The two sessions must be distinct.
 
+Per-section exclusivity
+-----------------------
+
+A workspace is genuinely **per-section**: the same planner/writer runtime mappings
+may not be reused by a *different* ``section_id``. ``propose`` scans the bounded,
+integrity-checked workspace history and refuses a proposal whose mappings are
+already bound to another section; reusing the same section's mappings across an
+accepted outline revision (an update) stays allowed. The scan ignores other
+generic ``report`` documents, but a *matching* workspace document is
+integrity-checked and its same-project refs validated; a corrupt or foreign
+matching document fails closed (never silently erases a recorded binding).
+
+Advancing the outline
+---------------------
+
+An edit (``parent_revision_id`` given) may advance to a **new revision of the same
+logical outline artifact** while retaining the exact section and planner/writer
+mapping pins (the new outline must be current and approved, and the section must
+still exist in it). Swapping the section or the mapping pins on an edit is
+refused, so a persistent workspace identity is never silently retargeted. Old
+revisions stay immutable and inspectable (``current=False``); the module never
+auto-approves blueprints.
+
 Not in scope / non-claims
 -------------------------
 
@@ -75,6 +98,7 @@ from ..domain.records import (
     validate_ref,
 )
 from ..parsing.repository import _NestedStore
+from ..runtime.gates import MAX_GATE_SNAPSHOT_ENTRIES
 from ..storage.agent_runtime import RuntimeRepository
 from ..storage.artifacts import ArtifactRepository, DependencyRef, sha256_digest
 from ..synthesis.workflow import SynthesisWorkflowError, SynthesisWorkflowRepository
@@ -244,6 +268,88 @@ class SectionWorkspaceRepository:
         sections = (result or {}).get("sections") or []
         return {s.get("section_id") for s in sections if isinstance(s, dict)}
 
+    # -- bounded per-section workspace history ------------------------------- #
+    def _workspace_history(self):
+        """Return ``(section_id, planner_mapping_id, writer_mapping_id)`` entries.
+
+        A bounded, integrity-checked scan of every stored workspace document, used
+        to enforce per-section exclusivity. Other generic ``report`` documents
+        (including raw-byte receipts and other document types) are ignored; a
+        *matching* workspace document is integrity-checked and its same-project refs
+        validated, and any malformed/foreign/corrupt matching document **fails
+        closed**. The scan is bounded by :data:`MAX_GATE_SNAPSHOT_ENTRIES` matching
+        workspace revisions.
+        """
+        entries = []
+        scanned = 0
+        for artifact in self.artifacts.list_artifacts():
+            if artifact.kind != ARTIFACT_KIND:
+                continue
+            for revision in self.artifacts.list_revisions(artifact.artifact_id):
+                stored = self.artifacts.get_revision(
+                    artifact.artifact_id, revision.revision_id
+                )
+                if stored is None:
+                    raise SectionWorkspaceError("a stored report revision is missing")
+                data = self.artifacts.read_content(
+                    artifact.artifact_id, revision.revision_id
+                )
+                try:
+                    doc = json.loads(data)
+                except (ValueError, UnicodeDecodeError):
+                    # A raw-byte report (e.g., a dispatch receipt) is not a document.
+                    continue
+                if not isinstance(doc, dict) or doc.get("document_type") != DOCUMENT_TYPE:
+                    continue
+                # A matching workspace document: verify its bytes, then its refs.
+                require(
+                    sha256_digest(data) == stored.content_sha256
+                    and len(data) == stored.byte_size,
+                    "a stored workspace revision fails content integrity",
+                )
+                scanned += 1
+                require(
+                    scanned <= MAX_GATE_SNAPSHOT_ENTRIES,
+                    "section workspace history exceeds the scan bound",
+                )
+                payload = doc.get("payload")
+                if (
+                    not isinstance(payload, dict)
+                    or not isinstance(payload.get("input"), dict)
+                ):
+                    raise SectionWorkspaceError(
+                        "a stored workspace has a malformed payload"
+                    )
+                input_payload = payload["input"]
+                if set(input_payload) != set(PAYLOAD_KEYS):
+                    raise SectionWorkspaceError(
+                        "a stored workspace has a malformed input"
+                    )
+                try:
+                    self._ref(input_payload["outline_ref"])
+                    section_id = self._section_id(input_payload["section_id"])
+                    planner_id = self._mapping_id(input_payload["planner_mapping_id"])
+                    writer_id = self._mapping_id(input_payload["writer_mapping_id"])
+                except (RecordValidationError, SectionWorkspaceError):
+                    raise SectionWorkspaceError(
+                        "a stored workspace carries a foreign or invalid reference"
+                    ) from None
+                entries.append((section_id, planner_id, writer_id))
+        return entries
+
+    def _require_per_section_exclusive(self, result):
+        """Refuse mappings already bound to a *different* section (per-section)."""
+        used_by_other_sections = set()
+        for section_id, planner_id, writer_id in self._workspace_history():
+            if section_id != result["section_id"]:
+                used_by_other_sections.add(planner_id)
+                used_by_other_sections.add(writer_id)
+        require(
+            result["planner"]["mapping_id"] not in used_by_other_sections
+            and result["writer"]["mapping_id"] not in used_by_other_sections,
+            "a runtime mapping/session is already bound to a different section",
+        )
+
     # -- normalized derivation (re-run against durable rows) ----------------- #
     def _normalize(self, input_payload, *, require_current):
         require(
@@ -376,10 +482,13 @@ class SectionWorkspaceRepository:
         """Create an inert workspace revision, atomically validating its inputs.
 
         The current approved outline, the section, and both runtime mapping pins are
-        validated before anything is written. On an edit (``parent_revision_id`` is
-        given) the planner/writer pins, the outline ref, and the section must not
-        **diverge** from the parent revision: a persistent workspace identity is not
-        silently retargeted.
+        validated before anything is written. The mappings must not already be bound
+        to a **different** section (per-section exclusivity). On an edit
+        (``parent_revision_id`` is given) the section and the planner/writer pins must
+        be retained; the outline ref may advance only to a **new revision of the same
+        logical outline artifact** (the new outline must be current and approved and
+        the section must still exist in it). A persistent workspace identity is never
+        silently retargeted, and no blueprint is auto-approved.
         """
         with self.store.transaction():
             require(
@@ -388,6 +497,7 @@ class SectionWorkspaceRepository:
                 "planner_mapping_id, writer_mapping_id",
             )
             result = self._normalize(payload, require_current=True)
+            self._require_per_section_exclusive(result)
             if parent_revision_id is not None:
                 parent_ref = {
                     "project_id": self.store.project_id,
@@ -396,11 +506,15 @@ class SectionWorkspaceRepository:
                 }
                 parent = self._read(parent_ref, current=False)
                 parent_result = parent["result"]
+                parent_outline = self._ref(parent_result["outline_ref"])
+                new_outline = self._ref(result["outline_ref"])
                 require(
-                    canonical_json(parent_result["outline_ref"])
-                    == canonical_json(result["outline_ref"])
-                    and parent_result["section_id"] == result["section_id"],
-                    "an edit may not diverge the workspace section or outline dependency",
+                    parent_result["section_id"] == result["section_id"],
+                    "an edit may not diverge the workspace section",
+                )
+                require(
+                    parent_outline["artifact_id"] == new_outline["artifact_id"],
+                    "an edit may only advance to a new revision of the same logical outline",
                 )
                 for slot in SLOTS:
                     require(

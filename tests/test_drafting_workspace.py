@@ -36,6 +36,8 @@ from review_article_agent.storage.agent_runtime import RuntimeRepository  # noqa
 from review_article_agent.synthesis.workflow import (  # noqa: E402
     GATE_FRAMEWORK,
     GATE_FRAMEWORK_KIND,
+    GATE_OUTLINE,
+    GATE_OUTLINE_KIND,
     GATE_SYNTHESIS,
     GATE_SYNTHESIS_KIND,
 )
@@ -321,6 +323,169 @@ class HistoryAndDivergenceTests(WorkspaceBase):
         }
         with self.assertRaises(SectionWorkspaceError):
             self.workspace.read(forged_ref)
+
+
+class PerSectionAndOutlineAdvanceTests(WorkspaceBase):
+    def test_cross_section_mapping_reuse_refused(self):
+        _s, _f, outline_ref = self.approved_chain()
+        planner = self.planner_mapping()
+        writer = self.writer_mapping()
+        # sec1 claims the planner/writer mappings.
+        self.propose_ws(
+            self.payload(outline_ref, section_id="sec1", planner=planner, writer=writer),
+            artifact_id="ws-sec1", revision="ws-sec1-r1",
+        )
+        # A different section may not reuse the same runtime mappings.
+        with self.assertRaises(SectionWorkspaceError):
+            self.propose_ws(
+                self.payload(outline_ref, section_id="sec3", planner=planner, writer=writer),
+                artifact_id="ws-sec3", revision="ws-sec3-r1",
+            )
+
+    def test_cross_section_reuse_with_only_one_mapping_shared_refused(self):
+        _s, _f, outline_ref = self.approved_chain()
+        planner = self.planner_mapping()
+        writer = self.writer_mapping(1)
+        writer2 = self.writer_mapping(2)
+        self.propose_ws(
+            self.payload(outline_ref, section_id="sec1", planner=planner, writer=writer),
+            artifact_id="ws-sec1", revision="ws-sec1-r1",
+        )
+        # sec3 shares the planner but uses a fresh writer: still a cross-section reuse.
+        with self.assertRaises(SectionWorkspaceError):
+            self.propose_ws(
+                self.payload(outline_ref, section_id="sec3", planner=planner, writer=writer2),
+                artifact_id="ws-sec3", revision="ws-sec3-r1",
+            )
+
+    def test_same_section_across_revisions_is_allowed(self):
+        _s, _f, outline_ref = self.approved_chain()
+        planner = self.planner_mapping()
+        writer = self.writer_mapping()
+        payload = self.payload(outline_ref, section_id="sec1", planner=planner, writer=writer)
+        self.propose_ws(payload, revision="ws-r1")
+        # A same-section revision (same mappings) is not a cross-section reuse.
+        ref2 = self.propose_ws(payload, revision="ws-r2", parent="ws-r1")
+        self.assertEqual(self.workspace.read(ref2)["result"]["section_id"], "sec1")
+
+    def test_accepted_outline_r2_rebind_retains_pins_and_history(self):
+        synthesis_ref, framework_ref, outline_ref = self.approved_chain()
+        planner = self.planner_mapping()
+        writer = self.writer_mapping()
+        ref1 = self.propose_ws(
+            self.payload(outline_ref, section_id="sec1", planner=planner, writer=writer),
+            artifact_id="ws-sec1", revision="ws-sec1-r1",
+        )
+        # A new accepted outline revision of the same logical outline artifact.
+        outline_r2 = self.put_outline(
+            synthesis_ref, framework_ref, revision="out-r2", parent="out-r1",
+            sec2_title="Revised evidence and correlation",
+        )
+        self.approve_ref(outline_r2, GATE_OUTLINE_KIND, GATE_OUTLINE)
+        # Advancing to the new accepted outline keeps the exact section + pins.
+        ref2 = self.propose_ws(
+            self.payload(outline_r2, section_id="sec1", planner=planner, writer=writer),
+            artifact_id="ws-sec1", revision="ws-sec1-r2", parent="ws-sec1-r1",
+        )
+        new = self.workspace.read(ref2)["result"]
+        self.assertEqual(new["outline_ref"], outline_r2)
+        self.assertEqual(new["section_id"], "sec1")
+        self.assertEqual(new["planner"]["session_id"], "ses_planner_1")
+        self.assertEqual(new["writer"]["session_id"], "ses_writer_1")
+        # The old revision stays immutable and inspectable, still bound to out-r1.
+        old = self.workspace.read(ref1, current=False)
+        self.assertEqual(old["result"]["outline_ref"], outline_ref)
+
+    def test_edit_may_not_swap_section(self):
+        _s, _f, outline_ref = self.approved_chain()
+        planner = self.planner_mapping()
+        writer = self.writer_mapping()
+        self.propose_ws(
+            self.payload(outline_ref, section_id="sec1", planner=planner, writer=writer),
+            revision="ws-r1",
+        )
+        with self.assertRaises(SectionWorkspaceError):
+            self.propose_ws(
+                self.payload(outline_ref, section_id="sec3", planner=planner, writer=writer),
+                revision="ws-r2", parent="ws-r1",
+            )
+
+    def test_edit_may_not_change_outline_artifact(self):
+        synthesis_ref, framework_ref, outline_ref = self.approved_chain()
+        planner = self.planner_mapping()
+        writer = self.writer_mapping()
+        self.propose_ws(
+            self.payload(outline_ref, section_id="sec1", planner=planner, writer=writer),
+            revision="ws-r1",
+        )
+        # A second, independently approved outline artifact.
+        other_outline = self.put_outline(
+            synthesis_ref, framework_ref, artifact_id="out2", revision="out2-r1",
+        )
+        self.approve_ref(other_outline, GATE_OUTLINE_KIND, GATE_OUTLINE)
+        with self.assertRaises(SectionWorkspaceError):
+            self.propose_ws(
+                self.payload(other_outline, section_id="sec1", planner=planner, writer=writer),
+                revision="ws-r2", parent="ws-r1",
+            )
+
+    def test_foreign_ref_in_matching_workspace_history_fails_closed(self):
+        _s, _f, outline_ref = self.approved_chain()
+        foreign = {
+            "project_id": "OTHER",
+            "artifact_id": outline_ref["artifact_id"],
+            "revision_id": outline_ref["revision_id"],
+        }
+        self.artifacts.create_artifact("foreign-ws", kind="report", created_by="import")
+        self.artifacts.import_revision(
+            artifact_id="foreign-ws",
+            revision_id="foreign-ws-r1",
+            content={
+                "schema_version": 1,
+                "document_type": DOCUMENT_TYPE,
+                "payload": {
+                    "input": {
+                        "outline_ref": foreign,
+                        "section_id": "sec1",
+                        "planner_mapping_id": "rmap_" + "1" * 32,
+                        "writer_mapping_id": "rmap_" + "2" * 32,
+                    },
+                    "result": None,
+                },
+            },
+            origin_locator="import:synthetic",
+            rights=self.rights("foreign-ws", "foreign-ws-r1"),
+            dependencies=[outline_ref],
+            acquired_by="import",
+        )
+        # A corrupt/foreign matching workspace must fail closed on the next proposal.
+        with self.assertRaises(SectionWorkspaceError):
+            self.propose_ws(
+                self.payload(outline_ref, planner=self.planner_mapping(), writer=self.writer_mapping())
+            )
+
+    def test_other_report_documents_are_ignored(self):
+        _s, _f, outline_ref = self.approved_chain()
+        # A raw-byte report receipt and an unrelated generic report document.
+        self.artifacts.create_artifact("receipt", kind="report", created_by="import")
+        self.artifacts.import_revision(
+            artifact_id="receipt", revision_id="receipt-r1", content=b"dispatch",
+            origin_locator="extraction:dispatch",
+            rights=self.rights("receipt", "receipt-r1"), acquired_by="import",
+        )
+        self.artifacts.create_artifact("other-doc", kind="report", created_by="import")
+        self.artifacts.import_revision(
+            artifact_id="other-doc", revision_id="other-doc-r1",
+            content={"schema_version": 1, "document_type": "synthesis_synthesis",
+                     "payload": {"input": {}, "result": {}, "impact": None}},
+            origin_locator="import:synthetic",
+            rights=self.rights("other-doc", "other-doc-r1"), acquired_by="import",
+        )
+        # Neither unrelated report type blocks a valid workspace proposal.
+        ref = self.propose_ws(
+            self.payload(outline_ref, planner=self.planner_mapping(), writer=self.writer_mapping())
+        )
+        self.assertEqual(self.workspace.read(ref)["result"]["section_id"], "sec1")
 
 
 if __name__ == "__main__":
