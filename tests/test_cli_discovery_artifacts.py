@@ -280,6 +280,42 @@ class DiscoveryCliTestCase(unittest.TestCase):
         out = self.cli("artifact", "revisions", artifact_id, "--project", pid)
         return out["revisions"]
 
+    # -- real out-of-band approvals (owner-auth seams; no in-band flag) ------- #
+    def install_owner_auth(self) -> None:
+        patches = [
+            mock.patch.object(owner_auth, "_new_challenge", lambda: _FIXED_CHALLENGE),
+            mock.patch.object(owner_auth, "_current_owner_uid", lambda: _OWNER_UID),
+            mock.patch.object(owner_auth, "_real_uid", lambda: _OWNER_UID),
+            mock.patch.object(owner_auth, "_utcnow", lambda: leadfx._BASE_TIME),
+            mock.patch.object(owner_auth, "_monotonic", lambda: 1000.0),
+            mock.patch.object(
+                owner_auth,
+                "_open_controlling_tty",
+                lambda: leadfx._FakeTty(replies=[_FIXED_CHALLENGE]),
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def approve(self, pid, artifact_id, revision_id, gate_kind, gate_id):
+        """Record one real, out-of-band human approval for an exact revision."""
+
+        def _approve(store):
+            prepared = prepare_gate_snapshot(
+                store,
+                self.ref(pid, artifact_id, revision_id),
+                gate_kind=gate_kind,
+                gate_id=gate_id,
+                decision="approved",
+                rationale="synthetic human gate",
+            )
+            capability = owner_auth.request_owner_confirmation(prepared.owner_action())
+            assert isinstance(capability, OwnerApproval)
+            return HumanApprovalRepository(store).record_decision(prepared, capability)
+
+        return self.with_store(pid, _approve)
+
     # -- discovery wrappers -------------------------------------------------- #
     def context_import(
         self,
@@ -1080,6 +1116,72 @@ class CorpusTest(DiscoveryCliTestCase):
         shown = self.cli("discovery", "corpus", "show", "--project", pid)["corpus"]
         self.assertEqual(shown["run_count"], 2)
         self.assertEqual(shown["input_run_count"], 1)
+
+
+# --------------------------------------------------------------------------- #
+# approval request vs an exact replayed revision
+# --------------------------------------------------------------------------- #
+class ApprovalRequestRevisionTest(DiscoveryCliTestCase):
+    SEED_GATE = "discovery.seed.a-seed"
+
+    def test_replayed_old_revision_is_never_satisfied_by_a_newer_approval(self) -> None:
+        pid = self.create_project()
+        run_id = self.record_run(pid, "dsr_r1", (fx.record(),))
+        doc = _envelope("discovery_seed", _seed_payload(run_id))
+
+        # An unapproved seed reports current, not stale, and not satisfied.
+        first = self.context_import(
+            pid=pid, artifact_id="a-seed", revision_id="rev-seed", document=doc
+        )
+        self.assertIs(first["approval_request"]["current"], True)
+        self.assertIs(first["approval_request"]["stale"], False)
+        self.assertIs(first["approval_request"]["satisfied"], False)
+
+        # A real out-of-band approval of the current revision satisfies it.
+        self.install_owner_auth()
+        self.approve(pid, "a-seed", "rev-seed", "artifact_revision", self.SEED_GATE)
+        approved = self.context_import(
+            pid=pid, artifact_id="a-seed", revision_id="rev-seed", document=doc
+        )
+        self.assertIs(approved["approval_request"]["current"], True)
+        self.assertIs(approved["approval_request"]["satisfied"], True)
+
+        # A genuinely new revision (rev-seed2) is approved at the same gate.
+        doc2 = _envelope(
+            "discovery_seed", _seed_payload(run_id, abstract="second abstract")
+        )
+        self.context_import(
+            pid=pid,
+            artifact_id="a-seed",
+            revision_id="rev-seed2",
+            document=doc2,
+            parent="rev-seed",
+        )
+        self.approve(pid, "a-seed", "rev-seed2", "artifact_revision", self.SEED_GATE)
+
+        # Replaying the *old* revision now: it is historical (stale) and, although a
+        # newer revision at the same gate is approved, this exact revision must NOT
+        # be reported satisfied.
+        replay = self.context_import(
+            pid=pid, artifact_id="a-seed", revision_id="rev-seed", document=doc
+        )
+        self.assertIs(replay["replayed"], True)
+        self.assertEqual(replay["revision"]["revision_id"], "rev-seed")
+        self.assertIs(replay["approval_request"]["current"], False)
+        self.assertIs(replay["approval_request"]["stale"], True)
+        self.assertIs(replay["approval_request"]["satisfied"], False)
+
+        # The fresh current revision is genuinely satisfied.
+        fresh = self.context_import(
+            pid=pid,
+            artifact_id="a-seed",
+            revision_id="rev-seed2",
+            document=doc2,
+            parent="rev-seed",
+        )
+        self.assertIs(fresh["approval_request"]["current"], True)
+        self.assertIs(fresh["approval_request"]["stale"], False)
+        self.assertIs(fresh["approval_request"]["satisfied"], True)
 
 
 # --------------------------------------------------------------------------- #

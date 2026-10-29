@@ -570,8 +570,11 @@ def _approval_request(
 
     Only a seed (its individual ``artifact_revision`` gate) and a plan (the
     combined ``protocol``/``discovery.plan`` gate) require an approval request. The
-    ``satisfied`` flag is the real repository's answer, never a fabricated claim;
-    ``current``/``stale`` state whether the returned revision is still the
+    ``satisfied`` flag is the real repository's answer **for this exact returned
+    revision** and is never a fabricated claim: ``named_gate_satisfied`` reports the
+    artifact's *current* gate, so a historical replay of an older revision is never
+    reported satisfied merely because a newer revision at the same gate was
+    approved. ``current``/``stale`` state whether the returned revision is still the
     artifact's head, so a historical replay never claims the old gate is active.
     """
     document_type = document["document_type"]
@@ -585,11 +588,15 @@ def _approval_request(
         impact_review = document["payload"]["impact_review"]
     else:
         return None
-    satisfied = HumanApprovalRepository(store).named_gate_satisfied(
-        revision.artifact_id, gate_kind=gate_kind, gate_id=gate_id
-    )
     head = repo.current_revision(revision.artifact_id)
     is_current = head is not None and head.revision_id == revision.revision_id
+    # ``named_gate_satisfied`` answers for the artifact's current gate; it may only
+    # mean *this exact returned revision* when that revision is still the head. For
+    # a historical (stale) replay it must never be reported satisfied, so an
+    # approval of a newer revision at the same gate is not mis-attributed here.
+    satisfied = is_current and HumanApprovalRepository(store).named_gate_satisfied(
+        revision.artifact_id, gate_kind=gate_kind, gate_id=gate_id
+    )
     return {
         "gate_kind": gate_kind,
         "gate_id": gate_id,
