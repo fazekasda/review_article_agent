@@ -29,14 +29,7 @@ Document source licenses/terms actually checked, retrieval failures, version pol
 
 ## Implementation status (appended; requirements above unchanged)
 
-**Status: implemented MVP (minimal).** Every deliverable and AC1–AC7 above has
-integrated source and named tests, exercised by the earlier full checkpoint
-`dbe613a` (**3,027 core tests, no skips**). The **final latest-head full suite and
-the retained-suite rollup are pending the coordinator's verification run**; no
-green final-suite or CI claim is made (no CI configured). See the
-[Step 06 handoff](handoffs/06-acquisition.md) for evidence pointers, the exact
-integrated surfaces, the global cross-artifact exact-byte guard (a parallel slice
-integrated separately), and honest limits. Not implemented: scientific
-parsing/screening/digestion (**Step 07+**), live retrieval/paid/hosted calls/
-uploads, Python 3.11, 10k-scale, and a real-network fault harness; **no human
-approval is invented** by any code or doc here.
+**MVP implemented; final validation pending.** AC1–AC7 have integrated source and named tests
+(checkpoint `dbe613a`; the global guard `4e1e5a3`+`d2f3d57` is integrated at `246df21`). Final
+delivery verification is recorded in the PR. Scientific parsing/screening/digestion are Step 07+.
+See the [handoff](handoffs/06-acquisition.md).

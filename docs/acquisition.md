@@ -1,13 +1,11 @@
 # Acquisition reference — local import, manifest, human gate, and official retrieval (Step 06, implemented MVP)
 
-> **Status: reference for the Step 06 acquisition MVP, implemented at base
-> `5b61ccfe039210763c1e64868ba79dc38a70eb0c`.** The local acquisition CLI, the
+> **Status: reference for the integrated Step 06 acquisition MVP.** The local acquisition CLI, the
 > libraries behind it, the atomic folder-batch import CLI, and the detached
 > official full-text retrieval job with its public `acquisition retrieve
-> id|run|show` CLI are all integrated. The final latest-head full suite and
-> retained-suite rollup are **pending the coordinator's verification run**; no CI
-> is configured. Scientific parsing/screening/digestion are **Step 07+**. Evidence
-> and honest limits are in
+> id|run|show` CLI are all integrated. Final delivery verification is recorded in
+> the PR; no CI is configured. Scientific parsing/screening/digestion are **Step
+> 07+**. Evidence and honest limits are in
 > [`implementation/handoffs/06-acquisition.md`](implementation/handoffs/06-acquisition.md).
 > No command here is a scientific, screening, seed, pilot, or hosted-use
 > authorization, and no human approval is invented.
@@ -352,5 +350,5 @@ a replay-key `request_id`, source and occurrence/report rights, and per-operatio
 * Scientific parsing, screening, and digestion are **Step 07+**. The global
   cross-artifact exact-byte guard (`cross_artifact_duplicate`, `matching_refs`,
   explicit canonical-target retry, no automatic identity merge/catalog) is
-  required Step 06 behavior (C01 §6.1 R1) integrated by a **separate parallel
-  slice**, not evidenced by the `dbe613a` checkpoint.
+  required Step 06 behavior (C01 §6.1 R1), now integrated at `246df21`
+  (`4e1e5a3` + `d2f3d57`); it is not evidenced by the `dbe613a` checkpoint.
