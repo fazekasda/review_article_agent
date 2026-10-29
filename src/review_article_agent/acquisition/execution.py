@@ -47,7 +47,8 @@ Public API (for the dependent worker/CLI task)
 ----------------------------------------------
 
 ``AcquisitionExecutor(store, *, registry, activation_token, lowlevel=None,
-transport_options=None, stop_requested=None, before_attempt=None)``
+transport_options=None, stop_requested=None, before_attempt=None,
+after_attempt=None)``
 
 ``AcquisitionExecutor.acquire(freeze_ref, candidate_id, *, request_id,
 source_artifact_id, source_revision_id, source_rights, occurrence_revision_id,
@@ -84,8 +85,10 @@ inferred or invented):
   "storage": {...}}``: per-operation terms reference (must equal the validated
   rights record's basis evidence ref for that operation) and the actual UTC
   check timestamp.
-* ``parent_revision_id`` -- the artifact head when the source artifact already
-  has revisions.
+* ``parent_revision_id`` -- must equal the current head when the source artifact
+  already has revisions and be ``None`` for a new artifact; any other value (and
+  an already-used proposed revision id) is a conflict raised BEFORE any GET.
+  Exact replay is resolved first, so it still works after the artifact exists.
 
 Return value (JSON-safe, no bytes): ``{"report_ref", "replayed", "status",
 "source_ref", "occurrence_ref", "disposition", "validation_status",
@@ -110,6 +113,40 @@ and :class:`AcquisitionExecutionBlockedError` is raised. Resolver failure
 entries of the form ``attempts_exhausted`` that follow an interruption denote
 steps that were refused locally.
 
+``after_attempt`` (``(dict) -> None``) is called exactly once per low-level GET
+that was dispatched, whether it returned or failed, with bounded metadata only
+(no bytes, no text): ``{attempt_index, source, url, outcome ("response" |
+"network_error" | "unexpected_error"), status, byte_count, body_sha256,
+truncated, started_at, completed_at, failure}``. ``attempt_index`` counts every
+low-level GET of this call (retries included), the same numbering as
+``before_attempt``. The engine worker should persist it to its durable job
+checkpoint: it then survives a later local import/report failure. If the
+callback raises, the request is already sent, so the run is marked interrupted
+(``after_attempt_callback_failed``; the send is ambiguous, never "nothing sent"),
+no further GET is made and any retrieved bytes are discarded.
+
+If the atomic local commit is rejected after GETs (for example a source rights
+conflict), the executor attempts ONE metadata-only ``interrupted`` report
+(``interrupted_reason = "local_commit_rejected:<code>"``) under the same fenced
+write guard and the same prospective report-rights identity check -- it never
+bypasses superseded or denied metadata rights. If that is refused too, the
+original error is raised; without an ``after_attempt`` journal the observations
+of that call are then lost (direct library use without a journal).
+
+Provenance labels: ``adapter_version`` (also kept as ``source_version``) names
+the official endpoint adapter, NOT a published-vs-preprint edition;
+``document_version`` is always ``{"status": "unknown", "reason": ...}`` because no
+edition evidence is observed. ``limits`` separates ``max_sources`` (2),
+``max_attempts_per_source`` and ``max_get_attempts`` (= product).
+
+Reads (``find_request``/``get_report``/replay) re-derive the candidate and its
+identifiers from the HISTORICAL pinned freeze and corpus (no current gate is
+needed), validate every scalar/bound, compare the dependency set including
+project ids, and recompute ``validate_asset``. A report written by another
+``validator_version`` is shown as ``validation_check = "stale_validator_version"``
+with ``validation_status = "stale_validator_version"`` (structurally checked,
+never trusted as ``ready``).
+
 Limitations (disclosed)
 -----------------------
 
@@ -119,9 +156,8 @@ Limitations (disclosed)
 * No lock is held across network work: the registry write guard and the SQLite
   transaction wrap only the local commit (source, rights, occurrence and report
   are one atomic transaction).
-* If the local commit is rejected (for example a rights conflict discovered on
-  a duplicate-byte reuse), nothing is retained and the observed attempts are not
-  recorded; the error is raised and the caller may retry with a new key.
+* A race between preflight and commit (for example another writer extends the
+  source artifact after dispatch) still fails closed at the atomic commit.
 * Like the underlying transport, an instance is **not** thread-safe.
 """
 
@@ -158,14 +194,27 @@ from .imports import (
     AssetImportRepository,
     _NestedStore,
 )
-from .resolution import MAX_REQUESTS, RESOLVER_VERSION, resolve_full_text
+from .resolution import (
+    EPMC_SOURCE,
+    FAILURE_CODES,
+    MAX_REQUESTS,
+    PMC_EFETCH_SOURCE,
+    RESOLVER_VERSION,
+    resolve_full_text,
+)
 from .transport import (
+    ATTEMPT_OUTCOMES,
+    EPMC_FULLTEXT_BASE,
+    PMC_EFETCH_URL,
+    TRANSPORT_FAILURE_REASONS,
     FullTextRequestInterrupted,
     FullTextTransport,
     FullTextTransportError,
+    TransportNetworkError,
     http_get,
 )
 from .validation import (
+    STATUSES as VALIDATION_STATUSES,
     VALIDATOR_VERSION,
     AcquisitionValidationError,
     validate_asset,
@@ -317,6 +366,7 @@ class AcquisitionExecutor:
         transport_options=None,
         stop_requested=None,
         before_attempt=None,
+        after_attempt=None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -325,12 +375,13 @@ class AcquisitionExecutor:
         low = http_get if lowlevel is None else lowlevel
         if not callable(low):
             raise _fail("invalid_request")
-        for hook in (stop_requested, before_attempt):
+        for hook in (stop_requested, before_attempt, after_attempt):
             if hook is not None and not callable(hook):
                 raise _fail("invalid_request")
         self._lowlevel = low
         self._stop_requested = stop_requested
         self._before_attempt = before_attempt
+        self._after_attempt = after_attempt
         options = dict(transport_options or {})
         options.pop("transport", None)  # the fenced low-level is the only one
         self._ctx: dict | None = None
@@ -409,9 +460,53 @@ class AcquisitionExecutor:
             ctx["interrupted"] = reason
             raise FullTextRequestInterrupted("interrupted")
         ctx["dispatched"] += 1
-        return self._lowlevel(
-            url, timeout=timeout, max_response_bytes=max_response_bytes
-        )
+        index, started = ctx["dispatched"], _utc_now()
+        try:
+            response = self._lowlevel(
+                url, timeout=timeout, max_response_bytes=max_response_bytes
+            )
+        except TransportNetworkError:
+            self._observe(ctx, index, url, started, None, "network_error")
+            raise
+        except BaseException:
+            self._observe(ctx, index, url, started, None, "unexpected_error")
+            raise
+        self._observe(ctx, index, url, started, response, None)
+        return response
+
+    def _observe(self, ctx, index, url, started, response, failure) -> None:
+        """Report one dispatched GET exactly once to ``after_attempt`` (no bytes).
+
+        A callback failure cannot be retried or ignored: the request was already
+        sent, so the run is marked interrupted (ambiguous) and no further GET is
+        made. The response, if any, is still handed back to the transport so its
+        own attempt record survives.
+        """
+        if self._after_attempt is None:
+            return
+        body = getattr(response, "body", b"")
+        status = getattr(response, "status", None)
+        info = {
+            "attempt_index": index,
+            "source": ctx["step"],
+            "url": url,
+            "outcome": "response" if response is not None else failure,
+            "status": status if isinstance(status, int) and not isinstance(status, bool) else None,
+            "byte_count": len(body) if isinstance(body, (bytes, bytearray)) else 0,
+            "body_sha256": (
+                hashlib.sha256(bytes(body)).hexdigest()
+                if isinstance(body, (bytes, bytearray)) and body
+                else None
+            ),
+            "truncated": bool(getattr(response, "truncated", False)),
+            "started_at": started,
+            "completed_at": _utc_now(),
+            "failure": failure,
+        }
+        try:
+            self._after_attempt(info)
+        except Exception:  # noqa: BLE001
+            ctx["interrupted"] = "after_attempt_callback_failed"
 
     # -- rights --------------------------------------------------------------- #
     def _norm_rights(self, record: object, subject: dict) -> dict:
@@ -568,7 +663,7 @@ class AcquisitionExecutor:
         for record in (src, occ, rep):
             self._check_rights_identity(record)
         self._check_identities(
-            source_artifact_id, source_revision_id, report_id, occ_id
+            source_artifact_id, source_revision_id, report_id, occ_id, parent
         )
 
         # -- 5. network: only through the fenced transport -------------------- #
@@ -684,7 +779,7 @@ class AcquisitionExecutor:
         conflicts = sorted(n for n, v in values.items() if len(v) > 1)
         return identifiers, conflicts
 
-    def _check_identities(self, source_id, source_rev, report_id, occ_id) -> None:
+    def _check_identities(self, source_id, source_rev, report_id, occ_id, parent) -> None:
         art = self._artifacts
         existing = art.get_artifact(source_id)
         if existing is not None:
@@ -692,11 +787,45 @@ class AcquisitionExecutor:
                 raise _fail("identity_conflict")
             if art.get_revision(source_id, source_rev) is not None:
                 raise _fail("identity_conflict")
+            head = art.current_revision(source_id)
+            # An existing source artifact must be extended from its exact head.
+            if head is not None and parent != head.revision_id:
+                raise _fail("identity_conflict")
+            if head is None and parent is not None:
+                raise _fail("identity_conflict")
+        elif parent is not None:
+            raise _fail("identity_conflict")
         if art.get_artifact(occ_id) is not None or art.get_artifact(report_id) is not None:
             raise _fail("identity_conflict")
 
     # -- commit --------------------------------------------------------------------- #
-    def _commit(self, *, result, attempts, interrupted, body, identifiers, conflicts,
+    _LOCAL_REJECTED = frozenset(
+        {"rights_conflict", "import_rejected", "storage_failure", "identity_conflict"}
+    )
+
+    def _commit(self, **kw) -> dict:
+        """Atomic commit; on a local rejection after GETs, try a metadata-only report.
+
+        The fallback never bypasses metadata rights: it re-runs the same prospective
+        report-rights identity check and the same fenced, atomic write. If that is
+        also refused, the original error is raised (the attempts were still given
+        to ``after_attempt`` as they happened).
+        """
+        try:
+            return self._write(**kw)
+        except AcquisitionExecutionError as original:
+            if kw["body"] is None or original.code not in self._LOCAL_REJECTED:
+                raise
+            try:
+                self._check_rights_identity(kw["report_rights"])
+                return self._write(
+                    **dict(kw, body=None,
+                           interrupted="local_commit_rejected:" + original.code)
+                )
+            except Exception:  # noqa: BLE001 - keep the original, specific error
+                raise original from None
+
+    def _write(self, *, result, attempts, interrupted, body, identifiers, conflicts,
                 freeze, freeze_doc, freeze_sha, candidate_id, request_id, digest,
                 report_id, report_revision_id, report_rights, source_artifact_id,
                 source_revision_id, source_rights, parent, occ_revision_id, occ_rights,
@@ -815,6 +944,12 @@ class AcquisitionExecutor:
             "resolver_version": RESOLVER_VERSION,
             "source": result["source"] if retained else None,
             "source_version": result["source_version"] if retained else None,
+            "adapter_version": result["source_version"] if retained else None,
+            "document_version": {
+                "status": "unknown",
+                "reason": "adapter endpoint version only; no published-vs-preprint "
+                          "edition evidence was observed",
+            },
             "media_type": _safe_media(result["media_type"]) if retained else None,
             "origin_locator": result["origin_locator"] if retained else None,
             "content_sha256": sha256_digest(body) if retained else None,
@@ -822,8 +957,9 @@ class AcquisitionExecutor:
             "attempts": attempts,
             "failures": [self._failure(f) for f in result["failures"]],
             "limits": {
-                "max_requests": MAX_REQUESTS,
-                "max_attempts": self._transport.max_attempts,
+                "max_sources": MAX_REQUESTS,
+                "max_attempts_per_source": self._transport.max_attempts,
+                "max_get_attempts": MAX_REQUESTS * self._transport.max_attempts,
                 "timeout_seconds": self._transport.timeout,
                 "max_response_bytes": self._transport.max_response_bytes,
                 "rate_spacing_seconds": self._transport.rate_spacing,
@@ -879,6 +1015,7 @@ class AcquisitionExecutor:
     @staticmethod
     def _summary(ref: dict, payload: dict, *, replayed: bool) -> dict:
         validation = payload["validation"]
+        current = payload["validator_version"] == VALIDATOR_VERSION
         return {
             "report_ref": ref,
             "replayed": replayed,
@@ -886,7 +1023,11 @@ class AcquisitionExecutor:
             "source_ref": payload["source_ref"],
             "occurrence_ref": payload["occurrence_ref"],
             "disposition": payload["import_disposition"],
-            "validation_status": None if validation is None else validation.get("status"),
+            "validation_status": (
+                None if validation is None
+                else validation.get("status") if current else "stale_validator_version"
+            ),
+            "validation_check": "verified" if current else "stale_validator_version",
             "attempt_count": len(payload["attempts"]),
             "report": payload,
         }
@@ -896,7 +1037,8 @@ class AcquisitionExecutor:
         "scientific_acceptance", "project_id", "request_id", "request_digest",
         "freeze_ref", "freeze_content_sha256", "candidate_id", "identifiers",
         "identifier_conflicts", "status", "interrupted_reason", "resolver_version",
-        "source", "source_version", "media_type", "origin_locator", "content_sha256",
+        "source", "source_version", "adapter_version", "document_version",
+        "media_type", "origin_locator", "content_sha256",
         "content_bytes", "attempts", "failures", "limits", "terms_evidence",
         "unofficial_locator_present", "source_ref", "occurrence_ref",
         "import_disposition", "validation", "validator_version", "created_at",
@@ -905,10 +1047,16 @@ class AcquisitionExecutor:
         "attempt_no", "requested_url", "requested_at", "completed_at", "status",
         "body_bytes", "body_sha256", "outcome", "media_type",
     })
+    _LIMIT_KEYS = frozenset({
+        "max_sources", "max_attempts_per_source", "max_get_attempts", "timeout_seconds",
+        "max_response_bytes", "rate_spacing_seconds", "wall_clock_bounded",
+    })
+    _SOURCES = (EPMC_SOURCE, PMC_EFETCH_SOURCE)
+    _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
     def _load(self, report_id: str, revision_id: str) -> dict:
         bad = _fail("report_invalid")
-        art, project = self._artifacts, self._project_id
+        art = self._artifacts
         artifact = art.get_artifact(report_id)
         revision = art.get_revision(report_id, revision_id)
         if artifact is None or artifact.kind != "report" or revision is None:
@@ -935,9 +1083,129 @@ class AcquisitionExecutor:
         try:
             self._verify(p, report_id, revision, bad)
         except (KeyError, TypeError, ValueError, AssetImportError, AcquisitionExecutionError,
-                RecordValidationError, ArtifactRepositoryError):
+                RecordValidationError, ArtifactRepositoryError, FreezeError, CandidateError):
             raise bad from None
         return p
+
+    # -- scalar / bound validation of a stored payload ---------------------------- #
+    @staticmethod
+    def _is_int(value, low=0, high=None) -> bool:
+        return (
+            type(value) is int and value >= low and (high is None or value <= high)
+        )
+
+    @staticmethod
+    def _is_ts(value) -> bool:
+        if not isinstance(value, str) or len(value) > 64:
+            return False
+        try:
+            datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _official_url(value) -> bool:
+        return isinstance(value, str) and len(value) <= 2048 and (
+            value.startswith(EPMC_FULLTEXT_BASE + "/") or value.startswith(PMC_EFETCH_URL + "?")
+        )
+
+    def _verify_scalars(self, p: dict) -> None:
+        ok = self._is_int
+        if not (
+            isinstance(p["resolver_version"], str) and 0 < len(p["resolver_version"]) <= 100
+            and isinstance(p["validator_version"], str) and 0 < len(p["validator_version"]) <= 100
+            and self._is_ts(p["created_at"])
+            and isinstance(p["request_digest"], str) and self._HEX64.fullmatch(p["request_digest"])
+            and isinstance(p["freeze_content_sha256"], str)
+            and p["freeze_content_sha256"].startswith("sha256:")
+            and isinstance(p["unofficial_locator_present"], bool)
+            and p["media_type"] in (None, _safe_media(p["media_type"]))
+            and p["source"] in (None,) + self._SOURCES
+            and p["source_version"] == p["adapter_version"]
+            and (p["adapter_version"] is None
+                 or (isinstance(p["adapter_version"], str) and 0 < len(p["adapter_version"]) <= 100))
+            and (p["origin_locator"] is None or self._official_url(p["origin_locator"]))
+            and (p["content_bytes"] is None or ok(p["content_bytes"], 1))
+            and (p["interrupted_reason"] is None or (
+                isinstance(p["interrupted_reason"], str)
+                and re.fullmatch(r"[a-z_]+(:[a-z_]+)?", p["interrupted_reason"])))
+        ):
+            raise ValueError
+        _ident(p["request_id"])
+        _ident(p["candidate_id"])
+        dv = p["document_version"]
+        if not (
+            isinstance(dv, dict) and set(dv) == {"status", "reason"}
+            and dv["status"] == "unknown" and isinstance(dv["reason"], str)
+            and 0 < len(dv["reason"]) <= 300
+        ):
+            raise ValueError
+        ids = p["identifiers"]
+        if not (
+            isinstance(ids, dict) and set(ids) <= set(_TOKEN_NAMESPACES)
+            and all(isinstance(v, str) and 0 < len(v) <= 200 for v in ids.values())
+            and isinstance(p["identifier_conflicts"], list)
+            and p["identifier_conflicts"] == sorted(set(p["identifier_conflicts"]))
+            and set(p["identifier_conflicts"]) <= set(_TOKEN_NAMESPACES)
+        ):
+            raise ValueError
+        limits = p["limits"]
+        if not (
+            isinstance(limits, dict) and set(limits) == self._LIMIT_KEYS
+            and ok(limits["max_sources"], 1, 10) and ok(limits["max_attempts_per_source"], 1, 5)
+            and limits["max_get_attempts"]
+            == limits["max_sources"] * limits["max_attempts_per_source"]
+            and ok(limits["max_response_bytes"], 1)
+            and all(
+                isinstance(limits[k], (int, float)) and not isinstance(limits[k], bool)
+                and limits[k] >= 0
+                for k in ("timeout_seconds", "rate_spacing_seconds")
+            )
+            and limits["wall_clock_bounded"] is False
+        ):
+            raise ValueError
+        terms = p["terms_evidence"]
+        if not (isinstance(terms, dict) and set(terms) == set(_OPS)):
+            raise ValueError
+        for entry in terms.values():
+            if not (
+                isinstance(entry, dict) and set(entry) == {"terms_ref", "checked_at"}
+                and isinstance(entry["terms_ref"], str) and 0 < len(entry["terms_ref"]) <= 512
+                and self._is_ts(entry["checked_at"])
+            ):
+                raise ValueError
+        attempts = p["attempts"]
+        if not isinstance(attempts, list) or len(attempts) > limits["max_get_attempts"]:
+            raise ValueError
+        for item in attempts:
+            if not (
+                isinstance(item, dict) and set(item) == self._ATTEMPT_KEYS
+                and ok(item["attempt_no"], 1, 5)
+                and self._official_url(item["requested_url"])
+                and self._is_ts(item["requested_at"]) and self._is_ts(item["completed_at"])
+                and (item["status"] is None or ok(item["status"], 100, 599))
+                and ok(item["body_bytes"])
+                and (item["body_sha256"] is None
+                     or (isinstance(item["body_sha256"], str)
+                         and self._HEX64.fullmatch(item["body_sha256"])))
+                and item["outcome"] in ATTEMPT_OUTCOMES
+                and item["media_type"] in (None, _safe_media(item["media_type"]))
+            ):
+                raise ValueError
+        failures = p["failures"]
+        if not isinstance(failures, list) or len(failures) > 20:
+            raise ValueError
+        codes = set(FAILURE_CODES) | set(TRANSPORT_FAILURE_REASONS)
+        for item in failures:
+            if not (
+                isinstance(item, dict) and set(item) <= {"code", "source", "status", "media_type"}
+                and item.get("code") in codes
+                and item.get("source") in (None,) + self._SOURCES
+                and (item.get("status") is None or ok(item["status"], 100, 599))
+                and item.get("media_type") in (None, _safe_media(item.get("media_type")))
+            ):
+                raise ValueError
 
     def _verify(self, p: dict, report_id: str, revision, bad) -> None:
         art, project = self._artifacts, self._project_id
@@ -952,22 +1220,36 @@ class AcquisitionExecutor:
             or p["project_id"] != project
             or p["status"] not in REPORT_STATUSES
             or self.report_artifact_id(p["request_id"]) != report_id
-            or not isinstance(p["request_digest"], str)
             or art.get_rights_record(revision.rights_ref) is None
         ):
             raise bad
-        for item in p["attempts"]:
-            if not isinstance(item, dict) or set(item) != self._ATTEMPT_KEYS:
-                raise bad
-        # freeze pin: exact revision and digest
+        self._verify_scalars(p)
+        # Re-derive candidate membership and identifiers from the HISTORICAL pinned
+        # freeze + corpus (no current gate is required to read a past report).
         freeze = _ref_dict(p["freeze_ref"], project)
         fr = art.get_revision(freeze["artifact_id"], freeze["revision_id"])
         if fr is None or fr.content_sha256 != p["freeze_content_sha256"]:
             raise bad
+        pinned = FreezeRepository(self._store).get(freeze)["payload"]
+        if (
+            pinned["decision"] != "freeze"
+            or p["candidate_id"] not in pinned["selection"]["included"]
+        ):
+            raise bad
+        identifiers, conflicts = self._candidate_identifiers(
+            {"payload": pinned}, p["candidate_id"]
+        )
+        if identifiers != p["identifiers"] or conflicts != p["identifier_conflicts"]:
+            raise bad
         expected = {(freeze["artifact_id"], freeze["revision_id"])}
         source_ref, occ_ref = p["source_ref"], p["occurrence_ref"]
         if p["status"] == "retrieved":
-            if source_ref is None or occ_ref is None or p["validation"] is None:
+            if (
+                source_ref is None or occ_ref is None or p["validation"] is None
+                or p["source"] is None or p["adapter_version"] is None
+                or p["interrupted_reason"] is not None
+                or p["origin_locator"] is None or p["content_sha256"] is None
+            ):
                 raise bad
             sref, oref = _ref_dict(source_ref, project), _ref_dict(occ_ref, project)
             source = art.get_revision(sref["artifact_id"], sref["revision_id"])
@@ -978,7 +1260,15 @@ class AcquisitionExecutor:
             ):
                 raise bad
             data = art.read_content(sref["artifact_id"], sref["revision_id"])
+            digest = hashlib.sha256(data).hexdigest()
             if sha256_digest(data) != p["content_sha256"]:
+                raise bad
+            winner = p["attempts"][-1] if p["attempts"] else None
+            if (
+                winner is None or winner["outcome"] != "ok" or winner["status"] != 200
+                or winner["body_sha256"] != digest
+                or winner["requested_url"] != p["origin_locator"]
+            ):
                 raise bad
             occurrence = AssetImportRepository(self._store).get_occurrence(oref)
             if (
@@ -990,10 +1280,18 @@ class AcquisitionExecutor:
                 or occurrence.source_revision_rights_ref != source.rights_ref
             ):
                 raise bad
+            validation = p["validation"]
             if p["validator_version"] == VALIDATOR_VERSION:
-                again = self._validate(data, p["identifiers"], p["media_type"])
-                if again != p["validation"]:
+                if self._validate(data, p["identifiers"], p["media_type"]) != validation:
                     raise bad
+            elif not (
+                isinstance(validation, dict)
+                and validation.get("status") in VALIDATION_STATUSES + ("not_validated",)
+                and validation.get("sha256", digest) == digest
+                and validation.get("byte_size", len(data)) == len(data)
+            ):
+                # unknown validator version: stored result is shown as stale, never trusted
+                raise bad
             expected |= {
                 (sref["artifact_id"], sref["revision_id"]),
                 (oref["artifact_id"], oref["revision_id"]),
@@ -1002,13 +1300,19 @@ class AcquisitionExecutor:
             source_ref is not None or occ_ref is not None or p["validation"] is not None
             or p["import_disposition"] is not None or p["content_sha256"] is not None
             or p["content_bytes"] is not None or p["source"] is not None
+            or p["adapter_version"] is not None or p["origin_locator"] is not None
+            or p["media_type"] is not None
         ):
             raise bad
         if p["status"] == "interrupted":
-            if not isinstance(p["interrupted_reason"], str) or not p["attempts"]:
+            if p["interrupted_reason"] is None or not p["attempts"]:
                 raise bad
         elif p["interrupted_reason"] is not None:
             raise bad
         deps = {(d.artifact_id, d.revision_id) for d in revision.dependencies}
-        if deps != expected or any(d.role != "derived_from" for d in revision.dependencies):
+        if (
+            deps != expected
+            or any(d.role != "derived_from" or d.project_id != project
+                   for d in revision.dependencies)
+        ):
             raise bad

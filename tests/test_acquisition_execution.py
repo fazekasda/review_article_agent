@@ -39,6 +39,8 @@ from review_article_agent.acquisition.transport import (  # noqa: E402
     TransportNetworkError,
     TransportResponse,
 )
+from review_article_agent.domain.records import canonical_json  # noqa: E402
+from review_article_agent.storage.artifacts import sha256_digest  # noqa: E402
 from review_article_agent.storage import (  # noqa: E402
     ArtifactRepository,
     ProjectStore,
@@ -259,7 +261,9 @@ class SuccessAndReplayTests(Base):
         body = self.full_text()
         ex = self.executor(Net(ok(body), ok(body)))
         first = ex.acquire(**self.args(ex, "req-1"))
-        second = ex.acquire(**self.args(ex, "req-2"))
+        second = ex.acquire(
+            **self.args(ex, "req-2", parent_revision_id=first["source_ref"]["revision_id"])
+        )
         self.assertEqual(second["disposition"], "duplicate_bytes_of_existing_revision")
         self.assertEqual(second["source_ref"], first["source_ref"])
         self.assertNotEqual(second["occurrence_ref"], first["occurrence_ref"])
@@ -529,6 +533,258 @@ class InterruptionTests(Base):
         self.assertEqual(result["report"]["interrupted_reason"], "freeze_changed_before_commit")
         self.assertIsNone(result["source_ref"])
         self.assertIsNone(ArtifactRepository(self.store).get_artifact("doc-a"))
+
+
+class ParentPreflightTests(Base):
+    def seed_source(self):
+        ex = self.executor(Net(ok(self.full_text())))
+        return ex.acquire(**self.args(ex, "req-seed"))
+
+    def test_invalid_parents_fail_before_any_get(self):
+        first = self.seed_source()
+        head = first["source_ref"]["revision_id"]
+        cases = {
+            "wrong parent": {"parent_revision_id": "not-the-head"},
+            "missing parent on existing artifact": {},
+            "parent on absent artifact": {
+                "source_artifact_id": "doc-new", "parent_revision_id": head,
+            },
+        }
+        for name, over in cases.items():
+            net = Net(ok(self.full_text(pmid=b"111")))
+            ex = self.executor(net)
+            before = self.count("revision")
+            with self.assertRaises(AcquisitionExecutionConflictError, msg=name):
+                ex.acquire(**self.args(ex, "req-" + name.replace(" ", "-"), **over))
+            self.assertEqual(net.urls, [], name)
+            self.assertEqual(self.count("revision"), before, name)
+
+    def test_exact_replay_still_wins_over_parent_preflight(self):
+        ex = self.executor(Net(ok(self.full_text())))
+        args = self.args(ex, "req-1")
+        ex.acquire(**args)
+        net = Net()
+        again = self.executor(net).acquire(**args)  # artifact exists now; no parent given
+        self.assertTrue(again["replayed"])
+        self.assertEqual(net.urls, [])
+
+
+class AfterAttemptTests(Base):
+    def test_called_exactly_once_per_get_with_safe_metadata(self):
+        seen = []
+        net = Net(TransportNetworkError("x"), ok(self.full_text()))
+        ex = self.executor(net, after_attempt=seen.append)
+        result = ex.acquire(**self.args(ex))
+        self.assertEqual(result["status"], "retrieved")
+        self.assertEqual(len(net.urls), 2)
+        self.assertEqual([m["attempt_index"] for m in seen], [1, 2])
+        self.assertEqual(seen[0]["outcome"], "network_error")
+        self.assertEqual(seen[0]["failure"], "network_error")
+        self.assertIsNone(seen[0]["status"])
+        self.assertEqual(seen[1]["outcome"], "response")
+        self.assertEqual(seen[1]["status"], 200)
+        self.assertEqual(seen[1]["source"], "pmc_efetch_pmc")
+        self.assertGreater(seen[1]["byte_count"], 0)
+        self.assertEqual(len(seen[1]["body_sha256"]), 64)
+        for meta in seen:
+            self.assertEqual(
+                set(meta),
+                {"attempt_index", "source", "url", "outcome", "status", "byte_count",
+                 "body_sha256", "truncated", "started_at", "completed_at", "failure"},
+            )
+            for value in meta.values():
+                self.assertNotIsInstance(value, (bytes, bytearray))
+
+    def test_post_get_local_conflict_keeps_observation_without_retry(self):
+        seen = []
+        holder = {}
+
+        def conflict(count):
+            repo = ArtifactRepository(self.store)
+            rev = holder["args"]["source_revision_id"]
+            repo.create_artifact("doc-a", kind="document")
+            repo.import_revision(
+                artifact_id="doc-a", content=b"already here", origin_locator="x:y",
+                rights=fz._rights(self.project_id, "doc-a", rev), revision_id=rev,
+            )
+
+        net = Net(ok(self.full_text()), after_call=conflict)
+        ex = self.executor(net, after_attempt=seen.append)
+        holder["args"] = self.args(ex)
+        result = ex.acquire(**holder["args"])
+        self.assertEqual(len(net.urls), 1)  # never re-fetched
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["status"], 200)
+        # metadata-only fallback report: attempt preserved, nothing imported
+        self.assertEqual(result["status"], "interrupted")
+        self.assertEqual(
+            result["report"]["interrupted_reason"], "local_commit_rejected:rights_conflict"
+        )
+        self.assertEqual(result["attempt_count"], 1)
+        self.assertIsNone(result["source_ref"])
+        self.assertEqual(ex.get_report(result["report_ref"])["status"], "interrupted")
+        self.assertEqual(len(ArtifactRepository(self.store).list_revisions("doc-a")), 1)
+
+    def test_local_conflict_with_unusable_report_rights_raises_original(self):
+        seen = []
+        holder = {}
+
+        def conflict(count):
+            repo = ArtifactRepository(self.store)
+            rev = holder["args"]["source_revision_id"]
+            repo.create_artifact("doc-a", kind="document")
+            repo.import_revision(
+                artifact_id="doc-a", content=b"already here", origin_locator="x:y",
+                rights=fz._rights(self.project_id, "doc-a", rev), revision_id=rev,
+            )
+            # report rights chain gets superseded after dispatch: must not be bypassed
+            newer = dict(holder["args"]["report_rights"], record_revision=2)
+            ArtifactRepository(self.store).store_rights_record(newer)
+
+        net = Net(ok(self.full_text()), after_call=conflict)
+        ex = self.executor(net, after_attempt=seen.append)
+        holder["args"] = self.args(ex)
+        with self.assertRaises(AcquisitionExecutionError):
+            ex.acquire(**holder["args"])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(net.urls), 1)
+        self.assertIsNone(ex.find_request("req-1"))
+
+    def test_callback_failure_after_request_is_ambiguous_and_stops_fallback(self):
+        def boom(_meta):
+            raise RuntimeError("journal down")
+
+        net = Net(not_found(), ok(self.full_text()))
+        ex = self.executor(net, after_attempt=boom)
+        result = ex.acquire(**self.args(ex))
+        self.assertEqual(result["status"], "interrupted")
+        self.assertEqual(result["report"]["interrupted_reason"], "after_attempt_callback_failed")
+        self.assertEqual(len(net.urls), 1)
+        self.assertEqual(result["attempt_count"], 1)
+        self.assertIsNone(result["source_ref"])
+
+    def test_callback_failure_on_final_response_discards_bytes(self):
+        def boom(_meta):
+            raise RuntimeError("journal down")
+
+        net = Net(ok(self.full_text()))
+        ex = self.executor(net, after_attempt=boom)
+        result = ex.acquire(**self.args(ex))
+        self.assertEqual(result["status"], "interrupted")
+        self.assertIsNone(result["source_ref"])
+        self.assertIsNone(ArtifactRepository(self.store).get_artifact("doc-a"))
+
+    def test_non_callable_hooks_are_refused(self):
+        with self.assertRaises(AcquisitionExecutionError):
+            self.executor(Net(), after_attempt="not callable")
+
+
+class ProvenanceTests(Base):
+    def test_adapter_vs_document_version_and_get_limits(self):
+        ex = self.executor(Net(ok(self.full_text())))
+        report = ex.acquire(**self.args(ex))["report"]
+        self.assertEqual(report["adapter_version"], report["source_version"])
+        self.assertEqual(report["adapter_version"], "europepmc/rest/fullTextXML")
+        self.assertEqual(report["document_version"]["status"], "unknown")
+        limits = report["limits"]
+        self.assertNotIn("max_requests", limits)
+        self.assertEqual(limits["max_sources"], 2)
+        self.assertEqual(limits["max_attempts_per_source"], 1)
+        self.assertEqual(limits["max_get_attempts"], 2)
+
+
+class TamperTests(Base):
+    """Trigger-drop + hash-recalc forgeries must not be trusted on read."""
+
+    def tamper(self, result, mutate, *, sql=None):
+        conn = self.store.connection
+        for trig in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall():
+            conn.execute(f"DROP TRIGGER {trig['name']}")
+        ref = result["report_ref"]
+        repo = ArtifactRepository(self.store)
+        env = json.loads(repo.read_content(ref["artifact_id"], ref["revision_id"]))
+        mutate(env["payload"])
+        raw = canonical_json(env)
+        conn.execute(
+            "UPDATE revision SET content = ?, content_sha256 = ?, byte_size = ? "
+            "WHERE artifact_id = ? AND revision_id = ?",
+            (raw, sha256_digest(raw), len(raw), ref["artifact_id"], ref["revision_id"]),
+        )
+        if sql:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(sql, (ref["artifact_id"], ref["revision_id"]))
+
+    def acquire_one(self, n):
+        ex = self.executor(Net(ok(self.full_text())))
+        result = ex.acquire(**self.args(ex, f"req-t{n}", source_artifact_id=f"doc-t{n}"))
+        return ex, result
+
+    def assert_rejected(self, mutate, n, *, sql=None):
+        ex, result = self.acquire_one(n)
+        self.tamper(result, mutate, sql=sql)
+        with self.assertRaises(AcquisitionExecutionError) as caught:
+            ex.get_report(result["report_ref"])
+        self.assertEqual(caught.exception.code, "report_invalid")
+
+    def test_forged_fields_are_rejected(self):
+        cases = [
+            lambda p: p.update(candidate_id=self.no_pmcid),
+            lambda p: p.update(identifiers={"pmid": "111", "pmcid": "PMC999"}),
+            lambda p: p["identifiers"].update(doi="10.1/forged"),
+            lambda p: p.update(identifier_conflicts=["doi"]),
+            lambda p: p["attempts"][0].update(body_bytes=True),
+            lambda p: p["attempts"][0].update(status=99),
+            lambda p: p["attempts"][0].update(requested_url="https://evil.example/x"),
+            lambda p: p["attempts"][0].update(outcome="made-up"),
+            lambda p: p["attempts"][0].update(requested_at="yesterday"),
+            lambda p: p["attempts"][0].update(body_sha256="0" * 64),
+            lambda p: p["limits"].update(max_get_attempts=99),
+            lambda p: p.update(adapter_version="forged/1"),
+            lambda p: p.update(document_version={"status": "final", "reason": "x"}),
+            lambda p: p.update(origin_locator="https://evil.example/x"),
+            lambda p: p.update(request_digest="nothex"),
+            lambda p: p["failures"].append({"code": "not-a-code"}),
+            lambda p: p["validation"].update(status="bogus"),
+            lambda p: p["validation"].update(byte_size=1),
+        ]
+        for n, mutate in enumerate(cases):
+            with self.subTest(case=n):
+                self.assert_rejected(mutate, n)
+
+    def test_unknown_validator_version_is_stale_never_trusted_ready(self):
+        ex, result = self.acquire_one(100)
+        self.assertEqual(result["validation_status"], "ready")
+        self.assertEqual(result["validation_check"], "verified")
+        self.tamper(result, lambda p: p.update(validator_version="future/9"))
+        again = ex.get_report(result["report_ref"])
+        self.assertEqual(again["validation_check"], "stale_validator_version")
+        self.assertEqual(again["validation_status"], "stale_validator_version")
+
+    def test_forged_validation_with_unknown_version_still_checked_structurally(self):
+        ex, result = self.acquire_one(101)
+
+        def forge(p):
+            p["validator_version"] = "future/9"
+            p["validation"]["sha256"] = "1" * 64
+
+        self.tamper(result, forge)
+        with self.assertRaises(AcquisitionExecutionError):
+            ex.get_report(result["report_ref"])
+
+    def test_foreign_project_dependency_is_rejected(self):
+        ex, result = self.acquire_one(102)
+        conn = self.store.connection
+        for trig in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall():
+            conn.execute(f"DROP TRIGGER {trig['name']}")
+        conn.execute("PRAGMA foreign_keys = OFF")
+        ref = result["report_ref"]
+        conn.execute(
+            "UPDATE dependency SET to_project_id = 'foreign' WHERE from_artifact_id = ? "
+            "AND from_revision_id = ?",
+            (ref["artifact_id"], ref["revision_id"]),
+        )
+        with self.assertRaises(AcquisitionExecutionError):
+            ex.get_report(result["report_ref"])
 
 
 if __name__ == "__main__":
