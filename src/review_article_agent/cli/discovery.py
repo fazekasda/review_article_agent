@@ -53,9 +53,10 @@ D1 acceptance criteria 1 and 2; the personal-CLI baseline; the existing
 What this module is **not**:
 
 * The discovery **background-job** submission/inspection surface
-  (``search``/``expand`` jobs, ``lead configure``/``run``) and the reporting/
-  freeze groups live in the addon :mod:`review_article_agent.cli.discovery_jobs`,
-  which extends this group's parser and dispatch through the narrow hooks
+  (``search``/``expand`` jobs, ``lead configure``/``run``) lives in the addon
+  :mod:`review_article_agent.cli.discovery_jobs`, and the reporting/freeze groups
+  live in the sibling addon :mod:`review_article_agent.cli.discovery_reports`;
+  both extend this group's parser and dispatch through the narrow hooks
   :func:`build_discovery_parser` and :func:`dispatch_discovery`. This module stays
   the owner of the context/corpus/lead-readback surface only.
 * No network call, no provider/model call, no approval, no execution, and no
@@ -387,6 +388,13 @@ def build_discovery_parser(sub: "argparse._SubParsersAction") -> None:
     from . import discovery_jobs as _job_commands
 
     _job_commands.build_discovery_jobs_parser(disc_sub, lead_sub)
+
+    # -- addon groups (coverage reports; freeze propose/status/show/...) ----- #
+    # A separate sibling addon owns the reporting/freeze surface; it too is
+    # imported lazily (same reason) and adds only new ``report``/``freeze`` groups.
+    from . import discovery_reports as _report_commands
+
+    _report_commands.build_discovery_reports_parser(disc_sub)
 
 
 # --------------------------------------------------------------------------- #
@@ -1083,6 +1091,11 @@ def dispatch_discovery(args: argparse.Namespace, ctx: Any) -> object | None:
     from . import discovery_jobs as _job_commands
 
     addon = _job_commands.dispatch_discovery_jobs(args)
+    if addon is None:
+        # The reporting/freeze addon is consulted last, for the same reason.
+        from . import discovery_reports as _report_commands
+
+        addon = _report_commands.dispatch_discovery_reports(args)
     if addon is None:
         return None
     return addon(args, ctx)

@@ -6,8 +6,9 @@ discovery background-job routes
 control transport (:mod:`review_article_agent.runtime.ipc`) and ensured through
 the detached-process launcher (:mod:`review_article_agent.worker.process`). It
 extends the existing root ``discovery`` command group cleanly through an **addon**
-builder + command map, so a later CLI slice can add reporting/freeze groups
-without a widespread refactor of :mod:`review_article_agent.cli.discovery`.
+builder + command map, so the reporting/freeze groups live in the sibling addon
+:mod:`review_article_agent.cli.discovery_reports` without a widespread refactor of
+:mod:`review_article_agent.cli.discovery`.
 
 It owns only the *CLI surface* over the existing value layers:
 
