@@ -112,6 +112,21 @@ def _claim(payload, claim_id):
     raise AssertionError(claim_id)
 
 
+def _draft_payload(blueprint, text="prose"):
+    """A raw draft payload covering the example blueprint."""
+    return {
+        "schema_version": 1,
+        "section_id": blueprint["section_id"],
+        "paragraphs": [
+            {"paragraph_id": "P1", "sentences": [
+                {"intent_id": "I1", "claim_ids": ["K1"], "text": text}]},
+            {"paragraph_id": "P2", "sentences": [
+                {"intent_id": "I2", "claim_ids": ["K2"], "text": text},
+                {"intent_id": "I3", "claim_ids": ["K3"], "text": text}]},
+        ],
+    }
+
+
 class ExampleAndDeterminismTests(unittest.TestCase):
     def test_blueprint_and_draft_are_json_portable_and_deterministic(self):
         package = drafting_example_package()
@@ -264,6 +279,100 @@ class AttributionTests(unittest.TestCase):
             validate_blueprint(payload, package=drafting_example_package())
 
 
+class MissingContextBlockingTests(unittest.TestCase):
+    def _package_with_missing_population(self):
+        package = drafting_example_package()
+        for entry in package["evidence"]:
+            if entry["finding_key"] == "A10:F1":
+                entry["finding"]["context"]["population"] = {"state": "missing", "value": None}
+        return package
+
+    def test_missing_original_context_blocks_reported_claim(self):
+        with self.assertRaises(DraftingError):
+            validate_blueprint(_blueprint_payload(), package=self._package_with_missing_population())
+
+    def test_missing_original_context_blocks_interpretive_claim(self):
+        # Renaming the classification must not bypass the block.
+        payload = _blueprint_payload()
+        claim = _claim(payload, "K1")
+        claim["classification"] = "new_interpretation"
+        claim["attribution"] = "author_interpretation"
+        with self.assertRaises(DraftingError):
+            validate_blueprint(payload, package=self._package_with_missing_population())
+
+    def test_missing_original_context_blocks_proposed_claim(self):
+        # K3 is proposed_synthesis grounded to A10:F1, whose context is missing.
+        with self.assertRaises(DraftingError):
+            validate_blueprint(_blueprint_payload(), package=self._package_with_missing_population())
+
+    def test_not_applicable_context_does_not_block(self):
+        package = drafting_example_package()
+        for entry in package["evidence"]:
+            entry["finding"]["context"]["conditions"] = {"state": "not_applicable", "value": None}
+        result = validate_blueprint(_blueprint_payload(), package=package)
+        self.assertFalse(_claim(result, "K1")["primary_verified"])
+
+
+class AttributionFidelityTests(unittest.TestCase):
+    def test_direct_observation_cannot_relabel_author_interpretation(self):
+        package = drafting_example_package()
+        for entry in package["evidence"]:
+            if entry["finding_key"] == "A10:F1":
+                entry["finding"]["attribution"] = "author_interpretation"
+        with self.assertRaises(DraftingError):
+            validate_blueprint(_blueprint_payload(), package=package)
+
+    def test_accurate_author_interpretation_attribution_is_accepted(self):
+        package = drafting_example_package()
+        for entry in package["evidence"]:
+            if entry["finding_key"] == "A10:F1":
+                entry["finding"]["attribution"] = "author_interpretation"
+        payload = _blueprint_payload()
+        _claim(payload, "K1")["attribution"] = "author_interpretation"
+        result = validate_blueprint(payload, package=package)
+        self.assertEqual(_claim(result, "K1")["attribution"], "author_interpretation")
+
+    def test_no_claim_is_primary_verified(self):
+        result = validate_blueprint(_blueprint_payload(), package=drafting_example_package())
+        for paragraph in result["paragraphs"]:
+            for intent in paragraph["intents"]:
+                for claim in intent["claims"]:
+                    self.assertIs(claim["primary_verified"], False)
+        self.assertIs(_claim(result, "K1")["primary_verified"], False)
+
+
+class HeterogeneousContextTests(unittest.TestCase):
+    def test_heterogeneous_source_context_is_not_unioned(self):
+        # A10 reports mouse, B7 reports rat; a single 'mouse' reported claim
+        # grounded to both must not silently generalize through a union.
+        package = drafting_example_package()
+        for entry in package["evidence"]:
+            if entry["finding_key"] == "B7:F1":
+                entry["finding"]["context"]["species"] = {"state": "known", "value": "rat"}
+        with self.assertRaises(DraftingError):
+            validate_blueprint(_blueprint_payload(), package=package)
+
+    def test_heterogeneous_context_allowed_as_separate_atomic_claims(self):
+        package = drafting_example_package()
+        for entry in package["evidence"]:
+            if entry["finding_key"] == "B7:F1":
+                entry["finding"]["context"]["species"] = {"state": "known", "value": "rat"}
+        payload = _blueprint_payload()
+        k1 = _claim(payload, "K1")
+        k1["finding_keys"] = ["A10:F1"]
+        k1["applicability"] = _context(species=_known("mouse"))
+        # a second, separately grounded atomic claim for the rat finding
+        k1["text"] = "Compound Z reduced tumor volume in a mouse model."
+        rat = copy.deepcopy(k1)
+        rat["claim_id"] = "K4"
+        rat["finding_keys"] = ["B7:F1"]
+        rat["applicability"] = _context(species=_known("rat"))
+        payload["paragraphs"][0]["intents"][0]["claims"].append(rat)
+        payload["source_suggestions"] = ["A10:F1", "B7:F1", "C3:F1"]
+        result = validate_blueprint(payload, package=package)
+        self.assertEqual(_claim(result, "K4")["citation_keys"], ["CIT-B7"])
+
+
 class DraftCoverageTests(unittest.TestCase):
     def _valid(self):
         package = drafting_example_package()
@@ -277,6 +386,12 @@ class DraftCoverageTests(unittest.TestCase):
         self.assertEqual(p1["citation_keys"], ["CIT-A10", "CIT-B7"])
         self.assertEqual(result["citations"]["CIT-A10"]["title"], "Report A10")
 
+    def test_draft_requires_actual_sentence_text(self):
+        blueprint, package = self._valid()
+        for bad in (None, "", "   "):
+            with self.assertRaises(DraftingError):
+                validate_draft(_draft_payload(blueprint, text=bad), blueprint=blueprint, package=package)
+
     def test_draft_must_cover_every_blueprint_intent(self):
         blueprint, package = self._valid()
         payload = {
@@ -284,7 +399,7 @@ class DraftCoverageTests(unittest.TestCase):
             "section_id": blueprint["section_id"],
             "paragraphs": [
                 {"paragraph_id": "P1", "sentences": [
-                    {"intent_id": "I1", "claim_ids": ["K1"]}]},
+                    {"intent_id": "I1", "claim_ids": ["K1"], "text": "prose"}]},
             ],
         }
         with self.assertRaises(DraftingError):
@@ -292,34 +407,15 @@ class DraftCoverageTests(unittest.TestCase):
 
     def test_draft_cannot_invent_a_claim(self):
         blueprint, package = self._valid()
-        payload = {
-            "schema_version": 1,
-            "section_id": blueprint["section_id"],
-            "paragraphs": [
-                {"paragraph_id": "P1", "sentences": [
-                    {"intent_id": "I1", "claim_ids": ["K1", "K999"]}]},
-                {"paragraph_id": "P2", "sentences": [
-                    {"intent_id": "I2", "claim_ids": ["K2"]},
-                    {"intent_id": "I3", "claim_ids": ["K3"]}]},
-            ],
-        }
+        payload = _draft_payload(blueprint)
+        payload["paragraphs"][0]["sentences"][0]["claim_ids"] = ["K1", "K999"]
         with self.assertRaises(DraftingError):
             validate_draft(payload, blueprint=blueprint, package=package)
 
     def test_draft_cannot_carry_study_details_or_bibliography(self):
         blueprint, package = self._valid()
-        payload = {
-            "schema_version": 1,
-            "section_id": blueprint["section_id"],
-            "bibliography": [{"doi": "10.0/fake"}],
-            "paragraphs": [
-                {"paragraph_id": "P1", "sentences": [
-                    {"intent_id": "I1", "claim_ids": ["K1"]}]},
-                {"paragraph_id": "P2", "sentences": [
-                    {"intent_id": "I2", "claim_ids": ["K2"]},
-                    {"intent_id": "I3", "claim_ids": ["K3"]}]},
-            ],
-        }
+        payload = _draft_payload(blueprint)
+        payload["bibliography"] = [{"doi": "10.0/fake"}]
         with self.assertRaises(DraftingError):
             validate_draft(payload, blueprint=blueprint, package=package)
 

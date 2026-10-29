@@ -78,6 +78,18 @@ ATTRIBUTION_CLASSES = (
     "proposed_synthesis",
 )
 
+#: Primary attribution classes ordered strongest (most direct) to weakest.  A
+#: claim may never be attributed more directly than its weakest supporting
+#: finding (a reported ``direct_observation`` may not be relabelled as the
+#: writer's own direct result).  ``secondary_account``/``proposed_synthesis`` are
+#: handled separately as explicit states.
+_PRIMARY_ATTRIBUTION_ORDER = (
+    "direct_observation",
+    "mixed",
+    "author_interpretation",
+    "unclear",
+)
+
 #: A claim is reported evidence, a new interpretation, a hypothesis, or a proposal.
 CLAIM_CLASSIFICATIONS = (
     "reported_evidence",
@@ -369,51 +381,81 @@ def _validate_claim(raw: object, *, label: str, package: dict) -> dict:
     applicability = _applicability(item["applicability"], label=f"{label}.applicability")
     causal = _stated(item["causal_limitations"], label=f"{label}.causal_limitations")
 
-    # Attribution fidelity: a secondary source can only be used with explicit
-    # secondary attribution, and is never primary-verified (POL-OPS-SECONDARY).
-    secondary = any(_is_secondary(package["evidence_by_key"][ref]["finding"]) for ref in finding_keys)
+    records = [package["evidence_by_key"][ref]["finding"] for ref in finding_keys]
+
+    # Attribution fidelity.  A secondary source can only be used with explicit
+    # secondary attribution (POL-OPS-SECONDARY); a novel author proposal only as
+    # proposed_synthesis; and a claim may never be attributed more directly than
+    # its weakest supporting finding -- a reported ``author_interpretation``,
+    # ``mixed``, or ``unclear`` finding cannot be relabelled as the writer's own
+    # ``direct_observation``.
+    secondary = any(_is_secondary(record) for record in records)
     if secondary:
         _require(
             attribution == "secondary_account",
             f"{label} presents a secondary source as primary support",
         )
+    if any(record.get("attribution") == "proposed_synthesis" for record in records):
+        _require(
+            attribution == "proposed_synthesis",
+            f"{label} presents a novel proposal as reported evidence",
+        )
+    primary_attrs = [record.get("attribution") for record in records]
+    primary_attrs = [a for a in primary_attrs if a in _PRIMARY_ATTRIBUTION_ORDER]
+    if primary_attrs and attribution in _PRIMARY_ATTRIBUTION_ORDER and not secondary:
+        weakest = max(_PRIMARY_ATTRIBUTION_ORDER.index(a) for a in primary_attrs)
+        _require(
+            _PRIMARY_ATTRIBUTION_ORDER.index(attribution) >= weakest,
+            f"{label} overstates the source attribution (a source class is relabelled as more direct)",
+        )
 
-    # Context fidelity: reported evidence may not widen the source's known context
-    # nor be produced as generalizable when original context is missing (POL-P2).
-    source_known: dict = {field: set() for field in CONTEXT_FIELDS}
+    # Context fidelity (POL-P2).  A consequential missing/unknown original
+    # context blocks the affected claim for *every* classification -- factual,
+    # interpretive, or proposed -- so it cannot be bypassed by renaming the
+    # classification.  ``not_applicable`` is an explicit, allowed state.
+    known_per_finding: list = []
     missing_original: set = set()
-    for ref in finding_keys:
-        for field, (state, value) in _finding_context(package["evidence_by_key"][ref]["finding"]).items():
-            if state in ("missing", "unknown"):
+    for record in records:
+        context = _finding_context(record)
+        known: dict = {}
+        for field in CONTEXT_FIELDS:
+            state, value = context.get(field, (None, None))
+            if state == "known" and isinstance(value, str):
+                known[field] = value
+            elif state == "not_applicable":
+                pass
+            else:  # missing / unknown / absent is consequential
                 missing_original.add(field)
-            elif state == "known" and isinstance(value, str):
-                source_known[field].add(value)
-    context_mismatch = sorted(
-        field
-        for field in CONTEXT_FIELDS
-        if applicability[field]["state"] == "known"
-        and source_known[field]
-        and applicability[field]["value"] not in source_known[field]
-    )
+        known_per_finding.append(known)
     missing_original_sorted = sorted(missing_original)
+    _require(
+        not missing_original_sorted,
+        f"{label} is blocked by missing/unknown original context: {missing_original_sorted}",
+    )
+    # A declared known value must be consistent with EACH supporting finding; a
+    # union of heterogeneous source contexts would silently generalize.
+    context_mismatch = []
+    for field in CONTEXT_FIELDS:
+        if applicability[field]["state"] != "known":
+            continue
+        for known in known_per_finding:
+            value = known.get(field)
+            if value is not None and value != applicability[field]["value"]:
+                context_mismatch.append(field)
+                break
     if classification == "reported_evidence":
         _require(
             not context_mismatch,
             f"{label} overstates the source context (unsupported generalization)",
         )
-        _require(
-            not missing_original_sorted,
-            f"{label} cannot be presented as generalizable with missing original context",
-        )
 
     warnings = []
     if secondary:
         warnings.append("secondary_origin_warning")
-    if classification != "reported_evidence":
-        if context_mismatch:
-            warnings.append("context_extension")
-        if missing_original_sorted:
-            warnings.append("missing_original_context")
+    if classification != "reported_evidence" and context_mismatch:
+        # A proposed context extension is a warning only; the underlying original
+        # context is fully present (missing context already blocked above).
+        warnings.append("context_extension")
     if proposed:
         warnings.append("author_proposal")
 
@@ -433,7 +475,9 @@ def _validate_claim(raw: object, *, label: str, package: dict) -> dict:
         "citation_keys": citation_keys,
         "secondary": secondary,
         "proposed_synthesis": proposed,
-        "primary_verified": classification == "reported_evidence" and not secondary and not proposed,
+        # No factual/origin check has run at blueprint time, so no claim is ever
+        # reported as primary-verified; that remains a later review obligation.
+        "primary_verified": False,
         "warnings": warnings,
     }
 
@@ -633,8 +677,7 @@ def validate_draft(payload, *, blueprint, package):
             s_label = f"{label}.sentences[{s_index}]"
             sentence = _keys(
                 raw_sentence, label=s_label,
-                required=frozenset({"intent_id", "claim_ids"}),
-                optional=frozenset({"text"}),
+                required=frozenset({"intent_id", "claim_ids", "text"}),
             )
             intent_id = _identifier(sentence["intent_id"], label=f"{s_label}.intent_id")
             _require(intent_id in allowed_intents, f"{s_label}.intent_id is not in the blueprint paragraph")
@@ -650,9 +693,8 @@ def validate_draft(payload, *, blueprint, package):
                 set(claim_ids) == allowed_claims,
                 f"{s_label} does not cover exactly the intent's atomic claims",
             )
-            text = sentence.get("text")
-            if text is not None:
-                text = _string(text, label=f"{s_label}.text")
+            # A draft must carry actual prose; a null/blank sentence is not a draft.
+            text = _string(sentence["text"], label=f"{s_label}.text")
             citation_keys = sorted({key for claim_id in claim_ids for key in index["claim_citations"][claim_id]})
             sentences.append({"intent_id": intent_id, "claim_ids": claim_ids, "text": text, "citation_keys": citation_keys})
         paragraphs.append({"paragraph_id": paragraph_id, "sentences": sentences})
