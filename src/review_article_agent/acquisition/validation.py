@@ -248,8 +248,20 @@ def _decode_head(data: bytes, limit: int = 4096) -> str:
     return data[:limit].decode("utf-8", errors="replace")
 
 
+def _leading(text: str) -> str:
+    """Lower-cased head with an optional leading UTF-8 BOM and whitespace removed.
+
+    A decoded ``\\ufeff`` (UTF-8 BOM) is *not* stripped by ``str.lstrip``, so a
+    BOM-prefixed document would otherwise evade leading ``<html`` / ``<?xml``
+    recognition and be misread as an unrecognised container.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    return text.lstrip().lower()
+
+
 def _looks_like_html(head: str) -> bool:
-    text = head.lstrip().lower()
+    text = _leading(head)
     if text.startswith("<!doctype html"):
         return True
     if text.startswith("<html"):
@@ -260,7 +272,7 @@ def _looks_like_html(head: str) -> bool:
 
 
 def _looks_like_xml(head: str) -> bool:
-    text = head.lstrip().lower()
+    text = _leading(head)
     if text.startswith("<?xml"):
         return True
     if text.startswith("<!doctype"):
@@ -287,12 +299,19 @@ def _looks_like_login(head: str) -> bool:
 
 
 def _sniff_kind(data: bytes) -> str:
-    """Best-effort media kind from leading bytes only (no parsing)."""
-    if b"%PDF-" in data[:PDF_HEADER_WINDOW]:
-        return "pdf"
+    """Best-effort media kind from leading bytes only (no parsing).
+
+    Leading HTML (ignoring an optional UTF-8 BOM / whitespace) is decided
+    *before* an incidental ``%PDF-`` marker: a login/HTML response that merely
+    contains PDF magic further inside its markup must never be classified as a
+    PDF.  A genuine PDF whose own header leads the bytes is unaffected, since its
+    leading text is never HTML.
+    """
     head = _decode_head(data)
     if _looks_like_html(head):
         return "html"
+    if b"%PDF-" in data[:PDF_HEADER_WINDOW]:
+        return "pdf"
     if _looks_like_xml(head):
         return "jats_xml" if _looks_like_jats(data) else "unknown"
     return "unknown"

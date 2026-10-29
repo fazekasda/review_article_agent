@@ -323,6 +323,36 @@ class ManifestRosterAndSourceTests(ManifestBase):
         with self.assertRaises(ManifestNotAcquiredError):
             self.acq.require_acquired()
 
+    def test_bom_and_fake_pdf_html_sources_cannot_be_human_waived(self):
+        # A structured human_review=True must never rescue a rejected source: a
+        # BOM-prefixed login page and a leading-HTML body carrying PDF magic are
+        # both classified html/rejected (not an inert unknown), so the genuine
+        # gate still cannot make acquisition complete.
+        self.setup_frozen()
+        a, b = self.cands["111"], self.cands["222"]
+        bom_login = self.put_source(av.BOM_LOGIN_HTML, media_type="application/pdf")
+        fake_pdf_html = self.put_source(
+            av.LEADING_HTML_FAKE_PDF, media_type="application/pdf"
+        )
+        rev = self.make([
+            self.entry(a, source=bom_login, human_review=_HR),
+            self.entry(b, source=fake_pdf_html, human_review=_HR),
+        ])
+        doc = self.acq.get(self.ref_of(rev))
+        self.assertEqual(
+            [(x["candidate_id"], x["code"]) for x in doc["payload"]["blockers"]],
+            sorted([(a, "source_rejected"), (b, "source_rejected")]),
+        )
+        entries = {e["candidate_id"]: e for e in doc["payload"]["entries"]}
+        self.assertEqual(entries[a]["validation"]["status"], "rejected")
+        self.assertEqual(entries[a]["validation"]["media_kind"], "html")
+        self.assertEqual(entries[b]["validation"]["status"], "rejected")
+        self.assertEqual(entries[b]["validation"]["media_kind"], "html")
+        self.gate(rev)
+        with self.assertRaises(ManifestNotAcquiredError) as ctx:
+            self.acq.require_acquired()
+        self.assertIn("blockers_present", ctx.exception.reasons)
+
     def test_pdf_needs_exact_human_review(self):
         self.setup_frozen()
         a, b = self.cands["111"], self.cands["222"]

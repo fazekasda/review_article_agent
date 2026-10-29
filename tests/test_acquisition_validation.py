@@ -106,6 +106,16 @@ LOGIN_HTML = (
 
 PLAIN_HTML = b"<!DOCTYPE html><html><body><h1>Not a paper</h1></body></html>"
 
+#: Step 06 known HTML/login sources that must never be sniffed as a PDF/unknown
+#: even when named ``.pdf`` / declared ``application/pdf`` (AC2).
+BOM_LOGIN_HTML = (
+    b"\xef\xbb\xbf<html><body><form><input type=\"password\"/>"
+    b"Log in</form></body></html>"
+)
+LEADING_HTML_FAKE_PDF = (
+    b"<html><body>login %PDF-1.7 1 0 obj %%EOF</body></html>"
+)
+
 
 class _Base(unittest.TestCase):
     def call(self, data, expected=None, declared=None):
@@ -189,6 +199,30 @@ class TestHtmlNeverSucceeds(_Base):
         for declared in (None, "application/pdf", "text/html", "application/xml"):
             self.assertNotEqual(self.call(LOGIN_HTML, declared=declared)["status"], "ready")
 
+    def test_bom_prefixed_login_html_is_rejected_not_unknown(self):
+        # A leading UTF-8 BOM must not hide the HTML root and demote the asset to
+        # an inert "unknown" that a later human review might try to waive.
+        result = self.call(
+            BOM_LOGIN_HTML, {"pmid": "123"}, declared="application/pdf"
+        )
+        self.assertEqual(result["media_kind"], "html")
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn("html_not_an_article", result["reasons"])
+        self.assertIn("html_login_page", result["reasons"])
+        self.assertIn("content_type_mismatch", result["reasons"])
+        self.assertNotIn("unrecognized_container", result["reasons"])
+
+    def test_leading_html_with_incidental_pdf_magic_is_hard_rejected(self):
+        # A login/HTML body that merely *contains* PDF magic must not be sniffed
+        # as a PDF ("pdf_not_inspected" would be a waivable needs_review).
+        result = self.call(
+            LEADING_HTML_FAKE_PDF, {"pmid": "123"}, declared="application/pdf"
+        )
+        self.assertEqual(result["media_kind"], "html")
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn("html_not_an_article", result["reasons"])
+        self.assertNotIn("pdf_not_inspected", result["reasons"])
+
 
 # --------------------------------------------------------------------------- #
 # AC2: PDF -- corrupt rejected, plausible needs_review (never ready)
@@ -243,6 +277,16 @@ class TestPdfFailClosed(_Base):
         self.assertIn("content_type_mismatch", result["reasons"])
         self.assertEqual(result["status"], "needs_review")
 
+    def test_genuine_pdf_header_with_later_html_string_stays_pdf(self):
+        # An incidental "<html" *after* a real leading PDF header must not
+        # hijack the sniff: only a leading HTML root takes precedence.
+        data = GOOD_PDF + b"\n<html><body>appended note</body></html>\n"
+        result = self.call(data, declared="application/pdf")
+        self.assertEqual(result["media_kind"], "pdf")
+        self.assertEqual(result["status"], "needs_review")
+        self.assertIn("pdf_not_inspected", result["reasons"])
+        self.assertNotIn("html_not_an_article", result["reasons"])
+
 
 # --------------------------------------------------------------------------- #
 # AC2/AC6: JATS parsing, DOCTYPE handling, identity
@@ -287,6 +331,25 @@ class TestJatsHappyPath(_Base):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["observed_identifiers"]["pmcid"], "PMC1234567")
         self.assertEqual(result["observed_identifiers"]["doi"], "10.1234/abc.def")
+
+    def test_bom_prefixed_full_article_ready_with_exact_identity(self):
+        # A UTF-8 BOM before the XML declaration must not defeat JATS parsing.
+        data = b"\xef\xbb\xbf" + jats(doctype=JATS_DOCTYPE)
+        result = self.call(
+            data,
+            {"pmid": "12345678", "pmcid": "PMC1234567", "doi": "10.1234/abc.def"},
+            declared="application/xml",
+        )
+        self.assertEqual(result["media_kind"], "jats_xml")
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(
+            result["observed_identifiers"],
+            {
+                "pmid": "12345678",
+                "pmcid": "PMC1234567",
+                "doi": "10.1234/abc.def",
+            },
+        )
 
     def test_extra_observed_namespace_does_not_break_match(self):
         data = jats(pmid=b"12345678", pmcid=b"PMC1", doi=b"10.1234/x")
