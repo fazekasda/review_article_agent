@@ -265,6 +265,8 @@ separately reviewable.
 - Decision format: [`docs/implementation/decision-template.md`](../implementation/decision-template.md).
 - **Unresolved follow-up (not blockers):** the per-suite breakdown and the final
   completion handoff remain in the [Step 05 handoff](../implementation/handoffs/05-discovery.md);
-  live lead-model validation (unrun); and the remaining Step 05 criteria/work,
-  including the report/freeze CLI integration being built by a separate worker. No
+  live lead-model validation (unrun); and the remaining Step 05 work — now
+  **verification/release only** (the E1B adversarial and E2 full-CLI-chain
+  acceptance cases, a final frozen-HEAD full-suite run, and the PR); the
+  report/freeze CLI is **integrated** (`e15b5b4`). No
   secrets and no licensed full text are included here.

@@ -673,11 +673,13 @@ already-integrated discovery value layers ([`discovery/context.py`](../src/revie
 [`discovery/lead_runner.py`](../src/review_article_agent/discovery/lead_runner.py),
 [`worker/discovery.py`](../src/review_article_agent/worker/discovery.py)).
 It is implemented by [`cli/discovery.py`](../src/review_article_agent/cli/discovery.py)
-(artifact/readback surface) and the addon
+(artifact/readback surface) and the two addons
 [`cli/discovery_jobs.py`](../src/review_article_agent/cli/discovery_jobs.py)
-(background-job submission). It stores **proposals only**, records **no**
-approval, and makes **no** scientific-validation, completeness, deduplication,
-coverage, or freeze claim. Exact field spellings, bounds, and library APIs are in
+(background-job submission) and
+[`cli/discovery_reports.py`](../src/review_article_agent/cli/discovery_reports.py)
+(report/freeze readbacks and proposals). It stores **proposals only**, records
+**no** approval, and makes **no** scientific-validation, completeness,
+deduplication, coverage, or freeze claim. Exact field spellings, bounds, and library APIs are in
 [`discovery.md`](discovery.md); this section documents the CLI surface only.
 
 ### 12.1 Commands (exact `--help` spellings)
@@ -697,6 +699,13 @@ coverage, or freeze claim. Exact field spellings, bounds, and library APIs are i
 | `discovery lead content --request-id ID [--project ID]` | Explicit **PRIVATE, NON-AUTHORIZING** view of the stored lead-proposal text/metadata (issues no call). A diagnostic outcome is refused rather than shown as a successful proposal. |
 | `discovery lead configure --artifact-id ID --revision-id ID --file PATH --rights-file PATH [--request-id ID] [--parent-revision-id ID] [--project ID]` | Validate and store one `discovery_hosted_use` batch as one immutable **proposal** revision. Records no approval and verifies no provider term. |
 | `discovery lead run --batch-artifact-id ID --batch-revision-id ID --credential-env NAME --request-id ID [--project ID] [--timeout SECONDS]` | Submit one scoped hosted lead-proposal job with the **mandatory** `--credential-env OPENROUTER_API_KEY`. Returns queued **admission** only; the credential value is never accepted. |
+| `discovery report create --corpus-artifact-id ID --corpus-revision-id ID --plan-artifact-id ID --plan-revision-id ID --revision-id ID --request-id ID --rights-file PATH [--artifact-id ID] [--expansion-job-id ID ...] [--known-relevant-file PATH] [--limitations-file PATH] [--project ID]` | Record one immutable **coverage-report** revision from exact corpus/plan refs. `--expansion-job-id` resolves only a real completed expansion report; the default summary claims no completeness. No worker, no network. |
+| `discovery report show [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Read one coverage report; a **safe summary** by default, `--content` the explicit private opt-in. |
+| `discovery freeze propose --corpus-artifact-id ID --corpus-revision-id ID --coverage-artifact-id ID --coverage-revision-id ID --decision freeze\|search_again --entry-reviews-file PATH --rationale TEXT --request-id ID --revision-id ID --rights-file PATH [--artifact-id ID] [--accept-coverage-limitations EXPLANATION] [--project ID]` | Record (or replay) one **inert** freeze/search-again proposal from an explicit caller per-candidate review file and a literal coverage-limitation acknowledgement. Returns the exact named-gate `approval_request` + `gate prepare`/`gate confirm` guidance; records no approval. |
+| `discovery freeze status [--artifact-id ID] [--project ID]` | Read the current decision and the last approved freeze roster as a **safe summary** (never auto-selects a new corpus). |
+| `discovery freeze show [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Read one freeze decision; a **safe summary** by default, `--content` the explicit private opt-in. |
+| `discovery freeze history [--artifact-id ID] [--project ID]` | Immutable previous decisions, newest-first, as **safe summaries**. |
+| `discovery freeze require [--artifact-id ID] [--content] [--require-active] [--project ID]` | Read the selection **only** when a currently-active authentic freeze authorizes it; **safe summary** by default (exact corpus ref, `included_count`, decision, active approval), `--content` (or the `--require-active` alias) the explicit private roster opt-in. Fails cleanly when no active freeze exists. |
 
 Every command uses the global data-directory resolution (§2) and the same
 optional config file (§4); `--project` defaults to the active selected project
@@ -829,17 +838,42 @@ discovery command surfaces or requires are:
 | individual seed revision | `artifact_revision` | `discovery.seed.<artifact_id>` |
 | search plan revision | `protocol` | `discovery.plan` |
 | hosted-use batch | `batch` | `discovery.hosted_use.<purpose>` |
-| corpus freeze (library; CLI pending) | `artifact_revision` | `discovery.freeze` |
+| corpus freeze | `artifact_revision` | `discovery.freeze` |
 
-### 12.6 Pending (not in this base)
+### 12.6 Report / freeze CLI (integrated)
 
-The **reporting** and **freeze** command groups are **not yet implemented as
-CLI** in this base (owned by a later bounded CLI slice, CLI1B); only their library
-layers exist. This section therefore documents **no** report/freeze CLI flags —
-consult [`discovery.md`](discovery.md) and the discovery library modules for those
-details. No completeness, coverage, freeze, scientific-validation, review, or
-writer claim is made or implied anywhere in this group, and later workflow steps
-remain unimplemented.
+The **reporting** and **freeze** command groups are **integrated** (CLI1B,
+`e15b5b4`): `discovery report create|show` and `discovery freeze
+propose|status|show|history|require` (exact spellings in §12.1). They surface the
+already-validated [`discovery/reporting.py`](../src/review_article_agent/discovery/reporting.py)
+and [`discovery/freeze.py`](../src/review_article_agent/discovery/freeze.py)
+value layers and introduce **no** new authority: they record only non-authorizing
+proposals, ensure no worker, make no network/provider/model call, and record no
+approval. Each JSON input file uses the same hard byte cap and strict parser as the
+rest of the group, and every project is opened through the registry with an
+expected project id.
+
+* **Entry reviews are caller-supplied.** `freeze propose --entry-reviews-file` is
+  a strict JSON list matching the freeze entry-review schema (one review per
+  pinned candidate: `candidate_id`, `checked_at`, `provenance`, the four
+  distinguished integrity statuses, a `disposition`, and a non-empty `rationale`);
+  an `include` requires a resolved candidate whose statuses are all **known**
+  (`unknown` is not clean), and unresolved/conflict candidates must be
+  `exclude`/`defer`/`no_scientific_use`.
+* **Coverage gaps need a literal acknowledgement.** A `freeze` over an explicit
+  coverage gap is refused unless `--accept-coverage-limitations EXPLANATION`
+  carries a literal explanation string — **never** a `--yes`/boolean or in-band
+  actor/authority flag.
+* **Exact named gate, out of band.** `freeze propose` returns the
+  `artifact_revision`/`discovery.freeze` `approval_request` and `gate
+  prepare`/`gate confirm` guidance; only the controlling-terminal `gate` path
+  records the approval that lets `freeze require` return a selection. A refused
+  append to an old frozen corpus artifact returns static guidance to choose a
+  **new** corpus + coverage id.
+
+No completeness, coverage, freeze, scientific-validation, study-identity,
+eligibility, extraction, review, or writer claim is made or implied anywhere in
+this group, and later workflow steps remain unimplemented.
 
 ## 13. Explicit exclusions (Step 02, and the Step 03/Step 04/Step 05 boundaries)
 
@@ -886,9 +920,10 @@ Adding a subcommand is intentionally small:
    `review_article_agent/cli/jobs.py`), `GATE_COMMANDS` (in
    `review_article_agent/cli/gates.py`), or the discovery group's own map
    `DISCOVERY_COMMANDS` / addon `DISCOVERY_JOB_COMMANDS` (in
-   `review_article_agent/cli/discovery.py` / `cli/discovery_jobs.py`; a later CLI
-   slice extends the group through the `build_discovery_parser` /
-   `dispatch_discovery` hooks).
+   `review_article_agent/cli/discovery.py` / `cli/discovery_jobs.py`) / addon
+   `DISCOVERY_REPORT_COMMANDS` (in `review_article_agent/cli/discovery_reports.py`;
+   the discovery group is extended through the `build_discovery_parser` /
+   `dispatch_discovery` addon hooks).
 
 Handlers receive a `Context` holding the resolved `Registry`, the data directory,
 the parsed config, and the environment, and never touch global state. New exit

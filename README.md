@@ -48,11 +48,16 @@ transport and provider adapters; a lossless codec and schema-11 observation
 repository; a typed context read-and-gate layer; an approved-plan/seed/metadata
 import execution library; a durable cumulative candidate ledger; bounded
 bidirectional citation expansion; a deterministic coverage/work/monetary report;
-an exact human-approved freeze/search-again record; and a revision-scoped hosted
-lead-proposal runner. The `discovery` CLI group submits and inspects these as
-**detached background jobs**. Step 05 completion is **pending final acceptance and
-PR** (see the [Step 05 handoff](docs/implementation/handoffs/05-discovery.md) and
-the [discovery API/limits](docs/discovery.md)).
+an exact human-approved freeze/search-again record; and a live-capable,
+separately-authorized direct lead-proposal runner (implemented but **unrun/not
+authorized** here; the existing app-owned OpenCode production block is unchanged).
+The `discovery` CLI group submits and inspects these as **detached background
+jobs**, including the integrated `report create|show` and `freeze
+propose|status|show|history|require` readbacks. Step 05 **implementation is
+integrated**; **final acceptance and PR are pending** (the E1B/E2 acceptance
+cases, a final frozen-HEAD run, and the PR) — see the
+[Step 05 handoff](docs/implementation/handoffs/05-discovery.md) and the
+[discovery API/limits](docs/discovery.md).
 
 ## Getting started (local core only)
 
@@ -136,10 +141,13 @@ candidate ledger (conservative exact publication matching — never a
 study-independence claim, missing IDs and identifier conflicts stay explicit and
 unresolved), bounded bidirectional citation expansion, a deterministic
 coverage/work/monetary report, an exact human-approved `freeze`/`search_again`
-record, and a revision-scoped hosted lead-proposal runner. The `discovery` CLI
+record, and a live-capable revision-scoped hosted lead-proposal runner (implemented
+but **unrun/not authorized** here). The `discovery` CLI
 group (`context import|show`, `corpus ingest|show`, `lead status|content`, plus
-`search run|seed|import`, `expand run|show`, `lead configure|run`) submits and
-inspects these as **detached background jobs**; a submission returns a queued
+`search run|seed|import`, `expand run|show`, `lead configure|run`,
+`report create|show`, and `freeze propose|status|show|history|require`) submits,
+proposes, and inspects these as **detached background jobs** or local readbacks; a
+submission returns a queued
 admission only. **No** scientific feature, production paid generation, upload,
 scientific validation, or literature-coverage claim is implemented or made, and
 metadata is an **untrusted observation** — no accepted context, eligibility, or
@@ -161,7 +169,7 @@ criterion-by-criterion status is in the
 - [Step 02 handoff (complete, local foundation)](docs/implementation/handoffs/02-project-foundation.md)
 - [Step 03 handoff (complete, synthetic detached worker)](docs/implementation/handoffs/03-durable-worker.md)
 - [Step 04 handoff (complete, restricted runtime)](docs/implementation/handoffs/04-agent-runtime.md)
-- [Step 05 handoff (partial — core and CLI implemented, completion pending acceptance)](docs/implementation/handoffs/05-discovery.md)
+- [Step 05 handoff (integrated — final acceptance/PR pending)](docs/implementation/handoffs/05-discovery.md)
 - [Discovery core, adapters, codec, CLI, and limits (Step 05)](docs/discovery.md)
 - [Step 02 CLI contract](docs/cli.md)
 - [Step 02 storage contract](docs/storage.md)
@@ -191,8 +199,10 @@ and personal discovery CLI implemented** — a bounded public-metadata transport
 provider adapters, a lossless schema-11 observation repository, a typed context
 read-and-gate layer, an approved-plan/seed/import execution library, a cumulative
 candidate ledger, bounded citation expansion, a coverage/work/monetary report, an
-exact human-approved freeze/search-again record, and a hosted lead-proposal runner,
-surfaced as **detached background jobs** through the `discovery` CLI (see the
-[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); completion is
-**pending final acceptance and PR**. No scientific feature, production paid
+exact human-approved freeze/search-again record, and a live-capable hosted
+lead-proposal runner, surfaced through the `discovery` CLI (see the
+[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); its
+**implementation is integrated** and **final acceptance and PR are pending** (the
+E1B/E2 acceptance cases, a final frozen-HEAD run, and the PR — no CI is
+configured). No scientific feature, production paid
 generation, upload, or scientific validation is implemented or claimed.

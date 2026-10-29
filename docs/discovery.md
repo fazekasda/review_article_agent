@@ -1,7 +1,8 @@
 # Discovery core, metadata adapters, durable observations, and CLI (Step 05)
 
-**Status: core library and personal discovery CLI implemented; Step 05 completion
-pending final acceptance and PR.** This document describes the implemented
+**Status: core library and personal discovery CLI implemented; Step 05
+implementation integrated — final acceptance and PR pending.** This document
+describes the implemented
 [Step 05](implementation/05-discovery.md) layers: (1) a bounded, stdlib-only
 public-metadata transport and provider adapters; (2) a lossless versioned codec
 and an inert, project-local, durable search-observation repository (store schema
@@ -11,14 +12,15 @@ candidate ledger, bounded bidirectional citation expansion, a deterministic
 coverage/work/monetary report, an exact human-approved freeze/search-again record,
 and a revision-scoped hosted lead-proposal runner; and (4) the **`discovery` CLI
 group** that submits/inspects these as detached background jobs. The
-criterion-by-criterion status and the final acceptance/PR step remain in the
-[Step 05 handoff](implementation/handoffs/05-discovery.md).
+criterion-by-criterion status and the remaining final-acceptance/PR work remain in
+the [Step 05 handoff](implementation/handoffs/05-discovery.md).
 
-**Current completion state.** The report/freeze **CLI** groups are **not yet
-integrated** (a separate worker is building them); this document therefore
-documents the **library** API for those layers now and does **not** invent CLI
-flags for them. The `context`/`corpus`/`lead status|content` readbacks and the
-`search`/`expand`/`lead configure|run` job submissions below are integrated.
+**Current completion state.** The report/freeze **CLI** groups are now
+**integrated** (`discovery report create|show` and `discovery freeze
+propose|status|show|history|require`); this document documents both their library
+API and their CLI flags below. The `context`/`corpus`/`lead status|content`
+readbacks and the `search`/`expand`/`lead configure|run` job submissions below
+are also integrated.
 
 Nothing here is scientific validation, eligibility, study identity, or a
 scientific completeness claim. Every provider value is an **untrusted
@@ -299,7 +301,7 @@ EuropePMCClient.search(query: str, page_size: int = 100,
   full attempt provenance; reaching `max_pages` while a cursor is still offered
   yields `page_limit` and is never complete.
 
-## Durable search observations (added partial slice)
+## Durable search observations (schema 11)
 
 ### `discovery.serialization` — codec version 1
 
@@ -720,6 +722,15 @@ discovery expand run    --artifact-id ID --revision-id ID --corpus-artifact-id I
 discovery expand show   (--job-id ID | --request-id ID) [--content]
 discovery lead configure --artifact-id ID --revision-id ID --file hosted_use.json --rights-file rights.json [--request-id ID] [--parent-revision-id ID]
 discovery lead run       --batch-artifact-id ID --batch-revision-id ID --credential-env OPENROUTER_API_KEY --request-id ID
+
+# Deterministic coverage report + exact freeze/search-again readbacks (no worker, no network)
+discovery report create --corpus-artifact-id ID --corpus-revision-id ID --plan-artifact-id ID --plan-revision-id ID --revision-id ID --request-id ID --rights-file rights.json [--artifact-id ID] [--expansion-job-id ID ...] [--known-relevant-file PATH] [--limitations-file PATH]
+discovery report show   [--artifact-id ID] [--revision-id ID] [--content]
+discovery freeze propose --corpus-artifact-id ID --corpus-revision-id ID --coverage-artifact-id ID --coverage-revision-id ID --decision freeze|search_again --entry-reviews-file reviews.json --rationale TEXT --request-id ID --revision-id ID --rights-file rights.json [--artifact-id ID] [--accept-coverage-limitations EXPLANATION]
+discovery freeze status  [--artifact-id ID]
+discovery freeze show    [--artifact-id ID] [--revision-id ID] [--content]
+discovery freeze history [--artifact-id ID]
+discovery freeze require [--artifact-id ID] [--content] [--require-active]
 ```
 
 - `search run` needs an exact approved-plan artifact/revision and a query index;
@@ -738,10 +749,22 @@ discovery lead run       --batch-artifact-id ID --batch-revision-id ID --credent
   the CLI may ensure a worker inherits its environment and warns when the key is
   absent, but it **never** restarts or reconfigures a user's worker. There is no
   key over IPC and **no** automatic paid call.
-- **Pending CLI.** The `discovery report` and `discovery freeze` **CLI** groups
-  are not yet integrated (a separate worker is active on them); their library APIs
-  are the `reporting` and `freeze` modules above. No CLI flags are documented here
-  for them until that integration lands.
+- **Report / freeze CLI (integrated).** `report create` records one immutable
+  coverage revision (exact corpus/plan refs; `--expansion-job-id` resolves only a
+  real completed expansion report; optional strict known-relevant/limitations
+  files) and claims no completeness. `report show` and `freeze show` are safe
+  summaries by default with `--content` the explicit private opt-in. `freeze
+  propose` records one **inert** freeze/search-again proposal from an explicit
+  caller per-candidate `--entry-reviews-file` (the `entry_reviews` schema
+  documented with the `discovery.freeze` module above: every candidate exactly
+  once; an `include` needs a resolved candidate whose four integrity statuses are
+  all **known** — `unknown` is not clean),
+  a literal `--accept-coverage-limitations` explanation, and `--rights-file`, and
+  returns the exact named-gate `approval_request` plus `gate prepare`/`gate
+  confirm` guidance — it records no approval. `freeze status|history|require` are
+  read-only; `require` always consults `require_frozen`, returns a safe summary by
+  default (exact corpus ref, `included_count`, decision, active approval), and
+  `--content` (or the `--require-active` alias) opts in to the private roster.
 
 ## Behaviour notes (limits to keep in mind)
 

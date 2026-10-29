@@ -19,11 +19,12 @@
 > **Step 05 addition (bounded).** On top of that unchanged foundation, the worker now also admits
 > **owner-controlled discovery background jobs** through a *separate* `discovery_submit` op and a
 > single serial discovery executor (§12). Those jobs make **real** public-metadata provider GET
-> requests (`query`/`seed`/`metadata_import`), a bounded citation-expansion traversal (`expand`), and
-> **one** guarded direct-lead `POST` per durable job (`lead`). §12 states their exact authority,
+> requests (`query`/`seed`/`expand`), a bounded citation-expansion traversal; `metadata_import` is a
+> **local, zero-HTTP** observation of a caller-supplied record file; and (`lead`) **one** guarded
+> direct-lead `POST` per durable job. §12 states their exact authority,
 > fences, and limits; nothing in §1–§11 is weakened, and the direct-lead route leaves the existing
-> app-owned OpenCode **production block unchanged**. Step 05 itself remains **partial/incomplete**
-> (see [`implementation/handoffs/05-discovery.md`](implementation/handoffs/05-discovery.md)); no
+> app-owned OpenCode **production block unchanged**. Step 05 **implementation is integrated with
+> final acceptance pending** (see [`implementation/handoffs/05-discovery.md`](implementation/handoffs/05-discovery.md)); no
 > scientific validation, completeness, review/writer, or later-step feature is implemented or
 > claimed.
 > Authority: [`implementation/03-durable-worker.md`](implementation/03-durable-worker.md),
@@ -201,8 +202,10 @@ provider with no real egress:
   dispatch only (no retraction of executed work, no auto-pass, not reset by restart); only an explicit
   human decision may raise a cap. For the **synthetic** `submit` jobs here, reserves are **virtual**
   fault-test values and actual external spend is **0**; a Step 05 discovery `lead` job reserves and
-  settles on the real runtime dispatch ledger instead (§12), and a discovery `query`/`seed`/
-  `metadata_import`/`expand` job reserves nothing (public metadata GETs are not a paid route).
+  settles on the real runtime dispatch ledger instead (§12), and a discovery `query`/`seed`/`expand`
+  job reserves nothing (read-only public-metadata GETs are not a paid route), while a
+  `metadata_import` job reserves nothing and issues **zero HTTP** (it records a caller-supplied local
+  observation).
 - **Exact-decimal, context-independent exposure**: amounts are exact decimals, never floats; exposure
   is `max(reserve bound, reported actual)` once the actual is known; the original reserve bound is
   **conservatively never released**, even when the known actual is `0`. A job can be stopped before
@@ -238,11 +241,12 @@ provider with no real egress:
   evidenced in the [Step 03 handoff](implementation/handoffs/03-durable-worker.md); a snapshot still
   proves storage integrity, not remote quiescence.
 - **Step 05 limits (added).** The `discovery_submit` jobs do make real bounded public-metadata
-  provider GET requests, a bounded citation-expansion traversal, and (for `lead`) **one** guarded
-  direct-lead `POST` per durable job — under the exact owner, gate, rights, credential, and cost
-  controls of §12. They still make **no** scientific-validation, completeness, deduplication,
-  coverage, freeze, or review/writer claim, and no exactly-once external-request or billing claim;
-  Step 05 remains **partial**.
+  provider GET requests (`query`/`seed`/`expand`), a bounded citation-expansion traversal, and (for
+  `lead`) **one** guarded direct-lead `POST` per durable job — under the exact owner, gate, rights,
+  credential, and cost controls of §12; a `metadata_import` job issues **zero HTTP** and records only
+  a caller-supplied local observation. They still make **no** scientific-validation, completeness,
+  deduplication, coverage, freeze, or review/writer claim, and no exactly-once external-request or
+  billing claim; Step 05 implementation is integrated with final acceptance pending.
 
 ## 11. Ownership map, safety tests, and verification
 
@@ -275,7 +279,8 @@ This section extends §1–§11 without weakening them. It documents the **only*
 worker surface that issues real provider/lead I/O: the `discovery_submit` op and
 the single serial discovery executor. The Step 05 CLI spellings are in
 [`cli.md`](cli.md) §12; the discovery value layers and their exact limits are in
-[`discovery.md`](discovery.md). Step 05 remains **partial/incomplete**
+[`discovery.md`](discovery.md). Step 05 implementation is **integrated** with
+**final acceptance pending**
 ([handoff](implementation/handoffs/05-discovery.md)); nothing here is a scientific
 workflow, a completion, or an approval.
 
@@ -364,8 +369,9 @@ workflow, a completion, or an approval.
   dispatch on the existing **runtime dispatch ledger**
   ([`runtime/dispatch.py`](../src/review_article_agent/runtime/dispatch.py)) before
   its one POST, and its cost is read from that ledger — it is **not** double-counted
-  against the synthetic reserve bucket. The query/seed/metadata_import/expand modes
-  contact only the read-only public-metadata endpoints and reserve nothing.
+  against the synthetic reserve bucket. The `query`/`seed`/`expand` modes contact only the read-only
+  public-metadata endpoints and reserve nothing; a `metadata_import` job issues **zero HTTP** (a
+  caller-supplied local observation) and reserves nothing.
 - **Explicit worker env name; value never persisted.** The one permitted credential
   name is **`OPENROUTER_API_KEY`** ([`worker/discovery.py`](../src/review_article_agent/worker/discovery.py)
   `LEAD_CREDENTIAL_ENV`). The worker reads the variable from its **own** environment
@@ -404,15 +410,18 @@ approval; only `gate prepare`/`gate confirm` on the controlling terminal records
 real named-gate human approval ([`cli.md`](cli.md) §11). The discovery gate names
 are: individual seed revision → `artifact_revision`/`discovery.seed.<artifact_id>`;
 search plan revision → `protocol`/`discovery.plan`; hosted-use batch →
-`batch`/`discovery.hosted_use.<purpose>`; corpus freeze (library only, CLI pending)
-→ `artifact_revision`/`discovery.freeze`.
+`batch`/`discovery.hosted_use.<purpose>`; corpus freeze
+→ `artifact_revision`/`discovery.freeze` (surfaced by `discovery freeze propose`
+and required by `discovery freeze require`).
 
 ### 12.6 Known limits of this addition
 
-- The **reporting** and **freeze** command groups are **not yet implemented as
-  CLI** in this base (pending a later bounded slice, CLI1B); only their library
-  layers exist, and [`cli.md`](cli.md) §12.6 documents **no** report/freeze flags —
-  see [`discovery.md`](discovery.md) for the library details.
+- The **reporting** and **freeze** command groups are now **integrated** as CLI
+  (CLI1B, `e15b5b4`): `discovery report create|show` and `discovery freeze
+  propose|status|show|history|require`. [`cli.md`](cli.md) §12.1/§12.6 documents
+  the exact flags; they record only non-authorizing proposals, ensure no worker,
+  and record no approval. See [`discovery.md`](discovery.md) for the library
+  details and the explicit per-candidate entry-review schema.
 - No scientific validation, completeness, coverage, deduplication, scientific
   identity, corpus freeze, review, or writer capability is implemented or claimed,
   and no exactly-once external-request or billing claim is made. Later workflow
@@ -421,6 +430,7 @@ search plan revision → `protocol`/`discovery.plan`; hosted-use batch →
   [`tests/test_discovery_worker.py`](../tests/test_discovery_worker.py),
   [`tests/test_discovery_job_routes.py`](../tests/test_discovery_job_routes.py),
   [`tests/test_cli_discovery_jobs.py`](../tests/test_cli_discovery_jobs.py),
-  [`tests/test_cli_discovery_artifacts.py`](../tests/test_cli_discovery_artifacts.py) —
+  [`tests/test_cli_discovery_artifacts.py`](../tests/test_cli_discovery_artifacts.py),
+  [`tests/test_cli_discovery_reports.py`](../tests/test_cli_discovery_reports.py) —
   worker discovery dispatch/replay/restart, submission route validation, and the
   discovery CLI surfaces.

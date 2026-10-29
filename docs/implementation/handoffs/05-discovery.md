@@ -1,433 +1,226 @@
-# Handoff — step 05: reproducible discovery and corpus freeze (partial)
+# Handoff — step 05: reproducible discovery and corpus freeze
 
-**Status: PARTIAL — metadata adapter foundation plus an added durable
-search-observation slice.** Step 05 is **not** complete and is **not** ticked in
-[`docs/implementation/README.md`](../README.md). This handoff documents **two
-partial library slices**: (1) the historic bounded, stdlib-only public-metadata
-transport plus two provider adapters, preserved below with its original evidence
-head; and (2) a newer, still inert **durable search-observation** codec, schema-11
-table, repository, and backup/restore verification. Neither slice is a scientific
-workflow, and neither makes a scientific, deduplication, coverage, or completeness
-claim. The historic adapter evidence is **not** rewritten; the new slice is a
-distinct section (§8).
+**Status: implementation INTEGRATED; FINAL ACCEPTANCE PENDING — Step 05 stays
+UNCHECKED in [`docs/implementation/README.md`](../README.md).** Every deliverable
+D1–D4 and acceptance criterion AC1–AC7 below is now realised by integrated
+source and tests on this branch's base `e15b5b4`. What remains is **verification
+and release work only** — the E1B adversarial cases, the E2 full-CLI-chain case, a
+final frozen-HEAD full-suite run, and the PR/merge — not any deferred feature.
+Nothing here is a scientific claim: no study identity, eligibility, primary
+support, evidence extraction, coverage, completeness, review, or review-writer
+capability is asserted.
 
-**Scope boundary (authority).** The step document
-[`docs/implementation/05-discovery.md`](../05-discovery.md) is authoritative and was
-**not** edited. The baseline is [`docs/specification.md`](../../specification.md)
-(workflow steps 2–5 and the safety invariants); the accepted policies are
-[decision 002](../../decisions/002-step01-contracts-and-policies.md) and the
-[policy register](../../contracts/03-policy-decisions.md) (`POL-OPS-COVERAGE`,
-`POL-OPS-TRACE`, `POL-OPS-SECONDARY`); the versioned contracts are
-[C01](../../contracts/01-identities.md), [C02](../../contracts/02-gates-and-runtime.md),
-[C03](../../contracts/03-policy-decisions.md). No baseline invariant, acceptance
-criterion, or policy was weakened.
+## 1. Scope, base revisions, and authority
 
-> **Historic adapter evidence (recorded 2026-10-28, not rewritten).** The
-> coordinator's **177 discovery tests passed at code HEAD `de179b4`** (with
-> `compileall`/`git diff --check` clean) — the adapter slice's targeted run. The
-> coordinator's **full frozen combined run** at the same code HEAD `de179b4` (log
-> `/tmp/opencode/step05-combined-all-checks.log`) then **passed**: see §5 for the
-> exact commands and counts (**2,282 tests total**). That historic run is at code
-> HEAD `de179b4`, before any documentation update, and the merged adapter baseline
-> was `6e20946` (same **2,282 total**: 2,067 core + 20 scripts + 195 retained
-> spike tests). The older checkpoints (core baseline `049a9c6` 1890 tests;
-> shared-only `0c856cc` 1957 tests; retained spike runs Python 79 / live-Jev mocked
-> 51 / integration mocks 7 / TypeScript 58 + `tsc`; scripts 20; doc checks 29) are
-> **historical heads**, superseded by that combined run.
->
-> **New durable-observation evidence (2026-10-28).** The added slice is verified
-> at integrated **code HEAD `25827dd`** (source-equivalent `7896af8`; T1 codec
-> `c8e52f0`, T2 repository `9f1ff31`). The coordinator's earlier codec-only run
-> was **223 discovery tests at `c8e52f0`**; this worker ran **252 discovery tests
-> OK**, **29 contract-doc checks OK**, **20 scripts tests OK**, and
-> `git diff --check` clean at `25827dd` before editing docs (§8.6). The
-> coordinator's **full frozen combined suite at the same code HEAD `25827dd`**
-> then completed **PASSED** (log
-> `/tmp/opencode/search-records-combined.log`, read to verify): Python **3.14.4**,
-> **2,142 core tests in 239.488 s**, **20 scripts**, **79 Python retained
-> spikes**, **51 live-Jev mock**, **7 integration mock**, and **58 TypeScript**
-> tests — **2,357 tests total, no skips**; **29 contract checks**; `tsc --noEmit`
-> and `compileall -q src tests` pass; `git diff --check` pass. Existing
-> SQLite/subprocess/unclosed-file `ResourceWarning`s are disclosed, not failures.
-> No paid/provider/live adapter call or hosted transfer was made; Python 3.11
-> remains untested. That combined run is at **code HEAD `25827dd`, before this
-> docs update**, **not** at this handoff's own docs commit; the coordinator will
-> verify the final docs head. **No full-suite claim is made at the final docs
-> commit.**
+- **Step document (authoritative, unedited):**
+  [`05-discovery.md`](../05-discovery.md) — deliverables D1–D4 and AC1–AC7, not
+  weakened or marked met by any doc.
+- **Baseline:** [`docs/specification.md`](../../specification.md) — workflow steps
+  2–5 and the gates/scientific invariants (not weakened).
+- **Accepted direction/policies:** [decision 002](../../decisions/002-step01-contracts-and-policies.md)
+  and the [policy register](../../contracts/03-policy-decisions.md) (`POL-OPS-COVERAGE`,
+  `POL-OPS-TRACE`, `POL-OPS-SECONDARY`); the [direct-lead exception (decision 003)](../../decisions/003-step05-discovery-and-direct-lead.md).
+- **Contracts:** [C01](../../contracts/01-identities.md), [C02](../../contracts/02-gates-and-runtime.md), [C03](../../contracts/03-policy-decisions.md).
+- **This branch:** `task/step05-completion-handoff`; starting HEAD **`e15b5b4`**
+  (`e15b5b417a4d41342e1f24ab52fd4f3beb92b1fd`). This task changes
+  **documentation only** (see §6).
 
-## 1. Scope, base revisions, and authority used
+## 2. Historical foundation (preserved anchors, superseded status)
 
-- **Step document (authoritative):**
-  [`05-discovery.md`](../05-discovery.md) — deliverables D1–D4, AC1–AC7, and
-  handoff/exclusions unedited.
-- **Baseline:** [`docs/specification.md`](../../specification.md) (confirmed; not
-  weakened).
-- **Historic adapter base:** `de179b4` (the adapter handoff's starting HEAD).
-- **Added durable-observation dependencies:** T1 codec `c8e52f0`, T2 repository
-  `9f1ff31`, and T2-R1 bounds fix `25827dd` (source-equivalent `7896af8`), which is
-  also the starting HEAD of this updated handoff branch.
-- **This handoff branch:** `task/step05-records-handoff`. It changes
-  **documentation only** (see §7).
+Two earlier partial slices are now **subsumed** by the integrated core; their
+measured evidence is kept only as history, not as the current claim.
 
-## 2. Deliverables → implementation and tests
+- **Adapter foundation** (base `de179b4`; merged `6e20946`): the bounded
+  stdlib-only transport, PubMed and Europe PMC metadata adapters, and value
+  contracts. Targeted run **177 discovery tests OK**; the coordinator's full
+  combined run then reported **2,282 tests** (log
+  `/tmp/opencode/step05-combined-all-checks.log`).
+- **Durable inert observation slice** (`25827dd`; codec T1 `c8e52f0`, repository
+  T2 `9f1ff31`): lossless codec plus additive schema-11 `discovery_search_run`
+  observation repository. Targeted run **252 discovery tests OK**; full combined
+  run **2,357 tests** (log `/tmp/opencode/search-records-combined.log`).
 
-| Step deliverable | Status | Implementation | Tests |
-| --- | --- | --- | --- |
-| D1 — brief/interview artifacts, seed search and individual approvals, framing challenge, provisional scope map, rubric/search-plan approval | **Deferred** | none | none |
-| D2 — PubMed and Europe PMC adapters plus complementary sources ratified in the project plan | **Partial** (two adapters; complementary sources not ratified) | [`discovery/pubmed.py`](../../../src/review_article_agent/discovery/pubmed.py), [`discovery/europepmc.py`](../../../src/review_article_agent/discovery/europepmc.py) | [`test_discovery_pubmed.py`](../../../tests/test_discovery_pubmed.py), [`test_discovery_europepmc.py`](../../../tests/test_discovery_europepmc.py) |
-| D3 — query runs, identity reconciliation, citation expansion, coverage report, explicit freeze/search-again decision | **Partial** (durable inert observation records only; identity reconciliation, citation expansion, coverage, freeze/search-again are deferred) | [`discovery/serialization.py`](../../../src/review_article_agent/discovery/serialization.py), [`storage/discovery.py`](../../../src/review_article_agent/storage/discovery.py) | [`test_discovery_serialization.py`](../../../tests/test_discovery_serialization.py), [`test_discovery_store.py`](../../../tests/test_discovery_store.py) |
-| D4 — bounded network retries/rate handling and project cost/work reporting | **Partial** (retries/rate handling only; project reporting deferred) | [`discovery/transport.py`](../../../src/review_article_agent/discovery/transport.py) | [`test_discovery_transport.py`](../../../tests/test_discovery_transport.py) |
+Those counts are historical. All later sources/tests are still present and
+covered by the current frozen checkpoint (§5).
 
-Supporting value contracts:
-[`discovery/records.py`](../../../src/review_article_agent/discovery/records.py)
-([`test_discovery_records.py`](../../../tests/test_discovery_records.py)).
+## 3. Deliverables → integrated source and named tests
 
-Additional durable-observation support (§8): the versioned codec
-[`discovery/serialization.py`](../../../src/review_article_agent/discovery/serialization.py)
-([`test_discovery_serialization.py`](../../../tests/test_discovery_serialization.py)),
-the schema-11 repository
-[`storage/discovery.py`](../../../src/review_article_agent/storage/discovery.py)
-([`test_discovery_store.py`](../../../tests/test_discovery_store.py)), and its
-backup hook ([`test_discovery_backup.py`](../../../tests/test_discovery_backup.py)).
-No adapter was changed by that slice.
+| Deliverable | Integrated implementation | Named tests / gates |
+| --- | --- | --- |
+| **D1** — brief/interview artifacts, seed search + individual approvals, framing challenge, provisional scope map, rubric/search-plan approval | [`discovery/context.py`](../../../src/review_article_agent/discovery/context.py) (typed envelopes, `require_approved_context`, `seed_context`), [`discovery/execution.py`](../../../src/review_article_agent/discovery/execution.py) (`seed_search`, always provisional) | [`test_discovery_context.py`](../../../tests/test_discovery_context.py)::`StaticValidationTest`/`ReadContextTest`/`SeedContextTest`/`PlanApprovalTest`; [`test_step05_core_acceptance.py`](../../../tests/test_step05_core_acceptance.py)::`SeedApprovalGateTest`/`PlanAmendmentTest`; [`test_step05_acceptance.py`](../../../tests/test_step05_acceptance.py)::`InjectionCannotExpandAuthorityTest`. Gates: seed `artifact_revision`/`discovery.seed.<artifact_id>`; plan `protocol`/`discovery.plan`. |
+| **D2** — PubMed and Europe PMC adapters plus complementary sources ratified in the project plan | [`discovery/pubmed.py`](../../../src/review_article_agent/discovery/pubmed.py), [`discovery/europepmc.py`](../../../src/review_article_agent/discovery/europepmc.py), [`discovery/citations.py`](../../../src/review_article_agent/discovery/citations.py); ratified complementary sources via `DiscoveryExecutor.import_metadata` | [`test_discovery_pubmed.py`](../../../tests/test_discovery_pubmed.py), [`test_discovery_europepmc.py`](../../../tests/test_discovery_europepmc.py), [`test_discovery_citations.py`](../../../tests/test_discovery_citations.py); `test_step05_core_acceptance.py`::`MetadataImportTest` |
+| **D3** — query runs, identity reconciliation, citation expansion, coverage report, explicit freeze/search-again decision | [`discovery/execution.py`](../../../src/review_article_agent/discovery/execution.py) (`execute_query`), [`discovery/serialization.py`](../../../src/review_article_agent/discovery/serialization.py), [`storage/discovery.py`](../../../src/review_article_agent/storage/discovery.py), [`discovery/reconciliation.py`](../../../src/review_article_agent/discovery/reconciliation.py), [`discovery/candidates.py`](../../../src/review_article_agent/discovery/candidates.py), [`discovery/expansion.py`](../../../src/review_article_agent/discovery/expansion.py), [`discovery/reporting.py`](../../../src/review_article_agent/discovery/reporting.py), [`discovery/freeze.py`](../../../src/review_article_agent/discovery/freeze.py); `discovery report\|freeze` CLI | [`test_discovery_execution.py`](../../../tests/test_discovery_execution.py), [`test_discovery_serialization.py`](../../../tests/test_discovery_serialization.py), [`test_discovery_store.py`](../../../tests/test_discovery_store.py), [`test_discovery_reconciliation.py`](../../../tests/test_discovery_reconciliation.py), [`test_discovery_candidates.py`](../../../tests/test_discovery_candidates.py), [`test_discovery_expansion.py`](../../../tests/test_discovery_expansion.py), [`test_discovery_reporting.py`](../../../tests/test_discovery_reporting.py), [`test_discovery_freeze.py`](../../../tests/test_discovery_freeze.py), [`test_cli_discovery_reports.py`](../../../tests/test_cli_discovery_reports.py); E0/E1 acceptance. Gate: `artifact_revision`/`discovery.freeze`. |
+| **D4** — bounded network retries/rate handling and project cost/work reporting | [`discovery/transport.py`](../../../src/review_article_agent/discovery/transport.py) (bounded retries, allowlist, size cap, per-instance pacing), [`discovery/reporting.py`](../../../src/review_article_agent/discovery/reporting.py) (cumulative work + known/estimated/unknown monetary view) | [`test_discovery_transport.py`](../../../tests/test_discovery_transport.py); `test_discovery_reporting.py`::`MonetaryTests`/`SourceReconstructionTests`/`MetadataImportProvenanceTests`; `test_cli_discovery_reports.py` |
 
-## 3. Acceptance criteria — criterion-by-criterion status (all partial/deferred)
+The **detached job surface** that drives D3 is [`worker/discovery.py`](../../../src/review_article_agent/worker/discovery.py)
+(five modes) over the execution library, with [`test_discovery_worker.py`](../../../tests/test_discovery_worker.py),
+[`test_discovery_job_routes.py`](../../../tests/test_discovery_job_routes.py),
+[`test_cli_discovery_jobs.py`](../../../tests/test_cli_discovery_jobs.py).
 
-| AC | Requirement (short) | Status | Concrete implemented evidence / what is missing |
-| --- | --- | --- | --- |
-| 1 | Seed abstracts remain provisional; unapproved seeds cannot silently become accepted project context | **Not fulfilled** | No workflow exists, so there is **no authorizing API** that could accept a seed as project context — but the criterion's provisional-seed/approval loop is **absent**. Nothing here makes a seed accepted; equally nothing implements the gate. |
-| 2 | Broad searches cannot execute unapproved scope/query plans | **Not fulfilled** | No workflow/approval gate exists. The adapters are a **library**; a caller can call `search()` directly. There is **no** scope/query-plan approval surface, so the criterion is unmet (and no authorizing API was added). |
-| 3 | Reconstruct exact queries, timestamps, contributing sources, failures, counts, and deduplication decisions from records | **Partial (improved by §8)** | The adapters retain exact query, UTC start/finish, source, requested URLs, statuses, body digests/bytes, failures, counts, every attempt, and PubMed `query_translation` **in memory**. The §8 codec/store can now **durably** reconstruct those exact observations after reopen/replay for a recorded request key, preserving overlaps, missing IDs, and partial failures. **Deduplication decisions are still absent**: there is no candidate identity, no dedup decision field, and no scientific candidate store. |
-| 4 | Fixed response fixtures test pagination, overlap, missing IDs, partial failures, and incremental reruns without duplicate scientific candidates | **Partial (improved by §8)** | Fixtures cover adapter **pagination, overlap, missing IDs, and partial failures** (e.g. `test_discovery_pubmed.py::PartialOutcomeTests`, `test_discovery_europepmc.py::ConsistencyTests`/`CursorTests`), and §8 adds lossless fixture round-trips plus **request-key replay**. Identical replay returns the historical observation; a divergent result is a conflict; different request keys remain separate observations even with identical payload. This is **not** cross-run scientific candidate ingestion, **not** deduplication, and does **not** make repeated `search()` calls idempotent candidate ingestion. **Incremental rerun producing unique scientific candidates remains absent.** |
-| 5 | Known-relevant fixture set and forward/backward citation expansion expose explicit coverage gaps; reporting never claims absolute completeness | **Deferred** | Citation expansion and coverage-gap reporting are **not** implemented. The adapters never claim completeness (`complete` only means a bounded retrieval reached a natural end). |
-| 6 | Human approval freezes a specific corpus revision; subsequent imports/searches do not mutate it silently | **Deferred** | Corpus freeze and the human freeze gate are **not** implemented. |
-| 7 | Public live smoke queries are small, documented, and separate from deterministic results; no arbitrary API result cap truncation hidden as complete retrieval | **Partial** | **No hidden cap**: a page/record budget or the provider window is always an explicit `stop_reason` (`page_limit`/`failure`), never `complete` (e.g. `test_discovery_pubmed.py::HardLimitTests`, `test_discovery_europepmc.py::BoundsTests`). Deterministic tests inject a scripted transport and make **no** network call. **No adapter live smoke** was run (see §5). |
+## 4. Acceptance criteria — integrated, final acceptance pending
 
-**Remaining deferred work (do not read as done):**
+Each criterion is realised in integrated source/tests; the step-level
+**acceptance decision** (frozen-HEAD full run + E1B/E2 + PR) is what remains.
 
-- **D1** — brief/interview, individual seed approvals, framing, scope, rubric, and
-  search-plan approval: **all deferred**.
-- **D3** — durable inert query **observation** replay is now partially
-  implemented (§8); candidate identity/reconciliation, citation expansion,
-  coverage reporting, and freeze/search-again remain **deferred**.
-- **D4** — project durable cost/work reporting: **deferred** (this slice only
-  returns attempts; **no model spend**).
-- **Complementary sources** are **not** ratified per project. The historical list
-  is configurable; **not every source is mandatory**.
+| AC | Status | Integrated evidence |
+| --- | --- | --- |
+| **1** Seed abstracts stay provisional; an unapproved seed cannot become accepted context | **Integrated** | `seed_context`/`require_approved_context` require the exact per-seed named gate; a seed's `abstract_context` stays `provisional` with or without approval (`test_discovery_context.py`::`SeedContextTest`; `test_step05_core_acceptance.py`::`SeedApprovalGateTest`). |
+| **2** Broad searches cannot run against an unapproved scope/query plan; a substantive change produces an approval request | **Integrated** | `execute_query` is pinned to the exact approved plan and fails closed (zero I/O) otherwise; plan amendments invalidate stale gates (`ExecuteQueryGateTest`; E0 `PlanAmendmentTest`; E1 `StaleApprovalTest`). |
+| **3** Reconstruct exact queries, timestamps, contributing sources, failures, counts, and dedup decisions from records | **Integrated** | Lossless codec + schema-11 observation store + reconciliation + report `SourceReconstructionTests` reconstruct exact observations and explicit dedup/conflict decisions from durable rows. |
+| **4** Fixtures cover pagination, overlap, missing IDs, partial failures, incremental reruns without duplicate candidates | **Integrated** | Adapter fixture suites (pagination/overlap/missing/partial) plus the cumulative ledger (`CumulativeDedupTests`; E0 `CumulativeCorpusTest`/`CorpusConflictTest`). |
+| **5** Known-relevant set + forward/backward expansion expose explicit coverage gaps; reporting never claims absolute completeness | **Integrated** | `test_discovery_reporting.py`::`KnownRelevantTests`/`CitationTests`; `test_discovery_expansion.py`; E1 `ExplicitGapsTest`/`NoForcedCompletenessTest`. |
+| **6** Human approval freezes a specific corpus revision; later imports/searches do not mutate it silently | **Integrated** | `FreezeAuthorityTests`/`CorpusFreezeImmutabilityTests`; E1 `IntegratedFreezeAuthorityTest`/`LaterWorkImmutabilityTest`/`SearchAgainTest`. |
+| **7** Live smoke small/documented/separate; no arbitrary cap truncation hidden as complete | **Integrated** | Adapters return explicit `page_limit`/`failure`, never `complete`, at any budget/window boundary (`test_discovery_pubmed.py`::`HardLimitTests`; `test_discovery_europepmc.py`::`BoundsTests`); the live observations are separately documented (§5.3). Adapter live smoke itself is unrun (below). |
 
-## 4. Behaviour and limits documented
+## 5. Verification
 
-The exact API signatures, defaults, and maximum limits are in
-[`docs/discovery.md`](../../discovery.md). Key limits:
+### 5.1 Frozen checkpoint (last full combined run)
 
-- **PubMed window.** `PUBMED_WINDOW_LIMIT = 9999` is a **conservative** stand-in
-  for NCBI's own ESearch window; a retrieval that would page past it is an explicit
-  `page_limit`. **Date-partitioned paging past the window is deferred.**
-- **Unsupported entries.** A `PubmedBookArticle` (or any unexpected child) is an
-  explicit `malformed_response`, **never** a silently dropped entry.
-- **DOCTYPE.** A normal NCBI EFetch reply's plain **external** `<!DOCTYPE ...>`
-  is **accepted without fetching** it; an internal DTD subset, any entity
-  declaration, or a non-http(s) DOCTYPE scheme is refused.
-- **Europe PMC.** `format=json`, `resultType=lite` (**no abstracts**), native
-  `source:id` identity, cursor pagination with a stable `hitCount`, nullable IDs,
-  and strict `malformed_response` outcomes.
-- **Provenance.** All `SearchPage` attempt provenance and the PubMed
-  `query_translation` are retained.
-- **Transport policy.** Bounded retries; hard body cap; no redirects; no proxies;
-  no credentials.
-- **Socket timeout is inactivity, not a wall-clock deadline.** A peer can keep one
-  attempt alive far longer than `timeout` seconds.
-- **Rate pacing is per-instance, not process-global.** A future caller must
-  **serialize** its requests or **share** one transport instance.
-- **`Retry-After` too-large sentinel is not the exact magnitude.** An
-  unrepresentable value yields the conservative sentinel
-  `MAX_RETRY_DELAY_SECONDS + 1.0` and an explicit `retry_after_exceeds_bound`.
-- **No scientific dedup / no candidate repository.** No automatic scientific
-  candidate deduplication and no cross-run/cross-provider candidate repository.
-  The §8 durable table is an **observation store keyed by caller request id**, not
-  a candidate store and not a deduplication decision.
-- **Each `search()` invocation repeats provider observations.** `search()` itself
-  persists nothing and is **not** idempotent candidate ingestion: it re-issues
-  requests and returns fresh observations. A trusted caller may separately pass
-  that returned value to `record_search`, which durably records the observation;
-  an identical request-key replay returns that historical record, but it does not
-  rerun the provider and does not ingest scientific candidates.
+The last **full frozen combined** run is at `VERIFIED_END_SHA=6ec58ea`
+(`6ec58ea2877ac9cc9edb86c7b60e98b2601c7ad2`), a **frozen checkpoint, not the
+current HEAD**, log `/tmp/opencode/step05-pre-final-checks.log`: Python
+**3.14.4**, **2,557 core tests in 295.874 s**, **20 scripts**, **79 Python
+retained spikes**, **51 live-Jev mock**, **7 integration mock**, **58
+TypeScript** — **2,772 tests total, no skips**; **29 contract-doc checks**;
+`tsc --noEmit`, `compileall -q src tests`, `git diff --check` all clean.
+Pre-existing SQLite/subprocess/unclosed-file `ResourceWarning`s are disclosed,
+not failures. **Python 3.11 is declared (`requires-python >=3.11`) but
+untested.**
 
-## 5. Historic adapter-slice verification — commands and results
+### 5.2 Commits after the checkpoint and the current base
 
-Environment: **Python 3.14.4** actually used; `requires-python = ">=3.11"` is
-**declared but 3.11 was not tested**.
+- **E0** core acceptance ([`test_step05_core_acceptance.py`](../../../tests/test_step05_core_acceptance.py)): `a6d21fb` (in the frozen run above).
+- **E1** integrated final acceptance: integrated `a7d1cd9` (library half) and
+  `752d359` (real-process half); source-equivalent `3eccfeb`/`f2a3ad2`. Adds
+  [`test_step05_acceptance.py`](../../../tests/test_step05_acceptance.py) — **9
+  library scenarios + 2 real owned-process scenarios** (real detached worker:
+  detach/reconnect of an authorized metadata-import job with zero provider
+  attempts; restart proves a standing accepted result on the same fence and a
+  durable POST counter stays at exactly one — no blind re-POST).
+- **DOC1** (`cb6e964`), **DOC2** (`3131031`): discovery/CLI/worker doc
+  reconciliation.
+- **CLI1A** (`c325b22`): discovery background-job CLI. **CLI1B** (`9085241`,
+  fix `e15b5b4`): `discovery report`/`freeze` readbacks (§6).
+- **This branch base `e15b5b4`** has only a **selective 84-test** CLI1B run
+  recorded by the coordinator, **not** a full-HEAD suite. A final frozen-HEAD
+  full-suite run is **pending** (§8).
 
-| Command | Result |
-| --- | --- |
-| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_discovery_*.py'` | **177 OK** (this handoff's own run) |
-| `python3 scripts/check_contract_docs.py --self-test` | **29 checks ok, 0 failed** |
-| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **20 OK** |
-| `git diff --check` | clean |
+### 5.3 Authorized live observations (separate from deterministic results)
 
-Coordinator evidence — **full frozen combined run at code HEAD `de179b4`** (log
-`/tmp/opencode/step05-combined-all-checks.log`), **ALL LOCAL CHECKS PASSED**:
+A tiny, separately authorized public-metadata smoke was run by the coordinator:
+**3 transport-level `webfetch` contract observations** (MED `15019270` refs
+pages 1/2 each `size=1` `hitCount=27`; citations page 1 `size=1` `hitCount=78`),
+**3 real search-adapter GET attempts** (PubMed `31452104[uid]` two GETs; Europe
+PMC `EXT_ID:31452104 AND SRC:MED` one GET — each 1/1 complete), and **2
+citation-adapter GETs** (MED `15019270` references 1/27 and citations 1/78, then
+stopped at `page_limit`, `complete=False`). These scope the tested
+**transport/adapter mechanisms only** — never literature/topic coverage. **No
+further public request is needed; no paid application-model call, upload, or
+live lead validation was made** in this run. Adapter-level live smoke remains
+**unrun**; the deterministic suites use scripted transports and make no network
+call.
 
-| Check | Result |
-| --- | --- |
-| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` | **2067 OK**, no skips |
-| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **20 OK** |
-| `python3 scripts/check_contract_docs.py --self-test` | **29 checks** |
-| `python3 -m unittest discover -s spikes/runtime/python -p 'test_*.py'` | **79 OK** |
-| `python3 -m unittest discover -s spikes/runtime/live-jev -p 'test_*.py'` | **51 OK** |
-| `python3 -m unittest discover -s spikes/runtime/integration -p 'test_*.py'` | **7 OK** |
-| `npm --prefix spikes/runtime/typescript test` | **58 OK** |
-| `(cd spikes/runtime/typescript && npx tsc --noEmit)` | pass |
-| `python3 -m compileall -q src tests` | pass |
-| `git diff --check` | pass |
+### 5.4 Not run / not claimed
 
-**Total 2,282 tests.** Existing SQLite/subprocess/unclosed-file `ResourceWarning`s
-remain (disclosed, not failures). This run is at the **code HEAD `de179b4`**, i.e.
-**before** this documentation update, **not** at this handoff's own docs commit;
-the coordinator will prove the product source/tests are identical and run the final
-docs checks after cherry-pick. **No latest full-suite claim is made at the docs
-commit.**
+Python 3.11; adapter live smoke; any paid app/model call, upload, or live lead
+validation; the final frozen-HEAD full-suite run; the E1B/E2 cases (§8). **No
+CI is configured**, so no CI-green claim is made and the PR checks must be
+inspected at PR time.
 
-**Not run / not claimed:** Python 3.11; any adapter live smoke; any paid model call;
-any hosted transfer.
+## 6. Files, interfaces, migrations, compatibility
 
-**CI:** the repository has **0 configured GitHub workflows** and a prior PR with
-an **empty rollup**; **no CI-green claim** is made.
+- **Public interfaces** (library, unchanged by this doc task): the modules in
+  §3 plus the `discovery` CLI group
+  ([`cli/discovery.py`](../../../src/review_article_agent/cli/discovery.py),
+  [`cli/discovery_jobs.py`](../../../src/review_article_agent/cli/discovery_jobs.py),
+  [`cli/discovery_reports.py`](../../../src/review_article_agent/cli/discovery_reports.py)).
+- **Migrations:** **none beyond the existing schema 11.** Step 05 core stores its
+  typed context/candidate/coverage/freeze records as immutable **artifact
+  revisions** (existing schema-3 tables) and its jobs in the existing schema-4
+  job tables; the only Step 05 table is the schema-11 `discovery_search_run`
+  observation (additive; earlier migrations unchanged). See
+  [`docs/storage.md`](../../storage.md).
+- **Compatibility / backup rights.** Schema 11 is within the supported snapshot
+  range; manifest `format_version` stays 1. `verify_backup`/`restore_backup`
+  share the read-only schema-11 integrity sweep; a legacy schema-10 snapshot is
+  still restorable (upgraded by ordinary store open). Older software refuses a
+  newer schema — back up before upgrading, no downgrade path. Restore proves
+  storage integrity, **not** scientific validity or remote quiescence.
+- **CLI1B readbacks (integrated at `e15b5b4`).** `discovery report
+  create|show` and `discovery freeze propose|status|show|history|require`:
+  - `report create` needs exact `--corpus-artifact-id/--corpus-revision-id`,
+    `--plan-artifact-id/--plan-revision-id`, `--revision-id`, `--request-id`,
+    `--rights-file`, optional repeatable `--expansion-job-id` (resolved only from
+    a real completed expansion report), optional `--known-relevant-file` and
+    `--limitations-file`; it records one immutable coverage revision and claims
+    no completeness.
+  - `freeze propose` needs exact corpus/coverage refs, `--decision
+    freeze|search_again`, `--entry-reviews-file`, `--rationale`, `--request-id`,
+    `--revision-id`, `--rights-file`, optional `--accept-coverage-limitations
+    EXPLANATION`; returns the exact named-gate `approval_request` and `gate
+    prepare`/`gate confirm` guidance, records no approval.
+  - `freeze require` consults `require_frozen` on **both** paths; the default is a
+    **safe summary** (exact corpus ref, `included_count`, decision, active
+    approval) and `--content` (or the `--require-active` alias) is the explicit
+    opt-in for the private validated document + exact roster.
+- **Caller-supplied reviews.** Entry reviews are an **explicit caller
+  per-candidate review list** following the schema in
+  [`discovery/freeze.py`](../../../src/review_article_agent/discovery/freeze.py):
+  one review per pinned candidate — `candidate_id`, `checked_at`, `provenance`,
+  the four distinguished integrity statuses (`retraction`,
+  `expression_of_concern`, `correction`, `non_replication`), a `disposition`, and
+  a non-empty `rationale`. An `include` requires a resolved (non-conflict)
+  candidate with all four statuses **known** — `unknown` is **not** clean;
+  unresolved/conflict candidates need `exclude`/`defer`/`no_scientific_use`. A
+  freeze over any explicit coverage gap is refused unless the exact decision
+  passes a **literal `--accept-coverage-limitations` explanation** (a string, not
+  a `--yes` boolean).
+- **DOC2 correction.** `metadata_import` performs **zero HTTP** (a local,
+  caller-supplied observation); only `query`/`seed`/`expand` may issue real
+  public-metadata GETs. `docs/worker.md` is corrected accordingly.
+- **Hosted lead route.** The direct OpenRouter lead proposal is **live-capable
+  and implemented** but **unrun/not authorized** in this run; it is a narrow,
+  separate exception and the **existing app-owned OpenCode production block is
+  unchanged** ([decision 003](../../decisions/003-step05-discovery-and-direct-lead.md)).
 
-### 5.1 LIVE evidence distinction (webfetch observations, not adapter smoke)
+## 7. Stubs, limits, and open decisions
 
-On **2026-10-28** the coordinator used `webfetch` for **two tiny public contract
-observations only**:
+- **PubMed window:** `PUBMED_WINDOW_LIMIT = 9999` is a conservative explicit cap
+  (a retrieval needing to page past it is `page_limit`, never complete);
+  date-partitioned paging past the window is deferred.
+- **Rate spacing is per-instance and the transport is not thread-safe**; the
+  socket timeout is **inactivity, not a wall-clock deadline**.
+- **Source coverage is partial.** Query execution is PubMed + Europe PMC;
+  additional sources are provenance-preserving `metadata_import` observations
+  explicitly ratified in the plan, never automatic. **No abstract auto-fetch**:
+  PubMed parses bibliographic metadata only, Europe PMC uses `resultType=lite`.
+- **Freeze protects the approved roster only.** A later search records normally,
+  a **new** corpus/coverage artifact reconciles freely, and the **old frozen
+  roster is unchanged**; there is **no automatic "latest"** following, and a
+  superseded freeze is preserved as honest history. A stale freeze is never
+  reported active.
+- **Costs/terms are human-reviewed.** Model/provider terms, context pricing, and
+  hosted-science approval are **not** machine-decided; an unknown reserve/cost
+  stays `unknown` (never `0`) and is retained under the shared caps.
+- **No scientific claim:** no study identity, eligibility, primary-support,
+  evidence-extraction, coverage-completeness, review, or review-writer promise.
+- **Open decisions:** complementary-source ratification per project; scientific
+  candidate identity beyond exact-identifier grouping; date-partitioned paging.
 
-- PubMed ESearch `term=31452104[uid]&retmax=1` returned `count=1` and one id.
-- Europe PMC query `EXT_ID:31452104 AND SRC:MED`, `pageSize=1`,
-  `resultType=lite` returned `version 6.9`, `hitCount=1`, one metadata record, and
-  **no** `nextCursorMark`.
+## 8. Next actions and commits (scoped; not done here)
 
-These are **live WEBFETCH observations**, **not** production adapter smoke — the
-adapters were **not** live-tested. The NCBI API index
-(`https://www.ncbi.nlm.nih.gov/home/develop/api/`) was fetched; the detailed
-`NBK25499`/`NBK25497` pages were **challenge-blocked**. The Europe PMC REST docs
-(`https://europepmc.org/RestfulWebService`) were fetched. T3 researched Solr
-terminal-cursor guidance — **not** proof of the complete Europe PMC contract. **No
-new public API request is authorized or needed for this task.**
+1. **E1B** — three adversarial acceptance cases (in progress; do not claim done).
+2. **E2** — full CLI-chain acceptance case (in progress; do not claim done).
+3. **Final frozen-HEAD full-suite run** on the frozen base, and **PR checks**
+   inspection (no CI is configured).
+4. **User review and merge**; the coordinator owns the PR and the README
+   checkbox (which **stays unchecked until 1–3 pass**).
+5. **Step 06** (full-text acquisition, imports, reconciliation) is **not
+   implemented**.
 
-## 6. Stubs, limitations, and open decisions
-
-- No discovery CLI, worker scheduling, approval gate, or search-plan approval is
-  built.
-- The storage schema advances additively to **11** with the inert observation
-  table (§8). It stores exact provider observations for a caller-supplied request
-  key; it is **not** a scientific candidate store and performs **no**
-  deduplication.
-- Metadata is an **untrusted observation**; there is no accepted context,
-  eligibility, scientific identity, deduplication decision, coverage claim, or
-  corpus freeze.
-- Open decisions remain: date-partitioned PubMed paging past the window;
-  complementary-source ratification; scientific candidate identity and cross-run
-  ingestion/dedup; citation expansion; coverage reporting; corpus freeze; project
-  cost/work reporting.
-
-## 7. Commits, changed files, and next actions
-
-- **Historic adapter slice base:** `de179b4` (integrated adapter dependencies);
-  its handoff commit history is preserved in Git.
-- **Added durable-observation slice base:** `25827dd` (T1/T2 integrated; source
-  equivalent `7896af8`), which is this updated handoff branch's starting HEAD.
-- **This documentation-only update** (`task/step05-records-handoff`) changes only
-  the allowlisted docs — **no source, test, config, contract, schema, baseline,
-  step-criteria, or policy edit**:
-  - `docs/implementation/handoffs/05-discovery.md` — this handoff: preserves the
-    historic adapter evidence and adds the distinct §8 durable-slice account;
-  - `docs/discovery.md` — adds the codec/repository API and durable-observation
-    limits while preserving the adapter reference;
-  - `docs/storage.md` — documents additive schema 11, the shared backup/restore
-    integrity sweep, and legacy compatibility;
-  - `docs/implementation/README.md` — keeps Step 05 **unchecked** and updates its
-    partial description to include the inert observation slice;
-  - `README.md` — updates the partial Step 05 summary without claiming a workflow
-    or completion.
-- **Next actions:** review and merge are the user's. Remaining Step 05 work
-  (D1, D3 candidate identity/reconciliation/citation expansion/coverage/freeze,
-  D4 project cost/work reporting, AC1/AC2/AC5/AC6, complementary-source
-  ratification, and cross-run scientific candidate ingestion/dedup) is **not
-  started** and needs its own bounded session(s). No comprehensive Step 05 claim
-  is made.
-
-## 8. Added partial slice — durable inert search observations (T3)
-
-This section is **new** and distinct from the historic adapter evidence above. It
-records what `25827dd` actually implements; it does not revise the adapter claims
-or tick Step 05.
-
-### 8.1 Lossless versioned codec (`discovery/serialization.py`)
-
-`encode_search_result(result) -> bytes` emits canonical (sorted-key, compact,
-UTF-8) JSON carrying an envelope with exactly `format`
-`review_article_agent.discovery.search_result`, `format_version` **1**,
-`result_type` (`search_result` or `pubmed_search_result`), and `result`.
-`decode_search_result(data) -> SearchResult` rebuilds the exact concrete class
-through the real dataclass constructors, so existing invariants still apply.
-
-- **Type preservation.** The exact `SearchResult` or `PubMedSearchResult` subtype
-  is preserved, as is the `int` vs `float` distinction of
-  `retry_after_seconds`; arrays become tuples; frozen values stay frozen.
-- **Lossless observation.** Exact query/source strings, UTC timestamps, requested
-  URLs, counts, page order, overlapping and duplicate records, missing
-  (`None`) identifiers, explicit stop/failure states, every attempt, and PubMed
-  `query_translation` all survive a round trip. Nothing is re-fetched,
-  re-parsed, deduplicated, or fabricated.
-- **Strict decode.** It refuses invalid UTF-8, malformed or over-deep JSON,
-  duplicate object keys, non-finite/overflowing numbers (including `1e999`),
-  unknown/missing fields at every level, unknown format/version/type, wrong JSON
-  types (including `bool` for `int`), lone Unicode surrogates, and values that
-  violate the dataclass contracts. Errors are static and value-free: they never
-  echo query, URL, title, identifier, or payload text.
-- **Technical 512 MiB cap.** `MAX_SEARCH_RESULT_BYTES` is **536,870,912 bytes
-  (512 MiB)**. It is checked before decode parsing and after encode. Crossing it
-  is an explicit `DiscoverySerializationError` refusal — never silent truncation,
-  a dropped page, or a re-fetch to fit. This is a resource bound derived from the
-  adapters' documented envelopes (20,000 PubMed records; up to 1,000,000 Europe
-  PMC lite records), **not** a scientific threshold and **not** a completeness
-  claim. The envelope retains both the page arrays and the aggregate
-  `result.records`/`result.attempts` fields (so a stored aggregate can be checked
-  against its pages), therefore duplicated aggregate content **counts toward the
-  same 512 MiB cap** in addition to the per-page copies.
-
-### 8.2 Additive schema 11 and public repository API
-
-Store migration 11 adds exactly one immutable table,
-`discovery_search_run`, via `storage/schema.py::_store_v11`. Earlier migrations
-are not rewritten. The table has `PRIMARY KEY (project_id, run_id)`,
-`UNIQUE (project_id, request_id)`, a project foreign key, `UPDATE`/`DELETE`
-abort triggers, and CHECK constraints for representation version 1, result type,
-non-negative counts, and `complete ∈ {0,1}`. The canonical result bytes are the
-truth; projected source/query/time/count/failure columns are re-derived from
-them on every read.
-
-Public API in `storage/discovery.py`:
-
-```python
-DiscoveryRepository(store)                        # bound to one ProjectStore
-repo.project_id                                   # store's actual project id
-repo.record_search(*, request_id: str, result: SearchResult) -> DiscoverySearchRecord
-repo.get_search(run_id: str) -> DiscoverySearchRecord | None
-repo.list_searches() -> list[DiscoverySearchRecord]   # deterministic insertion order
-repo.verify_all_integrity() -> list[str]          # static problems; empty = intact
-discovery_integrity_problems(conn, project_id) -> list[str]  # read-only backup hook
-```
-
-`DiscoverySearchRecord` exposes `project_id`, `run_id`, `request_id`,
-`schema_version` (representation version, currently 1), `recorded_at_utc`,
-`result_type`, `source`, `query`, `started_at`, `completed_at`, `stop_reason`,
-`total_count`, `complete`, `failure`, `page_count`, `record_count`,
-`attempt_count`, `result_sha256`, `result_bytes`, `canonical`,
-`binding_sha256`, `binding_bytes`, `binding`, and the decoded `result`.
-
-- **Deterministic project-local identity.** `run_id` is
-  `"dsr_" + sha256(canonical_json([project_id, request_id]))[:32]`, derived by the
-  repository, never supplied by the caller. `request_id` is bounded to 512
-  characters and must satisfy the existing identifier contract; a lone surrogate
-  is refused before any SQL.
-- **Atomic record.** Inputs are canonicalised and round-trip checked before the
-  transaction; insertion and immediate re-read happen in one `BEGIN IMMEDIATE`
-  transaction. An induced failure writes no row, and concurrent same-key inserts
-  yield one row.
-- **Static errors.** `DiscoverySearchValidationError` (malformed/mutated/
-  unsupported input), `DiscoverySearchConflictError` (divergent replay),
-  `DiscoverySearchCorruptionError` (stored row fails digest/projection/binding/
-  canonical revalidation), all under `DiscoverySearchError(StoreError)`.
-  Messages never echo queries, sources, URLs, titles, identifiers, payload bytes,
-  or digests.
-- **SQLite projection bounds.** The projected non-negative `total_count` must fit
-  signed 64-bit SQLite `INTEGER`; a larger value is refused before insertion with
-  a static validation error and no row. Page/record/attempt/byte counts are
-  checked too. Values are never truncated, coerced, or stored as floats.
-
-### 8.3 Replay semantics — observation replay, not scientific dedup
-
-- Identical `record_search(request_id=K, result=R)` replay returns the exact
-  historical row, including its original `recorded_at_utc`, digest, binding, and
-  canonical bytes — also after closing and reopening the store. It does **not**
-  create a second row.
-- A **different** result under the same project/request key raises
-  `DiscoverySearchConflictError` and never overwrites the historical row.
-- **Different request keys are separate observations** even when the payload is
-  byte-identical (two rows, two run ids, same digest). This is not scientific
-  deduplication. Conversely, a fresh `search()` call is **not** replay: it
-  re-issues provider requests and returns a fresh observation; only passing that
-  value to `record_search` with the same key replays the stored row.
-- Every read revalidates the request key/run id, timestamps, canonical size and
-  digest, binding, result type, source/query/time/count/failure projections,
-  `complete`, and full canonical round-trip. A tampered projection, matching-but-
-  forged payload, non-canonical blob, foreign project row, or changed timestamp
-  is corruption, not a trusted value. Integrity hashes detect accidental or
-  deliberate **corruption only**; they are not authenticity signatures.
-
-### 8.4 Lossless source observations and scope
-
-The recorded value preserves PubMed title/year/DOI/PMCID metadata and
-`query_translation`, and Europe PMC native `source:id` identity plus every page's
-provider URL/timestamp. Missing IDs stay `None`, overlapping/duplicate records
-stay in order, and partial failures keep earlier successful pages plus the failed
-page's attempts. The repository never merges, maps, scores, or drops a provider
-record.
-
-**Explicitly absent:** network/transport/provider execution, CLI, worker
-scheduling, approved seed context, search-plan approval, scientific identity,
-candidate deduplication, citation expansion, coverage reporting, corpus freeze,
-and project cost/work reporting. A recorded row is private, untrusted provenance:
-it may contain exact queries, source URLs, titles, and provider identifiers; it is
-not a secret scanner and its hashes do not prove authenticity.
-
-### 8.5 Backup, restore, and compatibility
-
-Schema 11 is within the supported snapshot range **3..11**; manifest
-`format_version` stays **1**. `verify_backup`/`restore_backup` run the shared
-read-only `discovery_integrity_problems` sweep at schema 11, revalidating every
-canonical/digest/binding/projection/run identity. Rewriting the outer manifest
-database hash does **not** bypass this inner validation. Restore validates fully
-before creating anything, stages the snapshot, registers last, and preserves the
-observation bytes, timestamps, and projections exactly.
-
-A schema-10 (legacy) snapshot without the table remains verifiable and restorable;
-the ordinary `ProjectStore` open on first use upgrades it to schema 11 and adds
-only the empty table. **Older software refuses a newer schema**, so back up before
-upgrading and do not expect a downgrade path. Restore proves storage integrity,
-not scientific validity or remote quiescence.
-
-### 8.6 Verification of this added slice
-
-Targeted checks at code HEAD `25827dd`, before docs edits:
-
-| Command | Result |
-| --- | --- |
-| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_discovery_*.py'` | **252 OK** |
-| `python3 scripts/check_contract_docs.py --self-test` | **29 checks ok, 0 failed** |
-| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **20 OK** |
-| `git diff --check` | clean |
-
-Confirmed **full frozen combined suite** at the same code HEAD `25827dd`
-(log `/tmp/opencode/search-records-combined.log`, read to verify), **ALL CHECKS
-PASSED**:
-
-| Check | Result |
-| --- | --- |
-| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` | **2,142 OK in 239.488 s**, no skips |
-| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **20 OK** |
-| `python3 scripts/check_contract_docs.py --self-test` | **29 checks ok, 0 failed** |
-| `python3 -m unittest discover -s spikes/runtime/python -p 'test_*.py'` | **79 OK** |
-| `python3 -m unittest discover -s spikes/runtime/live-jev -p 'test_*.py'` | **51 OK** (mocked; no paid/provider call) |
-| `python3 -m unittest discover -s spikes/runtime/integration -p 'test_*.py'` | **7 OK** |
-| `npm --prefix spikes/runtime/typescript test` | **58 OK**, 0 skipped |
-| `(cd spikes/runtime/typescript && npx tsc --noEmit)` | pass |
-| `python3 -m compileall -q src tests` | pass |
-| `git diff --check` | pass |
-
-**Total 2,357 tests.** Python **3.14.4** was used; **3.11 remains untested**.
-Existing SQLite/subprocess/unclosed-file `ResourceWarning`s are disclosed, not
-failures. No paid/provider/live adapter call or hosted transfer was made. This
-run is at **code HEAD `25827dd`, before this documentation update**, **not** at
-this handoff's own docs commit; **no full-suite claim is made at the final docs
-commit**. The historic adapter total remains **2,282 at `de179b4` / `6e20946`**
-and is not conflated with this 2,357-test combined run.
+Evidence log paths: frozen checkpoint `/tmp/opencode/step05-pre-final-checks.log`;
+historical `/tmp/opencode/search-records-combined.log`,
+`/tmp/opencode/step05-combined-all-checks.log`. Key commits: base `e15b5b4`;
+CLI1B `9085241`/`e15b5b4`; E1 `a7d1cd9`/`752d359` (source `3eccfeb`/`f2a3ad2`);
+E0 `a6d21fb`; frozen checkpoint `6ec58ea`. No secrets, licensed full text, or
+raw provider payloads are included here.
