@@ -29,17 +29,22 @@ Safety model
 * Paths are relative, ``/``-separated, with no empty, ``.`` or ``..``
   components, no control characters, surrogates or backslashes, and no
   ``.git`` component.  Duplicate paths are rejected.
-* The root and every path component are opened relative to an already-open
-  directory descriptor with ``O_NOFOLLOW`` (and ``O_DIRECTORY`` for
-  directories), so symlinks at the root, in any component or at the final name
-  are refused.  The final file is opened ``O_NONBLOCK`` (a FIFO cannot hang the
+* The root is opened by walking its own components (from ``/`` for absolute
+  roots, from the current directory for relative ones) and every entry path
+  component is opened relative to an already-open directory descriptor, all
+  with ``O_NOFOLLOW`` (and ``O_DIRECTORY`` for directories).  Symlinks anywhere
+  in the root chain, in any component or at the final name are refused, as is
+  ``..`` in the root.  Consequence: a root under a symlinked ancestor (for
+  example a symlinked ``/tmp``) is refused; pass a real path.  The current
+  directory itself is trusted for relative roots.  The final file is opened ``O_NONBLOCK`` (a FIFO cannot hang the
   open) and must then be a regular file by ``fstat``.
 * Per-file size is capped (32 MiB) and the batch total is capped (default
   64 MiB, hard ceiling 256 MiB); over-limit input is refused, never truncated.
 * ``fstat`` before and after reading must agree (size, mtime, inode, device)
   and the byte count must match, otherwise the file is reported as changed.
-* Hard links to regular files owned by the same user are accepted (they are
-  indistinguishable from the file itself).
+* Accessible regular files are accepted regardless of link count or owner:
+  hard links are indistinguishable from the file itself and no ownership
+  check is made.
 
 Limitations: this is not a sandbox.  Descriptor anchoring only prevents
 symlink/path swaps from redirecting a read outside the root; a process running
@@ -164,6 +169,41 @@ def _signature(st: os.stat_result) -> tuple[int, int, int, int]:
     return (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
 
 
+def _open_root(root_path: str) -> int:
+    """Open ``root_path`` component by component without following symlinks.
+
+    Absolute roots are walked from ``/``, relative roots from the current
+    directory (which is itself trusted as-is).  ``..`` is refused.  Every
+    intermediate descriptor is closed; the returned descriptor is the caller's.
+    """
+
+    if not isinstance(root_path, str) or not root_path or "\x00" in root_path:
+        raise FolderInputError("invalid_arguments")
+    try:
+        root_path.encode("utf-8")
+    except UnicodeEncodeError:
+        raise FolderInputError("invalid_arguments") from None
+    parts = [p for p in root_path.split("/") if p not in ("", ".")]
+    if ".." in parts:
+        raise FolderInputError("root_unavailable")
+    try:
+        current = os.open("/" if root_path.startswith("/") else ".", _DIR_FLAGS)
+    except OSError:
+        raise FolderInputError("root_unavailable") from None
+    try:
+        for part in parts:
+            try:
+                nxt = os.open(part, _DIR_FLAGS, dir_fd=current)
+            except OSError:
+                raise FolderInputError("root_unavailable") from None
+            os.close(current)
+            current = nxt
+    except BaseException:
+        os.close(current)
+        raise
+    return current
+
+
 def _read_one(root_fd: int, parts: tuple[str, ...], budget: int) -> bytes:
     opened: list[int] = []
     try:
@@ -232,12 +272,7 @@ def read_folder_batch(
         raise FolderInputError("invalid_arguments") from None
     if isinstance(root_path, bytes):
         root_path = os.fsdecode(root_path)
-    if not root_path or "\x00" in root_path:
-        raise FolderInputError("invalid_arguments")
-    try:
-        root_fd = os.open(root_path, _DIR_FLAGS)
-    except OSError:
-        raise FolderInputError("root_unavailable") from None
+    root_fd = _open_root(root_path)
     results: list[dict[str, Any]] = []
     try:
         remaining = max_total_bytes

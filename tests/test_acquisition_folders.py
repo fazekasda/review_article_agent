@@ -158,6 +158,54 @@ class FolderBatchTests(unittest.TestCase):
             read_folder_batch(link, [{"relative_path": "a.txt"}])
         self.assertEqual(cm.exception.code, "root_unavailable")
 
+    def root_code(self, root) -> str:
+        with self.assertRaises(FolderInputError) as cm:
+            read_folder_batch(root, [{"relative_path": "a.txt"}])
+        return cm.exception.code
+
+    def test_ancestor_symlink_in_root_chain_rejected(self) -> None:
+        (self.outside / "sub").mkdir()
+        (self.outside / "sub" / "a.txt").write_bytes(b"leak")
+        link = Path(self._tmp.name) / "ancestor"
+        os.symlink(self.outside, link)
+        self.assertEqual(self.root_code(link / "sub"), "root_unavailable")
+        self.assertEqual(self.root_code(str(link) + "/./sub/"), "root_unavailable")
+
+    def test_dotdot_and_bad_root_values_static_errors(self) -> None:
+        self.assertEqual(self.root_code(str(self.root) + "/../root"), "root_unavailable")
+        for bad in ("", "a\x00b", "bad\udcffroot"):
+            with self.subTest(bad=bad):
+                self.assertIn(
+                    self.root_code(bad), ("invalid_arguments", "root_unavailable")
+                )
+        with self.assertRaises(FolderInputError) as cm:
+            read_folder_batch(123, [])
+        self.assertEqual(cm.exception.code, "invalid_arguments")
+
+    def test_absolute_relative_and_bytes_roots_work(self) -> None:
+        self.write("nest/a.txt", b"A")
+        e = [{"relative_path": "a.txt"}]
+        real = os.path.realpath(self.root / "nest")
+        self.assertEqual(read_folder_batch(real, e)[0]["content"], b"A")
+        self.assertEqual(read_folder_batch(real + "/", e)[0]["content"], b"A")
+        self.assertEqual(read_folder_batch(os.fsencode(real), e)[0]["content"], b"A")
+        old = os.getcwd()
+        os.chdir(os.path.realpath(self.root))
+        try:
+            self.assertEqual(read_folder_batch("nest", e)[0]["content"], b"A")
+            self.assertEqual(read_folder_batch("./nest", e)[0]["content"], b"A")
+        finally:
+            os.chdir(old)
+
+    def test_root_failures_leak_no_descriptors(self) -> None:
+        link = Path(self._tmp.name) / "ancestor"
+        os.symlink(self.outside, link)
+        before = set(os.listdir("/proc/self/fd"))
+        for bad in (link / "x", self.root / "missing" / "deeper", str(self.root) + "/.."):
+            self.root_code(bad)
+        read_folder_batch(os.path.realpath(self.root), [])
+        self.assertEqual(before, set(os.listdir("/proc/self/fd")))
+
     def test_missing_root(self) -> None:
         with self.assertRaises(FolderInputError) as cm:
             read_folder_batch(self.root / "nope", [])
