@@ -33,7 +33,7 @@ from review_article_agent.drafting.schema import (  # noqa: E402
     draft_example,
     drafting_example_package,
 )
-from review_article_agent.review.schema import ROUND_LIMITS  # noqa: E402
+from review_article_agent.review.schema import ROUND_LIMITS, fact_check  # noqa: E402
 from review_article_agent.review.workflow import (  # noqa: E402
     SectionReviewError,
     SectionReviewRepository,
@@ -397,6 +397,31 @@ class ModelIdentityTests(ReviewBase):
                 writer=FakeWriter(),
                 rights=self.rights,
             )
+
+
+class InjectedFactCheckerTests(ReviewBase):
+    def test_injected_fact_checker_is_actually_called(self):
+        draft, package = _clean_draft()
+        calls = {"n": 0}
+
+        def counting_fact_checker(current_draft, current_package):
+            calls["n"] += 1
+            return fact_check(current_draft, current_package)
+
+        state = self.repo.run(
+            "review-fc-port",
+            draft=draft,
+            package=package,
+            writer_model=_WRITER,
+            critic_model=_CRITIC,
+            critic=FakeCritic([]),
+            writer=FakeWriter(),
+            fact_checker=counting_fact_checker,
+            rights=self.rights,
+        )
+
+        self.assertGreaterEqual(calls["n"], 1)
+        self.assertEqual(state["status"], "complete")
 
 
 if __name__ == "__main__":

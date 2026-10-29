@@ -448,7 +448,7 @@ class SectionReviewRepository:
     ):
         """Run (or resume) one durable section review; return the final state."""
         self._require_models(critic_model, writer_model)
-        fact_checker = fact_check or fact_checker
+        fact_checker = fact_checker or fact_check
         self._rights = rights
         artifact_id = validate_identifier(review_id, "review_id")
 
