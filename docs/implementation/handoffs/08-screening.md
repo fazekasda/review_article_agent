@@ -31,7 +31,10 @@ sampling policy. Builds on Step 07's partial XML parser. Step 08 remains unticke
   `screening show --historical`. A historical read verifies the stored target
   bytes/envelope, the exact declared dependency refs, and bounded transitive
   dependency content integrity (a report pins its parsing report, which pins the
-  exact source bytes), but it does **not** rerun the current model/parser/config/gates
+  exact source bytes). The walk is iterative and cycle-safe, prunes no depth, and
+  is bounded only by a unique-revision count (the `MAX_GATE_SNAPSHOT_ENTRIES`
+  convention, enforced at discovery): exceeding it raises rather than silently
+  checking a partial closure. It does **not** rerun the current model/parser/config/gates
   (an old algorithm may no longer exist). Its output is marked stored evidence only —
   never current validation, scientific, or eligibility authority. Default `show`
   stays summary-only, and `propose`/`exclusions` expose no historical option, so stale
@@ -68,12 +71,13 @@ Python 3, stdlib only. Executed:
 PYTHONPATH=src:tests python3 -m unittest test_screening test_parsing_core test_parsing_repository test_cli_parsing test_human_approvals
 ```
 
-**103 passed** (`test_screening` now has 22 tests; 5 new historical-inspection
+**105 passed** (`test_screening` now has 24 tests; 7 new historical-inspection
 tests), synthetic sources and simulated terminal confirmation only. Covers
 authentic named gates, acquisition rejection, restart, stale config/source, audit
 replay/coverage, pilot failures, false-exclusion pause, summary-only CLI reads,
 pilot model-string pinning, and explicit historical reads (after iteration and
-after config/source change, rejected on tampered target/dependency bytes, and
+after config/source change, rejected on tampered target/dependency bytes,
+deeper-than-any-depth-prune corruption, an over-bound graph failing closed, and
 unable to authorize stale work). No full-suite run, network calls, costs, or
 scientific validation.
 

@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from test_acquisition_manifest import ManifestBase
+from test_acquisition_manifest import ManifestBase, _jats
 from review_article_agent.parsing import ParsingRepository
 from review_article_agent.acquisition.manifest import ManifestNotAcquiredError
 from review_article_agent.cli.screening import dispatch_screening
@@ -13,6 +13,7 @@ from review_article_agent.domain.errors import StoreError
 from review_article_agent.parsing.core import NORMALIZATION_VERSION, PARSER_VERSION
 from review_article_agent.runtime.jev import MODEL
 from review_article_agent.screening import ScreeningError, ScreeningRepository
+from review_article_agent.screening import workflow
 from review_article_agent.screening.workflow import classify, questions
 from review_article_agent.storage.store import ProjectStore
 
@@ -363,6 +364,55 @@ class WorkflowTests(ManifestBase):
         self._tamper_revision_content(self.source, b"tampered")
         with self.assertRaises(ScreeningError):
             self.screening.read(self.pilot, "pilot", historical=True)
+
+    def _put_linked_doc(self, artifact_id, revision_id, data, *, dependency_ref=None):
+        self.artifacts.create_artifact(artifact_id, kind="document")
+        self.artifacts.import_revision(
+            artifact_id=artifact_id, revision_id=revision_id, content=data,
+            origin_locator="import:synthetic-exchange",
+            rights=self.rights(artifact_id, revision_id),
+            dependencies=[] if dependency_ref is None else [dependency_ref],
+        )
+        return self.ref(artifact_id, revision_id)
+
+    def test_historical_read_checks_dependencies_deeper_than_old_depth_prune(self):
+        # A reachable chain deeper than the old depth-8 prune. Corrupting its far
+        # end must be rejected, not silently skipped as unchecked.
+        links = 10
+        refs = []
+        prev = None
+        for index in range(links + 1):
+            aid = "chain-%d" % index
+            rid = "chain-%d-r1" % index
+            # The report source must be parseable; the deeper links carry opaque bytes.
+            data = _jats(str(index)) if index == links else b"chain node %d" % index
+            ref = self._put_linked_doc(aid, rid, data, dependency_ref=prev)
+            refs.append(ref)
+            prev = ref
+        report = ParsingRepository(self.store).parse_stored_document(
+            refs[-1], report_artifact_id="deep-report", report_revision_id="deep-report-r1",
+            rights=self.rights("deep-report", "deep-report-r1"))["report_ref"]
+        cfg = self.put("config", config(), artifact="deep-config", revision="deep-config-r1")
+        case = {"id": "p1", "report_ref": report, "passage_id": None, "response": response(0.1)}
+        pilot = self.put("pilot", {"config_ref": cfg, "cases": [case],
+                         "adjudications": {"p1": {"label": "exclude", "inspected_source": True,
+                          "important_failure": False, "rationale": "Checked source",
+                          "corrective_action": None}}},
+                         artifact="deep-pilot", revision="deep-pilot-r1")
+        # Intact deep history reads: the walk is not depth-pruned.
+        self.screening.read(pilot, "pilot", historical=True)
+        # Corrupt the deepest link (well beyond the former depth 8) and reject.
+        self._tamper_revision_content(refs[0], b"corrupt")
+        with self.assertRaises(ScreeningError):
+            self.screening.read(pilot, "pilot", historical=True)
+
+    def test_historical_read_bound_exceeded_fails_closed(self):
+        # Exceeding the unique-revision bound raises; never a partial integrity pass.
+        self.approve_ref(self.pilot, "pilot", "screening.pilot")
+        batch = self.put("batch", self.batch_input())
+        with mock.patch.object(workflow, "_HISTORICAL_MAX_REVISIONS", 1):
+            with self.assertRaises(ScreeningError):
+                self.screening.read(batch, "batch", historical=True)
 
 
 if __name__ == "__main__":

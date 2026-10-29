@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import deque
 from decimal import Decimal, InvalidOperation
 
 from ..acquisition.manifest import AcquisitionRepository
@@ -16,6 +17,7 @@ from ..domain.errors import ReviewAgentError
 from ..domain.records import canonical_json, validate_ref
 from ..parsing.core import NORMALIZATION_VERSION, PARSER_VERSION
 from ..parsing.repository import ParsingRepository, _NestedStore
+from ..runtime.gates import MAX_GATE_SNAPSHOT_ENTRIES
 from ..runtime.jev import MODEL, SAFE_MAX_REQUEST_BYTES, JevError, QuestionDef, build_request, validate_response
 from ..storage.artifacts import ArtifactRepository, DependencyRef, sha256_digest
 from ..storage.human_approvals import HumanApprovalRepository
@@ -33,11 +35,12 @@ HISTORICAL_NOTICE = ("Stored historical evidence only. Not revalidated against t
                      "current model, parser, config, or gates, and not scientific or "
                      "eligibility authority. Inspect; do not authorize work from it.")
 
-#: Bound the transitive dependency content-integrity walk of a historical read:
-#: depth and total revisions visited. The graph is a DAG for real data, but the
-#: bounds keep a corrupt/cyclic store from causing unbounded work.
-_HISTORICAL_MAX_DEPTH = 8
-_HISTORICAL_MAX_REVISIONS = 256
+#: Bound the transitive dependency content-integrity walk of a historical read
+#: by the number of *unique* revisions visited, reusing the gate-snapshot
+#: convention. It is enforced while discovering/enqueuing unique nodes, so
+#: exceeding it raises; there is no depth pruning that could silently leave
+#: deeper pinned bytes unverified.
+_HISTORICAL_MAX_REVISIONS = MAX_GATE_SNAPSHOT_ENTRIES
 
 
 def require(condition):
@@ -162,32 +165,41 @@ class ScreeningRepository:
         require(sha256_digest(data) == rev.content_sha256 and len(data) == rev.byte_size)
 
     def _verify_historical_dependencies(self, direct):
-        """Bounded transitive content integrity for declared dependencies.
+        """Bounded, fail-closed transitive content integrity for dependencies.
 
-        Historical inspection must not rely on stale data, so every declared
-        dependency revision must still exist with bytes matching its recorded
-        hash and size. The walk follows only the stored dependency edges (for
-        example a screening report pins its parsing report, which pins the exact
-        source bytes), up to a fixed depth/revision bound. It never re-derives
-        or re-classifies the old payload.
+        Historical inspection must not rely on stale data, so every revision
+        reachable from the declared dependencies must still exist with bytes
+        matching its recorded hash and size. The walk is iterative and
+        cycle-safe (a ``seen`` set), follows only the stored dependency edges
+        (for example a screening report pins its parsing report, which pins the
+        exact source bytes), and skips ``version_of`` ancestry exactly as the
+        current read does. It never re-derives or re-classifies the old payload.
+
+        The unique-revision bound is enforced at discovery/enqueue time: a graph
+        exceeding it raises rather than silently verifying only a partial
+        closure. There is no depth pruning, so deep-but-legitimate histories are
+        fully checked.
         """
         seen = set()
-        stack = [(self._ref(ref), 0) for ref in direct]
-        while stack:
-            ref, depth = stack.pop()
-            key = (ref["artifact_id"], ref["revision_id"])
-            if key in seen:
-                continue
-            require(len(seen) < _HISTORICAL_MAX_REVISIONS)
-            seen.add(key)
-            self._verify_revision_bytes(ref["artifact_id"], ref["revision_id"])
-            if depth >= _HISTORICAL_MAX_DEPTH:
-                continue
-            for dep in self.artifacts.list_dependencies(ref["artifact_id"], ref["revision_id"]):
-                if dep.role != "version_of":
-                    stack.append(({"project_id": dep.project_id,
-                                   "artifact_id": dep.artifact_id,
-                                   "revision_id": dep.revision_id}, depth + 1))
+        queue = deque()
+        for ref in direct:
+            key = self._ref(ref)
+            node = (key["artifact_id"], key["revision_id"])
+            if node not in seen:
+                seen.add(node)
+                require(len(seen) <= _HISTORICAL_MAX_REVISIONS)
+                queue.append(node)
+        while queue:
+            artifact_id, revision_id = queue.popleft()
+            self._verify_revision_bytes(artifact_id, revision_id)
+            for dep in self.artifacts.list_dependencies(artifact_id, revision_id):
+                if dep.role == "version_of":
+                    continue
+                node = (dep.artifact_id, dep.revision_id)
+                if node not in seen:
+                    seen.add(node)
+                    require(len(seen) <= _HISTORICAL_MAX_REVISIONS)
+                    queue.append(node)
 
     @staticmethod
     def _dependencies(payload):
