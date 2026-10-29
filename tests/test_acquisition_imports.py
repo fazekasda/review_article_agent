@@ -190,13 +190,87 @@ class NewAndDuplicateTest(Base):
                            src_rights=rights(self.pid, "doc-a", "src-2", rights_id="R-src-2"))
         self.assertEqual(len(self.artifacts.list_revisions("doc-a")), 1)
 
-    def test_same_bytes_in_different_artifacts_not_merged(self) -> None:
-        a = self.do_import("req-1", artifact="doc-a", revision="a-1")
-        b = self.do_import("req-2", artifact="doc-b", revision="b-1")
-        self.assertEqual(a["disposition"], "created_new_revision")
-        self.assertEqual(b["disposition"], "created_new_revision")
-        self.assertEqual(a["sha256"], b["sha256"])
-        self.assertNotEqual(a["source_ref"], b["source_ref"])
+    def test_identical_bytes_in_different_artifact_is_vetoed(self) -> None:
+        """C01 §6.1 R1: exact bytes under a *different* artifact must not create a
+        second independent source revision or artifact."""
+        first = self.do_import("req-1", artifact="doc-a", revision="a-1")
+        self.assertEqual(first["disposition"], "created_new_revision")
+        before = {
+            t: self.count(t)
+            for t in ("artifact", "revision", "rights_record", "dependency")
+        }
+        with self.assertRaises(AssetImportConflictError) as caught:
+            self.do_import("req-2", artifact="doc-b", revision="b-1")
+        self.assertEqual(caught.exception.code, "cross_artifact_duplicate")
+        # safe, immutable match refs point at the existing canonical revision
+        refs = caught.exception.matching_refs
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0].artifact_id, "doc-a")
+        self.assertEqual(refs[0].revision_id, first["source_ref"]["revision_id"])
+        self.assertEqual(refs[0].content_hash, first["sha256"])
+        self.assertEqual(refs[0].byte_size, first["byte_size"])
+        self.assertTrue(caught.exception.guidance)
+        # zero writes: no second artifact/revision/rights/occurrence row
+        for table, expected in before.items():
+            self.assertEqual(self.count(table), expected, table)
+        self.assertIsNone(self.artifacts.get_artifact("doc-b"))
+        self.assertIsNone(self.imports.find_request("req-2"))
+
+    def test_canonical_explicit_retry_after_veto_reuses_one_source(self) -> None:
+        first = self.do_import("req-1", artifact="doc-a", revision="a-1")
+        with self.assertRaises(AssetImportConflictError) as caught:
+            self.do_import("req-2", artifact="doc-b", revision="b-1")
+        self.assertEqual(caught.exception.code, "cross_artifact_duplicate")
+        # caller explicitly targets the canonical artifact -> one source, new occurrence
+        retry = self.do_import(
+            "req-3", artifact="doc-a", revision="a-2",
+            src_rights=rights(self.pid, "doc-a", "a-2", rights_id="R-a-2"),
+        )
+        self.assertEqual(retry["disposition"], "duplicate_bytes_of_existing_revision")
+        self.assertEqual(retry["source_ref"], first["source_ref"])
+        self.assertEqual(len(self.artifacts.list_revisions("doc-a")), 1)
+        self.assertIsNone(self.artifacts.get_artifact("doc-b"))
+
+    def test_preexisting_generic_duplicates_are_surfaced_not_rewritten(self) -> None:
+        """Legacy byte copies made through the generic store stay untouched; a new
+        import that collides is vetoed and shown *all* existing matches."""
+        for aid, rid in (("legacy-a", "la-1"), ("legacy-b", "lb-1")):
+            self.artifacts.create_artifact(aid, kind="document")
+            self.artifacts.import_revision(
+                artifact_id=aid, content=b"%PDF synthetic one",
+                origin_locator=f"file:///{aid}",
+                rights=rights(self.pid, aid, rid, rights_id=f"R-{rid}"),
+                revision_id=rid,
+            )
+        deps_before = self.count("dependency")
+        with self.assertRaises(AssetImportConflictError) as caught:
+            self.do_import("req-1", artifact="doc-c", revision="c-1")
+        self.assertEqual(caught.exception.code, "cross_artifact_duplicate")
+        self.assertEqual(
+            {r.artifact_id for r in caught.exception.matching_refs},
+            {"legacy-a", "legacy-b"},
+        )
+        # the pre-existing copies and links are untouched; nothing fabricated
+        self.assertEqual(self.count("dependency"), deps_before)
+        self.assertEqual(len(self.artifacts.list_revisions("legacy-a")), 1)
+        self.assertEqual(len(self.artifacts.list_revisions("legacy-b")), 1)
+        self.assertIsNone(self.artifacts.get_artifact("doc-c"))
+
+    def test_global_veto_and_same_artifact_reuse_survive_restart(self) -> None:
+        first = self.do_import("req-1", artifact="doc-a", revision="a-1")
+        self.reopen()
+        with self.assertRaises(AssetImportConflictError) as caught:
+            self.do_import("req-2", artifact="doc-b", revision="b-1")
+        self.assertEqual(caught.exception.code, "cross_artifact_duplicate")
+        self.assertEqual(caught.exception.matching_refs[0].artifact_id, "doc-a")
+        reuse = self.do_import(
+            "req-3", artifact="doc-a", revision="a-2",
+            src_rights=rights(self.pid, "doc-a", "a-2", rights_id="R-a-2"),
+        )
+        self.assertEqual(reuse["disposition"], "duplicate_bytes_of_existing_revision")
+        self.assertEqual(reuse["source_ref"], first["source_ref"])
+        self.assertEqual(len(self.artifacts.list_revisions("doc-a")), 1)
+        self.assertIsNone(self.artifacts.get_artifact("doc-b"))
 
     def test_alternate_bytes_are_versions_with_parent(self) -> None:
         self.do_import("req-1")

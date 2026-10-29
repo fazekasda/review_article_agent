@@ -20,11 +20,17 @@ What it guarantees
   record is an honest **proposal**: it authorizes no use and claims no
   scientific acceptance. Its own ``RightsRecord`` is supplied separately by the
   caller; this module never invents an unrestricted one.
-* **Exact-byte duplicates, same artifact only.** Equal bytes inside the *same*
-  explicit document artifact reuse the historical source revision (even from a
-  different origin) and record a new occurrence with the new origin, rights and
-  time. Equal bytes in a *different* artifact are never merged. Changed rights
-  that cannot authorize reuse of the exact existing source fail closed.
+* **Exact-byte duplicates are global (C01 §6.1 R1).** Equal bytes inside the
+  *same* explicit document artifact reuse the historical source revision (even
+  from a different origin) and record a new occurrence with the new origin,
+  rights and time. Equal bytes requested under a *different* document artifact
+  are vetoed atomically: the import raises a static ``cross_artifact_duplicate``
+  conflict carrying safe ``matching_refs`` and a guidance string, and writes no
+  second artifact, revision, rights record or occurrence. The caller must
+  explicitly target the canonical artifact (with rights bound to its exact
+  source revision) and retry, or record a ``no_full_text_acquired`` occurrence —
+  identity and rights are never inferred from bytes. Changed rights that cannot
+  authorize reuse of the exact existing source fail closed.
 * **Atomic.** Source revision, rights, artifact rows and occurrence are written in
   one outer ``BEGIN IMMEDIATE`` transaction; the repository's own inner writes
   run as SAVEPOINTs, so a failure leaves no orphan artifact or revision.
@@ -68,6 +74,11 @@ MAX_LOCATOR_CHARS = 2048
 MAX_REASON_CHARS = 1000
 MAX_DEPENDENCIES = 64
 MAX_RIGHTS_BYTES = 64 * 1024
+#: Technical bound on the number of same-hash/same-size candidate revisions the
+#: global exact-byte scan will byte-compare. Candidate rows are found by a
+#: metadata-only query; only this many are ever read as BLOBs. Exceeding it is an
+#: explicit diagnostic failure (never a silent truncation of the scan).
+MAX_BYTE_COLLISION_CANDIDATES = 256
 
 OCCURRENCE_DOCUMENT_TYPE = "acquisition_import_occurrence"
 OCCURRENCE_RECORD_VERSION = 1
@@ -85,6 +96,16 @@ IMPORT_DEPENDENCY_ROLES = (
     "derived_from",
 )
 
+#: Static guidance attached to a ``cross_artifact_duplicate`` conflict. It names
+#: no peer text and authorizes nothing: the caller must reconcile explicitly.
+CROSS_ARTIFACT_DUPLICATE_GUIDANCE = (
+    "identical bytes are already stored under another document artifact in this "
+    "project (C01 6.1 R1); no second source revision or independent artifact was "
+    "created. Target the canonical artifact explicitly with rights bound to its "
+    "exact source revision and retry, or record a no_full_text_acquired occurrence. "
+    "Do not infer shared identity or fabricate rights from byte equality."
+)
+
 _MESSAGES = {
     "invalid_input": "import input is invalid or out of bounds.",
     "content_too_large": "source bytes exceed the import size bound.",
@@ -100,16 +121,32 @@ _MESSAGES = {
     "dependency_conflict": "declared dependencies differ from the existing source.",
     "kind_conflict": "the artifact id is already used for a different kind.",
     "occurrence_invalid": "the stored occurrence failed validation.",
+    "cross_artifact_duplicate": (
+        "identical bytes already exist under another artifact; no second source "
+        "revision was created."
+    ),
+    "duplicate_scan_overflow": (
+        "too many same-hash candidate revisions to confirm an exact-byte match "
+        "safely; the scan was not truncated."
+    ),
     "storage_failure": "the local database operation failed.",
 }
 
 
 class AssetImportError(ArtifactRepositoryError):
-    """An import failed; carries a static ``code`` and a peer-text-free message."""
+    """An import failed; carries a static ``code`` and a peer-text-free message.
+
+    A ``cross_artifact_duplicate`` conflict additionally carries ``matching_refs``
+    (a tuple of :class:`ByteMatchRef` naming where the exact bytes already live)
+    and a static ``guidance`` string. Both are safe, immutable values; they
+    authorize nothing and never carry peer-supplied text.
+    """
 
     def __init__(self, code: str) -> None:
         super().__init__(_MESSAGES[code])
         self.code = code
+        self.matching_refs: tuple[ByteMatchRef, ...] = ()
+        self.guidance: str | None = None
 
 
 class AssetImportConflictError(AssetImportError, ArtifactConflictError):
@@ -117,13 +154,28 @@ class AssetImportConflictError(AssetImportError, ArtifactConflictError):
 
 
 _CONFLICT_CODES = frozenset(
-    {"request_conflict", "rights_conflict", "rights_superseded", "dependency_conflict", "kind_conflict"}
+    {
+        "request_conflict",
+        "rights_conflict",
+        "rights_superseded",
+        "dependency_conflict",
+        "kind_conflict",
+        "cross_artifact_duplicate",
+    }
 )
 
 
 def _fail(code: str):
     cls = AssetImportConflictError if code in _CONFLICT_CODES else AssetImportError
     return cls(code)
+
+
+def _cross_artifact_conflict(matching_refs) -> AssetImportConflictError:
+    """A static veto of a second revision for bytes already stored elsewhere."""
+    err = AssetImportConflictError("cross_artifact_duplicate")
+    err.matching_refs = tuple(matching_refs)
+    err.guidance = CROSS_ARTIFACT_DUPLICATE_GUIDANCE
+    return err
 
 
 def _utc_now() -> str:
@@ -144,6 +196,34 @@ class ArtifactRevisionRef:
             "project_id": self.project_id,
             "artifact_id": self.artifact_id,
             "revision_id": self.revision_id,
+        }
+
+
+@dataclass(frozen=True)
+class ByteMatchRef:
+    """A safe, immutable reference to a stored revision with identical bytes.
+
+    Returned on a ``cross_artifact_duplicate`` conflict so a caller can see
+    *where* the exact bytes already live and reconcile explicitly. It is opaque
+    and authorizes nothing: it resolves no rights, rebinds no subject and makes
+    no claim of shared identity, study, or scientific independence.
+    """
+
+    project_id: str
+    artifact_id: str
+    revision_id: str
+    content_hash: str
+    byte_size: int
+    media_type: str | None
+
+    def as_dict(self) -> dict:
+        return {
+            "project_id": self.project_id,
+            "artifact_id": self.artifact_id,
+            "revision_id": self.revision_id,
+            "content_hash": self.content_hash,
+            "byte_size": self.byte_size,
+            "media_type": self.media_type,
         }
 
 
@@ -407,8 +487,16 @@ class AssetImportRepository:
                 replay = self._replay(report_id, "import", digest)
                 if replay is not None:
                     return replay.result(replayed=True)
+                # Global exact-byte check, serialized in this same outer
+                # transaction BEFORE any new artifact/revision is written. The
+                # candidate set is found by a metadata-only query; only genuine
+                # same-hash/same-size candidates are read as bytes.
+                existing, cross = self._find_exact_bytes(artifact_id, sha, data)
+                if existing is None and cross:
+                    # Bytes already stored under a different document artifact:
+                    # create no second source revision or independent artifact.
+                    raise _cross_artifact_conflict(cross)
                 self._ensure_document(artifact_id)
-                existing = self._find_exact_bytes(artifact_id, sha, data)
                 if existing is None:
                     disposition = "created_new_revision"
                     source_rev = self._new_source(
@@ -568,15 +656,48 @@ class AssetImportRepository:
             raise _fail("invalid_input") from None
 
     def _find_exact_bytes(self, artifact_id: str, sha: str, data: bytes):
+        """Find revisions whose bytes are exactly ``data``, project-wide.
+
+        Returns ``(same_artifact_revision | None, cross_artifact_refs)``. The
+        candidate set is found with a **metadata-only** query on
+        ``content_sha256`` + ``byte_size``; only those candidates are read as
+        BLOBs and byte-compared, so unrelated project content is never loaded.
+        A candidate count above :data:`MAX_BYTE_COLLISION_CANDIDATES` is an
+        explicit diagnostic failure — the scan is never silently truncated.
+        """
         rows = self._store.connection.execute(
-            "SELECT revision_id FROM revision WHERE project_id = ? AND artifact_id = ? "
-            "AND content_sha256 = ? AND byte_size = ? ORDER BY rowid",
-            (self.project_id, artifact_id, sha, len(data)),
+            "SELECT artifact_id, revision_id FROM revision "
+            "WHERE project_id = ? AND content_sha256 = ? AND byte_size = ? "
+            "ORDER BY rowid",
+            (self.project_id, sha, len(data)),
         ).fetchall()
-        for row in rows:  # historical (earliest) exact match; bytes compared, not just hash
-            if self._repo.read_content(artifact_id, row["revision_id"]) == data:
-                return self._repo.get_revision(artifact_id, row["revision_id"])
-        return None
+        if len(rows) > MAX_BYTE_COLLISION_CANDIDATES:
+            raise _fail("duplicate_scan_overflow")
+        same = None
+        cross: list[ByteMatchRef] = []
+        for row in rows:  # actual byte equality is authoritative, not just the hash
+            candidate_id = row["artifact_id"]
+            revision_id = row["revision_id"]
+            if self._repo.read_content(candidate_id, revision_id) != data:
+                continue
+            revision = self._repo.get_revision(candidate_id, revision_id)
+            if revision is None:
+                continue
+            if candidate_id == artifact_id:
+                if same is None:
+                    same = revision
+            else:
+                cross.append(
+                    ByteMatchRef(
+                        project_id=self.project_id,
+                        artifact_id=candidate_id,
+                        revision_id=revision_id,
+                        content_hash=revision.content_sha256,
+                        byte_size=revision.byte_size,
+                        media_type=revision.media_type,
+                    )
+                )
+        return same, tuple(cross)
 
     def _new_source(self, artifact_id, data, origin, rights, revision_id, parent, deps):
         subject = {
@@ -940,7 +1061,10 @@ __all__ = [
     "AssetImportError",
     "AssetImportRepository",
     "ArtifactRevisionRef",
+    "ByteMatchRef",
+    "CROSS_ARTIFACT_DUPLICATE_GUIDANCE",
     "ImportOccurrence",
+    "MAX_BYTE_COLLISION_CANDIDATES",
     "MAX_SOURCE_BYTES",
     "OCCURRENCE_DOCUMENT_TYPE",
 ]
