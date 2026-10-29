@@ -42,6 +42,7 @@ from typing import Any, Callable
 
 from ..domain.errors import StoreError
 from ..domain.records import RecordValidationError
+from ..parsing.core import NORMALIZATION_VERSION, PARSER_VERSION
 from ..parsing.repository import ParsingRepository, ParsingRepositoryError
 from ..storage import ArtifactConflictError, ProjectStore, paths
 from .config import STRICT_JSON_REASONS, StrictJsonError, load_strict_json
@@ -96,11 +97,8 @@ _SHAPE_MESSAGE = (
     "was written."
 )
 
-#: Known parser-version family by format; the suffix is unvalidated free text.
-_VERSION_FAMILY_BY_FORMAT = {
-    fmt: "step07-jats-tei/" for fmt in ("jats", "tei", "unsupported")
-}
-_VERSION_FAMILY_BY_FORMAT["pdf"] = "step07-pdf-manual/"
+#: Known version-family prefixes; any suffix is unvalidated free text.
+_VERSION_FAMILIES = ("step07-jats-tei/", "step07-pdf-manual/")
 
 #: Static, value-free ``(category, message)`` for each repository error code.
 _CODE_ERRORS: dict[str, tuple[str, str]] = {
@@ -345,6 +343,15 @@ def _section_path_digest(section_path: list) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _safe_version_family(value: object) -> str:
+    """The known family prefix of a version string, else a static redaction."""
+    if isinstance(value, str):
+        for family in _VERSION_FAMILIES:
+            if value.startswith(family):
+                return family
+    return "unknown"
+
+
 # --------------------------------------------------------------------------- #
 # handlers
 # --------------------------------------------------------------------------- #
@@ -413,7 +420,7 @@ def _report_summary(record: dict) -> dict[str, Any]:
         summary.update({
             "human_action_required": True,
             "excludes_candidate": False,
-            "parser_version": _VERSION_FAMILY_BY_FORMAT.get(record["format"], "unknown"),
+            "parser_version": _safe_version_family(record["parser_version"]),
             "normalization_version": None,
             "reasons": ["parser_version_unverified"],
         })
@@ -454,6 +461,10 @@ def parsing_locator(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
             invalid_message=_REJECTED_MESSAGE,
         )
     section_path = list(locator.get("section_path", []))
+    verifiable = (
+        locator["parser_version"] == PARSER_VERSION
+        and locator["normalization_version"] == NORMALIZATION_VERSION
+    )
     summary: dict[str, Any] = {
         "report_ref": locator["report_ref"],
         "source_ref": locator["source_ref"],
@@ -461,8 +472,12 @@ def parsing_locator(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
         "locator_sha256": locator["locator_sha256"],
         "text_sha256": locator["text_sha256"],
         "source_sha256": locator["source_sha256"],
-        "parser_version": locator["parser_version"],
-        "normalization_version": locator["normalization_version"],
+        "parser_version": locator["parser_version"]
+        if verifiable
+        else _safe_version_family(locator["parser_version"]),
+        "normalization_version": locator["normalization_version"] if verifiable else None,
+        "verifiable": verifiable,
+        "supported": verifiable,
         "section_path_depth": len(section_path),
         "section_path_sha256": _section_path_digest(section_path),
         "private_content_included": False,

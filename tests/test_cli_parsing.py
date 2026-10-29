@@ -438,9 +438,10 @@ class UnverifiedGenericReportPrivacyTest(ParsingCliBase):
         payload = {
             "schema_version": 1,
             "document_type": "parsed_passages",
-            # prefix-valid but unknown family version -> not reproducible here
-            "parser_version": "step07-jats-tei/0",
-            "normalization_version": "nfc-ligature-ws/1",
+            # prefix-valid but unknown family version (arbitrary free-text suffix)
+            # -> not reproducible here
+            "parser_version": "step07-jats-tei/SECRET",
+            "normalization_version": "SECRET",
             "format": "jats",
             "status": "parsed",
             "source": {"sha256": src_sha, "byte_size": len(JATS_BYTES)},
@@ -518,13 +519,30 @@ class UnverifiedGenericReportPrivacyTest(ParsingCliBase):
         self.assertTrue(content["private_content_included"])
         self.assertIn("SECRET", json.dumps(content))
 
-        # build the exact pointer via the CLI, then resolve it after a restart
-        locator = self.cli(
+        # locator: the default summary must redact the unverified version strings
+        # (arbitrary suffix / normalization label) just like show/resolve
+        loc_default = self.cli(
+            "parsing", "locator", "--project", self.project_id,
+            "--report-artifact-id", "art-generic", "--report-revision-id", "rev-generic",
+            "--passage-id", "g0001",
+        )
+        self.assertNotIn("SECRET", json.dumps(loc_default))
+        self.assertFalse(loc_default["verifiable"])
+        self.assertFalse(loc_default["supported"])
+        self.assertEqual(loc_default["parser_version"], "step07-jats-tei/")
+        self.assertIsNone(loc_default["normalization_version"])
+
+        # ...but --content still returns the full original locator (usable by
+        # resolve) with the true, unredacted version strings
+        loc_full = self.cli(
             "parsing", "locator", "--project", self.project_id,
             "--report-artifact-id", "art-generic", "--report-revision-id", "rev-generic",
             "--passage-id", "g0001", "--content",
         )
-        locator_path = self.write_json("generic-locator.json", locator["locator"])
+        self.assertIn("SECRET", json.dumps(loc_full["locator"]))
+        self.assertEqual(loc_full["locator"]["parser_version"], "step07-jats-tei/SECRET")
+        self.assertEqual(loc_full["locator"]["normalization_version"], "SECRET")
+        locator_path = self.write_json("generic-locator.json", loc_full["locator"])
         self.store.close()
         self.store = ProjectStore.open_at(self.app_dir)
 
