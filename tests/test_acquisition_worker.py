@@ -449,6 +449,135 @@ class StopAndArbitrationTest(AcquireWorkerBase):
         self.assertEqual(net.urls, [])
 
 
+def _status(status, body=b"x", media="application/xml"):
+    return acq.TransportResponse(status=status, body=body, headers={"Content-Type": media})
+
+
+class SendAdmissionRaceTest(AcquireWorkerBase):
+    """Send admission is linearizable with pause/cancel and the captured lease.
+
+    The coordinator's repro patches ``AcquireJournal._persist`` so the *first*
+    ``allow_draining=False`` call commits a pause/project-lease change **before**
+    the original admission write. No GET may then be admitted, and the old run
+    must never be rebound to the project's *current* token.
+    """
+
+    def _run_with_before_persist_hook(self, request_id, hook):
+        net = acq.Net(acq.ok(self.full_text()))
+        engine = self.engine(net)
+        res = self.submit(engine, request_id, self.params(request_id))
+        job_id = res["job"]["job_id"]
+        original = acquisition_jobs.AcquireJournal._persist
+        state = {"done": False}
+
+        def patched(journal, allow_draining):
+            if not allow_draining and not state["done"]:
+                state["done"] = True
+                hook(engine)
+            return original(journal, allow_draining)
+
+        with mock.patch.object(acquisition_jobs.AcquireJournal, "_persist", patched):
+            self.drive(engine)
+        return engine, net, job_id
+
+    def test_pause_committed_before_admission_issues_no_get(self):
+        def pause(engine):
+            out = engine.handle(_req("pause", project_id=self.project_id))
+            self.assertTrue(out["ok"], out)
+
+        engine, net, job_id = self._run_with_before_persist_hook("pz-send", pause)
+        self.assertEqual(net.urls, [])
+        job = self.job(engine, job_id)
+        self.assertEqual(job["state"], "paused")
+        self.assertNotIn("accepted_result", job)
+
+    def test_cancel_committed_before_admission_issues_no_get(self):
+        holder = {}
+
+        def cancel(engine):
+            out = engine.handle(
+                _req("cancel", project_id=self.project_id, job_id=holder["job_id"])
+            )
+            self.assertTrue(out["ok"], out)
+
+        net = acq.Net(acq.ok(self.full_text()))
+        engine = self.engine(net)
+        res = self.submit(engine, "cx-send", self.params("cx-send"))
+        holder["job_id"] = res["job"]["job_id"]
+        original = acquisition_jobs.AcquireJournal._persist
+        state = {"done": False}
+
+        def patched(journal, allow_draining):
+            if not allow_draining and not state["done"]:
+                state["done"] = True
+                cancel(engine)
+            return original(journal, allow_draining)
+
+        with mock.patch.object(acquisition_jobs.AcquireJournal, "_persist", patched):
+            self.drive(engine)
+        self.assertEqual(net.urls, [])
+        job = self.job(engine, holder["job_id"])
+        self.assertEqual(job["state"], "cancelled")
+        self.assertNotIn("accepted_result", job)
+
+    def test_captured_stale_lease_never_rebinds_to_current_token(self):
+        """The lease changes between E1's lease check and the admission write."""
+
+        def rebind(engine):
+            self.registry.release_execution(self.token)
+            new = self.registry.activate_execution(self.project_id).activation_token
+            self.assertNotEqual(new, self.token)
+
+        engine, net, job_id = self._run_with_before_persist_hook("st-send", rebind)
+        self.assertEqual(net.urls, [])  # never admitted under the new token
+        job = self.job(engine, job_id)
+        self.assertNotIn("accepted_result", job)
+        # an unknown/refused outcome requires the owner, never a silent retry
+        self.assertEqual(job["state"], "waiting_human")
+
+    def test_admitted_inflight_completes_observation_after_pause(self):
+        body = self.full_text()
+        started, release = threading.Event(), threading.Event()
+
+        def on_call(n):
+            if n == 1:
+                started.set()
+                release.wait(timeout=10.0)
+
+        net = acq.Net(acq.ok(body), after_call=on_call)
+        engine = self.engine(net)
+        res = self.submit(engine, "adm-pz", self.params("adm-pz"))
+        job_id = res["job"]["job_id"]
+        engine.tick()
+        self.assertTrue(started.wait(timeout=10.0), "GET never started")
+        # admission already committed before the GET; pause may follow safely
+        self.assertTrue(engine.handle(_req("pause", project_id=self.project_id))["ok"])
+        release.set()
+        self.drive(engine)
+        self.assertEqual(len(net.urls), 1)
+        job = self.job(engine, job_id)
+        self.assertEqual(job["state"], "paused")
+        result = job["accepted_result"]["result"]
+        self.assertEqual(result["status"], "retrieved")
+        self.assertEqual(result["attempt_count"], 1)
+        (checkpoint,) = self.checkpoint(job_id)
+        self.assertEqual(len(checkpoint["acquisition"]["attempts"]), 1)
+        self.assertIsNone(checkpoint["acquisition"]["pending"])
+
+    def test_retry_within_one_attempt_does_not_deadlock(self):
+        # Two GETs on the same attempt (a retryable 503 then a 200) exercise the
+        # admission transaction and the nested checkpoint savepoint twice.
+        net = acq.Net(_status(503), acq.ok(self.full_text()))
+        engine = self.engine(net)
+        params = self.params("retry-1")
+        params["transport_options"] = dict(_OPTIONS, max_attempts=2)
+        job_id, job = self.run_job(engine, "retry-1", params)
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(len(net.urls), 2)
+        (checkpoint,) = self.checkpoint(job_id)
+        self.assertEqual(len(checkpoint["acquisition"]["attempts"]), 2)
+
+
 class ModuleSeamTest(AcquireWorkerBase):
     def test_default_lowlevel_is_the_acquisition_transport(self):
         from review_article_agent.acquisition.transport import http_get

@@ -1763,17 +1763,18 @@ class WorkerEngine:
             self._registry,
             token,
             job,
-            repo=repo,
             attempt_id=attempt.attempt_id,
+            fence=job.current_fence,
             lowlevel=self._acquisition_lowlevel,
             stop_requested=lambda: self._discovery_stop_requested(repo, project_id, job_id),
-            guard=lambda allow_draining: self._write_guard(
-                project_id, allow_draining=allow_draining
-            ),
         )
         if run.summary is not None and not run.journal_failed:
             try:
-                with self._write_guard(project_id, allow_draining=True):
+                # Fence the commit on the same captured lease (never the project's
+                # current token), so an old run can never commit under a new one.
+                with self._registry.execution_write_guard(
+                    token, project_id, allow_draining=True
+                ):
                     repo.accept_result(
                         attempt.attempt_id,
                         result_kind=discovery_jobs.RESULT_KIND_ACQUISITION,

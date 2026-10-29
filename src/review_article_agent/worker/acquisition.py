@@ -55,7 +55,7 @@ from ..acquisition.execution import (
     AcquisitionExecutionError,
     AcquisitionExecutor,
 )
-from ..acquisition.imports import AssetImportRepository
+from ..acquisition.imports import AssetImportRepository, _NestedStore
 from ..acquisition.resolution import MAX_REQUESTS
 from ..acquisition.transport import (
     DEFAULT_MAX_ATTEMPTS,
@@ -70,6 +70,7 @@ from ..domain.records import (
     validate_ref,
     validate_rights_record,
 )
+from ..runtime.jobs import JobRepository
 
 __all__ = [
     "MODE_ACQUIRE",
@@ -363,16 +364,39 @@ _ENTRY_KEYS = (
 class AcquireJournal:
     """Persist a may-have-dispatched mark before, and the safe metadata after, each GET.
 
-    ``guard(allow_draining)`` is the engine's registry write-guard context
-    factory. The *before* mark is written with ``allow_draining=False`` so a
-    drain/stale lease refuses the send; the *after* record is written with
-    ``allow_draining=True`` so an observation is never lost to a pause/drain.
+    Every write is fenced by the **captured original dispatch token** (not the
+    project's *current* token): a released/re-acquired same-project lease can
+    never silently authorize this old run. The *before* (send-admission) write
+    additionally re-reads the durable job/attempt/fence and the paused/cancelled
+    state **inside the same SQLite write transaction as the checkpoint**, so no
+    GET can be admitted once a pause/cancel has committed (a *legitimate*
+    admission that committed first may outlive a later pause). The *after* record
+    uses ``allow_draining=True`` and never re-checks the held state, so an
+    observation is never lost to a pause/drain that happened after the send.
     """
 
-    def __init__(self, repo, attempt_id: str, guard: Callable[[bool], Any], max_get: int):
-        self._repo = repo
+    def __init__(
+        self,
+        store: Any,
+        registry: Any,
+        token: str,
+        *,
+        project_id: str,
+        job_id: str,
+        attempt_id: str,
+        fence: int,
+        max_get: int,
+    ):
+        self._store = store
+        self._registry = registry
+        self._token = token
+        self._project_id = project_id
+        self._job_id = job_id
         self._attempt_id = attempt_id
-        self._guard = guard
+        self._fence = fence
+        # Nested repo so the checkpoint write shares the admission transaction
+        # (a SAVEPOINT inside it) rather than opening a second BEGIN IMMEDIATE.
+        self._repo = JobRepository(_NestedStore(store))
         self.max_get = max_get
         self.entries: list[dict[str, Any]] = []
         self.pending: dict[str, Any] | None = None
@@ -383,10 +407,55 @@ class AcquireJournal:
         """True when any GET may have been dispatched."""
         return bool(self.entries) or self.pending is not None
 
+    def _guard(self, allow_draining: bool) -> Any:
+        return self._registry.execution_write_guard(
+            self._token, self._project_id, allow_draining=allow_draining
+        )
+
+    def _admission_check(self) -> None:
+        """Refuse the send unless it is linearizable with pause/cancel/switch.
+
+        Runs inside the admission SQLite write transaction: it re-reads the job
+        row (current attempt, fence) and the attempt state, and refuses when the
+        job is paused/cancelled or the fence has moved on. The registry guard
+        already re-checked the project/lease (active only) under the captured
+        original token.
+        """
+        conn = self._store.connection
+        row = conn.execute(
+            "SELECT state, current_attempt_id, current_fence FROM job "
+            "WHERE project_id = ? AND job_id = ?",
+            (self._project_id, self._job_id),
+        ).fetchone()
+        if (
+            row is None
+            or row["current_attempt_id"] != self._attempt_id
+            or row["current_fence"] != self._fence
+            or row["state"] in ("paused", "cancelled")
+        ):
+            raise ReviewAgentError(
+                "the acquisition job is held or its fence moved; refusing to "
+                "admit a provider request."
+            )
+        attempt = conn.execute(
+            "SELECT state FROM job_attempt WHERE project_id = ? AND attempt_id = ?",
+            (self._project_id, self._attempt_id),
+        ).fetchone()
+        if attempt is None or attempt["state"] not in ("queued", "admitted", "running"):
+            raise ReviewAgentError(
+                "the acquisition attempt is not in an admissible state; refusing "
+                "to admit a provider request."
+            )
+
     def _persist(self, allow_draining: bool) -> None:
         checkpoint = journal_checkpoint(self.entries, self.pending, self.max_get)
         with self._guard(allow_draining):
-            self._repo.record_checkpoint(self._attempt_id, checkpoint)
+            if allow_draining:
+                self._repo.record_checkpoint(self._attempt_id, checkpoint)
+            else:
+                with self._store.transaction():
+                    self._admission_check()
+                    self._repo.record_checkpoint(self._attempt_id, checkpoint)
 
     def before(self, info: dict[str, Any]) -> None:
         if len(self.entries) >= self.max_get:
@@ -453,18 +522,30 @@ def dispatch_acquire(
     token: str,
     job: Any,
     *,
-    repo: Any,
     attempt_id: str,
+    fence: int,
     lowlevel: Callable[..., Any],
     stop_requested: Callable[[], bool],
-    guard: Callable[[bool], Any],
 ) -> AcquireRun:
-    """Run one ``acquire`` job through E1 with the durable attempt journal."""
+    """Run one ``acquire`` job through E1 with the durable attempt journal.
+
+    ``token`` is the exact lease captured when this dispatch started; the journal
+    fences every checkpoint on it (never the project's current token).
+    """
     from ..acquisition.execution import AcquisitionExecutionBlockedError
 
     params = job.parameters if isinstance(job.parameters, dict) else {}
     options = dict(params.get("transport_options") or {})
-    journal = AcquireJournal(repo, attempt_id, guard, _max_get(options))
+    journal = AcquireJournal(
+        store,
+        registry,
+        token,
+        project_id=job.project_id,
+        job_id=job.job_id,
+        attempt_id=attempt_id,
+        fence=fence,
+        max_get=_max_get(options),
+    )
     try:
         executor = AcquisitionExecutor(
             store,
