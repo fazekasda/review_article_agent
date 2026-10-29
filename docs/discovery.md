@@ -762,9 +762,11 @@ discovery freeze require [--artifact-id ID] [--content] [--require-active]
   a literal `--accept-coverage-limitations` explanation, and `--rights-file`, and
   returns the exact named-gate `approval_request` plus `gate prepare`/`gate
   confirm` guidance — it records no approval. `freeze status|history|require` are
-  read-only; `require` always consults `require_frozen`, returns a safe summary by
-  default (exact corpus ref, `included_count`, decision, active approval), and
-  `--content` (or the `--require-active` alias) opts in to the private roster.
+  read-only; `require` always consults `require_frozen` and returns a safe summary
+  by default (exact corpus ref, `included_count`, decision, active approval);
+  **only `--content`** opts in to the private roster, while `--require-active` is a
+  redundant active-check alias that keeps the safe summary and never returns the
+  roster.
 
 ## Behaviour notes (limits to keep in mind)
 

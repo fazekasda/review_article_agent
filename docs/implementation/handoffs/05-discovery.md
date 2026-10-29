@@ -3,9 +3,10 @@
 **Status: implementation INTEGRATED; FINAL ACCEPTANCE PENDING — Step 05 stays
 UNCHECKED in [`docs/implementation/README.md`](../README.md).** Every deliverable
 D1–D4 and acceptance criterion AC1–AC7 below is now realised by integrated
-source and tests on this branch's base `e15b5b4`. What remains is **verification
-and release work only** — the E1B adversarial cases, the E2 full-CLI-chain case, a
-final frozen-HEAD full-suite run, and the PR/merge — not any deferred feature.
+source and tests on this branch's base `ec9c32d`. What remains is **verification
+and release work only** — the E2 full-CLI-chain case, a final frozen-HEAD
+full-suite run, and the PR/merge — not any deferred feature. The E1B adversarial
+cases are now **integrated** (§5.2).
 Nothing here is a scientific claim: no study identity, eligibility, primary
 support, evidence extraction, coverage, completeness, review, or review-writer
 capability is asserted.
@@ -40,8 +41,11 @@ measured evidence is kept only as history, not as the current claim.
   observation repository. Targeted run **252 discovery tests OK**; full combined
   run **2,357 tests** (log `/tmp/opencode/search-records-combined.log`).
 
-Those counts are historical. All later sources/tests are still present and
-covered by the current frozen checkpoint (§5).
+Those counts are historical. The frozen checkpoint below (§5.1) verified only
+the code present at its own head `6ec58ea`; it **predates** the E1/E1B acceptance
+suites, the CLI1A report/freeze CLI, and later fixes, so those additions have
+their **own separate selective-run evidence** (§5.2) and are **not** covered by
+that checkpoint.
 
 ## 3. Deliverables → integrated source and named tests
 
@@ -60,7 +64,7 @@ The **detached job surface** that drives D3 is [`worker/discovery.py`](../../../
 ## 4. Acceptance criteria — integrated, final acceptance pending
 
 Each criterion is realised in integrated source/tests; the step-level
-**acceptance decision** (frozen-HEAD full run + E1B/E2 + PR) is what remains.
+**acceptance decision** (frozen-HEAD full run + E2 + PR) is what remains.
 
 | AC | Status | Integrated evidence |
 | --- | --- | --- |
@@ -70,7 +74,7 @@ Each criterion is realised in integrated source/tests; the step-level
 | **4** Fixtures cover pagination, overlap, missing IDs, partial failures, incremental reruns without duplicate candidates | **Integrated** | Adapter fixture suites (pagination/overlap/missing/partial) plus the cumulative ledger (`CumulativeDedupTests`; E0 `CumulativeCorpusTest`/`CorpusConflictTest`). |
 | **5** Known-relevant set + forward/backward expansion expose explicit coverage gaps; reporting never claims absolute completeness | **Integrated** | `test_discovery_reporting.py`::`KnownRelevantTests`/`CitationTests`; `test_discovery_expansion.py`; E1 `ExplicitGapsTest`/`NoForcedCompletenessTest`. |
 | **6** Human approval freezes a specific corpus revision; later imports/searches do not mutate it silently | **Integrated** | `FreezeAuthorityTests`/`CorpusFreezeImmutabilityTests`; E1 `IntegratedFreezeAuthorityTest`/`LaterWorkImmutabilityTest`/`SearchAgainTest`. |
-| **7** Live smoke small/documented/separate; no arbitrary cap truncation hidden as complete | **Integrated** | Adapters return explicit `page_limit`/`failure`, never `complete`, at any budget/window boundary (`test_discovery_pubmed.py`::`HardLimitTests`; `test_discovery_europepmc.py`::`BoundsTests`); the live observations are separately documented (§5.3). Adapter live smoke itself is unrun (below). |
+| **7** Live smoke small/documented/separate; no arbitrary cap truncation hidden as complete | **Integrated** | Adapters return explicit `page_limit`/`failure`, never `complete`, at any budget/window boundary (`test_discovery_pubmed.py`::`HardLimitTests`; `test_discovery_europepmc.py`::`BoundsTests`); the live observations/smoke are separately documented (§5.3) and are distinct from the deterministic fixtures. |
 
 ## 5. Verification
 
@@ -101,9 +105,18 @@ untested.**
   reconciliation.
 - **CLI1A** (`c325b22`): discovery background-job CLI. **CLI1B** (`9085241`,
   fix `e15b5b4`): `discovery report`/`freeze` readbacks (§6).
-- **This branch base `e15b5b4`** has only a **selective 84-test** CLI1B run
+- **E1B** adversarial J1 admission/interruption seams: **integrated at `630545c`**
+  (source-equivalent `8939db5`). Adds `tests/test_step05_job_adversarial.py` (not
+  present in this checkout until `630545c` is integrated) with three cases:
+  `ExpansionInterruptionAdversarialTest` (stale corpus /
+  drained token stops further I/O mid-expansion),
+  `ReservedUnsentLeadBoundaryTest` (drained before POST never sends and retains
+  its reserve), and `RealProcessKillDuringPostTest` (kill during the first fake
+  POST before response never re-posts). The combined **E0 + E1 + E1B** suite
+  reported **26 tests passed** at `630545c`.
+- **The CLI1B integration at `e15b5b4`** has only a **selective 84-test** run
   recorded by the coordinator, **not** a full-HEAD suite. A final frozen-HEAD
-  full-suite run is **pending** (§8).
+  full-suite run is **pending** (§8), and E2 (full CLI chain) is still running.
 
 ### 5.3 Authorized live observations (separate from deterministic results)
 
@@ -113,17 +126,21 @@ pages 1/2 each `size=1` `hitCount=27`; citations page 1 `size=1` `hitCount=78`),
 **3 real search-adapter GET attempts** (PubMed `31452104[uid]` two GETs; Europe
 PMC `EXT_ID:31452104 AND SRC:MED` one GET — each 1/1 complete), and **2
 citation-adapter GETs** (MED `15019270` references 1/27 and citations 1/78, then
-stopped at `page_limit`, `complete=False`). These scope the tested
-**transport/adapter mechanisms only** — never literature/topic coverage. **No
-further public request is needed; no paid application-model call, upload, or
-live lead validation was made** in this run. Adapter-level live smoke remains
-**unrun**; the deterministic suites use scripted transports and make no network
-call.
+stopped at `page_limit`, `complete=False`). The search- and citation-adapter
+attempts were **real production adapters** driven through the real
+`DiscoveryTransport` (`timeout=15`, `max_attempts=1`; search `page_size=1`,
+`max_pages=1`; citation `page_size=1`, `max_pages=1`) and **passed**, separate
+from the 3 `webfetch` contract observations and the deterministic fixture
+suites. These scope the tested **transport/adapter mechanisms only** — never
+literature/topic coverage, which remains **partial and unvalidated**. **No
+further public request is needed or authorized; no paid application-model call,
+upload, or live lead-model validation was made** in this run (the internal
+worker's own deterministic usage is not an application-model smoke).
 
 ### 5.4 Not run / not claimed
 
-Python 3.11; adapter live smoke; any paid app/model call, upload, or live lead
-validation; the final frozen-HEAD full-suite run; the E1B/E2 cases (§8). **No
+Python 3.11; any paid app/model call, upload, or live lead-model validation; the
+final frozen-HEAD full-suite run; the E2 full-CLI-chain case (§8). **No
 CI is configured**, so no CI-green claim is made and the PR checks must be
 inspected at PR time.
 
@@ -159,10 +176,11 @@ inspected at PR time.
     `--revision-id`, `--rights-file`, optional `--accept-coverage-limitations
     EXPLANATION`; returns the exact named-gate `approval_request` and `gate
     prepare`/`gate confirm` guidance, records no approval.
-  - `freeze require` consults `require_frozen` on **both** paths; the default is a
+  - `freeze require` consults `require_frozen` on **both** paths. The default is a
     **safe summary** (exact corpus ref, `included_count`, decision, active
-    approval) and `--content` (or the `--require-active` alias) is the explicit
-    opt-in for the private validated document + exact roster.
+    approval) and **only `--content`** opts in to the private validated document +
+    exact roster. `--require-active` is a redundant active-check alias that keeps
+    the safe summary; it **never** returns the roster.
 - **Caller-supplied reviews.** Entry reviews are an **explicit caller
   per-candidate review list** following the schema in
   [`discovery/freeze.py`](../../../src/review_article_agent/discovery/freeze.py):
@@ -209,18 +227,23 @@ inspected at PR time.
 
 ## 8. Next actions and commits (scoped; not done here)
 
-1. **E1B** — three adversarial acceptance cases (in progress; do not claim done).
-2. **E2** — full CLI-chain acceptance case (in progress; do not claim done).
-3. **Final frozen-HEAD full-suite run** on the frozen base, and **PR checks**
+1. **E2** — full CLI-chain acceptance case (in progress; do not claim done).
+2. **Final frozen-HEAD full-suite run** on the frozen base, and **PR checks**
    inspection (no CI is configured).
-4. **User review and merge**; the coordinator owns the PR and the README
-   checkbox (which **stays unchecked until 1–3 pass**).
-5. **Step 06** (full-text acquisition, imports, reconciliation) is **not
+3. **User review and merge**; the coordinator owns the PR and the README
+   checkbox (which **stays unchecked until 1–2 pass**).
+4. **Step 06** (full-text acquisition, imports, reconciliation) is **not
    implemented**.
+
+The **E1B** adversarial cases are **integrated** (`630545c`, source `8939db5`;
+three cases in `tests/test_step05_job_adversarial.py`; combined E0+E1+E1B **26
+tests passed**) and are no longer pending; **E2** and the final frozen-HEAD run
+remain.
 
 Evidence log paths: frozen checkpoint `/tmp/opencode/step05-pre-final-checks.log`;
 historical `/tmp/opencode/search-records-combined.log`,
-`/tmp/opencode/step05-combined-all-checks.log`. Key commits: base `e15b5b4`;
-CLI1B `9085241`/`e15b5b4`; E1 `a7d1cd9`/`752d359` (source `3eccfeb`/`f2a3ad2`);
+`/tmp/opencode/step05-combined-all-checks.log`. Key commits: this docs base
+`ec9c32d`; CLI1B `9085241`/`e15b5b4`; E1B `630545c` (source `8939db5`); E1
+`a7d1cd9`/`752d359` (source `3eccfeb`/`f2a3ad2`);
 E0 `a6d21fb`; frozen checkpoint `6ec58ea`. No secrets, licensed full text, or
 raw provider payloads are included here.

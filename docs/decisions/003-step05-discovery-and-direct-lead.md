@@ -266,7 +266,7 @@ separately reviewable.
 - **Unresolved follow-up (not blockers):** the per-suite breakdown and the final
   completion handoff remain in the [Step 05 handoff](../implementation/handoffs/05-discovery.md);
   live lead-model validation (unrun); and the remaining Step 05 work — now
-  **verification/release only** (the E1B adversarial and E2 full-CLI-chain
-  acceptance cases, a final frozen-HEAD full-suite run, and the PR); the
-  report/freeze CLI is **integrated** (`e15b5b4`). No
+  **verification/release only** (the E2 full-CLI-chain case, a final frozen-HEAD
+  full-suite run, and the PR; the E1B adversarial cases are now **integrated** at
+  `630545c`); the report/freeze CLI is **integrated** (`e15b5b4`). No
   secrets and no licensed full text are included here.

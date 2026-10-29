@@ -54,8 +54,8 @@ authorized** here; the existing app-owned OpenCode production block is unchanged
 The `discovery` CLI group submits and inspects these as **detached background
 jobs**, including the integrated `report create|show` and `freeze
 propose|status|show|history|require` readbacks. Step 05 **implementation is
-integrated**; **final acceptance and PR are pending** (the E1B/E2 acceptance
-cases, a final frozen-HEAD run, and the PR) — see the
+integrated**; **final acceptance and PR are pending** (the E2 full-CLI-chain case,
+a final frozen-HEAD run, and the PR) — see the
 [Step 05 handoff](docs/implementation/handoffs/05-discovery.md) and the
 [discovery API/limits](docs/discovery.md).
 
@@ -203,6 +203,6 @@ exact human-approved freeze/search-again record, and a live-capable hosted
 lead-proposal runner, surfaced through the `discovery` CLI (see the
 [Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); its
 **implementation is integrated** and **final acceptance and PR are pending** (the
-E1B/E2 acceptance cases, a final frozen-HEAD run, and the PR — no CI is
+E2 full-CLI-chain case, a final frozen-HEAD run, and the PR — no CI is
 configured). No scientific feature, production paid
 generation, upload, or scientific validation is implemented or claimed.

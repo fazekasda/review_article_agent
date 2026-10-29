@@ -705,7 +705,7 @@ deduplication, coverage, or freeze claim. Exact field spellings, bounds, and lib
 | `discovery freeze status [--artifact-id ID] [--project ID]` | Read the current decision and the last approved freeze roster as a **safe summary** (never auto-selects a new corpus). |
 | `discovery freeze show [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Read one freeze decision; a **safe summary** by default, `--content` the explicit private opt-in. |
 | `discovery freeze history [--artifact-id ID] [--project ID]` | Immutable previous decisions, newest-first, as **safe summaries**. |
-| `discovery freeze require [--artifact-id ID] [--content] [--require-active] [--project ID]` | Read the selection **only** when a currently-active authentic freeze authorizes it; **safe summary** by default (exact corpus ref, `included_count`, decision, active approval), `--content` (or the `--require-active` alias) the explicit private roster opt-in. Fails cleanly when no active freeze exists. |
+| `discovery freeze require [--artifact-id ID] [--content] [--require-active] [--project ID]` | Read the selection **only** when a currently-active authentic freeze authorizes it; **safe summary** by default (exact corpus ref, `included_count`, decision, active approval). **Only `--content`** opts in to the private roster; `--require-active` is a redundant active-check alias that keeps the safe summary. Both paths consult `require_frozen`. Fails cleanly when no active freeze exists. |
 
 Every command uses the global data-directory resolution (§2) and the same
 optional config file (§4); `--project` defaults to the active selected project
