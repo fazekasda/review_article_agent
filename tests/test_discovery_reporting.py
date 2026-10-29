@@ -1252,5 +1252,144 @@ class HistorySnapshotRepairTests(ReportingTestBase):
             self.coverage.current()
 
 
+# --------------------------------------------------------------------------- #
+# R1-R2 repair: conservative metadata-import provenance classification
+# --------------------------------------------------------------------------- #
+class MetadataImportProvenanceTests(ReportingTestBase):
+    PREFIX_QUERY = "metadata_import:registry"
+
+    def _run(self, request_id, *, attempts, records=(), complete=True,
+             stop_reason="completed", failure=None, source="pubmed"):
+        page = fx.page(
+            source=source,
+            query=self.PREFIX_QUERY,
+            records=tuple(records),
+            attempts=tuple(attempts),
+            complete=complete,
+            stop_reason=stop_reason,
+            failure=failure,
+        )
+        result = fx.result(
+            (page,), query=self.PREFIX_QUERY, source=source,
+            stop_reason=stop_reason, failure=failure,
+        )
+        return self.observe(request_id, result)
+
+    def _report_for(self, run_ids):
+        revision = self.ingest_corpus(run_ids, request_id="corpus-1")
+        corpus_ref = self.ref(revision.artifact_id, revision.revision_id)
+        plan_ref = self.build_plan()
+        return self.build(corpus_ref, plan_ref)
+
+    def test_prefix_query_with_real_http_attempt_is_provider_not_import(self) -> None:
+        provider = self._run(
+            "req_provider",
+            attempts=(fx.attempt(),),
+            records=(self.rec(pmid="700", source_id="700"),),
+        )
+        report = self._report_for([provider.run_id])
+        sources = report["payload"]["sources"]
+        row = sources["runs"][0]
+        self.assertFalse(row["is_metadata_import"])
+        self.assertEqual(row["attempt_count"], 1)
+        self.assertEqual(sources["totals"]["http_attempts"], 1)
+        work_row = next(
+            r for r in report["payload"]["work"]["observations"]
+            if r["run_id"] == provider.run_id
+        )
+        self.assertFalse(work_row["is_metadata_import"])
+        # No false "no-provider-import" limitation is asserted.
+        self.assertNotIn("Metadata-import", " ".join(report["payload"]["limitations_summary"]))
+
+    def test_honest_zero_attempt_local_import_is_import(self) -> None:
+        imported = self._run(
+            "req_import",
+            attempts=(),
+            records=(self.rec(pmid="701", source_id="701"),),
+        )
+        report = self._report_for([imported.run_id])
+        row = report["payload"]["sources"]["runs"][0]
+        self.assertTrue(row["is_metadata_import"])
+        self.assertEqual(row["attempt_count"], 0)
+        work_row = next(
+            r for r in report["payload"]["work"]["observations"]
+            if r["run_id"] == imported.run_id
+        )
+        self.assertTrue(work_row["is_metadata_import"])
+        self.assertIn("Metadata-import", " ".join(report["payload"]["limitations_summary"]))
+
+    def test_zero_attempt_failed_prefix_query_is_not_import(self) -> None:
+        failed = self._run(
+            "req_failed",
+            attempts=(),
+            records=(),
+            complete=False,
+            stop_reason="failure",
+            failure="http_status",
+        )
+        report = self._report_for([failed.run_id])
+        row = report["payload"]["sources"]["runs"][0]
+        self.assertFalse(row["is_metadata_import"])
+        self.assertEqual(row["attempt_count"], 0)
+        # A zero-call failed/interrupted provider query is not a local import.
+        self.assertNotIn("Metadata-import", " ".join(report["payload"]["limitations_summary"]))
+
+    def test_import_classification_is_revalidated_on_read(self) -> None:
+        provider = self._run(
+            "req_provider",
+            attempts=(fx.attempt(),),
+            records=(self.rec(pmid="702", source_id="702"),),
+        )
+        revision = self.ingest_corpus([provider.run_id], request_id="corpus-1")
+        corpus_ref = self.ref(revision.artifact_id, revision.revision_id)
+        plan_ref = self.build_plan()
+        report = self.record(corpus_ref, plan_ref, request_id="coverage-1")
+
+        def mutate(envelope):
+            envelope["payload"]["sources"]["runs"][0]["is_metadata_import"] = True
+            envelope["payload"]["work"]["observations"][0]["is_metadata_import"] = True
+            envelope["payload"]["limitations_summary"].append(
+                "Metadata-import observations download nothing."
+            )
+
+        self._forge_existing(report, mutate)
+        with self.assertRaises(CoverageCorruptionError):
+            self.coverage.current()
+
+    def _forge_existing(self, revision, mutate) -> None:
+        import hashlib
+        import sqlite3
+
+        content = self.artifacts.read_content(revision.artifact_id, revision.revision_id)
+        envelope = json.loads(content.decode("utf-8"))
+        mutate(envelope)
+        forged = canonical_json(envelope)
+        conn = sqlite3.connect(paths.store_path_for(str(self.tmp / "project")))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='revision_no_update'"
+            ).fetchone()
+            saved = row[0] if row and row[0] else None
+            conn.execute("DROP TRIGGER IF EXISTS revision_no_update")
+            conn.execute(
+                "UPDATE revision SET content = ?, content_sha256 = ?, byte_size = ? "
+                "WHERE project_id = ? AND artifact_id = ? AND revision_id = ?",
+                (
+                    forged,
+                    "sha256:" + hashlib.sha256(forged).hexdigest(),
+                    len(forged),
+                    self.project_id,
+                    revision.artifact_id,
+                    revision.revision_id,
+                ),
+            )
+            if saved:
+                conn.execute(saved)
+            conn.commit()
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

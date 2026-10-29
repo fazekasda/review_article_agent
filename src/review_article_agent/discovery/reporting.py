@@ -614,6 +614,36 @@ def _plan_section(plan_doc: dict, plan_revision: Revision) -> dict:
 # --------------------------------------------------------------------------- #
 # Sources (corpus scope)
 # --------------------------------------------------------------------------- #
+def _is_metadata_import(record) -> bool:
+    """Conservatively classify one stored observation as a local metadata import.
+
+    Publication **text cannot decide provenance**: an approved provider/seed query
+    is an arbitrary string and may literally start with the import descriptor
+    prefix. A genuine local metadata import therefore requires *all* of the actual
+    import observation semantics:
+
+    * the query descriptor carries the ``metadata_import:`` prefix;
+    * **zero** captured HTTP attempts — a local import performs no provider
+      request, so any attempt (or any recorded attempt on the result) is provider
+      retrieval, never an import; and
+    * a successful **local** supplied-row result — ``complete``, no ``failure``,
+      and ``stop_reason == "completed"`` — so a zero-call failed/interrupted
+      provider query that merely shares the prefix is not an import either.
+
+    Nothing here infers the provenance of an unknown native caller observation.
+    """
+    result = record.result
+    if not record.query.startswith(METADATA_IMPORT_QUERY_PREFIX):
+        return False
+    if record.attempt_count != 0 or result.attempts:
+        return False
+    return (
+        record.complete
+        and record.failure is None
+        and record.stop_reason == "completed"
+    )
+
+
 def _source_row(record) -> dict:
     return {
         "run_id": record.run_id,
@@ -629,7 +659,7 @@ def _source_row(record) -> dict:
         "record_count": record.record_count,
         "attempt_count": record.attempt_count,
         "result_sha256": record.result_sha256,
-        "is_metadata_import": record.query.startswith(METADATA_IMPORT_QUERY_PREFIX),
+        "is_metadata_import": _is_metadata_import(record),
     }
 
 
@@ -689,7 +719,7 @@ def _work_row(record) -> dict:
         "attempt_bytes": attempt_bytes,
         "attempt_statuses": _canonical_int_map(statuses),
         "attempt_outcomes": _canonical_int_map(outcomes),
-        "is_metadata_import": record.query.startswith(METADATA_IMPORT_QUERY_PREFIX),
+        "is_metadata_import": _is_metadata_import(record),
     }
 
 
@@ -1381,25 +1411,13 @@ def _validate_sources(section: dict, corpus: dict, discovery) -> None:
     _validate_source_rows(rows)
     if sorted(row["run_id"] for row in rows) != corpus["run_ids"]:
         _fail(_M_CORRUPT_TOTALS)
-    # Durable source pin: every corpus-scope row must still match its stored run.
+    # Durable source pin: every corpus-scope row must be re-derived exactly from
+    # its stored run, including the conservative metadata-import classification.
     for row in rows:
         record = discovery.get_search(row["run_id"])
         if record is None:
             raise CoverageCorruptionError(_M_CORRUPT_PIN)
-        if (
-            record.source != row["source"]
-            or record.query != row["query"]
-            or record.result_sha256 != row["result_sha256"]
-            or record.page_count != row["page_count"]
-            or record.record_count != row["record_count"]
-            or record.attempt_count != row["attempt_count"]
-            or record.stop_reason != row["stop_reason"]
-            or record.failure != row["failure"]
-            or record.complete != row["complete"]
-            or record.started_at != row["started_at"]
-            or record.completed_at != row["completed_at"]
-            or record.total_count != row["total_count"]
-        ):
+        if _source_row(record) != row:
             raise CoverageCorruptionError(_M_CORRUPT_PIN)
     totals = _exact_keys(section["totals"], _SOURCE_TOTAL_KEYS, _M_CORRUPT_PAYLOAD)
     expected = _recompute_source_totals(rows)
