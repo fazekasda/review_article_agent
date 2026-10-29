@@ -289,6 +289,81 @@ class WorkflowTests(ManifestBase):
         self.assertEqual(failed["machine"]["label"], "uncertain")
         self.assertIsNone(failed["observed_model"])
 
+    # -- S8-R3: explicit read-only historical inspection --------------------- #
+    def _ctx(self):
+        return SimpleNamespace(registry=SimpleNamespace(get=lambda pid: SimpleNamespace(
+            root_path=str(self.tmp / "project"), project_id=self.project_id)))
+
+    def _tamper_revision_content(self, ref, content=b"{}"):
+        conn = self.store.connection
+        conn.execute("DROP TRIGGER IF EXISTS revision_no_update")
+        conn.execute(
+            "UPDATE revision SET content = ? WHERE project_id = ? AND "
+            "artifact_id = ? AND revision_id = ?",
+            (content, self.project_id, ref["artifact_id"], ref["revision_id"]))
+
+    def test_historical_read_after_pilot_iteration(self):
+        self.put("pilot", self.pilot_input, revision="pilot-r2", parent="pilot-r1")
+        with self.assertRaises(ScreeningError):
+            self.screening.read(self.pilot, "pilot")  # no longer current head
+        stored = self.screening.read(self.pilot, "pilot", historical=True)
+        self.assertTrue(stored["historical"])
+        self.assertFalse(stored["current_validation"])
+        self.assertEqual(stored["authority"], "stored_evidence_only")
+        self.assertEqual(stored["payload"]["input"]["config_ref"], self.config_ref)
+        # CLI: same explicit inspection, summary-only unless --content.
+        args = SimpleNamespace(project=self.project_id, artifact_id="pilot",
+                               revision_id="pilot-r1", kind="pilot",
+                               screening_command="show", content=False, historical=True)
+        result = dispatch_screening(args, self._ctx())
+        self.assertTrue(result["historical"])
+        self.assertFalse(result["current_validation"])
+        self.assertNotIn("payload", result)
+        self.assertEqual(result["case_count"], 1)
+        args.content = True
+        self.assertIn("adjudications", dispatch_screening(args, self._ctx())["payload"]["input"])
+
+    def test_historical_read_survives_config_and_source_changes(self):
+        batch = self.make_batch()
+        audit = self.put("audit", self.audit_input(batch))
+        cfg = config()
+        cfg["questions"][0]["instructions"] = "Changed eligibility criteria"
+        self.put("config", cfg, revision="config-r2", parent="config-r1")
+        data = self.artifacts.read_content(self.source["artifact_id"], self.source["revision_id"])
+        self.append_source(self.source, data + b"\n")
+        for ref, kind in ((batch, "batch"), (audit, "audit")):
+            with self.assertRaises(ScreeningError):
+                self.screening.read(ref, kind)  # stale current validation
+            stored = self.screening.read(ref, kind, historical=True)
+            self.assertTrue(stored["historical"])
+            self.assertTrue(stored["payload"])
+
+    def test_historical_read_cannot_authorize_stale_work(self):
+        batch = self.make_batch()
+        audit = self.put("audit", self.audit_input(batch))
+        self.approve_ref(audit, "exclusion_set", "screening.exclusions")
+        cfg = config()
+        cfg["questions"][0]["instructions"] = "Changed eligibility criteria"
+        self.put("config", cfg, revision="config-r2", parent="config-r1")
+        # Historical inspection works, but every authorizing path stays strict.
+        self.screening.read(self.pilot, "pilot", historical=True)
+        with self.assertRaises(ScreeningError):
+            self.screening.require_pilot(self.pilot)
+        with self.assertRaises(ScreeningError):
+            self.put("batch", self.batch_input(), revision="batch-r2")
+        with self.assertRaises(ScreeningError):
+            self.screening.require_exclusions(audit)
+
+    def test_historical_read_rejects_tampered_target(self):
+        self._tamper_revision_content(self.pilot, b"{}")
+        with self.assertRaises(ScreeningError):
+            self.screening.read(self.pilot, "pilot", historical=True)
+
+    def test_historical_read_rejects_tampered_source_dependency(self):
+        self._tamper_revision_content(self.source, b"tampered")
+        with self.assertRaises(ScreeningError):
+            self.screening.read(self.pilot, "pilot", historical=True)
+
 
 if __name__ == "__main__":
     unittest.main()

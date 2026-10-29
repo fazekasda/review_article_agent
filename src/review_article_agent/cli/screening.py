@@ -21,6 +21,10 @@ def build_screening_parser(sub):
             parser.add_argument("--parent-revision-id")
         elif action == "show":
             parser.add_argument("--content", action="store_true")
+            # Explicit, read-only inspection of a superseded/stale revision.
+            # Never available on propose/exclusions: stale evidence cannot
+            # authorize work.
+            parser.add_argument("--historical", action="store_true")
 
 
 def dispatch_screening(args, ctx):
@@ -37,8 +41,15 @@ def dispatch_screening(args, ctx):
                 return {"ref": ref, "approved": False, "authorizes_extraction": False}
             if args.screening_command == "exclusions":
                 return {"excluded_case_ids": repo.require_exclusions(ref), "authorizes_extraction": False}
-            payload = repo.read(ref, args.kind)
-            result = {"ref": ref, "kind": args.kind, "authorizes_extraction": False}
+            if args.screening_command == "show" and getattr(args, "historical", False):
+                stored = repo.read(ref, args.kind, historical=True)
+                payload = stored["payload"]
+                result = {"ref": ref, "kind": args.kind, "historical": True,
+                          "freshly_validated": False, "current_validation": False,
+                          "authorizes_extraction": False, "notice": stored["notice"]}
+            else:
+                payload = repo.read(ref, args.kind)
+                result = {"ref": ref, "kind": args.kind, "authorizes_extraction": False}
             if args.content:
                 result["payload"] = payload
             else:

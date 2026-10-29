@@ -25,6 +25,21 @@ class ScreeningError(ReviewAgentError):
     """Static diagnostics: never include source text or provider output."""
 
 
+#: Explicit historical reads return *stored* evidence only. The historic
+#: decision is NOT recomputed with the current model/parser/config/gates (an old
+#: algorithm may no longer be available), so the result is never current
+#: validation or scientific/eligibility authority.
+HISTORICAL_NOTICE = ("Stored historical evidence only. Not revalidated against the "
+                     "current model, parser, config, or gates, and not scientific or "
+                     "eligibility authority. Inspect; do not authorize work from it.")
+
+#: Bound the transitive dependency content-integrity walk of a historical read:
+#: depth and total revisions visited. The graph is a DAG for real data, but the
+#: bounds keep a corrupt/cyclic store from causing unbounded work.
+_HISTORICAL_MAX_DEPTH = 8
+_HISTORICAL_MAX_REVISIONS = 256
+
+
 def require(condition):
     if not condition:
         raise ScreeningError("screening input, dependency, or approval is invalid or stale")
@@ -64,10 +79,13 @@ def _classify_and_observe(config, response, *, context_ready=True):
     """Return the machine decision and the validated response model identity.
 
     The observed identity is the model the response envelope actually reported
-    after :func:`validate_response`; it is ``None`` when the response (or every
-    answer) could not be validated. Failure/refusal/malformed/unknown responses
-    are therefore retained as ``uncertain`` and never contribute a model
-    identity a pilot could use to authorize a later bulk run.
+    after :func:`validate_response`; it is ``None`` only when that envelope
+    could not be validated at all. Once a valid envelope is observed the model
+    identity is returned even if individual answers are missing, refused, or
+    malformed: those answers still map to ``uncertain``, but they do not erase
+    the identity the envelope reported. A response whose envelope is invalid
+    contributes no identity. The identity is a reported model *string*; equal
+    strings (for example a base alias) cannot prove the same frozen weights.
     """
     definitions = questions(config)
     decisions = []
@@ -117,13 +135,15 @@ class ScreeningRepository:
     def _ref(self, ref):
         return validate_ref(ref, self.store.project_id)
 
-    def _read(self, ref, kind):
+    def _read(self, ref, kind, *, current=True):
         ref = self._ref(ref)
         rev = self.artifacts.get_revision(ref["artifact_id"], ref["revision_id"])
-        head = self.artifacts.current_revision(ref["artifact_id"])
-        require(rev is not None and head is not None and head.revision_id == rev.revision_id)
+        require(rev is not None)
+        if current:
+            head = self.artifacts.current_revision(ref["artifact_id"])
+            require(head is not None and head.revision_id == rev.revision_id)
         data = self.artifacts.read_content(ref["artifact_id"], ref["revision_id"])
-        require(sha256_digest(data) == rev.content_sha256)
+        require(sha256_digest(data) == rev.content_sha256 and len(data) == rev.byte_size)
         doc = json.loads(data)
         require(doc.get("schema_version") == 1 and doc.get("document_type") == "screening_" + kind)
         payload = doc["payload"] if kind == "config" else doc["payload"]["input"]
@@ -133,6 +153,41 @@ class ScreeningRepository:
         require(all(d.role == "derived_from" for d in live))
         require({canonical_json(d.as_ref()) for d in live} == expected)
         return doc["payload"]
+
+    def _verify_revision_bytes(self, artifact_id, revision_id):
+        """Require one stored revision's bytes to match its recorded hash/size."""
+        rev = self.artifacts.get_revision(artifact_id, revision_id)
+        require(rev is not None)
+        data = self.artifacts.read_content(artifact_id, revision_id)
+        require(sha256_digest(data) == rev.content_sha256 and len(data) == rev.byte_size)
+
+    def _verify_historical_dependencies(self, direct):
+        """Bounded transitive content integrity for declared dependencies.
+
+        Historical inspection must not rely on stale data, so every declared
+        dependency revision must still exist with bytes matching its recorded
+        hash and size. The walk follows only the stored dependency edges (for
+        example a screening report pins its parsing report, which pins the exact
+        source bytes), up to a fixed depth/revision bound. It never re-derives
+        or re-classifies the old payload.
+        """
+        seen = set()
+        stack = [(self._ref(ref), 0) for ref in direct]
+        while stack:
+            ref, depth = stack.pop()
+            key = (ref["artifact_id"], ref["revision_id"])
+            if key in seen:
+                continue
+            require(len(seen) < _HISTORICAL_MAX_REVISIONS)
+            seen.add(key)
+            self._verify_revision_bytes(ref["artifact_id"], ref["revision_id"])
+            if depth >= _HISTORICAL_MAX_DEPTH:
+                continue
+            for dep in self.artifacts.list_dependencies(ref["artifact_id"], ref["revision_id"]):
+                if dep.role != "version_of":
+                    stack.append(({"project_id": dep.project_id,
+                                   "artifact_id": dep.artifact_id,
+                                   "revision_id": dep.revision_id}, depth + 1))
 
     @staticmethod
     def _dependencies(payload):
@@ -305,13 +360,29 @@ class ScreeningRepository:
             batch = self._read(audit["input"]["batch_ref"], "batch")
             return batch["proposed_exclusion_ids"]
 
-    def read(self, ref, kind):
-        payload = self._read(ref, kind)
+    def read(self, ref, kind, *, historical=False):
+        """Read a screening report; default is a current, freshly validated read.
+
+        ``historical=True`` is an explicit, read-only inspection of a pinned old
+        revision that may no longer be the artifact head or may depend on stale
+        inputs. It verifies the stored target bytes/envelope, the exact declared
+        dependency refs, and bounded transitive dependency content integrity, but
+        it does **not** recompute the historic decision with the current
+        model/parser/config/gates. The result is marked stored evidence only and
+        conveys no current validation or scientific/eligibility authority.
+        """
+        result = self._read(ref, kind, current=not historical)
+        if historical:
+            source = result if kind == "config" else result["input"]
+            self._verify_historical_dependencies(self._dependencies(source))
+            return {"historical": True, "freshly_validated": False,
+                    "current_validation": False, "authority": "stored_evidence_only",
+                    "notice": HISTORICAL_NOTICE, "payload": result}
         if kind == "config":
-            questions(payload)
+            questions(result)
         else:
-            require(getattr(self, "_" + kind)(payload["input"]) == payload)
-        return payload
+            require(getattr(self, "_" + kind)(result["input"]) == result)
+        return result
 
     def propose(self, kind, payload, *, artifact_id, revision_id, rights, parent_revision_id=None):
         """Create an inert proposal, atomically validating its current inputs."""
