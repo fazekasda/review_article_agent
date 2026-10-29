@@ -326,10 +326,110 @@ class ParentTests(unittest.TestCase):
             r = pdf_inspection.inspect_pdf(self.PDF)
             self.assertEqual(r["failure_code"], "child_output_invalid", obj)
 
+    def emit_raw(self, text: str) -> None:
+        self.child(f"import sys\nsys.stdin.buffer.read()\nsys.stdout.write({text!r})\n")
+
+    def assert_invalid_via_public_path(self, label: object) -> None:
+        r = pdf_inspection.inspect_pdf(self.PDF)  # must not raise
+        self.assertEqual((r["status"], r["failure_code"]), ("failed", "child_output_invalid"), label)
+        self.assertEqual(r["page_text_present"], [])
+        self.assertEqual(r["text_preview"], "")
+
+    FAILED = {**GOOD_CHILD, "status": "failed", "failure_code": "malformed_pdf",
+              "encrypted": None, "page_count": None, "page_text_present": [], "text_preview": "",
+              "identifiers": {"doi": None, "pmid": None, "pmcid": None}}
+
+    def test_hostile_scalar_types_never_raise(self) -> None:
+        hostile_values = [[], {}, [1], {"a": 1}, None, True, False, 1.5, 7, "x", ""]
+        for field in GOOD_CHILD:
+            for value in hostile_values:
+                for base in (GOOD_CHILD, self.FAILED):
+                    obj = {**base, field: value}
+                    if obj == base:
+                        continue
+                    with self.subTest(field=field, value=value, base=base["status"]):
+                        # Direct boundary must return None or a valid dict, never raise.
+                        out = pdf_inspection._validate_child(json.dumps(obj).encode())
+                        self.assertTrue(out is None or out["status"] in pdf_inspection.STATUSES)
+                        if out is None:
+                            self.emit(obj)
+                            self.assert_invalid_via_public_path(obj)
+
+    def test_unhashable_status_and_code_regression(self) -> None:
+        for obj in ({"status": "failed", "failure_code": []},
+                    {**self.FAILED, "failure_code": []},
+                    {**self.FAILED, "failure_code": {}},
+                    {**self.FAILED, "status": []},
+                    {**self.FAILED, "status": {}}):
+            self.assertIsNone(pdf_inspection._validate_child(json.dumps(obj).encode()))
+            self.emit(obj)
+            self.assert_invalid_via_public_path(obj)
+
+    def test_duplicate_keys_nonfinite_and_structure(self) -> None:
+        dup = json.dumps(GOOD_CHILD).replace(
+            '"status": "inspected"', '"status": "failed", "status": "inspected"')
+        raws = [
+            dup,
+            json.dumps(GOOD_CHILD).replace('"page_count": 2', '"page_count": NaN'),
+            json.dumps(GOOD_CHILD).replace('"page_count": 2', '"page_count": Infinity'),
+            json.dumps(GOOD_CHILD).replace('"page_count": 2', '"page_count": 2.0'),
+            json.dumps({**GOOD_CHILD, "extra": 1}),
+            json.dumps({k: v for k, v in GOOD_CHILD.items() if k != "encrypted"}),
+            json.dumps({**GOOD_CHILD, "identifiers": {"doi": None, "pmid": None}}),
+            json.dumps({**GOOD_CHILD, "identifiers": {"doi": None, "pmid": None,
+                                                       "pmcid": None, "x": None}}),
+            '{"status":"inspected"',
+            "null", "[]", "1", '"s"', "",
+            "\xff",
+        ]
+        for raw in raws:
+            with self.subTest(raw=raw[:60]):
+                self.emit_raw(raw)
+                self.assert_invalid_via_public_path(raw)
+
+    def test_status_code_encryption_consistency(self) -> None:
+        bad = [
+            {**GOOD_CHILD, "encrypted": True},                          # inspected + encrypted
+            {**GOOD_CHILD, "encrypted": None},
+            {**GOOD_CHILD, "page_count": None},
+            {**GOOD_CHILD, "page_count": 0, "page_text_present": []},
+            {**GOOD_CHILD, "status": "limited", "failure_code": "encrypted"},
+            {**GOOD_CHILD, "status": "limited", "failure_code": None},
+            {**GOOD_CHILD, "status": "limited", "failure_code": "timeout"},
+            {**GOOD_CHILD, "status": "limited", "failure_code": "page_limit",
+             "page_text_present": []},
+            {**GOOD_CHILD, "failure_code": "page_limit"},               # inspected with code
+            {**self.FAILED, "failure_code": "encrypted", "encrypted": False},
+            {**self.FAILED, "failure_code": "malformed_pdf", "encrypted": True},
+            {**self.FAILED, "failure_code": "page_limit"},               # limited code on failed
+            {**self.FAILED, "failure_code": None},
+            {**self.FAILED, "text_preview": "leaked text"},
+            {**self.FAILED, "page_text_present": [True]},
+            {**self.FAILED, "identifiers": {"doi": "10.1000/abc", "pmid": None, "pmcid": None}},
+            {**self.FAILED, "status": "unavailable", "failure_code": "dependency_missing",
+             "page_count": 3},
+            {**self.FAILED, "status": "unavailable", "failure_code": "malformed_pdf"},
+        ]
+        for obj in bad:
+            with self.subTest(obj=obj):
+                self.emit(obj)
+                self.assert_invalid_via_public_path(obj)
+
+    def test_valid_limited_and_unavailable_pass(self) -> None:
+        limited = {**GOOD_CHILD, "status": "limited", "failure_code": "page_limit",
+                   "page_count": 5}
+        self.emit(limited)
+        self.assertEqual(pdf_inspection.inspect_pdf(self.PDF), limited)
+        unavailable = {**self.FAILED, "status": "unavailable", "encrypted": None,
+                       "failure_code": "dependency_missing"}
+        self.emit(unavailable)
+        self.assertEqual(pdf_inspection.inspect_pdf(self.PDF), unavailable)
+
     def test_child_status_failed_with_static_code_passes_through(self) -> None:
         self.emit({**GOOD_CHILD, "status": "failed", "failure_code": "encrypted",
                    "encrypted": True, "page_count": None, "page_text_present": [],
-                   "text_preview": ""})
+                   "text_preview": "",
+                   "identifiers": {"doi": None, "pmid": None, "pmcid": None}})
         r = pdf_inspection.inspect_pdf(self.PDF)
         self.assertEqual((r["status"], r["failure_code"], r["encrypted"]),
                          ("failed", "encrypted", True))

@@ -236,55 +236,108 @@ def _run_child(
     return "ok", bytes(out)
 
 
+_FIELDS = frozenset(
+    {"status", "encrypted", "page_count", "page_text_present", "text_preview",
+     "identifiers", "failure_code", "parser_version"}
+)
+_ID_KEYS = frozenset({"doi", "pmid", "pmcid"})
+_LIMITED_CODES = frozenset({"page_limit", "text_limit", "page_extract_error"})
+_UNAVAILABLE_CODES = frozenset({"dependency_missing", "platform_unsupported"})
+_FAILED_CODES = FAILURE_CODES - _LIMITED_CODES - _UNAVAILABLE_CODES
+
+
+def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    obj: dict[str, object] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("duplicate key")
+        obj[key] = value
+    return obj
+
+
+def _reject_constant(_name: str) -> object:
+    raise ValueError("non-finite number")
+
+
 def _validate_child(raw: bytes) -> dict[str, object] | None:
-    """Strictly validate the child's JSON; ``None`` means unusable."""
+    """Strictly validate the child's JSON; ``None`` means unusable.
+
+    Every scalar is type-checked *before* any membership test or lookup, the
+    key set must be exact, duplicate keys and NaN/Infinity are rejected, and
+    status / failure_code / encrypted / page data must be mutually consistent.
+    Never raises.
+    """
     try:
-        obj = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError, RecursionError):
+        return _validate_child_unsafe(raw)
+    except Exception:  # noqa: BLE001 - defence in depth; hostile input only
         return None
-    if not isinstance(obj, dict):
+
+
+def _validate_child_unsafe(raw: bytes) -> dict[str, object] | None:
+    obj = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=_no_duplicates,
+        parse_constant=_reject_constant,
+    )
+    if not isinstance(obj, dict) or set(obj) != _FIELDS:
         return None
-    status = obj.get("status")
-    if status not in STATUSES:
+    status = obj["status"]
+    code = obj["failure_code"]
+    if not isinstance(status, str) or status not in STATUSES:
         return None
-    code = obj.get("failure_code")
-    if code is not None and code not in FAILURE_CODES:
+    if code is not None and (not isinstance(code, str) or code not in FAILURE_CODES):
         return None
-    if (status == "inspected") != (code is None):
-        return None
-    encrypted = obj.get("encrypted")
+    encrypted = obj["encrypted"]
     if encrypted is not None and not isinstance(encrypted, bool):
         return None
-    page_count = obj.get("page_count")
+    page_count = obj["page_count"]
     if page_count is not None and (not _is_int(page_count) or not 0 <= page_count <= 10_000_000):
         return None
-    present = obj.get("page_text_present")
+    present = obj["page_text_present"]
     if not isinstance(present, list) or len(present) > MAX_PAGES_CEILING:
         return None
     if not all(isinstance(item, bool) for item in present):
         return None
-    if page_count is not None and len(present) > page_count:
-        return None
-    if status == "inspected" and (page_count is None or len(present) != page_count):
-        return None
-    preview = obj.get("text_preview")
+    preview = obj["text_preview"]
     if not isinstance(preview, str):
         return None
     preview = _CONTROL_RE.sub(" ", preview.encode("utf-8", "replace").decode("utf-8"))[:MAX_PREVIEW_CHARS]
-    ids = obj.get("identifiers")
-    if not isinstance(ids, dict):
+    ids = obj["identifiers"]
+    if not isinstance(ids, dict) or set(ids) != _ID_KEYS:
         return None
     clean_ids = _empty_ids()
     for key, pattern in (("doi", _DOI_VALUE), ("pmid", _PMID_VALUE), ("pmcid", _PMCID_VALUE)):
-        value = ids.get(key)
+        value = ids[key]
         if value is None:
             continue
         if not isinstance(value, str) or len(value) > 256 or not pattern.match(value):
             return None
         clean_ids[key] = value
-    version = obj.get("parser_version")
+    version = obj["parser_version"]
     if version is not None and (not isinstance(version, str) or len(version) > 64):
         return None
+
+    # Cross-field consistency.
+    if (code == "encrypted") != (encrypted is True):
+        return None
+    if status in ("inspected", "limited"):
+        if encrypted is not False or page_count is None or page_count < 1:
+            return None
+        if not 1 <= len(present) <= page_count:
+            return None
+        if status == "inspected" and (code is not None or len(present) != page_count):
+            return None
+        if status == "limited" and code not in _LIMITED_CODES:
+            return None
+    else:
+        if status == "unavailable" and (
+            code not in _UNAVAILABLE_CODES or encrypted is not None or page_count is not None
+        ):
+            return None
+        if status == "failed" and code not in _FAILED_CODES:
+            return None
+        if present or preview or any(v is not None for v in clean_ids.values()):
+            return None
     return _result(
         status,
         code,
