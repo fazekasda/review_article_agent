@@ -321,6 +321,11 @@ def build_acquisition_parser(sub: "argparse._SubParsersAction") -> None:
 
     build_manifest_parsers(acq_sub)
 
+    # Step 06 C3 addon (atomic explicit folder import); same lazy-import reason.
+    from .acquisition_folders import build_folder_parsers
+
+    build_folder_parsers(acq_sub)
+
 
 # --------------------------------------------------------------------------- #
 # shared helpers
@@ -676,6 +681,10 @@ def dispatch_acquisition(args: argparse.Namespace, ctx: Any) -> object | None:
         from .acquisition_manifest import dispatch_manifest
 
         return dispatch_manifest(args, ctx)
+    if command == "folder":
+        from .acquisition_folders import dispatch_folder
+
+        return dispatch_folder(args, ctx)
     if command == "occurrence":
         handler = _OCCURRENCE_COMMANDS.get(
             getattr(args, "acquisition_occurrence_command", None)
