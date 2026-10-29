@@ -141,6 +141,7 @@ from .parsing import (
     build_parsing_parser,
     dispatch_parsing,
 )
+from .screening import build_screening_parser, dispatch_screening
 
 PROG = "review-article-agent"
 
@@ -285,6 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_discovery_parser(sub)
     build_acquisition_parser(sub)
     build_parsing_parser(sub)
+    build_screening_parser(sub)
 
     return parser
 
@@ -1022,6 +1024,8 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
                 f"unknown parsing command {args.parsing_command!r}"
             )
         return result
+    if args.command == "screening":
+        return dispatch_screening(args, ctx)
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
