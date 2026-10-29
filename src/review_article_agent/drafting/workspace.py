@@ -272,11 +272,12 @@ class SectionWorkspaceRepository:
     def _workspace_history(self):
         """Return ``(section_id, planner_mapping_id, writer_mapping_id)`` entries.
 
-        A bounded, integrity-checked scan of every stored workspace document, used
-        to enforce per-section exclusivity. Other generic ``report`` documents
-        (including raw-byte receipts and other document types) are ignored; a
-        *matching* workspace document is integrity-checked and its same-project refs
-        validated, and any malformed/foreign/corrupt matching document **fails
+        A bounded, integrity-checked scan of every stored report revision, used to
+        enforce per-section exclusivity. **Every** scanned revision's bytes are
+        first verified against its immutable metadata (so a tampered row fails
+        closed); a verified raw-byte receipt or another document type is then
+        ignored, while a matching workspace document has its same-project refs
+        validated and any malformed/foreign/corrupt matching document **fails
         closed**. The scan is bounded by :data:`MAX_GATE_SNAPSHOT_ENTRIES` matching
         workspace revisions.
         """
@@ -294,19 +295,25 @@ class SectionWorkspaceRepository:
                 data = self.artifacts.read_content(
                     artifact.artifact_id, revision.revision_id
                 )
-                try:
-                    doc = json.loads(data)
-                except (ValueError, UnicodeDecodeError):
-                    # A raw-byte report (e.g., a dispatch receipt) is not a document.
-                    continue
-                if not isinstance(doc, dict) or doc.get("document_type") != DOCUMENT_TYPE:
-                    continue
-                # A matching workspace document: verify its bytes, then its refs.
+                # Verify the stored bytes against the revision's immutable metadata
+                # for EVERY scanned report revision, BEFORE any decode/filter.
+                # ``read_content`` returns bytes without hash validation, so a
+                # tampered row — bytes replaced with raw bytes or with another
+                # document_type — must fail closed here rather than silently vanish
+                # from the scan (which would otherwise allow a cross-section reuse).
                 require(
                     sha256_digest(data) == stored.content_sha256
                     and len(data) == stored.byte_size,
-                    "a stored workspace revision fails content integrity",
+                    "a stored report revision fails content integrity",
                 )
+                try:
+                    doc = json.loads(data)
+                except (ValueError, UnicodeDecodeError):
+                    # A verified raw-byte report (e.g., a dispatch receipt) is not a
+                    # document and is ignored only after the integrity pass above.
+                    continue
+                if not isinstance(doc, dict) or doc.get("document_type") != DOCUMENT_TYPE:
+                    continue
                 scanned += 1
                 require(
                     scanned <= MAX_GATE_SNAPSHOT_ENTRIES,

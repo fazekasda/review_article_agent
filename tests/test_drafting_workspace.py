@@ -23,6 +23,7 @@ import json
 
 from test_synthesis_workflow import SynthesisBase  # noqa: E402
 
+from review_article_agent.domain.errors import ReviewAgentError  # noqa: E402
 from review_article_agent.domain.records import RecordValidationError  # noqa: E402
 from review_article_agent.drafting.workspace import (  # noqa: E402
     DOCUMENT_TYPE,
@@ -486,6 +487,35 @@ class PerSectionAndOutlineAdvanceTests(WorkspaceBase):
             self.payload(outline_ref, planner=self.planner_mapping(), writer=self.writer_mapping())
         )
         self.assertEqual(self.workspace.read(ref)["result"]["section_id"], "sec1")
+
+    def test_corrupt_workspace_bytes_fail_closed_not_silently_ignored(self):
+        _s, _f, outline_ref = self.approved_chain()
+        planner = self.planner_mapping()
+        writer = self.writer_mapping()
+        ref = self.propose_ws(
+            self.payload(outline_ref, section_id="sec1", planner=planner, writer=writer),
+            artifact_id="ws-sec1", revision="ws-sec1-r1",
+        )
+        # Test-only DB tamper (throwaway store): replace the stored workspace bytes
+        # with invalid JSON WITHOUT updating the revision's immutable metadata.
+        conn = self.store.connection
+        conn.execute("DROP TRIGGER revision_no_update")
+        conn.execute(
+            "UPDATE revision SET content = ? WHERE artifact_id = ? AND revision_id = ?",
+            (b"not-json", ref["artifact_id"], ref["revision_id"]),
+        )
+        conn.commit()
+        # The workspace scan itself must fail closed: integrity is verified before
+        # the document is decoded/filtered, so a tampered workspace cannot vanish
+        # from the scan (``read_content`` returns bytes without hash validation).
+        with self.assertRaises(SectionWorkspaceError):
+            self.workspace._workspace_history()
+        # End-to-end: the same runtime mappings may not bind to a different section.
+        with self.assertRaises(ReviewAgentError):
+            self.propose_ws(
+                self.payload(outline_ref, section_id="sec3", planner=planner, writer=writer),
+                artifact_id="ws-sec3", revision="ws-sec3-r1",
+            )
 
 
 if __name__ == "__main__":
