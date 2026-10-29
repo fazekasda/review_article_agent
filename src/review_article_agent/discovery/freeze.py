@@ -1011,26 +1011,43 @@ def _read_document(artifacts: ArtifactRepository, revision: Revision) -> dict:
     return parsed
 
 
-def _safe_envelope(artifacts: ArtifactRepository, revision: Revision):
-    """Decode an envelope read-only; return ``None`` on any problem (guard only)."""
-    try:
-        return _read_document(artifacts, revision)
-    except FreezeError:
-        return None
-
-
 # --------------------------------------------------------------------------- #
 # Read-only corpus freeze guard (used by CandidateRepository.ingest)
 # --------------------------------------------------------------------------- #
+def _approved_freeze_payload(store, revision):
+    """Return the validated freeze payload of ``revision``, or ``None``.
+
+    The revision must be a canonical typed ``discovery_freeze_decision`` envelope
+    whose payload fully re-derives from durable state (so a forged/tampered
+    payload is refused). The revision's *origin locator*, filename, or any other
+    provenance string is never consulted here.
+    """
+    try:
+        document = _read_document(ArtifactRepository(store), revision)
+    except FreezeError:
+        return None
+    if document["document_type"] != DOCUMENT_TYPE:
+        return None
+    try:
+        payload = _validate_payload(document["payload"], store.project_id, store)
+    except FreezeError:
+        return None
+    return payload
+
+
 def corpus_has_authentic_freeze(store, corpus_artifact_id: str) -> bool:
     """``True`` iff a logical corpus artifact already carries an authentic freeze.
 
-    Read-only: it scans the freeze decision documents (stored as ``report``
-    artifacts) and returns ``True`` only when one pins this exact corpus artifact
-    **and** its exact revision carries a currently-active, human-approved
-    ``artifact_revision``/``discovery.freeze`` gate. It writes nothing and never
-    follows into a circular write; a forged proposal with no real human gate is
-    never treated as a freeze.
+    Read-only. It derives its candidates from the **actual human approval
+    records** (the only authority), not from any origin locator, filename, or
+    provenance string: for every currently-*active*, human-approved
+    ``artifact_revision``/``discovery.freeze`` gate it reads the *exact target
+    revision* named by the approval, decodes it as a canonical typed
+    ``discovery_freeze_decision`` envelope, fully re-derives its payload from
+    durable state, and returns ``True`` only when the decision is a ``freeze``
+    whose exact ``corpus`` pin names this corpus artifact. A forged payload, a
+    rejected/stale/wrong-gate approval, or an unapproved import is never treated
+    as a freeze. It writes nothing and never follows into a circular write.
     """
     try:
         corpus_artifact_id = _artifact_identifier(corpus_artifact_id)
@@ -1038,25 +1055,26 @@ def corpus_has_authentic_freeze(store, corpus_artifact_id: str) -> bool:
         return False
     artifacts = ArtifactRepository(store)
     approvals = HumanApprovalRepository(store)
-    for artifact in artifacts.list_artifacts():
-        for revision in artifacts.list_revisions(artifact.artifact_id):
-            if not revision.origin_locator.startswith(_ORIGIN_PREFIX):
-                continue
-            document = _safe_envelope(artifacts, revision)
-            if document is None or document["document_type"] != DOCUMENT_TYPE:
-                continue
-            payload = document["payload"]
-            if not isinstance(payload, dict) or payload.get("decision") != "freeze":
-                continue
-            corpus = payload.get("corpus")
-            if not isinstance(corpus, dict):
-                continue
-            ref = corpus.get("ref")
-            if not isinstance(ref, dict) or ref.get("artifact_id") != corpus_artifact_id:
-                continue
-            status = _newest_approved_status(approvals, artifact.artifact_id, revision.revision_id)
-            if status is not None and status.satisfies_named_gate:
-                return True
+    for record in approvals.list_approvals():
+        if record.gate_kind != FREEZE_GATE_KIND or record.gate_id != FREEZE_GATE_ID:
+            continue
+        if record.decision != "approved":
+            continue
+        try:
+            status = approvals.evaluate(record.approval_id)
+        except Exception:  # pragma: no cover - defensive; evaluate never raises here
+            continue
+        if not status.satisfies_named_gate:
+            continue
+        target = record.target
+        revision = artifacts.get_revision(target["artifact_id"], target["revision_id"])
+        if revision is None:
+            continue
+        payload = _approved_freeze_payload(store, revision)
+        if payload is None or payload["decision"] != "freeze":
+            continue
+        if payload["corpus"]["ref"]["artifact_id"] == corpus_artifact_id:
+            return True
     return False
 
 
@@ -1131,12 +1149,14 @@ class FreezeRepository:
         Every durable/logical input is re-read and re-derived from the store: the
         exact corpus snapshot (via :class:`CandidateRepository`), the exact
         coverage report (via :class:`CoverageRepository`) whose own ``corpus`` and
-        ``plan`` references must pin the supplied corpus and an **approved** plan
-        exactly, the exact plan revision, and the explicit per-candidate entry
-        reviews. ``rights`` (a validated ``RightsRecord`` or a stored
-        ``RightsRecordRef``) is pinned to this exact revision. An identical
-        ``request_id`` replay returns the historical revision; a divergent reuse
-        raises :class:`FreezeConflictError`.
+        ``plan`` references must pin the supplied corpus exactly and (for a
+        genuinely **new** proposal) a **currently-approved** plan, the exact plan
+        revision, and the explicit per-candidate entry reviews. ``rights`` (a
+        validated ``RightsRecord`` or a stored ``RightsRecordRef``) is pinned to
+        this exact revision. An identical ``request_id`` replay returns the
+        historical revision **without** re-requiring the current plan approval
+        (the historical read grants no new authority); a divergent reuse raises
+        :class:`FreezeConflictError`.
 
         This records a **proposal only**: it freezes nothing and grants no
         authority. A corpus is frozen **only** when the exact named human gate
@@ -1160,10 +1180,26 @@ class FreezeRepository:
         if existing is not None:
             existing_revision, existing_binding = existing
             if existing_binding == binding:
+                # A logical replay of an already-recorded request stays historical
+                # even after the plan/coverage head later moves: the historical
+                # read carries no new authority, so the *current* approval is not
+                # re-required here.
                 return existing_revision
             raise FreezeConflictError(_M_DIVERGENT)
 
         payload = prepared["payload"]
+        # A genuinely NEW proposal requires the exact approved plan behind the
+        # coverage report's ``plan`` ref (the replay path above never weakens it).
+        try:
+            require_approved_context(
+                self._store,
+                payload["plan"]["ref"],
+                gate_kind=PROTOCOL_GATE_KIND,
+                gate_id=PLAN_GATE_ID,
+                expected_type="discovery_plan",
+            )
+        except Exception as exc:  # DiscoveryContextError
+            raise FreezeValidationError(_M_PLAN_NOT_APPROVED) from exc
         try:
             _validate_payload(payload, self.project_id, self._store)
         except FreezeError as exc:
@@ -1388,17 +1424,11 @@ class FreezeRepository:
         if plan_revision.content_sha256 != cov_payload["plan"]["content_sha256"]:
             raise FreezeValidationError(_M_BAD_PLAN)
 
-        # Require the exact approved plan via the coverage report's plan ref.
-        try:
-            require_approved_context(
-                self._store,
-                plan_ref,
-                gate_kind=PROTOCOL_GATE_KIND,
-                gate_id=PLAN_GATE_ID,
-                expected_type="discovery_plan",
-            )
-        except Exception as exc:  # DiscoveryContextError
-            raise FreezeValidationError(_M_PLAN_NOT_APPROVED) from exc
+        # NOTE: the *current* approval of this plan is deliberately NOT checked
+        # here. A logical replay of an already-recorded request must stay
+        # historical even after the plan/coverage head later moves (the historical
+        # read carries no new authority); a genuinely NEW proposal checks the
+        # current approval in ``propose`` before it writes anything.
 
         entry_reviews_norm = _normalize_entry_reviews(
             entry_reviews, corpus["candidates"]

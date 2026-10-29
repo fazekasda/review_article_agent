@@ -39,6 +39,7 @@ if str(TESTS) not in sys.path:
 import test_discovery_serialization as fx  # noqa: E402
 
 from review_article_agent.discovery import context as ctx  # noqa: E402
+from review_article_agent.discovery import freeze as freeze_mod  # noqa: E402
 from review_article_agent.discovery.candidates import (  # noqa: E402
     DEFAULT_CORPUS_ARTIFACT_ID,
     CandidateRepository,
@@ -332,6 +333,7 @@ class FreezeTestBase(unittest.TestCase):
             revision_id=rid,
             artifact_id=artifact_id,
         )
+        self._corpus_run_ids = [a.run_id, b.run_id]
         return self.ref(rev.artifact_id, rev.revision_id), self.corpus.current()
 
     def record_coverage(self, corpus_ref, plan_ref, *, request_id="cov-1", **kwargs):
@@ -923,6 +925,200 @@ class FreezeBackupTests(FreezeTestBase):
         self.addCleanup(restored.close)
         doc = FreezeRepository(restored).require_frozen()
         self.assertEqual(doc["included_candidate_ids"], included)
+
+
+# --------------------------------------------------------------------------- #
+# H. Locator-independent authority + serialized write boundary (repair)
+# --------------------------------------------------------------------------- #
+class FreezeAuthorityDerivationTests(FreezeTestBase):
+    def _import_manual_freeze(self, corpus_ref, coverage_ref, snapshot, *, locator):
+        """Store an authentic-shaped freeze through the *generic* artifact path.
+
+        The document is built by the module's own payload builder but written with
+        an honest, non-``propose`` origin locator, so it exercises exactly the case
+        where a locator/provenance string must not stand in for authority.
+        """
+        repo = FreezeRepository(self.store)
+        prepared = repo._prepare_logical(
+            "freeze-manual", corpus_ref, coverage_ref, "freeze",
+            self.reviews_for(snapshot), "manual freeze", "accepted",
+        )
+        payload = prepared["payload"]
+        document = {
+            "schema_version": 1,
+            "document_type": "discovery_freeze_decision",
+            "payload": payload,
+        }
+        rid = ArtifactRepository.new_revision_id()
+        self.artifacts.create_artifact(DEFAULT_FREEZE_ARTIFACT_ID, kind="report")
+        deps = [
+            {**payload["corpus"]["ref"], "role": "derived_from"},
+            {**payload["coverage"]["ref"], "role": "derived_from"},
+            {**payload["plan"]["ref"], "role": "derived_from"},
+        ]
+        return self.artifacts.import_revision(
+            artifact_id=DEFAULT_FREEZE_ARTIFACT_ID,
+            content=document,
+            origin_locator=locator,
+            rights=self.rights(DEFAULT_FREEZE_ARTIFACT_ID, rid),
+            revision_id=rid,
+            dependencies=deps,
+        )
+
+    def test_approved_freeze_without_the_propose_locator_protects_the_corpus(self):
+        corpus_ref, coverage_ref, _plan, snapshot = self.freeze_setup()
+        revision = self._import_manual_freeze(
+            corpus_ref, coverage_ref, snapshot, locator="import:honest-freeze"
+        )
+        # The imported document was NOT written through propose's locator.
+        self.assertFalse(revision.origin_locator.startswith("discovery-freeze:"))
+        # Before the human gate it is not a freeze (no false freeze from data).
+        self.assertFalse(corpus_has_authentic_freeze(self.store, DEFAULT_CORPUS_ARTIFACT_ID))
+        self.assertIsNone(self.freeze.current_decision())
+
+        # The real human gate over the exact imported revision is the authority.
+        self.approve_freeze(revision)
+        self.assertTrue(corpus_has_authentic_freeze(self.store, DEFAULT_CORPUS_ARTIFACT_ID))
+        # Detected by the read helpers too (they never consulted the locator).
+        self.assertEqual(self.freeze.current_decision()["payload"]["decision"], "freeze")
+        self.assertEqual(
+            self.freeze.frozen_corpus()["revision_id"], revision.revision_id
+        )
+        self.assertEqual(
+            self.freeze.require_frozen()["revision_id"], revision.revision_id
+        )
+        self.assertEqual(
+            [d["revision_id"] for d in self.freeze.history()], [revision.revision_id]
+        )
+
+        # A new cumulative snapshot into the frozen corpus artifact is refused...
+        before = len(self.artifacts.list_revisions(DEFAULT_CORPUS_ARTIFACT_ID))
+        new_run = self.observe("req-new", self.pubmed_run((self.rec(pmid="333", source_id="c"),)))
+        rid = CandidateRepository.new_revision_id()
+        with self.assertRaises(CandidateValidationError):
+            self.corpus.ingest(
+                [new_run.run_id],
+                request_id="corpus-new",
+                rights=self.rights(DEFAULT_CORPUS_ARTIFACT_ID, rid),
+                revision_id=rid,
+            )
+        self.assertEqual(
+            len(self.artifacts.list_revisions(DEFAULT_CORPUS_ARTIFACT_ID)), before
+        )
+        # ...while a genuinely NEW corpus artifact reconciles freely.
+        rid2 = CandidateRepository.new_revision_id()
+        self.corpus.ingest(
+            [new_run.run_id],
+            request_id="corpus-new-2",
+            rights=self.rights("discovery.corpus.2", rid2),
+            revision_id=rid2,
+            artifact_id="discovery.corpus.2",
+        )
+
+    def test_forged_payload_under_the_propose_locator_is_not_a_freeze(self):
+        # An unapproved *forged* document with the propose prefix is still not a
+        # freeze: the guard derives authority from approvals, not the locator.
+        corpus_ref, coverage_ref, _plan, snapshot = self.freeze_setup()
+        revision = self._import_manual_freeze(
+            corpus_ref, coverage_ref, snapshot, locator="discovery-freeze:forged"
+        )
+        self.assertTrue(revision.origin_locator.startswith("discovery-freeze:"))
+        self.assertFalse(corpus_has_authentic_freeze(self.store, DEFAULT_CORPUS_ARTIFACT_ID))
+
+
+class FreezeWriteBoundaryTests(FreezeTestBase):
+    def test_frozen_guard_runs_inside_the_append_transaction_and_refuses(self):
+        corpus_ref, coverage_ref, _plan, _snapshot = self.freeze_setup()
+        revision = self.propose(corpus_ref, coverage_ref, _snapshot, request_id="f1", accept="accepted")
+        self.approve_freeze(revision)
+        self.freeze.require_frozen()
+
+        before = len(self.artifacts.list_revisions(DEFAULT_CORPUS_ARTIFACT_ID))
+        new_run = self.observe("req-new", self.pubmed_run((self.rec(pmid="333", source_id="c"),)))
+
+        real = freeze_mod.corpus_has_authentic_freeze
+        seen = []
+
+        def wrapper(store, artifact_id):
+            seen.append(store.connection.in_transaction)
+            return real(store, artifact_id)
+
+        with mock.patch.object(freeze_mod, "corpus_has_authentic_freeze", wrapper):
+            rid = CandidateRepository.new_revision_id()
+            with self.assertRaises(CandidateValidationError):
+                self.corpus.ingest(
+                    [new_run.run_id],
+                    request_id="corpus-new",
+                    rights=self.rights(DEFAULT_CORPUS_ARTIFACT_ID, rid),
+                    revision_id=rid,
+                )
+            # An exact replay of an older request is still historical and never
+            # reaches the guard (it is a shortcut inside the same transaction).
+            replay = self.corpus.ingest(
+                self._corpus_run_ids,
+                request_id="corpus-1",
+                rights=self.rights(DEFAULT_CORPUS_ARTIFACT_ID, CandidateRepository.new_revision_id()),
+            )
+        # The guard ran exactly once, inside an active write transaction.
+        self.assertEqual(seen, [True])
+        self.assertEqual(
+            len(self.artifacts.list_revisions(DEFAULT_CORPUS_ARTIFACT_ID)), before
+        )
+        self.assertEqual(
+            replay.revision_id,
+            self.corpus.current(DEFAULT_CORPUS_ARTIFACT_ID)["revision_id"],
+        )
+
+    def test_identical_propose_replay_survives_plan_and_coverage_amendment(self):
+        corpus_ref, coverage_ref, plan_ref, snapshot = self.freeze_setup()
+        first = self.propose(corpus_ref, coverage_ref, snapshot, request_id="f1", accept="accepted")
+
+        # A substantive plan amendment moves the plan head (the pinned plan is no
+        # longer current) and a later coverage revision moves the coverage head.
+        new_payload = json.loads(
+            self.artifacts.read_content("a-plan", "rev-plan").decode("utf-8")
+        )["payload"]
+        new_payload["queries"] = [
+            {"source": "pubmed", "query": "amended", "page_size": 20, "max_pages": 2}
+        ]
+        new_payload["impact_review"] = {
+            "previous_plan": plan_ref,
+            "affected": ["queries"],
+            "rationale": "broader query",
+        }
+        deps = [
+            self.ref("a-brief", "rev-brief"),
+            self.ref("a-interview", "rev-interview"),
+            self.ref("a-seed0", "rev-seed0"),
+            self.ref("a-framing", "rev-framing"),
+            self.ref("a-scope", "rev-scope"),
+            self.ref("a-rubric", "rev-rubric"),
+        ]
+        self._put(
+            "a-plan", "report", "rev-plan-2",
+            _envelope("discovery_plan", new_payload),
+            dependencies=deps,
+            parent="rev-plan",
+        )
+
+        # An identical replay stays historical: no new authority is needed to
+        # re-read an already-recorded decision.
+        replay = self.propose(corpus_ref, coverage_ref, snapshot, request_id="f1", accept="accepted")
+        self.assertEqual(replay.revision_id, first.revision_id)
+        self.assertEqual(
+            len(self.artifacts.list_revisions(DEFAULT_FREEZE_ARTIFACT_ID)), 1
+        )
+        # A divergent reuse still conflicts.
+        with self.assertRaises(FreezeConflictError):
+            self.propose(corpus_ref, coverage_ref, snapshot, request_id="f1", accept="other")
+        # A NEW proposal is refused because the pinned plan is no longer approved.
+        with self.assertRaises(FreezeValidationError):
+            self.propose(corpus_ref, coverage_ref, snapshot, request_id="f2", accept="accepted")
+
+        # The same holds after the coverage head also moves.
+        self.record_coverage(corpus_ref, plan_ref, request_id="cov-2")
+        replay2 = self.propose(corpus_ref, coverage_ref, snapshot, request_id="f1", accept="accepted")
+        self.assertEqual(replay2.revision_id, first.revision_id)
 
 
 if __name__ == "__main__":  # pragma: no cover

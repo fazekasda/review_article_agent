@@ -502,6 +502,71 @@ class TransactionFaultTest(ArtifactTestBase):
             self.assertIsNone(repo._import_request_row("req-fk"))
 
 
+class WritePreconditionTest(ArtifactTestBase):
+    """The trusted ``write_precondition`` seam on ``import_revision``.
+
+    It runs inside the same ``BEGIN IMMEDIATE`` append transaction, after the exact
+    replay shortcut and before any new content is written; it is a plain Python
+    callable (not serialized, not read from content), grants no authority, and the
+    ``None`` default preserves every generic import.
+    """
+
+    def test_none_default_preserves_a_generic_import(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            art = repo.create_artifact(kind="document")
+            rev = self.import_document(repo, art.artifact_id, b"bytes", rights_revision="rev-1")
+            self.assertEqual(repo.read_content(art.artifact_id, rev.revision_id), b"bytes")
+
+    def test_precondition_runs_in_transaction_and_vetoes_with_no_rows(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            art = repo.create_artifact(kind="document")
+            seen: list[bool] = []
+
+            def precondition() -> None:
+                seen.append(store.connection.in_transaction)
+                raise RecordValidationError("veto")
+
+            with self.assertRaises(RecordValidationError):
+                self.import_document(
+                    repo, art.artifact_id, b"bytes", rights_revision="rev-1",
+                    write_precondition=precondition,
+                )
+            self.assertEqual(seen, [True])
+            self.assertEqual(repo.list_revisions(art.artifact_id), [])
+            self.assertIsNone(repo.get_rights_record(RightsRef(store.project_id, "RIGHTS-rev-1", 1)))
+
+    def test_precondition_is_never_run_for_an_exact_replay(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            art = repo.create_artifact(kind="document")
+            first = self.import_document(repo, art.artifact_id, b"bytes", rights_revision="rev-1")
+            calls: list[int] = []
+
+            def precondition() -> None:
+                calls.append(1)
+                raise RecordValidationError("veto")
+
+            replayed = self.import_document(
+                repo, art.artifact_id, b"bytes", rights_revision="rev-1",
+                write_precondition=precondition,
+            )
+            self.assertEqual(replayed.revision_id, first.revision_id)
+            self.assertEqual(calls, [])
+
+    def test_non_callable_precondition_is_refused(self) -> None:
+        with self.new_store() as store:
+            repo = self.repo_for(store)
+            art = repo.create_artifact(kind="document")
+            with self.assertRaises(RecordValidationError):
+                self.import_document(
+                    repo, art.artifact_id, b"bytes", rights_revision="rev-1",
+                    write_precondition=123,
+                )
+            self.assertEqual(repo.list_revisions(art.artifact_id), [])
+
+
 class MigrationTest(ArtifactTestBase):
     def test_migration1_metadata_preserved_across_v2(self) -> None:
         app_dir = self.tmp / "v1proj" / paths.APP_DIR_NAME

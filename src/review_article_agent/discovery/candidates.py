@@ -1193,15 +1193,21 @@ class CandidateRepository:
 
         # Freeze immutability (Step 05 AC6): a logical corpus artifact that already
         # carries an authentic human-approved freeze must not silently accept a new
-        # cumulative revision. The check is a read-only helper (lazy import avoids
-        # an import cycle and writes nothing), so an already-frozen roster is never
-        # mutated in place. An identical replay above is still historical-safe; only
-        # a genuinely new snapshot is refused, with static guidance to choose a new
+        # cumulative revision. The authoritative check runs as a trusted
+        # ``write_precondition`` *inside* the artifact store's own ``BEGIN
+        # IMMEDIATE`` append transaction (after the exact replay shortcut and
+        # before any new content is written), so no other writer — including a
+        # concurrent owner approval of a freeze — can commit between the check and
+        # the INSERT. It is a plain Python closure (never read from content,
+        # envelope, or configuration) that grants no authority and only vetoes the
+        # append. An identical replay above is still historical-safe; only a
+        # genuinely new snapshot is refused, with static guidance to choose a new
         # corpus artifact.
         from .freeze import corpus_has_authentic_freeze  # noqa: PLC0415
 
-        if corpus_has_authentic_freeze(self._store, artifact_id):
-            raise CandidateValidationError(_M_FROZEN_CORPUS)
+        def _write_precondition() -> None:
+            if corpus_has_authentic_freeze(self._store, artifact_id):
+                raise CandidateValidationError(_M_FROZEN_CORPUS)
 
         prior_revision = self._current_revision(artifact_id)
         prior_payload = None
@@ -1279,6 +1285,7 @@ class CandidateRepository:
                 dependencies=dependencies,
                 acquired_by="import",
                 request_id=request_id,
+                write_precondition=_write_precondition,
             )
         except ArtifactConflictError as exc:
             raise CandidateConflictError(_M_DIVERGENT) from exc
