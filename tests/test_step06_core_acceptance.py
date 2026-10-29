@@ -277,11 +277,17 @@ class Ac3DuplicateVersionTests(CoreBase):
         rev = self.make([self.entry(a, source=dup["source_ref"]), self.entry(b, "exclude")])
         self.gate(rev)
         self.assertEqual(self.acq.require_acquired()["acquired_candidate_ids"], [a])
-        # identical bytes under a different artifact id are NOT merged (no fuzzy identity)
-        other = self.import_source(data, artifact="paper-other", origin="file:///inbox/other.xml")
-        self.assertEqual(other["disposition"], "created_new_revision")
-        self.assertNotEqual(other["source_ref"], first["source_ref"])
-        self.assertEqual(other["sha256"], first["sha256"])
+        # C01 6.1 R1: identical bytes under a DIFFERENT artifact id must not
+        # create a second independent source revision; the import is vetoed and
+        # the caller is shown the existing canonical bytes to reconcile.
+        with self.assertRaises(AssetImportError) as caught:
+            self.import_source(data, artifact="paper-other", origin="file:///inbox/other.xml")
+        self.assertEqual(caught.exception.code, "cross_artifact_duplicate")
+        self.assertEqual(
+            [r.artifact_id for r in caught.exception.matching_refs], ["paper-111"]
+        )
+        self.assertIsNone(self.artifacts.get_artifact("paper-other"))
+        self.assertEqual(len(self.artifacts.list_revisions("paper-111")), 1)
 
     def test_ac3_alternate_versions_stay_distinct_and_shared_study_links_are_retained(self):
         self.setup_frozen()
@@ -363,10 +369,10 @@ class Ac4ImportsAndImpactTests(CoreBase):
         self.setup_frozen()
         a, b = self.cands["111"], self.cands["222"]
         s1 = self.import_source(_jats("111"), artifact="paper-one")
-        s2 = self.import_source(_jats("111"), artifact="paper-two")
+        s2 = self.import_source(_jats("222"), artifact="paper-two")
         m1 = self.make([self.entry(a, source=s1["source_ref"]), self.entry(b, "exclude")],
                        request_id="m1", artifact_id="acq.one")
-        m2 = self.make([self.entry(a, source=s2["source_ref"]), self.entry(b, "exclude")],
+        m2 = self.make([self.entry(b, source=s2["source_ref"]), self.entry(a, "exclude")],
                        request_id="m2", artifact_id="acq.two")
         self.gate(m1)
         self.gate(m2)

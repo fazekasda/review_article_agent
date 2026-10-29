@@ -16,11 +16,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from review_article_agent.acquisition import imports as imports_mod  # noqa: E402
 from review_article_agent.acquisition.imports import (  # noqa: E402
     MAX_SOURCE_BYTES,
     AssetImportConflictError,
@@ -255,6 +257,39 @@ class NewAndDuplicateTest(Base):
         self.assertEqual(len(self.artifacts.list_revisions("legacy-a")), 1)
         self.assertEqual(len(self.artifacts.list_revisions("legacy-b")), 1)
         self.assertIsNone(self.artifacts.get_artifact("doc-c"))
+
+    def test_report_bytes_are_not_treated_as_canonical_source(self) -> None:
+        """Produced report bytes are never a canonical paper source: only
+        ``kind='document'`` revisions are collision candidates."""
+        payload = b"%PDF synthetic one"
+        self.artifacts.create_artifact("rep-x", kind="report")
+        self.artifacts.import_revision(
+            artifact_id="rep-x", content=payload, origin_locator="report:x",
+            rights=rights(self.pid, "rep-x", "rep-r", rights_id="R-rep"),
+            revision_id="rep-r",
+        )
+        # importing the same bytes as a document source must not be blocked
+        result = self.do_import("req-1", artifact="doc-a", revision="a-1", content=payload)
+        self.assertEqual(result["disposition"], "created_new_revision")
+        self.assertEqual(len(self.artifacts.list_revisions("doc-a")), 1)
+        self.assertIsNone(self.artifacts.get_artifact("doc-b"))
+
+    def test_collision_scan_overflow_is_explicit_not_truncated(self) -> None:
+        for aid, rid in (("doc-a", "a-1"), ("doc-b", "b-1")):
+            self.artifacts.create_artifact(aid, kind="document")
+            self.artifacts.import_revision(
+                artifact_id=aid, content=b"%PDF synthetic one",
+                origin_locator=f"file:///{aid}",
+                rights=rights(self.pid, aid, rid, rights_id=f"R-{rid}"),
+                revision_id=rid,
+            )
+        with mock.patch.object(imports_mod, "MAX_BYTE_COLLISION_CANDIDATES", 1):
+            with self.assertRaises(AssetImportError) as caught:
+                self.do_import("req-1", artifact="doc-c", revision="c-1")
+        self.assertEqual(caught.exception.code, "duplicate_scan_overflow")
+        # explicit diagnostic, never a silent success/truncation
+        self.assertIsNone(self.artifacts.get_artifact("doc-c"))
+        self.assertIsNone(self.imports.find_request("req-1"))
 
     def test_global_veto_and_same_artifact_reuse_survive_restart(self) -> None:
         first = self.do_import("req-1", artifact="doc-a", revision="a-1")

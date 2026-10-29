@@ -26,7 +26,9 @@ What it guarantees
   rights and time. Equal bytes requested under a *different* document artifact
   are vetoed atomically: the import raises a static ``cross_artifact_duplicate``
   conflict carrying safe ``matching_refs`` and a guidance string, and writes no
-  second artifact, revision, rights record or occurrence. The caller must
+  second artifact, revision, rights record or occurrence. Only document source
+  revisions are candidates (``artifact.kind = 'document'``); produced report
+  bytes are never treated as a canonical paper. The caller must
   explicitly target the canonical artifact (with rights bound to its exact
   source revision) and retry, or record a ``no_full_text_acquired`` occurrence —
   identity and rights are never inferred from bytes. Changed rights that cannot
@@ -658,18 +660,25 @@ class AssetImportRepository:
     def _find_exact_bytes(self, artifact_id: str, sha: str, data: bytes):
         """Find revisions whose bytes are exactly ``data``, project-wide.
 
-        Returns ``(same_artifact_revision | None, cross_artifact_refs)``. The
-        candidate set is found with a **metadata-only** query on
-        ``content_sha256`` + ``byte_size``; only those candidates are read as
-        BLOBs and byte-compared, so unrelated project content is never loaded.
-        A candidate count above :data:`MAX_BYTE_COLLISION_CANDIDATES` is an
-        explicit diagnostic failure — the scan is never silently truncated.
+        Returns ``(same_artifact_revision | None, cross_artifact_refs)``. Only
+        genuine **document source** revisions are candidates (:class:`artifact`
+        ``kind='document'``): produced report/occurrence bytes are never treated
+        as a canonical paper. The candidate set is found with a **metadata-only**
+        query bound by ``LIMIT cap+1`` — so the bound is applied before any
+        ``fetchall`` and only those candidates are read as BLOBs and
+        byte-compared; unrelated project content is never loaded. A candidate
+        count above :data:`MAX_BYTE_COLLISION_CANDIDATES` is an explicit
+        diagnostic failure — the scan is never silently truncated.
         """
         rows = self._store.connection.execute(
-            "SELECT artifact_id, revision_id FROM revision "
-            "WHERE project_id = ? AND content_sha256 = ? AND byte_size = ? "
-            "ORDER BY rowid",
-            (self.project_id, sha, len(data)),
+            "SELECT r.artifact_id AS artifact_id, r.revision_id AS revision_id "
+            "FROM revision AS r "
+            "JOIN artifact AS a ON a.project_id = r.project_id "
+            "AND a.artifact_id = r.artifact_id "
+            "WHERE r.project_id = ? AND r.content_sha256 = ? AND r.byte_size = ? "
+            "AND a.kind = 'document' "
+            "ORDER BY r.rowid LIMIT ?",
+            (self.project_id, sha, len(data), MAX_BYTE_COLLISION_CANDIDATES + 1),
         ).fetchall()
         if len(rows) > MAX_BYTE_COLLISION_CANDIDATES:
             raise _fail("duplicate_scan_overflow")

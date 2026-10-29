@@ -715,7 +715,11 @@ class TamperTests(Base):
             conn.execute(sql, (ref["artifact_id"], ref["revision_id"]))
 
     def acquire_one(self, n):
-        ex = self.executor(Net(ok(self.full_text())))
+        # Distinct bytes per case (identifiers pmid/pmcid stay constant) so every
+        # tamper case exercises a genuinely retrieved report rather than a
+        # cross-artifact duplicate fallback.
+        body = b"<sec><p>Tamper case " + str(n).encode() + b".</p></sec>"
+        ex = self.executor(Net(ok(self.full_text(body=body))))
         result = ex.acquire(**self.args(ex, f"req-t{n}", source_artifact_id=f"doc-t{n}"))
         return ex, result
 

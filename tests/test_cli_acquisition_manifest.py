@@ -46,6 +46,41 @@ _OK = cli_main.EXIT_SUCCESS
 _VALID = cli_main.EXIT_VALIDATION
 _CONFLICT = cli_main.EXIT_CONFLICT
 
+#: Field names that would expose a private candidate identifier or free text.
+_PRIVATE_IDENTIFIER_FIELDS = frozenset(
+    {
+        "pmid", "pmcid", "doi", "expected_identifiers", "observed_identifiers",
+        "identifiers", "tokens", "rationale",
+    }
+)
+
+
+def _private_identifier_paths(obj, private_values, path="$"):
+    """JSON paths of any private identifier *field name* or *exact value*.
+
+    Opaque ids and hashes that merely *contain* a private value as a substring
+    are not flagged (they are not private identifiers); only a field named like a
+    private identifier, or a string that is exactly a private identifier value,
+    counts as a real leak. This keeps the privacy check deterministic while
+    still rejecting a genuine exposed ``pmid``/``expected_identifiers``.
+    """
+    found = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            here = f"{path}.{key}"
+            if key in _PRIVATE_IDENTIFIER_FIELDS:
+                found.append(here)
+                continue
+            found.extend(_private_identifier_paths(value, private_values, here))
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            found.extend(
+                _private_identifier_paths(item, private_values, f"{path}[{i}]")
+            )
+    elif isinstance(obj, str) and obj in private_values:
+        found.append(path)
+    return found
+
 
 class ManifestCliBase(ManifestBase):
     """``ManifestBase`` fixtures over a registry-created project the CLI can open."""
@@ -343,6 +378,8 @@ class ManifestCliTests(ManifestCliBase):
         entries = self.secret_entries()
         _rid, out = self.cli_propose(entries)
         self.gate(self.rev(out))
+        # the frozen candidates' private pmid identifiers must not be exposed
+        private_values = {value for value in self.cands}
         for blob in (
             json.dumps(out),
             json.dumps(self.cli("acquisition", "manifest", "show")),
@@ -351,7 +388,11 @@ class ManifestCliTests(ManifestCliBase):
         ):
             self.assertNotIn(_SECRET, blob)
             self.assertNotIn(_SECRET2, blob)
-            self.assertNotIn("111", blob.replace(self.project_id, ""))
+            self.assertEqual(
+                _private_identifier_paths(json.loads(blob), private_values),
+                [],
+                blob,
+            )
         shown = self.cli("acquisition", "manifest", "show")
         entry = next(e for e in shown["manifest"]["entries"] if e["candidate_id"] == self.a)
         self.assertEqual(entry["validation_status"], "ready")
@@ -368,6 +409,33 @@ class ManifestCliTests(ManifestCliBase):
         self.assertIn(_SECRET, json.dumps(private["document"]))
         self.cli("acquisition", "manifest", "show", "--revision-id", "nope",
                  expect=_VALID)
+
+    def test_private_identifier_check_allows_opaque_ids_but_rejects_pmid(self):
+        # An opaque id/hash that merely contains "111" is not a leak.
+        opaque = {
+            "candidate_id": "cand_1110deadbeef1111",
+            "revision_id": "rev_111abcdef",
+            "content_sha256": "sha256:" + "1" * 64,
+        }
+        self.assertEqual(_private_identifier_paths(opaque, {"111"}), [])
+        # A real private field name, or an exact private value, is flagged.
+        self.assertEqual(
+            _private_identifier_paths({"entry": {"pmid": "111"}}, {"111"}),
+            ["$.entry.pmid"],
+        )
+        self.assertEqual(
+            _private_identifier_paths(
+                {"e": {"expected_identifiers": {"pmid": "111"}}}, {"111"}
+            ),
+            ["$.e.expected_identifiers"],
+        )
+        self.assertEqual(
+            _private_identifier_paths({"note": "111"}, {"111"}), ["$.note"]
+        )
+        self.assertEqual(
+            _private_identifier_paths({"observed_identifiers": []}, {"111"}),
+            ["$.observed_identifiers"],
+        )
 
     def test_show_without_any_manifest_is_a_static_refusal(self):
         self.setup_frozen()
