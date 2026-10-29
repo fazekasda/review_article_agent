@@ -536,7 +536,7 @@ def _derive_material(store, report_refs: list[dict], *, config: dict):
             raise ExtractionRunnerError(
                 "report: is stale relative to the current parser/normalization version"
             )
-        if report["status"] != "parsed":
+        if report["status"] != "parsed" or report["human_action_required"]:
             raise ExtractionRunnerError(
                 "report: the structural parse failed; unreadable original evidence "
                 "requires human action"

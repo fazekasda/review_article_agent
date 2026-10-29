@@ -66,7 +66,7 @@ JATS = (
     "  </sec></body>\n"
     "</article>\n"
 )
-JATS_BYTES = JATS.encode("utf-8")
+JATS_BYTES = (JATS[:JATS.index('    <table-wrap')] + JATS[JATS.index('  </sec>'):]).encode("utf-8")
 PLAIN_BYTES = b"not a structured article; unreadable"
 
 
@@ -309,10 +309,10 @@ class RunnerTestBase(unittest.TestCase):
     def ref(self, artifact_id, revision_id):
         return {"project_id": self.project_id, "artifact_id": artifact_id, "revision_id": revision_id}
 
-    def _store_report(self, source_id, report_id):
+    def _store_report(self, source_id, report_id, data=JATS_BYTES):
         self.artifacts.create_artifact(source_id, kind="document", created_by="import")
         self.artifacts.import_revision(
-            artifact_id=source_id, revision_id="rev-" + source_id, content=JATS_BYTES,
+            artifact_id=source_id, revision_id="rev-" + source_id, content=data,
             origin_locator="import:synthetic",
             rights=_rights(self.project_id, source_id, "rev-" + source_id), acquired_by="import",
         )
@@ -422,7 +422,7 @@ class ConfigAuthorityTest(RunnerTestBase):
 
 
 class PilotRunTest(RunnerTestBase):
-    def test_pilot_success_public_receipt_keys_and_assets(self):
+    def test_pilot_success_public_receipt_keys(self):
         result = self.pilot_extraction()
         self.assertEqual(result["outcome"], "completed")
         receipt = require_run(self.store, result["run_ref"], purpose="extraction")
@@ -430,9 +430,15 @@ class PilotRunTest(RunnerTestBase):
         self.assertEqual(receipt["observed_model"], _MODEL)
         self.assertEqual(receipt["source_refs"], [self.source_ref])
         self.assertEqual(receipt["raw_output"]["schema_version"], 1)
-        # The table asset handle is surfaced as required coverage material.
+        # This supported source has no unresolved non-text assets.
         asset_ids = [aid for p in receipt["passages"] for aid in p.get("asset_ids", [])]
-        self.assertTrue(asset_ids)
+        self.assertFalse(asset_ids)
+
+    def test_caption_does_not_replace_required_table_review(self):
+        _, report_ref, _ = self._store_report("table-src", "table-report", JATS.encode("utf-8"))
+        with self.assertRaises(ExtractionRunnerError):
+            runner._derive_material(self.store, [report_ref], config=_config_payload())
+        self.assertEqual(self.transport.call_count, 0)
 
     def test_require_pilot_workflow_authority(self):
         # Mandatory failure labels are required to propose a pilot at all.
