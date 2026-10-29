@@ -587,3 +587,29 @@ module. A restore never fabricates a scientific or model approval.
   must never be published. The application never automatically ingests secrets;
   this module cannot prove the absence of any secret a user manually stored as
   artifact content. Do not store credentials as artifact content.
+
+## 8. Step 06 acquisition records (no new store table)
+
+Schema **11 is unchanged** by the integrated Step 06 local acquisition work. No
+new table exists for acquisition; each record is an immutable, typed `report`
+**artifact revision** in the existing schema-3 artifact/revision tables
+(imported source documents are `document` revisions):
+
+| Record (`document_type`) | Written by | Notes |
+| --- | --- | --- |
+| `acquisition_import_occurrence` v1 | `acquisition import`/`missing`, folder-batch library | One per request; a proposal that authorizes nothing. |
+| `acquisition_manifest` v1 | `acquisition manifest propose` | Inert; effective only under the exact named human gate. |
+| `acquisition_retrieval` v1 | `AcquisitionExecutor` (library) | Metadata only: no bytes, base64, or preview. |
+
+The generic backup/restore therefore captures and `verify_backup` revalidates
+these as ordinary artifacts: bytes, digests, bindings, and pinned references. The
+**inner acquisition records are re-derived by the acquisition runtime
+repositories on read** (manifest from the stored freeze, sources, and assets;
+reports from the pinned freeze and corpus), not by the generic backup verifier.
+A verified snapshot is a storage-integrity statement, never an acquisition,
+rights, approval, or scientific one.
+
+Source bytes appear in a snapshot only where acquisition and storage rights
+allowed them (and no privacy denial existed); an unknown storage right stores
+metadata only. A snapshot is a **private** copy, never a source publication or
+redistribution package. See [`acquisition.md`](acquisition.md).
