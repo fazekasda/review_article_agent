@@ -41,6 +41,16 @@ It is deliberately conservative:
 * the artifact stays ``provisional`` with ``authorizes_export`` false and pending
   source checks / origin tracing; it cannot accept a ``final``/``approved`` flag.
 
+This is a deliberately **constrained MVP** for drafting: no semantic validator can
+judge arbitrary prose, so a draft sentence's ``text`` must exactly equal the
+ordered approved atomic claim text(s) joined with a single space, and prose edits
+require a new blueprint approval.  The approved **package** is trusted, internally
+constructed context (from ``require_for_blueprints`` plus the accepted extraction):
+its readable string summary, exact global refs, ``section_id``/``document_type``,
+inert authority flags, and verified-receipt originals are accepted rather than
+treated as model output.  Later critique/edit stages may broaden the draft text
+rule when authorized.
+
 Public API: :class:`DraftingError`, :func:`validate_blueprint`,
 :func:`validate_draft`, and the synthetic example builders
 :func:`drafting_example_package`, :func:`blueprint_example`,
@@ -190,13 +200,15 @@ def _keys(
     label: str,
     required: frozenset,
     optional: frozenset = frozenset(),
+    allow_extra: bool = False,
 ) -> dict:
     _require(isinstance(value, dict), f"{label} must be a JSON object")
     present = set(value)
     missing = required - present
     _require(not missing, f"{label} is missing required keys: {sorted(missing)}")
-    unknown = present - required - optional
-    _require(not unknown, f"{label} has unknown keys")
+    if not allow_extra:
+        unknown = present - required - optional
+        _require(not unknown, f"{label} has unknown keys")
     return value
 
 
@@ -284,20 +296,57 @@ def _is_secondary(finding: dict) -> bool:
     return isinstance(warning, dict) and warning.get("state") == "known" and warning.get("value") is True
 
 
+def _readable_summary(value: object, *, label: str):
+    """Accept the accepted-extraction readable summary **string** (dict tolerated)."""
+    if isinstance(value, str):
+        return _string(value, label=label)
+    return _mapping(value, label=label)
+
+
 def _index_package(package: object) -> dict:
-    """Validate and index the approved drafting package (the authorized context)."""
+    """Validate and index the approved drafting package (the authorized context).
+
+    The package is trusted, internally constructed context (from
+    ``require_for_blueprints`` plus the accepted extraction) -- not model output --
+    so permitted metadata (exact global refs, ``section_id``, ``schema_version``/
+    ``document_type``, inert authority flags, ``methods``, ...) is accepted rather
+    than rejected, and an evidence entry may carry verified-receipt originals
+    (``original_passage``, ``source_context``).  The accepted-extraction summary is
+    a readable string.
+    """
     _preflight(package, "drafting package")
     item = _keys(
         package,
         label="drafting package",
-        required=frozenset({"section", "framework", "synthesis", "evidence", "citations"}),
-        optional=frozenset({"methods", "global_refs"}),
+        required=frozenset({"evidence", "citations"}),
+        allow_extra=True,
     )
-    section = _mapping(item["section"], label="drafting package.section")
-    section_id = _identifier(section.get("section_id"), label="drafting package.section.section_id")
-    section_title = _string(section.get("title"), label="drafting package.section.title")
-    framework = _mapping(item["framework"], label="drafting package.framework")
-    synthesis = _mapping(item["synthesis"], label="drafting package.synthesis")
+    section = item.get("section")
+    section_id = None
+    section_title = None
+    if section is not None:
+        section = _mapping(section, label="drafting package.section")
+        section_id = _identifier(section.get("section_id"), label="drafting package.section.section_id")
+        section_title = _string(section.get("title"), label="drafting package.section.title")
+    top_section_id = item.get("section_id")
+    if top_section_id is not None:
+        top_section_id = _identifier(top_section_id, label="drafting package.section_id")
+        if section_id is not None:
+            _require(
+                top_section_id == section_id,
+                "drafting package section_id disagrees with section.section_id",
+            )
+        else:
+            section_id = top_section_id
+    _require(section_id is not None, "drafting package must carry a section_id")
+    if section_title is None:
+        section_title = _string(item.get("section_title", section_id), label="drafting package.section_title")
+    framework = item.get("framework")
+    if framework is not None:
+        framework = _mapping(framework, label="drafting package.framework")
+    synthesis = item.get("synthesis")
+    if synthesis is not None:
+        synthesis = _mapping(synthesis, label="drafting package.synthesis")
 
     evidence_by_key: dict = {}
     for index, raw in enumerate(_list(item["evidence"], label="drafting package.evidence", allow_empty=False)):
@@ -308,14 +357,21 @@ def _index_package(package: object) -> dict:
             required=frozenset(
                 {"finding_key", "finding", "summary", "extraction_ref", "source_refs", "citation_keys"}
             ),
+            allow_extra=True,
         )
         finding_key = _identifier(entry["finding_key"], label=f"{label}.finding_key")
         _require(finding_key not in evidence_by_key, "duplicate finding_key in the drafting package")
         finding = _mapping(entry["finding"], label=f"{label}.finding")
-        summary = _mapping(entry["summary"], label=f"{label}.summary")
+        summary = _readable_summary(entry["summary"], label=f"{label}.summary")
         extraction_ref = _mapping(entry["extraction_ref"], label=f"{label}.extraction_ref")
         source_refs = _list(entry["source_refs"], label=f"{label}.source_refs", allow_empty=False)
         citation_keys = _str_list(entry["citation_keys"], label=f"{label}.citation_keys", allow_empty=False)
+        original_passage = entry.get("original_passage")
+        if original_passage is not None:
+            original_passage = _mapping(original_passage, label=f"{label}.original_passage")
+        source_context = entry.get("source_context")
+        if source_context is not None:
+            source_context = _mapping(source_context, label=f"{label}.source_context")
         evidence_by_key[finding_key] = {
             "finding_key": finding_key,
             "finding": finding,
@@ -323,6 +379,8 @@ def _index_package(package: object) -> dict:
             "extraction_ref": extraction_ref,
             "source_refs": source_refs,
             "citation_keys": citation_keys,
+            "original_passage": original_passage,
+            "source_context": source_context,
         }
 
     citations_raw = _mapping(item["citations"], label="drafting package.citations")
@@ -595,30 +653,31 @@ def validate_blueprint(payload, *, package):
 # Draft
 # --------------------------------------------------------------------------- #
 def _index_blueprint(blueprint: object) -> dict:
+    """Index a validated blueprint, preserving the approved paragraph/intent/claim order."""
     _preflight(blueprint, "validated blueprint")
     _require(isinstance(blueprint, dict), "blueprint must be a validated blueprint result")
     _require(blueprint.get("kind") == "drafting_blueprint", "blueprint is not a validated blueprint result")
-    paragraphs: dict = {}
-    claim_citations: dict = {}
+    paragraphs: list = []
+    claim_info: dict = {}
     for paragraph in blueprint.get("paragraphs", []):
-        intents: dict = {}
+        intents: list = []
         for intent in paragraph["intents"]:
-            intents[intent["intent_id"]] = [claim["claim_id"] for claim in intent["claims"]]
-            for claim in intent["claims"]:
-                claim_citations[claim["claim_id"]] = list(claim["citation_keys"])
-        paragraphs[paragraph["paragraph_id"]] = intents
-    return {
-        "section_id": blueprint["section_id"],
-        "paragraphs": paragraphs,
-        "claim_citations": claim_citations,
-    }
+            claims = [(claim["claim_id"], claim) for claim in intent["claims"]]
+            intents.append({"intent_id": intent["intent_id"], "claims": claims})
+            for claim_id, claim in claims:
+                claim_info[claim_id] = claim
+        paragraphs.append({"paragraph_id": paragraph["paragraph_id"], "intents": intents})
+    return {"section_id": blueprint["section_id"], "paragraphs": paragraphs, "claim_info": claim_info}
 
 
 def validate_draft(payload, *, blueprint, package):
     """Validate and normalize one untrusted section draft over a blueprint.
 
-    ``blueprint`` is a validated :func:`validate_blueprint` result; ``package`` is
-    the same approved drafting context.  ``payload`` is the draft content::
+    This is a deliberately constrained MVP: it does not judge arbitrary free prose
+    (no semantic validator can).  A sentence's ``text`` must **exactly** equal the
+    ordered approved atomic claim text(s) of its intent joined with a single
+    space, so a changed number, condition, or added assertion is rejected; prose
+    editing requires a new blueprint approval.  ``payload`` is the draft content::
 
         {
           "schema_version": 1,
@@ -626,17 +685,17 @@ def validate_draft(payload, *, blueprint, package):
           "paragraphs": [
             {"paragraph_id": "...",
              "sentences": [
-               {"intent_id": "...", "claim_ids": ["K1", ...], "text": "<prose>"}
+               {"intent_id": "...", "claim_ids": ["K1", ...], "text": "<approved text>"}
              ]}
           ]
         }
 
-    Returns a deterministic, JSON-portable ``dict`` or raises
-    :class:`DraftingError`.  The draft must **exactly** cover the blueprint
-    paragraphs, sentence intents, and atomic claim ids; it may not introduce a
-    claim, an unauthorized citation, or a model-generated bibliography/study
-    detail.  Citations are derived from the package.  The result stays
-    ``provisional`` and is never exportable as approved output.
+    ``claim_ids`` must equal the intent's approved claim ids in order.  The output
+    is derived deterministically from the validated blueprint (paragraphs/intents/
+    claims normalized to approved order) and carries per-sentence attribution/
+    classification warnings so assembly can label secondary accounts and author
+    proposals accurately -- there are no scientific verified flags.  Returns a
+    deterministic, JSON-portable ``dict`` or raises :class:`DraftingError`.
     """
     _preflight(payload, "draft payload")
     _require(isinstance(payload, dict), "draft payload must be a JSON object")
@@ -660,53 +719,78 @@ def validate_draft(payload, *, blueprint, package):
     section_id = _identifier(item["section_id"], label="section_id")
     _require(section_id == index["section_id"], "draft section_id does not match the blueprint section")
 
-    covered_intents: set = set()
-    covered_claims: set = set()
-    seen_paragraphs: set = set()
-    paragraphs = []
+    # Index the untrusted draft by id, rejecting duplicates.
+    draft_paragraphs: dict = {}
     for p_index, raw in enumerate(_list(item["paragraphs"], label="paragraphs", allow_empty=False)):
         label = f"paragraphs[{p_index}]"
         paragraph = _keys(raw, label=label, required=frozenset({"paragraph_id", "sentences"}))
         paragraph_id = _identifier(paragraph["paragraph_id"], label=f"{label}.paragraph_id")
-        _require(paragraph_id not in seen_paragraphs, "duplicate paragraph_id in draft")
-        _require(paragraph_id in index["paragraphs"], f"{label}.paragraph_id is not in the blueprint")
-        seen_paragraphs.add(paragraph_id)
-        allowed_intents = index["paragraphs"][paragraph_id]
-        sentences = []
-        for s_index, raw_sentence in enumerate(_list(paragraph["sentences"], label=f"{label}.sentences", allow_empty=False)):
+        _require(paragraph_id not in draft_paragraphs, "duplicate paragraph_id in draft")
+        sentences: dict = {}
+        for s_index, raw_sentence in enumerate(
+            _list(paragraph["sentences"], label=f"{label}.sentences", allow_empty=False)
+        ):
             s_label = f"{label}.sentences[{s_index}]"
             sentence = _keys(
                 raw_sentence, label=s_label,
                 required=frozenset({"intent_id", "claim_ids", "text"}),
             )
             intent_id = _identifier(sentence["intent_id"], label=f"{s_label}.intent_id")
-            _require(intent_id in allowed_intents, f"{s_label}.intent_id is not in the blueprint paragraph")
-            _require(intent_id not in covered_intents, "an intent is covered more than once in the draft")
-            covered_intents.add(intent_id)
+            _require(intent_id not in sentences, "an intent is covered more than once in the draft")
+            sentences[intent_id] = sentence
+        draft_paragraphs[paragraph_id] = sentences
+
+    approved_paragraph_ids = [paragraph["paragraph_id"] for paragraph in index["paragraphs"]]
+    _require(
+        set(draft_paragraphs) == set(approved_paragraph_ids),
+        "the draft does not cover exactly the blueprint paragraphs",
+    )
+
+    # Normalize to the approved order and derive the output from the blueprint.
+    paragraphs = []
+    for paragraph in index["paragraphs"]:
+        paragraph_id = paragraph["paragraph_id"]
+        sentences_in = draft_paragraphs[paragraph_id]
+        approved_intents = {intent["intent_id"]: intent for intent in paragraph["intents"]}
+        _require(
+            set(sentences_in) == set(approved_intents),
+            f"draft paragraph {paragraph_id!r} does not cover exactly the blueprint intents",
+        )
+        sentences = []
+        for intent in paragraph["intents"]:
+            intent_id = intent["intent_id"]
+            sentence = sentences_in[intent_id]
+            s_label = f"paragraph {paragraph_id!r} intent {intent_id!r}"
+            approved_ids = [claim_id for claim_id, _ in intent["claims"]]
             claim_ids = _str_list(sentence["claim_ids"], label=f"{s_label}.claim_ids", allow_empty=False)
-            allowed_claims = set(allowed_intents[intent_id])
-            for claim_id in claim_ids:
-                _require(claim_id in allowed_claims, f"{s_label}.claim_ids names a claim outside the intent")
-                _require(claim_id not in covered_claims, "a claim is covered more than once in the draft")
-                covered_claims.add(claim_id)
             _require(
-                set(claim_ids) == allowed_claims,
-                f"{s_label} does not cover exactly the intent's atomic claims",
+                claim_ids == approved_ids,
+                f"{s_label}.claim_ids must equal the intent's approved claim ids in order",
             )
-            # A draft must carry actual prose; a null/blank sentence is not a draft.
-            text = _string(sentence["text"], label=f"{s_label}.text")
-            citation_keys = sorted({key for claim_id in claim_ids for key in index["claim_citations"][claim_id]})
-            sentences.append({"intent_id": intent_id, "claim_ids": claim_ids, "text": text, "citation_keys": citation_keys})
+            approved_text = " ".join(index["claim_info"][claim_id]["text"] for claim_id in approved_ids)
+            _require(
+                sentence["text"] == approved_text,
+                f"{s_label}.text must exactly match the approved atomic claim text(s)",
+            )
+            citation_keys = sorted(
+                {key for claim_id in approved_ids for key in index["claim_info"][claim_id]["citation_keys"]}
+            )
+            sentences.append(
+                {
+                    "intent_id": intent_id,
+                    "claim_ids": approved_ids,
+                    "text": approved_text,
+                    "citation_keys": citation_keys,
+                    "attributions": sorted({index["claim_info"][c]["attribution"] for c in approved_ids}),
+                    "classifications": sorted({index["claim_info"][c]["classification"] for c in approved_ids}),
+                    "warnings": sorted({w for c in approved_ids for w in index["claim_info"][c]["warnings"]}),
+                    "secondary": any(index["claim_info"][c]["secondary"] for c in approved_ids),
+                    "proposed_synthesis": any(index["claim_info"][c]["proposed_synthesis"] for c in approved_ids),
+                }
+            )
         paragraphs.append({"paragraph_id": paragraph_id, "sentences": sentences})
 
-    missing_paragraphs = set(index["paragraphs"]) - seen_paragraphs
-    _require(not missing_paragraphs, "the draft does not cover every blueprint paragraph")
-    expected_intents = {iid for intents in index["paragraphs"].values() for iid in intents}
-    _require(covered_intents == expected_intents, "the draft does not cover every blueprint intent exactly once")
-    expected_claims = set(index["claim_citations"])
-    _require(covered_claims == expected_claims, "the draft does not cover every blueprint claim exactly once")
-
-    used_citations = sorted({key for sentence in paragraphs for s in sentence["sentences"] for key in s["citation_keys"]})
+    used_citations = sorted({key for p in paragraphs for s in p["sentences"] for key in s["citation_keys"]})
     citations = {key: package["citation_by_key"][key] for key in used_citations}
     return {
         "schema_version": SCHEMA_VERSION,
@@ -766,6 +850,20 @@ def drafting_example_package():
     map to verified-corpus records keyed by stable citation keys.
     """
     return {
+        # Trusted, internally constructed metadata (exact global refs, inert
+        # authority flags) is accepted alongside the authorized context.
+        "schema_version": 1,
+        "document_type": "drafting_package",
+        "section_id": "sec2",
+        "outline_ref": _ref("outline", "r1"),
+        "framework_ref": _ref("framework", "r1"),
+        "synthesis_ref": _ref("synthesis", "r1"),
+        "audit_ref": _ref("audit", "r1"),
+        "acquisition_ref": _ref("acquisition", "r1"),
+        "freeze_ref": _ref("freeze", "r1"),
+        "corpus_ref": _ref("corpus", "r1"),
+        "authority": "named_gate_only",
+        "authorizes_export": False,
         "section": {
             "section_id": "sec2",
             "order": 2,
@@ -798,7 +896,15 @@ def drafting_example_package():
             {
                 "finding_key": "A10:F1",
                 "finding": _example_finding("F1", "docA10", "reduced tumor volume by 12.5 mm3"),
-                "summary": {"text": "A mouse study reported a reduced tumor volume."},
+                "summary": "A mouse study reported a reduced tumor volume.",
+                # A verified-receipt original may accompany the evidence; it is
+                # accepted, not forbidden.
+                "original_passage": {
+                    "locator": {"page": 3, "paragraph": 2},
+                    "source_ref": _ref("A10", "a1"),
+                    "text": "tumor volume was reduced in the treated cohort",
+                },
+                "source_context": {"species": "mouse"},
                 "extraction_ref": _ref("A10", "e1"),
                 "source_refs": [_ref("A10", "a1")],
                 "citation_keys": ["CIT-A10"],
@@ -806,7 +912,7 @@ def drafting_example_package():
             {
                 "finding_key": "B7:F1",
                 "finding": _example_finding("F1", "docB7", "reduced tumor volume in an independent cohort"),
-                "summary": {"text": "A separate mouse study reported a reduced tumor volume."},
+                "summary": "A separate mouse study reported a reduced tumor volume.",
                 "extraction_ref": _ref("B7", "e1"),
                 "source_refs": [_ref("B7", "a1")],
                 "citation_keys": ["CIT-B7"],
@@ -818,7 +924,7 @@ def drafting_example_package():
                     attribution="secondary_account",
                     secondary_warning={"state": "known", "value": True},
                 ),
-                "summary": {"text": "A review article repeats the reported reduction."},
+                "summary": "A review article repeats the reported reduction.",
                 "extraction_ref": _ref("C3", "e1"),
                 "source_refs": [_ref("C3", "a1")],
                 "citation_keys": ["CIT-C3"],
@@ -902,38 +1008,20 @@ def blueprint_example(package=None):
 
 
 def draft_example(blueprint=None, package=None):
-    """Return a validated synthetic draft covering the example blueprint."""
+    """Return a validated synthetic draft whose text is derived from the blueprint."""
     package = package or drafting_example_package()
     blueprint = blueprint or blueprint_example(package)
+    paragraphs = []
+    for paragraph in blueprint["paragraphs"]:
+        sentences = []
+        for intent in paragraph["intents"]:
+            claim_ids = [claim["claim_id"] for claim in intent["claims"]]
+            text = " ".join(claim["text"] for claim in intent["claims"])
+            sentences.append({"intent_id": intent["intent_id"], "claim_ids": claim_ids, "text": text})
+        paragraphs.append({"paragraph_id": paragraph["paragraph_id"], "sentences": sentences})
     payload = {
         "schema_version": SCHEMA_VERSION,
         "section_id": blueprint["section_id"],
-        "paragraphs": [
-            {
-                "paragraph_id": "P1",
-                "sentences": [
-                    {
-                        "intent_id": "I1",
-                        "claim_ids": ["K1"],
-                        "text": "Compound Z reduced tumor volume in a mouse model (mouse, n=8 mice).",
-                    }
-                ],
-            },
-            {
-                "paragraph_id": "P2",
-                "sentences": [
-                    {
-                        "intent_id": "I2",
-                        "claim_ids": ["K2"],
-                        "text": "A secondary account repeats the reduction.",
-                    },
-                    {
-                        "intent_id": "I3",
-                        "claim_ids": ["K3"],
-                        "text": "A shared upstream mechanism may explain the effect.",
-                    },
-                ],
-            },
-        ],
+        "paragraphs": paragraphs,
     }
     return validate_draft(payload, blueprint=blueprint, package=package)

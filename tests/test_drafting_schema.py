@@ -112,19 +112,33 @@ def _claim(payload, claim_id):
     raise AssertionError(claim_id)
 
 
-def _draft_payload(blueprint, text="prose"):
-    """A raw draft payload covering the example blueprint."""
-    return {
-        "schema_version": 1,
-        "section_id": blueprint["section_id"],
-        "paragraphs": [
-            {"paragraph_id": "P1", "sentences": [
-                {"intent_id": "I1", "claim_ids": ["K1"], "text": text}]},
-            {"paragraph_id": "P2", "sentences": [
-                {"intent_id": "I2", "claim_ids": ["K2"], "text": text},
-                {"intent_id": "I3", "claim_ids": ["K3"], "text": text}]},
-        ],
-    }
+def _approved_text(intent):
+    return " ".join(claim["text"] for claim in intent["claims"])
+
+
+_DERIVE = object()
+
+
+def _draft_payload(blueprint, text=_DERIVE):
+    """A raw draft payload covering the example blueprint.
+
+    ``text`` overrides every sentence's text; by default each sentence carries the
+    approved atomic claim text(s) joined with a single space (the only accepted
+    draft text for the constrained MVP).
+    """
+    paragraphs = []
+    for paragraph in blueprint["paragraphs"]:
+        sentences = []
+        for intent in paragraph["intents"]:
+            sentences.append(
+                {
+                    "intent_id": intent["intent_id"],
+                    "claim_ids": [claim["claim_id"] for claim in intent["claims"]],
+                    "text": _approved_text(intent) if text is _DERIVE else text,
+                }
+            )
+        paragraphs.append({"paragraph_id": paragraph["paragraph_id"], "sentences": sentences})
+    return {"schema_version": 1, "section_id": blueprint["section_id"], "paragraphs": paragraphs}
 
 
 class ExampleAndDeterminismTests(unittest.TestCase):
@@ -418,6 +432,81 @@ class DraftCoverageTests(unittest.TestCase):
         payload["bibliography"] = [{"doi": "10.0/fake"}]
         with self.assertRaises(DraftingError):
             validate_draft(payload, blueprint=blueprint, package=package)
+
+    def test_no_change_draft_is_accepted(self):
+        blueprint, package = self._valid()
+        result = validate_draft(_draft_payload(blueprint), blueprint=blueprint, package=package)
+        p1 = result["paragraphs"][0]["sentences"][0]
+        self.assertEqual(p1["text"], _approved_text(blueprint["paragraphs"][0]["intents"][0]))
+
+    def test_draft_text_cannot_invent_new_data(self):
+        # Arbitrary prose (changed numbers/conditions) is rejected: text must equal
+        # the approved atomic claim text(s) exactly.
+        blueprint, package = self._valid()
+        payload = _draft_payload(blueprint)
+        payload["paragraphs"][0]["sentences"][0]["text"] = "Totally new data n=999999 humans"
+        with self.assertRaises(DraftingError):
+            validate_draft(payload, blueprint=blueprint, package=package)
+
+    def test_draft_claim_ids_must_follow_blueprint_order(self):
+        payload = _blueprint_payload()
+        second = copy.deepcopy(_claim(payload, "K1"))
+        second["claim_id"] = "K4"
+        second["finding_keys"] = ["A10:F1"]
+        payload["paragraphs"][0]["intents"][0]["claims"].append(second)
+        package = drafting_example_package()
+        blueprint = validate_blueprint(payload, package=package)
+        draft = _draft_payload(blueprint)
+        sentence = draft["paragraphs"][0]["sentences"][0]
+        sentence["claim_ids"] = ["K4", "K1"]
+        sentence["text"] = " ".join(
+            claim["text"] for claim in blueprint["paragraphs"][0]["intents"][0]["claims"]
+        )
+        with self.assertRaises(DraftingError):
+            validate_draft(draft, blueprint=blueprint, package=package)
+
+    def test_sentence_exposes_attribution_labels_without_verified_flags(self):
+        result = draft_example()
+        sentences = [s for p in result["paragraphs"] for s in p["sentences"]]
+        for sentence in sentences:
+            self.assertNotIn("primary_verified", sentence)
+            self.assertIn("attributions", sentence)
+            self.assertIn("classifications", sentence)
+            self.assertIn("warnings", sentence)
+        secondary = [s for s in sentences if s["intent_id"] == "I2"][0]
+        self.assertTrue(secondary["secondary"])
+        self.assertIn("secondary_origin_warning", secondary["warnings"])
+        proposal = [s for s in sentences if s["intent_id"] == "I3"][0]
+        self.assertTrue(proposal["proposed_synthesis"])
+        self.assertIn("author_proposal", proposal["warnings"])
+
+
+class PackageContextTests(unittest.TestCase):
+    def test_package_metadata_and_readable_summary_are_accepted(self):
+        package = drafting_example_package()
+        self.assertIsInstance(package["evidence"][0]["summary"], str)
+        # exact global refs + inert authority flags + section_id are tolerated
+        for key in ("outline_ref", "framework_ref", "synthesis_ref", "audit_ref",
+                    "acquisition_ref", "freeze_ref", "corpus_ref", "document_type"):
+            self.assertIn(key, package)
+        validate_blueprint(_blueprint_payload(), package=package)
+
+    def test_evidence_extra_originals_are_accepted(self):
+        package = drafting_example_package()
+        self.assertIn("original_passage", package["evidence"][0])
+        package["evidence"][1]["original_passage"] = {
+            "locator": {"page": 1},
+            "source_ref": {"artifact_id": "B7"},
+            "text": "independent cohort",
+        }
+        package["evidence"][1]["source_context"] = {"species": "mouse"}
+        validate_blueprint(_blueprint_payload(), package=package)
+
+    def test_package_section_id_metadata_matches_section(self):
+        package = drafting_example_package()
+        package["section_id"] = "sec9"
+        with self.assertRaises(DraftingError):
+            validate_blueprint(_blueprint_payload(), package=package)
 
 
 if __name__ == "__main__":
