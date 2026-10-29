@@ -173,7 +173,11 @@ class ScreeningRepository:
         cycle-safe (a ``seen`` set), follows only the stored dependency edges
         (for example a screening report pins its parsing report, which pins the
         exact source bytes), and skips ``version_of`` ancestry exactly as the
-        current read does. It never re-derives or re-classifies the old payload.
+        current read does. Every edge's own exact ``{project_id, artifact_id,
+        revision_id}`` reference is validated with :meth:`_ref` before any skip
+        or dedup, so a foreign-project edge (even one reusing local ids) is
+        rejected rather than reinterpreted as a local revision. It never
+        re-derives or re-classifies the old payload.
 
         The unique-revision bound is enforced at discovery/enqueue time: a graph
         exceeding it raises rather than silently verifying only a partial
@@ -193,9 +197,14 @@ class ScreeningRepository:
             artifact_id, revision_id = queue.popleft()
             self._verify_revision_bytes(artifact_id, revision_id)
             for dep in self.artifacts.list_dependencies(artifact_id, revision_id):
+                # Validate the edge's own exact reference (including its project)
+                # before any skip or dedup: a stored edge is not trusted to be
+                # this project's, and a foreign edge that reuses already-seen
+                # local ids must not bypass validation.
+                edge = self._ref(dep.as_ref())
                 if dep.role == "version_of":
                     continue
-                node = (dep.artifact_id, dep.revision_id)
+                node = (edge["artifact_id"], edge["revision_id"])
                 if node not in seen:
                     seen.add(node)
                     require(len(seen) <= _HISTORICAL_MAX_REVISIONS)

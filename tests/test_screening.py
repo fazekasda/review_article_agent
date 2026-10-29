@@ -15,6 +15,7 @@ from review_article_agent.runtime.jev import MODEL
 from review_article_agent.screening import ScreeningError, ScreeningRepository
 from review_article_agent.screening import workflow
 from review_article_agent.screening.workflow import classify, questions
+from review_article_agent.storage.artifacts import DependencyRef
 from review_article_agent.storage.store import ProjectStore
 
 
@@ -405,6 +406,33 @@ class WorkflowTests(ManifestBase):
         self._tamper_revision_content(refs[0], b"corrupt")
         with self.assertRaises(ScreeningError):
             self.screening.read(pilot, "pilot", historical=True)
+
+    def test_historical_read_rejects_foreign_project_transitive_edge(self):
+        # The parsed report is a *transitive* dependency of the pilot. Forge its
+        # stored edge list to a foreign project that reuses the existing local
+        # source ids; a duplicate local edge to the same ids follows so the
+        # already-seen node must not bypass reference validation either.
+        source = self.source
+        original = self.screening.artifacts.list_dependencies
+
+        def forged(artifact_id, revision_id):
+            deps = original(artifact_id, revision_id)
+            if (artifact_id, revision_id) == (self.report["artifact_id"],
+                                              self.report["revision_id"]):
+                return [
+                    DependencyRef(source["project_id"], source["artifact_id"],
+                                  source["revision_id"], "derived_from"),
+                    DependencyRef("other-project", source["artifact_id"],
+                                  source["revision_id"], "derived_from"),
+                ]
+            return deps
+
+        with mock.patch.object(self.screening.artifacts, "list_dependencies",
+                               side_effect=forged):
+            with self.assertRaises(ValueError):
+                self.screening.read(self.pilot, "pilot", historical=True)
+        # Root/direct dependencies were real: the same read is fine unpatched.
+        self.screening.read(self.pilot, "pilot", historical=True)
 
     def test_historical_read_bound_exceeded_fails_closed(self):
         # Exceeding the unique-revision bound raises; never a partial integrity pass.
