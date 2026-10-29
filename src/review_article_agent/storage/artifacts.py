@@ -579,6 +579,7 @@ class ArtifactRepository:
         provenance: dict | None = None,
         request_id: str | None = None,
         acquired_at_utc: str | None = None,
+        write_precondition=None,
     ) -> Revision:
         """Import (or edit) content as a new immutable revision.
 
@@ -616,6 +617,17 @@ class ArtifactRepository:
         against a reused revision on any replay/shortcut (a changed explicit
         timestamp conflicts); generated ``now()`` timestamps are intentionally
         excluded from idempotency.
+
+        ``write_precondition`` is an optional **trusted** Python callable run
+        inside this call's ``BEGIN IMMEDIATE`` transaction, after the exact
+        request-key / identical-revision replay shortcuts and before any new
+        content is written. It is never read from ``content``, a document
+        envelope, or any caller configuration, it grants no authority, and it can
+        only veto the new revision by raising (the transaction then rolls back
+        with no rows written). It lets a caller serialize a safety check — for
+        example, "this logical corpus artifact is already frozen" — against the
+        append itself, so no other writer can commit between the check and the
+        INSERT. ``None`` (the default) preserves every existing generic import.
         """
         conn = self._assert_open()
         # ---- structural validation (before the transaction) ---------------- #
@@ -629,6 +641,14 @@ class ArtifactRepository:
         if request_id is not None:
             request_id = validate_identifier(request_id, "request_id")
         acquired_by = _require_enum(acquired_by, ACQUIRED_BY, "acquired_by")
+        # A trusted, non-serialized write precondition: an optional Python
+        # callable run inside the write transaction (see below). It is never read
+        # from content, a document envelope, or any configuration, and it grants
+        # no authority; it may only veto the new revision by raising.
+        if write_precondition is not None and not callable(write_precondition):
+            raise RecordValidationError(
+                "write_precondition: must be a callable or None"
+            )
 
         content_bytes, resolved_media = self._normalize_content(content, media_type)
         content_sha = sha256_digest(content_bytes)
@@ -807,6 +827,21 @@ class ArtifactRepository:
 
             # (3) a genuinely new revision must name the CURRENT head (or none for
             # a first revision); this prevents a stale/lost edit.
+            #
+            # Before anything new is written, run the optional trusted write
+            # precondition inside THIS ``BEGIN IMMEDIATE`` transaction. It runs
+            # after the exact replay shortcuts above (so an identical retry still
+            # returns its historical revision) and before any new content is
+            # written, so a check it performs (for example, re-deriving whether
+            # the logical corpus is already frozen) is serialized against every
+            # other writer: no other transaction can commit between the check and
+            # the INSERT. It is a trusted Python callable — never read from
+            # content, an envelope, or configuration — that grants no authority
+            # and may only veto the new revision by raising. A ``None`` default
+            # preserves every existing generic import unchanged.
+            if write_precondition is not None:
+                write_precondition()
+
             self._enforce_parent_freshness(artifact_id, parent_revision_id)
 
             # persist/confirm the rights record, pinned to this revision.

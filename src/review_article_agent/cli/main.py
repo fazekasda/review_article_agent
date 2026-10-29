@@ -126,6 +126,11 @@ from .gates import (
     GateControlError,
     build_gates_parser,
 )
+from .discovery import (
+    DiscoveryControlError,
+    build_discovery_parser,
+    dispatch_discovery,
+)
 
 PROG = "review-article-agent"
 
@@ -267,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_worker_parser(sub)
     build_jobs_parser(sub)
     build_gates_parser(sub)
+    build_discovery_parser(sub)
 
     return parser
 
@@ -983,6 +989,13 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
         except KeyError as exc:  # pragma: no cover - argparse enforces choices
             raise CliUsageError(f"unknown gate command {args.gate_command!r}") from exc
         return handler(args, ctx)
+    if args.command == "discovery":
+        result = dispatch_discovery(args, ctx)
+        if result is None:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(
+                f"unknown discovery command {args.discovery_command!r}"
+            )
+        return result
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -1044,6 +1057,15 @@ _WORKER_CATEGORY_EXITS = {
 #: codes. ``gate`` raises :class:`GateControlError` with a curated, value-free
 #: message; a preparation failure records no approval.
 _GATE_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+
+#: Discovery artifact-preparation/review error categories mapped to the CLI's
+#: stable exit codes. ``discovery`` raises :class:`DiscoveryControlError` with a
+#: curated, value-free message; a validation failure records no revision.
+_DISCOVERY_CATEGORY_EXITS = {
     "validation": EXIT_VALIDATION,
     "conflict": EXIT_CONFLICT,
     "storage": EXIT_STORAGE,
@@ -1127,6 +1149,8 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
         return exc.category, _WORKER_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, GateControlError):
         return exc.category, _GATE_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, DiscoveryControlError):
+        return exc.category, _DISCOVERY_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1162,6 +1186,9 @@ def _error_message(exc: BaseException, category: str) -> str:
         return str(exc)
     if isinstance(exc, GateControlError):
         # Authored in ``cli.gates``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, DiscoveryControlError):
+        # Authored in ``cli.discovery``; a static, curated, value-free message.
         return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):

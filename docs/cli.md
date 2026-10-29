@@ -1,6 +1,6 @@
-# CLI contract — `review-article-agent` (Step 02, with bounded Step 03 and Step 04 additions)
+# CLI contract — `review-article-agent` (Step 02, with bounded Step 03, Step 04, and Step 05 additions)
 
-> **Scope: Step 02, plus clearly bounded Step 03 and Step 04 additions.** This
+> **Scope: Step 02, plus clearly bounded Step 03, Step 04, and Step 05 additions.** This
 > document is the **contract** for the command-line surface over the durable local
 > project foundation. It describes exactly what the commands accept, what they
 > print, and how they fail. It is **not** a scientific or approval contract and it
@@ -12,28 +12,39 @@
 > `worker start|status|stop` over the already-integrated detached-worker process
 > layer, the later Step 03 addition of **synthetic durable job control**
 > (`job run|status|list|pause|resume|cancel|switch|drain|reconcile|attach`) over
-> the integrated synthetic worker engine, and the bounded Step 04 addition of
+> the integrated synthetic worker engine, the bounded Step 04 addition of
 > **app-owned exact named-gate human approvals** (`gate prepare|confirm|status|
-> list`). The `fixture` commands record a local *fixture* only; they are **never**
-> a real protocol/pilot/outline/final release approval and never authorize
-> execution, export, or science. The `worker` commands manage the worker **process
-> lifecycle** only. The `job` commands run and control **bounded synthetic** tasks
-> only: they accept **no** real model, provider, credential, or budget setting,
-> make no network call, and perform or imply no scientific approval. The `gate`
-> commands preview or record **one exact named-gate human decision**; a recorded
-> approval never authorizes global execution, manuscript export, or scientific
-> validity, and no named gate — including `final_release` — waives scientific
-> validation. The wider Step 04 execution surface — production paid provider
-> sessions and hosted transfer — **remains blocked**, and the integrated restricted
-> runtime (the bounded `submit_session_turn`/`reconcile_session_turn` library path,
-> the Jev adapter, and durable result persistence) is **not exposed as a CLI** here.
+> list`), and the bounded Step 05 addition of the **`discovery` command group**
+> (typed discovery context/corpus artifacts, seed/plan proposal documents,
+> bounded search/expand background jobs, and a scoped hosted
+> lead-proposal route). The `fixture` commands record a local *fixture* only; they
+> are **never** a real protocol/pilot/outline/final release approval and never
+> authorize execution, export, or science. The `worker` commands manage the worker
+> **process lifecycle** only. The `job` commands run and control **bounded
+> synthetic** tasks only: they accept **no** real model, provider, credential, or
+> budget setting, make no network call, and perform or imply no scientific
+> approval. The `gate` commands preview or record **one exact named-gate human
+> decision**; a recorded approval never authorizes global execution, manuscript
+> export, or scientific validity, and no named gate — including `final_release` —
+> waives scientific validation. The `discovery` commands (§12) are a **separate**
+> owner-controlled surface: they store discovery proposals only, submit bounded
+> **background jobs** (real public-metadata provider GETs, a bounded citation
+> expansion, and at most one guarded direct-lead `POST` per durable job), and
+> record **no** approval, no completeness, and no scientific validation. The wider
+> Step 04 execution surface — production paid provider sessions and hosted
+> transfer — **remains blocked**, and the integrated restricted runtime (the
+> bounded `submit_session_turn`/`reconcile_session_turn` library path, the Jev
+> adapter, and durable result persistence) is **not exposed as a CLI** here.
 >
-> **This is not a real-execution product.** Every task is a bounded *synthetic
-> numeric* task or a synthetic *waiting-human* gate. Durable job states, run/
-> attach/job control, recovery, budgets, and project activation are all exercised
-> locally against the synthetic engine; real agent integration follows in a later
-> step. A `job run` reserve is a small, clearly **virtual** synthetic value — not
-> real money — and nothing here is a scientific result.
+> **This is not a real-execution product.** Every `job` task is a bounded
+> *synthetic numeric* task or a synthetic *waiting-human* gate. Durable job states,
+> run/attach/job control, recovery, budgets, and project activation are all
+> exercised locally against the synthetic engine. The Step 05 `discovery` group
+> additionally admits owner-controlled discovery background jobs that do issue
+> bounded real metadata requests and one guarded direct-lead call under explicit
+> owner/gate/rights/credential/cost controls (§12); it is still not a scientific
+> workflow. A `job run` reserve is a small, clearly **virtual** synthetic value —
+> not real money — and nothing here is a scientific result.
 
 The contract was decided in task T6a; the exact spellings below are the T6a
 decision. The behavior boundaries are fixed by
@@ -431,10 +442,14 @@ is not running it.
 worker engine ([`review_article_agent.worker.engine`](../src/review_article_agent/worker/engine.py)),
 reached through the owner-authenticated control transport
 ([`review_article_agent.runtime.ipc`](../src/review_article_agent/runtime/ipc.py)).
-There is **no** real model, provider, network call, or scientific approval: the
-only submittable task kinds are `synthetic_numeric` and
-`synthetic_waiting_human`. No arbitrary result JSON, source document, path, or
-credential is ever accepted.
+For the `job` group there is **no** real model, provider, network call, source
+processing, or scientific approval: the only submittable task kinds are
+`synthetic_numeric` and `synthetic_waiting_human`, and the same **virtual**
+synthetic reserve is exercised locally. No arbitrary result JSON, source
+document, path, or credential is ever accepted. (The separate Step 05
+`discovery` group (§12) admits **real** discovery background jobs through the
+same engine; it is not a `job` subcommand and does not widen this group, but the
+root `job` lifecycle controls below apply to every discovery admission too.)
 
 | Command | Synopsis |
 | --- | --- |
@@ -650,32 +665,252 @@ $ review-article-agent --data-dir "$DD" gate status --approval-id <APPROVAL_ID> 
 $ review-article-agent --data-dir "$DD" gate list --project <PROJECT_ID>
 ```
 
-## 12. Explicit exclusions (Step 02, and the Step 03/Step 04 boundaries)
+## 12. Discovery artifact preparation and background jobs — `discovery` (Step 05 addition)
+
+The root `discovery` command group is the bounded Step 05 addition over the
+already-integrated discovery value layers ([`discovery/context.py`](../src/review_article_agent/discovery/context.py),
+[`discovery/candidates.py`](../src/review_article_agent/discovery/candidates.py),
+[`discovery/lead_runner.py`](../src/review_article_agent/discovery/lead_runner.py),
+[`worker/discovery.py`](../src/review_article_agent/worker/discovery.py)).
+It is implemented by [`cli/discovery.py`](../src/review_article_agent/cli/discovery.py)
+(artifact/readback surface) and the two addons
+[`cli/discovery_jobs.py`](../src/review_article_agent/cli/discovery_jobs.py)
+(background-job submission) and
+[`cli/discovery_reports.py`](../src/review_article_agent/cli/discovery_reports.py)
+(report/freeze readbacks and proposals). It stores **proposals only**, records
+**no** approval, and makes **no** scientific-validation, completeness,
+deduplication, coverage, or freeze claim. **Step 05 is complete as a scoped
+discovery workflow** (final full combined check passed at head `f3d97fe`; see the
+[Step 05 handoff](implementation/handoffs/05-discovery.md)); this group is not a
+review writer. Exact field spellings, bounds, and library APIs are in
+[`discovery.md`](discovery.md); this section documents the CLI surface only.
+
+### 12.1 Commands (exact `--help` spellings)
+
+| Command | Synopsis |
+| --- | --- |
+| `discovery context import --artifact-id ID --revision-id ID --file PATH --rights-file PATH [--request-id ID] [--parent-revision-id ID] [--project ID]` | Strictly validate one typed context envelope, then store one immutable **proposal** revision (`report` kind, or `rubric` for a `discovery_rubric`). Records no approval. |
+| `discovery context show --artifact-id ID [--revision-id ID] [--content] [--historical] [--project ID]` | Read one stored context revision. Default is a **safe summary**; `--content` explicitly returns the private validated document JSON; `--historical` reads an exact superseded revision without claiming current authority. `validate` is an alias of `show`. |
+| `discovery corpus ingest --run-id ID [--artifact-id ID] --revision-id ID --request-id ID --rights-file PATH [--project ID]` | Record one cumulative publication-candidate snapshot from saved observations. Metadata is local only, never scientific-accepted context. |
+| `discovery corpus show [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Read one snapshot; the default summary never echoes raw titles/tokens, and `--content` is the explicit private opt-in. |
+| `discovery search run --artifact-id ID --revision-id ID --query-index N --request-id ID [--project ID] [--timeout SECONDS]` | Submit one exact approved-plan **query** background job. Returns queued **admission**, never completion. |
+| `discovery search seed --source SOURCE --query TEXT --page-size N --max-pages N --request-id ID [--project ID] [--timeout SECONDS]` | Submit one provisional **seed** search job; the worker enforces the hard ceilings and the result stays **provisional**. |
+| `discovery search import --artifact-id ID --revision-id ID --file PATH --source SOURCE --origin-locator LOCATOR --observed-at INSTANT --request-id ID [--project ID] [--timeout SECONDS]` | Submit one local **metadata-import** job from a strict record-array file (a user-chosen local file only; no arbitrary download), planned-ref bound. |
+| `discovery expand run --artifact-id ID --revision-id ID --corpus-artifact-id ID --corpus-revision-id ID --roots-file PATH --request-id ID [--project ID] [--timeout SECONDS]` | Submit one bounded citation-**expansion** job from a plan + corpus ref plus a strict `[{"source","id"}]` roots file. The only accepted limits are the approved plan's; there is no CLI override. |
+| `discovery expand show [--job-id ID \| --request-id ID] [--content] [--project ID]` | Read one completed expansion report. Default is a **safe summary** (counts, limits, stop reasons, report digest — never the graph); `--content` is the explicit private **full mapping**. |
+| `discovery lead status --request-id ID [--project ID]` | Safe readback of one recorded hosted-lead request (issues no call). |
+| `discovery lead content --request-id ID [--project ID]` | Explicit **PRIVATE, NON-AUTHORIZING** view of the stored lead-proposal text/metadata (issues no call). A diagnostic outcome is refused rather than shown as a successful proposal. |
+| `discovery lead configure --artifact-id ID --revision-id ID --file PATH --rights-file PATH [--request-id ID] [--parent-revision-id ID] [--project ID]` | Validate and store one `discovery_hosted_use` batch as one immutable **proposal** revision. Records no approval and verifies no provider term. |
+| `discovery lead run --batch-artifact-id ID --batch-revision-id ID --credential-env NAME --request-id ID [--project ID] [--timeout SECONDS]` | Submit one scoped hosted lead-proposal job with the **mandatory** `--credential-env OPENROUTER_API_KEY`. Returns queued **admission** only; the credential value is never accepted. |
+| `discovery report create --corpus-artifact-id ID --corpus-revision-id ID --plan-artifact-id ID --plan-revision-id ID --revision-id ID --request-id ID --rights-file PATH [--artifact-id ID] [--expansion-job-id ID ...] [--known-relevant-file PATH] [--limitations-file PATH] [--project ID]` | Record one immutable **coverage-report** revision from exact corpus/plan refs. `--expansion-job-id` resolves only a real completed expansion report; the default summary claims no completeness. No worker, no network. |
+| `discovery report show [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Read one coverage report; a **safe summary** by default, `--content` the explicit private opt-in. |
+| `discovery freeze propose --corpus-artifact-id ID --corpus-revision-id ID --coverage-artifact-id ID --coverage-revision-id ID --decision freeze\|search_again --entry-reviews-file PATH --rationale TEXT --request-id ID --revision-id ID --rights-file PATH [--artifact-id ID] [--accept-coverage-limitations EXPLANATION] [--project ID]` | Record (or replay) one **inert** freeze/search-again proposal from an explicit caller per-candidate review file and a literal coverage-limitation acknowledgement. Returns the exact named-gate `approval_request` + `gate prepare`/`gate confirm` guidance; records no approval. |
+| `discovery freeze status [--artifact-id ID] [--project ID]` | Read the current decision and the last approved freeze roster as a **safe summary** (never auto-selects a new corpus). |
+| `discovery freeze show [--artifact-id ID] [--revision-id ID] [--content] [--project ID]` | Read one freeze decision; a **safe summary** by default, `--content` the explicit private opt-in. |
+| `discovery freeze history [--artifact-id ID] [--project ID]` | Immutable previous decisions, newest-first, as **safe summaries**. |
+| `discovery freeze require [--artifact-id ID] [--content] [--require-active] [--project ID]` | Read the selection **only** when a currently-active authentic freeze authorizes it; **safe summary** by default (exact corpus ref, `included_count`, decision, active approval). **Only `--content`** opts in to the private roster; `--require-active` is a redundant active-check alias that keeps the safe summary. Both paths consult `require_frozen`. Fails cleanly when no active freeze exists. |
+
+Every command uses the global data-directory resolution (§2) and the same
+optional config file (§4); `--project` defaults to the active selected project
+(§5), and each project is opened through the registry with an expected project id
+before any read/write. Every input file is read with a hard byte cap and the
+strict parser (§6, "Strict JSON everywhere").
+
+### 12.2 Exact references, rights files, and private `--content`
+
+* **Exact same-project refs.** Plan/corpus/batch references are exact
+  `{project_id, artifact_id, revision_id}` tuples in the current project; a
+  cross-project or malformed reference is refused before anything is written or
+  sent. `search run`/`import`/`expand run` reuse the approved discovery-plan
+  library to revalidate the exact plan (and, for `expand`, the current corpus and
+  the observed roots) **before every provider request**.
+* **Explicit rights files.** `context import`, `corpus ingest`, and `lead
+  configure` all require a separately supplied `--rights-file`: a canonical
+  `RightsRecord` v1 (C03 §5.1) whose `source_revision` subject binds the exact
+  `{project_id, artifact_id, revision_id}` and whose `storage` operation is
+  `allowed`. The CLI **never** manufactures, infers, or upgrades a rights record
+  (§6, "No automatic rights grants").
+* **Explicit model config, no automatic paid call.** `lead configure` validates a
+  `discovery_hosted_use` payload that carries an explicit `config` (a strict
+  `LeadConfig` mapping), exact `source_refs`, and the three evidence references
+  `provider_terms`/`privacy_review`/`pricing_evidence` (each `{ref, verified_at}`).
+  Storing it reserves nothing and dispatches nothing. Only an explicit
+  `lead run` — after the exact `batch` named gate is recorded and every pinned
+  source's rights are revalidated — may issue **one** guarded `POST`; nothing here
+  makes an automatic or implicit paid call.
+* **Private `--content`.** A `--content` flag (or `lead content`) is the one
+  explicit read of private data, and it is always marked
+  `private`/`non_authorizing` with `authorizes_execution=false`,
+  `authorizes_export=false`, and `scientific_validation=false`. Provider metadata,
+  corpus titles/tokens, stored lead text, and the expansion graph are **untrusted,
+  non-authorizing data**: no field of an imported document (or a model reply) can
+  grant an approval or influence rights.
+
+### 12.3 Background jobs: admission, fences, and lifecycle
+
+`discovery search|expand|lead run` are submitted through the owner-only control
+transport as a `discovery_submit` request over the worker engine
+([`worker.md`](worker.md) §12). This surface is `owner-only`: only the verified
+owner transport may submit; there is no unauthenticated path.
+
+* **Five modes, exact parameters.** The accepted modes are exactly `query`,
+  `seed`, `metadata_import`, `expand`, and `lead`, each with a fixed parameter-key
+  allowlist (no actor/authority field). The CLI validates shape and bounds locally
+  **before** a worker is ensured; the worker re-validates the exact canonical
+  parameters and persists them with the caller's `--request-id` as the logical
+  idempotency key (an identical replay is stable; a divergent replay is a
+  `conflict`).
+* **Active-project global fence.** Submission acquires/verifies the single global
+  registry execution activation for the target project (the same old-project
+  drain/switch arbitration as §10); another project cannot be silently drained,
+  and a recovery blocker forbids new queuing.
+* **One scientific future per process, own store, no lock over the network.** All
+  discovery dispatch runs on **one** serial executor (one future at a time); the
+  provider work runs on its own thread with its **own** store connection, and no
+  store/lock is held across network I/O.
+* **Admission, not completion; CLI detach.** A returned `run` means the job was
+  **admitted** (queued), never that it completed; completion is observed later
+  from a **new** CLI via `job status`/`job attach` (§10), which carry
+  `job_completion=false`. `job attach` detaches on a normal exit, Ctrl-C, or a
+  closed pipe without cancelling the job.
+* **Per-attempt gate/token/job-held checks; no fabricated sockets.** Before
+  **every** real provider attempt the job rechecks the exact approved plan (and,
+  for `expand`, the current corpus, the observed roots, the activation **token**,
+  and the job's held/paused/cancelled/draining state). A stop before any attempt
+  aborts cleanly; a stop *after* a real attempt is an explicit **interrupted
+  partial page** with **no fabricated attempt and no fabricated socket** — the
+  pages already observed are retained and the attempt count reflects only real
+  requests.
+* **Honest restart.** A possibly-dispatched discovery attempt is **never**
+  blind-retried. After a restart the engine proves an existing local observation
+  on the **same fence** (and accepts it), or, when nothing can be proven, marks
+  the attempt `ambiguous` and escalates to `waiting_human` for an explicit owner
+  reconciliation. An `unknown`/unresolved outcome keeps its reserve and runtime
+  occupancy and is never re-sent.
+* **Root `job` lifecycle controls apply.** `job pause|resume|cancel|switch|drain|
+  reconcile|status|list|attach` (§10) are the only lifecycle controls and apply to
+  every discovery admission unchanged. They control **scheduling/admission** — they
+  are not a parallel approval path and grant no scientific authority. `cancel`
+  stops scheduling but never terminal-clears an ambiguous outcome; `resume` does
+  not clear an unknown outcome, raise a cap, or bypass a waiting gate.
+
+### 12.4 Cost, credential, and the direct-lead route
+
+* **Synthetic jobs stay virtual.** A `job run` reserve is a small, clearly
+  **virtual** synthetic fault-test value; synthetic actual external spend is
+  **0**, and no real model billing occurs for the `job` group.
+* **Direct-lead money is the existing runtime dispatch ledger.** A discovery
+  `lead` job reserves and settles a `direct_call` dispatch on the existing runtime
+  dispatch ledger ([`runtime/dispatch.py`](../src/review_article_agent/runtime/dispatch.py))
+  **before** its one `POST`, and its cost is read from that ledger — it is **not**
+  double-counted against the synthetic reserve bucket. Caps
+  (project USD 25 / stage USD 10 / at most 2 concurrent) count every route; an
+  `unknown` reserve is **retained** and continues to occupy the shared caps and
+  runtime occupancy until reconciled.
+* **Explicit worker environment variable.** The one permitted credential name is
+  **`OPENROUTER_API_KEY`**. The credential **value** is never accepted on the
+  command line, never sent over IPC, and never persisted or logged in the DB; the
+  worker reads the named variable from its own environment at dispatch. `lead run`
+  may ensure a worker that inherits the CLI's environment, and it **warns** when
+  the key is absent; it **never** restarts or reconfigures an already-running
+  worker to inject a credential. Starting an existing worker without the key does
+  **not** auto-restart it.
+* **One guarded `POST` per durable job.** The direct-lead route issues **at most
+  one** `POST` per durable job, only after re-deriving the current, canonical
+  hosted-use **batch** revision, revalidating the **exact named `batch` gate**, and
+  revalidating every pinned source's `storage`/hosted rights plus the
+  `provider_terms`/`privacy_review`/`pricing_evidence` shape. The route
+  machine-validates only shape/presence/boundedness/freshness; the **truth** of
+  those references and the legal/provider-term/pricing judgments remain
+  human-reviewed. The existing app-owned OpenCode **production block is
+  unchanged**; the direct-lead route is a narrow, separate exception and does not
+  weaken it.
+* **Sources are untrusted.** All provider metadata, corpus records, imported
+  metadata, and lead output are untrusted, non-authorizing observations; they never
+  become accepted context, eligibility, scientific identity, or a frozen corpus.
+
+### 12.5 Named-gate guidance (recorded out of band)
+
+The discovery proposals name the human gate they need, but they **record no
+approval**: exactly as in §11, only `gate prepare`/`gate confirm` (on the
+controlling terminal) records a real named-gate human approval. The gate names a
+discovery command surfaces or requires are:
+
+| Discovery object | `gate_kind` | `gate_id` |
+| --- | --- | --- |
+| individual seed revision | `artifact_revision` | `discovery.seed.<artifact_id>` |
+| search plan revision | `protocol` | `discovery.plan` |
+| hosted-use batch | `batch` | `discovery.hosted_use.<purpose>` |
+| corpus freeze | `artifact_revision` | `discovery.freeze` |
+
+### 12.6 Report / freeze CLI (integrated)
+
+The **reporting** and **freeze** command groups are **integrated** (CLI1B,
+`e15b5b4`): `discovery report create|show` and `discovery freeze
+propose|status|show|history|require` (exact spellings in §12.1). They surface the
+already-validated [`discovery/reporting.py`](../src/review_article_agent/discovery/reporting.py)
+and [`discovery/freeze.py`](../src/review_article_agent/discovery/freeze.py)
+value layers and introduce **no** new authority: they record only non-authorizing
+proposals, ensure no worker, make no network/provider/model call, and record no
+approval. Each JSON input file uses the same hard byte cap and strict parser as the
+rest of the group, and every project is opened through the registry with an
+expected project id.
+
+* **Entry reviews are caller-supplied.** `freeze propose --entry-reviews-file` is
+  a strict JSON list matching the freeze entry-review schema (one review per
+  pinned candidate: `candidate_id`, `checked_at`, `provenance`, the four
+  distinguished integrity statuses, a `disposition`, and a non-empty `rationale`);
+  an `include` requires a resolved candidate whose statuses are all **known**
+  (`unknown` is not clean), and unresolved/conflict candidates must be
+  `exclude`/`defer`/`no_scientific_use`.
+* **Coverage gaps need a literal acknowledgement.** A `freeze` over an explicit
+  coverage gap is refused unless `--accept-coverage-limitations EXPLANATION`
+  carries a literal explanation string — **never** a `--yes`/boolean or in-band
+  actor/authority flag.
+* **Exact named gate, out of band.** `freeze propose` returns the
+  `artifact_revision`/`discovery.freeze` `approval_request` and `gate
+  prepare`/`gate confirm` guidance; only the controlling-terminal `gate` path
+  records the approval that lets `freeze require` return a selection. A refused
+  append to an old frozen corpus artifact returns static guidance to choose a
+  **new** corpus + coverage id.
+
+No completeness, coverage, freeze, scientific-validation, study-identity,
+eligibility, extraction, review, or writer claim is made or implied anywhere in
+this group, and later workflow steps remain unimplemented.
+
+## 13. Explicit exclusions (Step 02, and the Step 03/Step 04/Step 05 boundaries)
 
 * No scientific `approve`/`reject` command exists here, and no arbitrary job
   `result` payload is accepted. `job reconcile` takes only the fixed owner
   dispositions in §10. `gate confirm` records a named-gate human approval only; it
   performs no scientific validation and authorizes no execution, export, or
-  final-release waiver. The restricted runtime is integrated as a **library**, but no
-  model-task CLI/executor exists; a model/scientific run surface follows in a later
-  step.
-* No `model`/provider/credential/budget command or setting exists here, and none
-  is read from the config file (§4). `worker`, `job`, and `gate` accept no such
-  setting.
+  final-release waiver. The restricted runtime is integrated as a **library**. The
+  Step 05 `discovery` group (§12) submits bounded discovery **background jobs** and
+  a narrow, guarded direct-lead route, but it still exposes **no** general
+  model-task executor and records no approval; a broader model/scientific run
+  surface follows in a later step.
+* No `model`/provider/credential/budget **command or setting** exists here, and
+  none is read from the config file (§4). `worker`, `job`, and `gate` accept no
+  such setting. The one credential input anywhere is `discovery lead run
+  --credential-env`, which names the single approved environment variable
+  (`OPENROUTER_API_KEY`) and accepts no credential **value** (§12.4).
 * `fixture` records a local, non-authorizing fixture only. No real
   protocol/pilot/outline/final-release gate and no in-band actor/authority is
   accepted; an imported document still cannot self-grant any approval. The `gate`
   command group is the separate exact named-gate path and does not turn a fixture
   into a real approval.
-* No scientific acquisition or evidence validation is performed or implied. All
-  jobs, fixtures, and archives are synthetic/private and non-authorizing, and the
-  worker lifecycle and job control are exercised only with owned disposable
-  processes. A `gate` approval is a local metadata decision, not scientific
-  correctness.
+* No scientific acquisition or evidence validation is performed or implied. The
+  `job`/`fixture`/backup surfaces stay synthetic/private and non-authorizing, and
+  the worker lifecycle and `job` control are exercised only with owned disposable
+  processes. The Step 05 `discovery` group does issue **bounded real** public
+  metadata requests and at most one guarded direct-lead `POST` per durable job,
+  but it records only untrusted observations/proposals and makes no scientific,
+  coverage, completeness, or freeze claim (§12). A `gate` approval is a local
+  metadata decision — for a discovery gate too — not scientific correctness.
 * `backup`/`export` is a **private local storage snapshot**, not a manuscript
   (Markdown/BibTeX/RIS) or redistribution export; never publish an archive.
 
-## 13. Extension hooks
+## 14. Extension hooks
 
 Adding a subcommand is intentionally small:
 
@@ -685,23 +920,29 @@ Adding a subcommand is intentionally small:
 3. Register it in `_COMMANDS`, `_ARTIFACT_COMMANDS`, `_BACKUP_COMMANDS`,
    `_FIXTURE_COMMANDS`, `WORKER_COMMANDS` (in
    `review_article_agent/cli/worker.py`), `JOB_COMMANDS` (in
-   `review_article_agent/cli/jobs.py`), or `GATE_COMMANDS` (in
-   `review_article_agent/cli/gates.py`).
+   `review_article_agent/cli/jobs.py`), `GATE_COMMANDS` (in
+   `review_article_agent/cli/gates.py`), or the discovery group's own map
+   `DISCOVERY_COMMANDS` / addon `DISCOVERY_JOB_COMMANDS` (in
+   `review_article_agent/cli/discovery.py` / `cli/discovery_jobs.py`) / addon
+   `DISCOVERY_REPORT_COMMANDS` (in `review_article_agent/cli/discovery_reports.py`;
+   the discovery group is extended through the `build_discovery_parser` /
+   `dispatch_discovery` addon hooks).
 
 Handlers receive a `Context` holding the resolved `Registry`, the data directory,
 the parsed config, and the environment, and never touch global state. New exit
 categories are added to `classify_error()` and this table.
 
-## 14. Verification
+## 15. Verification
 
 * `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` — includes
   the real-subprocess CLI acceptance tests (`tests/test_cli.py`,
   `tests/test_cli_snapshot.py`), the config tests (`tests/test_config.py`), the
   worker-lifecycle CLI tests (`tests/test_cli_worker.py`), the real
   detached worker-process tests (`tests/test_worker_process.py`), the
-  real-subprocess job-control CLI tests (`tests/test_cli_jobs.py`), and the
+  real-subprocess job-control CLI tests (`tests/test_cli_jobs.py`), the
   human-gate CLI tests (`tests/test_cli_human_gates.py`, including a real-PTY
-  controlling-terminal case).
+  controlling-terminal case), and the discovery CLI tests
+  (`tests/test_cli_discovery_artifacts.py`, `tests/test_cli_discovery_jobs.py`).
 * `python3 scripts/check_contract_docs.py --self-test` — the Step 01 contract
   checks remain green (this document adds no fixtures or schema field semantics).
 * The packaged console script and the absence of an invented license are checked

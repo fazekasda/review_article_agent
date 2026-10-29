@@ -42,14 +42,26 @@ scientific feature, production model run, or **scientific validation is claimed*
 Step 04 is **complete as a restricted runtime**: its full local verification passed
 at `c1f927b` (**2,105 tests, no skips**; see the
 [Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)).
-Step 05 (reproducible discovery and corpus freeze) is **partial — metadata adapter
-foundation plus inert durable search observations**: a bounded, stdlib-only
-public-metadata transport and two provider adapters exist as a **library**, and an
-added lossless codec/schema-11 repository can durably replay exact provider
-observations (see the [Step 05 handoff](docs/implementation/handoffs/05-discovery.md)
-and the [discovery API/limits](docs/discovery.md)). There is still no workflow,
-approval/search-plan gate, scientific candidate deduplication or cross-run
-ingestion, coverage reporting, or corpus freeze; the step is **not** complete.
+Step 05 (reproducible discovery and corpus freeze) is now **complete as a scoped
+discovery workflow**, with its **core library and personal discovery CLI**
+implemented and verified: a bounded, stdlib-only public-metadata
+transport and provider adapters; a lossless codec and schema-11 observation
+repository; a typed context read-and-gate layer; an approved-plan/seed/metadata
+import execution library; a durable cumulative candidate ledger; bounded
+bidirectional citation expansion; a deterministic coverage/work/monetary report;
+an exact human-approved freeze/search-again record; and a live-capable,
+separately-authorized direct lead-proposal runner (implemented but **unrun/not
+authorized** here; the existing app-owned OpenCode production block is unchanged).
+The `discovery` CLI group submits and inspects these as **detached background
+jobs**, including `report create|show` and `freeze
+propose|status|show|history|require`. The final full combined check passed at the
+exact source/test/docs head `f3d97fe` (**2,920 tests, no skips**; 29 contract
+checks; `tsc`/`compileall`/`diffcheck` clean) — see the
+[Step 05 handoff](docs/implementation/handoffs/05-discovery.md) and the
+[discovery API/limits](docs/discovery.md). This is **not** a review writer: no
+study identity, eligibility, extraction, topic/literature completeness, or
+review-writer capability is claimed; final PR delivery and user review/merge are
+release actions.
 
 ## Getting started (local core only)
 
@@ -88,13 +100,14 @@ surface in [CLI contract §10](docs/cli.md); the runtime safety contract is in
 [Worker runtime safety contract](docs/worker.md), with the completion evidence in
 the [Step 03 handoff](docs/implementation/handoffs/03-durable-worker.md).
 
-### Discovery metadata adapters and inert observations (Step 05, partial)
+### Discovery metadata adapters and inert observations (Step 05)
 
 A bounded, stdlib-only **library** foundation for public literature metadata now
 exists under `src/review_article_agent/discovery/`: a fixed-allowlist HTTPS GET
 transport (no credentials, redirects/proxies disabled, bounded retries, size cap,
-per-instance rate spacing) and two provider adapters — PubMed ESearch+EFetch and
-Europe PMC cursor-paginated search. Constructing a transport and the adapters
+per-instance rate spacing) and provider adapters — PubMed ESearch+EFetch,
+Europe PMC cursor-paginated search, and the Europe PMC citation family for
+bounded bidirectional expansion. Constructing a transport and the adapters
 performs **no** network I/O; a request happens only when `search()` is called. The
 calls below are **placeholders** and are **not** executed by the docs or the tests:
 
@@ -124,15 +137,30 @@ identical payload (this is **not** scientific deduplication). The repository
 performs **no** network call, so `search()` itself still repeats provider
 observations and is **not** idempotent candidate ingestion.
 
-This is **not** a workflow: there is **no** discovery CLI, worker scheduling,
-search-plan/approval gate, candidate deduplication or cross-run scientific
-candidate ingestion, citation expansion, coverage report, corpus freeze, or cost
-reporting, and metadata is an **untrusted observation** — no accepted context,
-eligibility, or scientific identity. Its private bytes may contain exact queries,
-source URLs, titles, and identifiers; hashes detect corruption, not authenticity,
-and it is not a secret scanner. The exact API, defaults, and maximum limits are in
-the [discovery API/limits](docs/discovery.md), and the criterion-by-criterion
-status is in the
+Beyond the observation repository, the Step 05 **core library** and a personal
+**discovery CLI** are implemented: a typed context read-and-gate layer
+(brief/interview/seed/framing/scope/rubric/plan with exact named gates), an
+approved-plan/seed/metadata-import execution library, a durable cumulative
+candidate ledger (conservative exact publication matching — never a
+study-independence claim, missing IDs and identifier conflicts stay explicit and
+unresolved), bounded bidirectional citation expansion, a deterministic
+coverage/work/monetary report, an exact human-approved `freeze`/`search_again`
+record, and a live-capable revision-scoped hosted lead-proposal runner (implemented
+but **unrun/not authorized** here). The `discovery` CLI
+group (`context import|show`, `corpus ingest|show`, `lead status|content`, plus
+`search run|seed|import`, `expand run|show`, `lead configure|run`,
+`report create|show`, and `freeze propose|status|show|history|require`) submits,
+proposes, and inspects these as **detached background jobs** or local readbacks; a
+submission returns a queued
+admission only. **No** scientific feature, production paid generation, upload,
+scientific validation, or literature-coverage claim is implemented or made, and
+metadata is an **untrusted observation** — no accepted context, eligibility, or
+scientific identity. Default outputs are private, safe summaries and `--content`
+is the explicit opt-in for private content. Its private bytes may contain exact
+queries, source URLs, titles, and identifiers; hashes detect corruption, not
+authenticity, and it is not a secret scanner. The exact API, defaults, and maximum
+limits are in the [discovery API/limits](docs/discovery.md), and the
+criterion-by-criterion status is in the
 [Step 05 handoff](docs/implementation/handoffs/05-discovery.md).
 
 ## Planning documents
@@ -145,8 +173,8 @@ status is in the
 - [Step 02 handoff (complete, local foundation)](docs/implementation/handoffs/02-project-foundation.md)
 - [Step 03 handoff (complete, synthetic detached worker)](docs/implementation/handoffs/03-durable-worker.md)
 - [Step 04 handoff (complete, restricted runtime)](docs/implementation/handoffs/04-agent-runtime.md)
-- [Step 05 handoff (partial, adapters plus durable observations)](docs/implementation/handoffs/05-discovery.md)
-- [Discovery adapters, codec, and observation API/limits (Step 05, partial)](docs/discovery.md)
+- [Step 05 handoff (complete — scoped discovery workflow)](docs/implementation/handoffs/05-discovery.md)
+- [Discovery core, adapters, codec, CLI, and limits (Step 05)](docs/discovery.md)
 - [Step 02 CLI contract](docs/cli.md)
 - [Step 02 storage contract](docs/storage.md)
 - [Step 03 worker runtime safety contract](docs/worker.md)
@@ -170,11 +198,15 @@ execution and no scientific approval, step 03 is a synthetic detached worker wit
 model, provider, or scientific approval, and step 04 is a **restricted** runtime
 whose only model transport is a loopback fixture — no scientific autonomous
 workflow, production paid generation, hosted transfer, scientific feature, or
-scientific validation is implemented or claimed. Step 05 is **partial — metadata
-adapter foundation plus inert durable observations**: a bounded public-metadata
-transport, two provider adapters, and a lossless schema-11 observation repository
-exist as **libraries** (see the
-[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); no discovery
-workflow, approval/search-plan gate, scientific candidate dedup/ingestion,
-citation expansion, coverage, corpus freeze, cost reporting, or scientific feature
-is implemented or claimed, and the step is **not** complete.
+scientific validation is implemented or claimed. Step 05 is **complete as a
+scoped discovery workflow** with its **core library
+and personal discovery CLI implemented** — a bounded public-metadata transport,
+provider adapters, a lossless schema-11 observation repository, a typed context
+read-and-gate layer, an approved-plan/seed/import execution library, a cumulative
+candidate ledger, bounded citation expansion, a coverage/work/monetary report, an
+exact human-approved freeze/search-again record, and a live-capable hosted
+lead-proposal runner, surfaced through the `discovery` CLI (see the
+[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); the final full
+combined check passed at the head `f3d97fe` (**2,920 tests, no skips**), and final
+PR delivery and user review/merge are release actions. No scientific feature, production paid
+generation, upload, or scientific validation is implemented or claimed.
