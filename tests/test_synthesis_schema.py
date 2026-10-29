@@ -93,6 +93,24 @@ class CorrelationTests(unittest.TestCase):
         self.assertEqual(b7["independence"], "unknown")
         self.assertEqual(b7["basis"], "single_observation")
 
+    def test_same_exact_source_revision_across_cases_is_not_independent(self):
+        result = validate_synthesis(_source_identity_payload(), cases=_shared_source_cases())
+        groups = result["correlation_groups"]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["independence"], "not_independent")
+        self.assertEqual(groups[0]["basis"], "shared_source_document")
+        self.assertEqual(groups[0]["member_findings"], ["X1:F1", "X2:F1"])
+
+    def test_alternate_revision_of_one_document_correlates(self):
+        cases = _shared_source_cases(rev_a="v1", rev_b="v2")
+        result = validate_synthesis(_source_identity_payload(), cases=cases)
+        self.assertEqual(result["correlation_groups"][0]["independence"], "not_independent")
+
+    def test_independent_claim_for_same_original_document_is_refused(self):
+        payload = _source_identity_payload(independence=True)
+        with self.assertRaises(SynthesisError):
+            validate_synthesis(payload, cases=_shared_source_cases())
+
 
 class DispositionTests(unittest.TestCase):
     def test_every_finding_must_be_dispositioned(self):
@@ -111,14 +129,23 @@ class DispositionTests(unittest.TestCase):
         result = _valid()
         self.assertEqual(result["by_disposition"]["null_evidence"], ["A11:F1"])
 
-    def test_statement_cannot_trace_to_non_incorporated_finding(self):
+    def test_statement_cannot_trace_to_excluded_disposition(self):
         payload = synthesis_example_payload()
-        payload["statements"][0]["evidence"] = ["A11:F1", "B7:F1"]
+        for entry in payload["dispositions"]:
+            if entry["finding"] == "A11:F1":
+                entry["disposition"] = "not_used"
         with self.assertRaises(SynthesisError):
             validate_synthesis(payload, cases=synthesis_example_cases())
 
+    def test_statement_can_trace_retained_scientific_dispositions(self):
+        result = _valid()
+        s2 = [s for s in result["statements"] if s["statement_id"] == "S-2"][0]
+        self.assertEqual(s2["evidence"], ["A11:F1"])
+        self.assertEqual(result["by_disposition"]["null_evidence"], ["A11:F1"])
+
     def test_incorporated_finding_must_be_traced_by_a_statement(self):
         payload = synthesis_example_payload()
+        payload["statements"] = [s for s in payload["statements"] if s["statement_id"] != "S-2"]
         for entry in payload["dispositions"]:
             if entry["finding"] == "A11:F1":
                 entry["disposition"] = "incorporated"
@@ -140,19 +167,52 @@ class StatementTests(unittest.TestCase):
         with self.assertRaises(SynthesisError):
             validate_synthesis(payload, cases=synthesis_example_cases())
 
-    def test_approved_claim_with_missing_context_is_rejected(self):
+    def test_approved_claim_with_missing_declared_context_is_rejected(self):
         payload = synthesis_example_payload()
         payload["statements"][0]["status"] = "approved"
         payload["statements"][0]["applicability"]["species"] = {"state": "unknown", "value": None}
         with self.assertRaises(SynthesisError):
             validate_synthesis(payload, cases=synthesis_example_cases())
 
-    def test_proposed_claim_with_missing_context_is_blocked_not_generalised(self):
+    def test_proposed_claim_with_missing_original_context_is_blocked(self):
+        cases = synthesis_example_cases()
+        for finding in cases[0]["extraction"]["findings"]:
+            finding["context"]["species"] = {"state": "missing", "value": None}
+        result = validate_synthesis(synthesis_example_payload(), cases=cases)
+        s1 = [s for s in result["statements"] if s["statement_id"] == "S-1"][0]
+        self.assertTrue(s1["blocked"])
+        self.assertEqual(s1["blocking_reasons"], ["missing_original_context"])
+        self.assertEqual(s1["missing_original_context"], ["species"])
+
+    def test_approved_claim_with_missing_original_context_is_rejected(self):
+        cases = synthesis_example_cases()
+        for finding in cases[0]["extraction"]["findings"]:
+            finding["context"]["population"] = {"state": "unknown", "value": None}
         payload = synthesis_example_payload()
-        payload["statements"][0]["applicability"]["species"] = {"state": "unknown", "value": None}
-        result = validate_synthesis(payload, cases=synthesis_example_cases())
-        self.assertTrue(result["statements"][0]["blocked"])
-        self.assertEqual(result["statements"][0]["blocking_reasons"], ["missing_applicable_context"])
+        payload["statements"][0]["status"] = "approved"
+        with self.assertRaises(SynthesisError):
+            validate_synthesis(payload, cases=cases)
+
+    def test_context_mismatch_blocks_reported_evidence(self):
+        cases = synthesis_example_cases()
+        for finding in cases[1]["extraction"]["findings"]:
+            finding["context"]["species"] = {"state": "known", "value": "human"}
+        result = validate_synthesis(synthesis_example_payload(), cases=cases)
+        s2 = [s for s in result["statements"] if s["statement_id"] == "S-2"][0]
+        self.assertTrue(s2["blocked"])
+        self.assertIn("context_mismatch", s2["blocking_reasons"])
+        self.assertEqual(s2["context_mismatch"], ["species"])
+
+    def test_context_mismatch_allowed_for_new_interpretation(self):
+        cases = synthesis_example_cases()
+        for finding in cases[1]["extraction"]["findings"]:
+            finding["context"]["species"] = {"state": "known", "value": "human"}
+        payload = synthesis_example_payload()
+        payload["statements"][1]["classification"] = "new_interpretation"
+        result = validate_synthesis(payload, cases=cases)
+        s2 = [s for s in result["statements"] if s["statement_id"] == "S-2"][0]
+        self.assertFalse(s2["blocked"])
+        self.assertEqual(s2["context_mismatch"], ["species"])
 
     def test_hypothesis_is_classified_separately(self):
         result = _valid()
@@ -261,6 +321,35 @@ class FrameworkTests(unittest.TestCase):
         framework = validate_framework(_framework_payload(), synthesis={"A10:F1", "A11:F1", "B7:F1"})
         self.assertEqual(framework["kind"], "framework")
 
+    def test_missing_counterevidence_safeguard_leaves_unclassified(self):
+        synthesis = synthesis_example()
+        payload = _framework_payload()
+        del payload["concepts"][0]["counterevidence_note"]
+        framework = validate_framework(payload, synthesis=synthesis)
+        self.assertFalse(framework["concepts"][0]["counterevidence_safeguard"])
+        self.assertEqual(framework["concepts"][0]["status"], "unclassified")
+        self.assertIn("C1", framework["unclassified_concepts"])
+
+    def test_empty_counterevidence_allowed_with_explicit_note(self):
+        synthesis = synthesis_example()
+        payload = _framework_payload()
+        payload["concepts"][0]["counterevidence"] = []
+        payload["concepts"][0]["counterevidence_note"] = "no counterevidence identified"
+        framework = validate_framework(payload, synthesis=synthesis)
+        self.assertTrue(framework["concepts"][0]["counterevidence_safeguard"])
+        self.assertEqual(framework["concepts"][0]["status"], "proposed")
+
+    def test_established_relationship_requires_traceable_support(self):
+        synthesis = synthesis_example()
+        payload = _framework_payload()
+        payload["relationships"][0]["status"] = "established"
+        payload["relationships"][0]["justification"] = "because"
+        with self.assertRaises(SynthesisError):
+            validate_framework(payload, synthesis=synthesis)
+        payload["relationships"][0]["evidence"] = ["A10:F1"]
+        framework = validate_framework(payload, synthesis=synthesis)
+        self.assertEqual(framework["relationships"][0]["status"], "established")
+
 
 class OutlineTests(unittest.TestCase):
     def test_example_outline_is_ordered_with_a_dependency_index(self):
@@ -310,6 +399,88 @@ class OutlineTests(unittest.TestCase):
             validate_outline(payload, framework=framework, synthesis=synthesis)
 
 
+def _shared_source_cases(rev_a="v1", rev_b="v1"):
+    """Two accepted cases that read the SAME original document (revision or artifact)."""
+
+    def case(case_id, revision_id, finding_id):
+        return {
+            "id": case_id,
+            "extraction_ref": {"project_id": "P-0001", "artifact_id": case_id, "revision_id": "e1"},
+            "source_refs": [{"project_id": "P-0001", "artifact_id": "DOC", "revision_id": revision_id}],
+            "extraction": {
+                "source_records": [{"source_key": "s1", "source_kind": "document"}],
+                "findings": [
+                    {
+                        "finding_id": finding_id,
+                        "source_key": "s1",
+                        "passage_id": "p1",
+                        "snippet": "text",
+                        "statement": "statement",
+                        "attribution": "direct_observation",
+                        "citation_flag": "own_result",
+                        "context": {
+                            "species": {"state": "known", "value": "mouse"},
+                            "population": {"state": "known", "value": "n=8"},
+                            "assay": {"state": "known", "value": "tumor volume"},
+                            "outcome": {"state": "known", "value": "tumor volume"},
+                            "conditions": {"state": "known", "value": "vehicle"},
+                        },
+                        "secondary_warning": {"state": "not_applicable", "value": None},
+                        "limitations": {"state": "known", "value": "single model"},
+                        "numeric_details": [],
+                    }
+                ],
+                "links": [],
+            },
+        }
+
+    return [case("X1", rev_a, "F1"), case("X2", rev_b, "F1")]
+
+
+def _source_identity_payload(independence=False):
+    payload = {
+        "schema_version": 1,
+        "memo": "two extractions of the same original document",
+        "statements": [
+            {
+                "statement_id": "S-1",
+                "text": "effect",
+                "classification": "reported_evidence",
+                "evidence": ["X1:F1", "X2:F1"],
+                "applicability": {
+                    "species": {"state": "known", "value": "mouse"},
+                    "population": {"state": "known", "value": "n=8"},
+                    "assay": {"state": "known", "value": "tumor volume"},
+                    "outcome": {"state": "known", "value": "tumor volume"},
+                    "conditions": {"state": "known", "value": "vehicle"},
+                },
+                "causal_limitations": {"state": "known", "value": "association only"},
+                "uncertainty": {"state": "known", "value": "limited"},
+                "status": "proposed",
+            }
+        ],
+        "dispositions": [
+            {"finding": "X1:F1", "disposition": "incorporated", "rationale": "used"},
+            {"finding": "X2:F1", "disposition": "incorporated", "rationale": "used"},
+        ],
+    }
+    if independence:
+        payload["independence"] = [
+            {
+                "adjudication_id": "IND-1",
+                "reviewed_a": "X1:F1",
+                "reviewed_b": "X2:F1",
+                "underlying_a": "document:DOC/v1",
+                "underlying_b": "document:DOC/v2",
+                "conclusion": "independent",
+                "basis": "different revisions",
+                "rationale": "mistaken adjudication",
+                "adjudicated_by": {"actor_kind": "user", "actor_id": "user:r1", "confirmation_ref": None},
+            }
+        ]
+    return payload
+
+
 def _framework_payload():
     return {
         "schema_version": 1,
@@ -327,6 +498,7 @@ def _framework_payload():
                 "definition": "def",
                 "role": "role",
                 "original_support": ["A10:F1"],
+                "counterevidence_note": "no counterevidence identified",
                 "applicability_limits": "limits",
                 "testable_implication": "an experiment would show it",
                 "status": "proposed",
@@ -336,6 +508,7 @@ def _framework_payload():
                 "definition": "def2",
                 "role": "role2",
                 "original_support": ["B7:F1"],
+                "counterevidence_note": "no counterevidence identified",
                 "applicability_limits": "limits2",
                 "testable_implication": {"state": "not_applicable", "reason": "methodological"},
                 "status": "proposed",

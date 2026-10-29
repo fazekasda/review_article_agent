@@ -257,6 +257,8 @@ def _index_cases(cases: object):
     ordered: list[str] = []
     findings_by_key: dict[str, dict] = {}
     refs_by_key: dict[str, set] = {}
+    source_exact_by_case: dict[str, set] = {}
+    source_doc_by_case: dict[str, set] = {}
     for index, raw in enumerate(raw_cases):
         label = f"cases[{index}]"
         item = _keys(
@@ -329,6 +331,25 @@ def _index_cases(cases: object):
             }
             refs_by_key[key] = refs
             case_finding_keys.append(key)
+
+        # Exact original-source document/revision identities for this case, used to
+        # correlate two accepted extractions of the *same* source even when no
+        # model link was proposed.  An alternate revision of one document artifact
+        # is conservatively the same underlying source document.
+        source_exact = set()
+        source_doc = set()
+        source_refs = _list(item.get("source_refs", []), label=f"{label}.source_refs")
+        for s_index, source_ref in enumerate(source_refs):
+            ref_map = _mapping(source_ref, label=f"{label}.source_refs[{s_index}]")
+            project_id = ref_map.get("project_id")
+            artifact_id = ref_map.get("artifact_id")
+            revision_id = ref_map.get("revision_id")
+            project = project_id if isinstance(project_id, str) and project_id.strip() else ""
+            if isinstance(artifact_id, str) and artifact_id.strip():
+                source_doc.add(f"{project}|{artifact_id}")
+                if isinstance(revision_id, str) and revision_id.strip():
+                    source_exact.add(f"{project}|{artifact_id}|{revision_id}")
+
         cases_by_id[case_id] = {
             "id": case_id,
             "extraction_ref": copy.deepcopy(extraction_ref),
@@ -336,18 +357,22 @@ def _index_cases(cases: object):
             "source_keys": sorted(source_by_key),
             "finding_keys": case_finding_keys,
         }
+        source_exact_by_case[case_id] = source_exact
+        source_doc_by_case[case_id] = source_doc
         ordered.append(case_id)
-    return ordered, cases_by_id, findings_by_key, refs_by_key
+    return ordered, cases_by_id, findings_by_key, refs_by_key, source_exact_by_case, source_doc_by_case
 
 
-def _correlation_groups(findings_by_key: dict, refs_by_key: dict):
+def _correlation_groups(findings_by_key: dict, refs_by_key: dict, source_exact_by_case: dict, source_doc_by_case: dict):
     """Union-find findings that share a source document or an underlying entity.
 
-    Connectivity comes from (a) the same case/source document and (b) any shared
-    declared ``study``/``dataset``/``experiment`` -- whether the link was
-    ``proposed`` or ``confirmed``.  A group with more than one finding is
-    ``not_independent`` (shared underlying data is a hard prohibition); a
-    singleton is ``unknown``.  Nothing is ever auto-labelled independent.
+    Connectivity comes from (a) the same case/source document, (b) any shared
+    declared ``study``/``dataset``/``experiment`` (``proposed`` or ``confirmed``),
+    and (c) the same exact original-source document revision -- or an alternate
+    revision of the same document artifact -- across different cases.  A group
+    with more than one finding is ``not_independent`` (shared underlying data is a
+    hard prohibition); a singleton is ``unknown``.  Nothing is auto-labelled
+    independent.
     """
     parent: dict[str, str] = {}
 
@@ -381,6 +406,16 @@ def _correlation_groups(findings_by_key: dict, refs_by_key: dict):
     for members in by_ref.values():
         for other in members[1:]:
             union(members[0], other)
+    # same exact original-source revision, or an alternate revision of the same
+    # document artifact, across different cases
+    for identity_map in (source_exact_by_case, source_doc_by_case):
+        by_identity: dict[str, list] = {}
+        for key in keys:
+            for identity in identity_map.get(findings_by_key[key]["case_id"], set()):
+                by_identity.setdefault(identity, []).append(key)
+        for members in by_identity.values():
+            for other in members[1:]:
+                union(members[0], other)
 
     grouped: dict[str, list] = {}
     for key in keys:
@@ -397,6 +432,9 @@ def _correlation_groups(findings_by_key: dict, refs_by_key: dict):
             independence = "unknown"
         elif len(case_ids) > 1 and underlying:
             reason = "shared_underlying_study_or_dataset"
+            independence = "not_independent"
+        elif len(case_ids) > 1:
+            reason = "shared_source_document"
             independence = "not_independent"
         else:
             reason = "same_source_document"
@@ -445,13 +483,50 @@ def _validate_statements(value: object, findings_by_key: dict) -> list:
         causal = _stated(item["causal_limitations"], label=f"{label}.causal_limitations", kind="str")
         uncertainty = _stated(item["uncertainty"], label=f"{label}.uncertainty", kind="str")
         status = _enum(item["status"], label=f"{label}.status", allowed=STATEMENT_STATUSES)
-        missing_context = [
-            name for name, stated in applicability["context"].items() if stated["state"] in ("missing", "unknown")
+        declared = applicability["context"]
+        # Preserve the ORIGINAL extraction context of every linked finding.
+        source_context = {field: {"states": set(), "known_values": set()} for field in CONTEXT_FIELDS}
+        source_limitations = []
+        for ref in evidence:
+            record = findings_by_key[ref]["record"]
+            finding_context = record.get("context")
+            if isinstance(finding_context, dict):
+                for field in CONTEXT_FIELDS:
+                    stated = finding_context.get(field)
+                    if isinstance(stated, dict):
+                        source_context[field]["states"].add(stated.get("state"))
+                        if stated.get("state") == "known":
+                            value = stated.get("value")
+                            if isinstance(value, str):
+                                source_context[field]["known_values"].add(value)
+            limitations = record.get("limitations")
+            if isinstance(limitations, dict):
+                source_limitations.append({"finding": ref, "limitations": limitations})
+        missing_original = [
+            field
+            for field in CONTEXT_FIELDS
+            if ("missing" in source_context[field]["states"]) or ("unknown" in source_context[field]["states"])
         ]
-        if status == "approved":
-            _require(
-                not missing_context,
-                f"{label} is approved but has consequential missing applicable context: {sorted(missing_context)}",
+        # A statement may not silently widen beyond a known original context: a
+        # reported-evidence claim whose declared known value differs from every
+        # known source value is blocked (an interpretation may state a scoped
+        # extension under its own classification, but never as reported evidence).
+        context_mismatch = [
+            field
+            for field in CONTEXT_FIELDS
+            if declared[field]["state"] == "known"
+            and source_context[field]["known_values"]
+            and declared[field]["value"] not in source_context[field]["known_values"]
+        ]
+        blocking_reasons = []
+        if missing_original:
+            blocking_reasons.append("missing_original_context")
+        if context_mismatch and classification == "reported_evidence":
+            blocking_reasons.append("context_mismatch")
+        declared_missing = [field for field in CONTEXT_FIELDS if declared[field]["state"] in ("missing", "unknown")]
+        if status == "approved" and (blocking_reasons or declared_missing):
+            raise _fail(
+                f"{label} is approved but has unresolved applicable-context issues"
             )
         out.append(
             {
@@ -459,15 +534,26 @@ def _validate_statements(value: object, findings_by_key: dict) -> list:
                 "text": text,
                 "classification": classification,
                 "evidence": evidence,
-                "applicability": applicability["context"],
+                "applicability": declared,
                 "applicability_note": applicability["note"],
                 "causal_limitations": causal,
                 "uncertainty": uncertainty,
                 "status": status,
-                # A proposal with consequential missing context is a blocked
-                # proposal, never silently generalizable (POL-P2).
-                "blocked": bool(missing_context) and status != "approved",
-                "blocking_reasons": ["missing_applicable_context"] if missing_context else [],
+                # Original context is preserved beside the statement; consequential
+                # missing/mismatched original context blocks the statement so it is
+                # never silently generalizable (POL-P2).
+                "source_context": {
+                    field: {
+                        "states": sorted(state for state in source_context[field]["states"] if state is not None),
+                        "known_values": sorted(source_context[field]["known_values"]),
+                    }
+                    for field in CONTEXT_FIELDS
+                },
+                "source_limitations": source_limitations,
+                "missing_original_context": missing_original,
+                "context_mismatch": context_mismatch,
+                "blocked": bool(blocking_reasons),
+                "blocking_reasons": blocking_reasons,
             }
         )
     return out
@@ -495,14 +581,21 @@ def _validate_dispositions(value: object, findings_by_key: dict, statements: lis
         not missing,
         "every accepted finding must be explicitly dispositioned (contradictory/negative/insufficient evidence cannot be omitted)",
     )
-    # A statement may only trace to findings explicitly marked incorporated...
+    # A statement may trace to any *retained scientific* disposition: incorporated
+    # evidence, genuine disagreement, species/outcome difference, null evidence, or
+    # insufficient data.  Only `not_used`/`out_of_scope` may not be traced to.
+    retained = {
+        finding
+        for finding, disposition in ((entry["finding"], entry["disposition"]) for entry in out)
+        if disposition in ("incorporated", "genuine_disagreement", "species_or_outcome_difference", "null_evidence", "insufficient_data")
+    }
     linked = {ref for statement in statements for ref in statement["evidence"]}
-    not_incorporated = linked - incorporated
+    not_retained = linked - retained
     _require(
-        not not_incorporated,
-        "a statement traces to a finding that is not dispositioned 'incorporated'",
+        not not_retained,
+        "a statement traces to a finding dispositioned 'not_used' or 'out_of_scope'",
     )
-    # ...and every incorporated finding must actually be traced to a statement.
+    # Every incorporated finding must actually be traced to a statement.
     unused = incorporated - linked
     _require(
         not unused,
@@ -621,8 +714,8 @@ def validate_synthesis(payload, *, cases):
     )
     memo = _string(item["memo"], label="memo")
 
-    _ordered, cases_by_id, findings_by_key, refs_by_key = _index_cases(cases)
-    groups, group_of = _correlation_groups(findings_by_key, refs_by_key)
+    _ordered, cases_by_id, findings_by_key, refs_by_key, source_exact_by_case, source_doc_by_case = _index_cases(cases)
+    groups, group_of = _correlation_groups(findings_by_key, refs_by_key, source_exact_by_case, source_doc_by_case)
     statements = _validate_statements(item["statements"], findings_by_key)
     dispositions = _validate_dispositions(item["dispositions"], findings_by_key, statements)
     independence = _validate_independence(item.get("independence", []), findings_by_key, group_of)
@@ -700,7 +793,7 @@ def _validate_concepts(value: object, finding_keys: set) -> list:
             raw,
             label=label,
             required=frozenset({"concept_id", "definition", "role", "original_support", "applicability_limits"}),
-            optional=frozenset({"counterevidence", "testable_implication", "status", "justification", "novelty", "notes"}),
+            optional=frozenset({"counterevidence", "counterevidence_note", "testable_implication", "status", "justification", "novelty", "notes"}),
         )
         concept_id = _identifier(item["concept_id"], label=f"{label}.concept_id")
         _require(concept_id not in seen, "duplicate concept_id")
@@ -713,13 +806,20 @@ def _validate_concepts(value: object, finding_keys: set) -> list:
         counterevidence = _str_list(item.get("counterevidence", []), label=f"{label}.counterevidence")
         for ref in counterevidence:
             _require(ref in finding_keys, f"{label}.counterevidence names an unknown finding key")
+        counterevidence_note = item.get("counterevidence_note")
+        if counterevidence_note is not None:
+            counterevidence_note = _string(counterevidence_note, label=f"{label}.counterevidence_note")
+        # POL-P1 counterevidence safeguard: empty counterevidence is allowed only
+        # with an explicit no-counterevidence rationale; a missing safeguard leaves
+        # the concept unclassified and can never be established.
+        counterevidence_ok = bool(counterevidence) or bool(counterevidence_note)
         applicability_limits = _string(item["applicability_limits"], label=f"{label}.applicability_limits")
         implication, implication_ok = _testable_implication(item.get("testable_implication"), label=f"{label}.testable_implication")
         novelty = item.get("novelty", "unclear")
         novelty = _enum(novelty, label=f"{label}.novelty", allowed=NOVELTY_VALUES)
         requested = item.get("status", "proposed")
         requested = _enum(requested, label=f"{label}.status", allowed=CONCEPT_STATUSES)
-        admitted = bool(definition and role and applicability_limits and original_support and implication_ok)
+        admitted = bool(definition and role and applicability_limits and original_support and implication_ok and counterevidence_ok)
         if requested == "established" and not admitted:
             raise _fail(f"{label} cannot be established without its required safeguards")
         if not admitted:
@@ -736,6 +836,8 @@ def _validate_concepts(value: object, finding_keys: set) -> list:
                 "role": role,
                 "original_support": original_support,
                 "counterevidence": counterevidence,
+                "counterevidence_note": counterevidence_note,
+                "counterevidence_safeguard": counterevidence_ok,
                 "applicability_limits": applicability_limits,
                 "testable_implication": implication,
                 "novelty": novelty,
@@ -781,6 +883,10 @@ def _validate_relationships(value: object, concepts: list, finding_keys: set) ->
             _require(
                 concept_by_id[from_concept]["admitted"] and concept_by_id[to_concept]["admitted"],
                 f"{label} cannot be established from unclassified concepts",
+            )
+            _require(
+                evidence,
+                f"{label} cannot be established without non-empty traceable support",
             )
             _string(item.get("justification"), label=f"{label}.justification")
             status = "established"
@@ -1003,14 +1109,10 @@ def _known(value):
     return {"state": "known", "value": value}
 
 
-def _missing():
-    return {"state": "missing", "value": None}
-
-
 def _example_context(**overrides):
     base = {
         "species": _known("mouse"),
-        "population": _missing(),
+        "population": _known("n=8 mice"),
         "assay": _known("tumor volume"),
         "outcome": _known("tumor volume"),
         "conditions": _known("vehicle comparison"),
@@ -1117,7 +1219,7 @@ def synthesis_example_payload():
                 "statement_id": "S-2",
                 "text": "A second report of the same study did not observe the reduction.",
                 "classification": "reported_evidence",
-                "evidence": ["A10:F1"],
+                "evidence": ["A11:F1"],
                 "applicability": _example_context(),
                 "causal_limitations": _known("same study; not an independent replication"),
                 "uncertainty": _known("null result retained, not treated as refutation"),
@@ -1128,7 +1230,7 @@ def synthesis_example_payload():
                 "text": "A shared upstream mechanism may explain the divergent reports.",
                 "classification": "hypothesis",
                 "evidence": ["A10:F1"],
-                "applicability": _example_context(species={"state": "unknown", "value": None}),
+                "applicability": _example_context(),
                 "causal_limitations": _known("proposed only; not established"),
                 "uncertainty": _known("untested"),
                 "status": "proposed",
@@ -1196,6 +1298,7 @@ def framework_example(synthesis=None):
                 "definition": "Report correlation by shared underlying study.",
                 "role": "Explains why two reports are not independent confirmation.",
                 "original_support": ["A10:F1", "A11:F1"],
+                "counterevidence_note": "no counterevidence identified in the reviewed corpus",
                 "applicability_limits": "Only for reports declaring a shared study/dataset.",
                 "testable_implication": {"state": "not_applicable", "reason": "a methodological relation, not an empirical hypothesis"},
                 "status": "proposed",
