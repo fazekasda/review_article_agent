@@ -303,6 +303,12 @@ _M_CORRUPT_COVERAGE = "a corpus snapshot does not cover exactly its observed occ
 _M_CORRUPT_MEMBERSHIP = "a corpus snapshot candidate membership is internally inconsistent"
 _M_CORRUPT_INTEGRITY = "a corpus snapshot asserts a forbidden clean integrity status"
 _M_SQL = "the corpus snapshot could not be read or written safely"
+_M_FROZEN_CORPUS = (
+    "this corpus artifact already carries an authentic human-approved freeze and "
+    "cannot accept new revisions; choose a new corpus artifact id for a new "
+    "cumulative snapshot so the frozen roster stays unchanged (query observations "
+    "may still be recorded, and a new corpus artifact reconciles freely)"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -1184,6 +1190,18 @@ class CandidateRepository:
             if existing_payload["input_run_ids"] == supplied:
                 return existing_revision
             raise CandidateConflictError(_M_DIVERGENT)
+
+        # Freeze immutability (Step 05 AC6): a logical corpus artifact that already
+        # carries an authentic human-approved freeze must not silently accept a new
+        # cumulative revision. The check is a read-only helper (lazy import avoids
+        # an import cycle and writes nothing), so an already-frozen roster is never
+        # mutated in place. An identical replay above is still historical-safe; only
+        # a genuinely new snapshot is refused, with static guidance to choose a new
+        # corpus artifact.
+        from .freeze import corpus_has_authentic_freeze  # noqa: PLC0415
+
+        if corpus_has_authentic_freeze(self._store, artifact_id):
+            raise CandidateValidationError(_M_FROZEN_CORPUS)
 
         prior_revision = self._current_revision(artifact_id)
         prior_payload = None
