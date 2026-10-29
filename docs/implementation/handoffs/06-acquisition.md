@@ -1,10 +1,10 @@
 # Handoff — step 06: full-text acquisition, imports, and reconciliation
 
-**Status: MVP implemented; final validation pending.** The Step 06 acquisition MVP
-(AC1–AC7) is implemented with integrated source and named tests; the **final
-latest-head full suite is pending at this handoff's creation**, and its results are
-recorded in the PR — no final pass or count is claimed here. No CI is configured.
-This is the minimal acquisition MVP only; no human approval is invented.
+**Status: complete (scoped acquisition MVP), locally verified.** The Step 06
+acquisition MVP (AC1–AC7) has integrated source and named tests; full integration
+code+tests at `246df21` passed **3,079 tests, OK, no skips** (see Verification). The
+exact final docs-head result is recorded in the PR. This is the minimal acquisition
+MVP only; no human approval is invented.
 
 ## Acceptance criteria → evidence pointers
 
@@ -40,12 +40,13 @@ Details in [`acquisition.md`](../../acquisition.md), [`cli.md`](../../cli.md) §
 
 ## Verification
 
-- Earlier checkpoint `dbe613a`: **Ran 3027 tests — OK, no skips** (Python 3.14.4);
-  retained rollup 29 contract checks + 58 TypeScript pass. **That checkpoint does
-  not cover the retrieval CLI, the send fence, or the global guard.**
-- The **global cross-artifact exact-byte guard** (`4e1e5a3` + `d2f3d57`) is now
-  integrated by the coordinator at `246df21`, so it is not accounted for by
-  `dbe613a`.
+- Full integration code+tests at `246df21`: `PYTHONPATH=src …/python -m unittest
+  discover -s tests -p 'test_*.py'` → **3,079 tests in 412.6 s, OK, no skips**. While
+  the docs were integrated, the final docs head `b11c193` had the product/test tree
+  unchanged. Retained: 20 scripts, 79 Python, 51 Jev, 7 integration, 58 TS, 29
+  contract checks, `tsc`/`compileall`/`diffcheck` clean (non-fatal SQLite
+  `ResourceWarning`s; no CI workflows). This run covers the retrieval CLI, the send
+  fence, and the global cross-artifact exact-byte guard (`4e1e5a3` + `d2f3d57`).
 - **Unrun validation checks** (not later features): live official retrieval,
   paid/hosted calls, uploads, Python 3.11, 10k-scale, a real-network fault harness.
 - **Unimplemented later scientific features (Step 07+):** scientific parsing,

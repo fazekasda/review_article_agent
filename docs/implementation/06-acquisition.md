@@ -29,7 +29,7 @@ Document source licenses/terms actually checked, retrieval failures, version pol
 
 ## Implementation status (appended; requirements above unchanged)
 
-**MVP implemented; final validation pending.** AC1–AC7 have integrated source and named tests
-(checkpoint `dbe613a`; the global guard `4e1e5a3`+`d2f3d57` is integrated at `246df21`). Final
-delivery verification is recorded in the PR. Scientific parsing/screening/digestion are Step 07+.
-See the [handoff](handoffs/06-acquisition.md).
+**Complete (scoped acquisition MVP), locally verified.** Full integration code+tests at `246df21`
+passed **3,079 tests, OK, no skips** (29 contract checks; `tsc`/`compileall`/`diffcheck` clean;
+no CI). The exact final docs-head result is recorded in the PR. Scientific parsing/screening/
+digestion are Step 07+. See the [handoff](handoffs/06-acquisition.md).
