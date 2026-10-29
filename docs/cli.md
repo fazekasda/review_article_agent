@@ -999,3 +999,11 @@ Notes:
 * Errors use the exit categories of §3 with static, value-free messages.
 * No test or app call in this section was run against a live source or paid
   service.
+
+## 17. Section blueprints and drafting — `drafting` (Step 11, partial)
+
+The local, private-by-default `drafting` group (`propose|show|package|accepted|status`)
+binds a per-section planner/writer workspace to existing app-owned runtime mappings
+over an exact approved outline. Only `workspace`/`blueprint` kinds are registered;
+the CLI `draft`/`assembly` adapter is **pending** (no default model, no live call).
+Status and disclosures: [Step 11 handoff](implementation/handoffs/11-drafting.md).
