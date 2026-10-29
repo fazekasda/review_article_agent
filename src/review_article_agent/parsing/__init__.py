@@ -15,9 +15,13 @@ explicit non-claims.  Public API:
   passage locators, staleness resolution, and local citation-link checks.
 * :func:`~review_article_agent.parsing.pdf_adapter.parse_pdf` -- the
   conservative PDF human-review result (never full text).
+* :class:`~review_article_agent.parsing.repository.ParsingRepository` -- persist
+  a parsed result as a distinct immutable ``report`` revision and read it back
+  (S7-STORE); no schema change, no CLI.
 
-No storage, CLI, network, model, or approval; nothing here authorises
-scientific digestion, screening, extraction, or exclusion.
+The parsing package itself does no storage, CLI, network, model, or approval;
+nothing here authorises scientific digestion, screening, extraction, or
+exclusion.
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ from .locator import (
     resolve_locator,
 )
 from .pdf_adapter import PdfAdapterRequestError, parse_pdf
+from .repository import ParsingRepository, ParsingRepositoryError
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -67,4 +72,6 @@ __all__ = [
     "resolve_locator",
     "passage_citation_check",
     "parse_pdf",
+    "ParsingRepository",
+    "ParsingRepositoryError",
 ]
