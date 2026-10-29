@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -62,6 +63,8 @@ def _completion_body(model: str) -> str:
 def _build_engine(data_dir: str) -> WorkerEngine:
     model = os.environ.get("RAA_FIXTURE_LEAD_MODEL", "anthropic/claude-sonnet-5-5")
     counter = os.environ.get("RAA_FIXTURE_LEAD_COUNTER")
+    block_file = os.environ.get("RAA_FIXTURE_LEAD_BLOCK_FILE")
+    release_file = os.environ.get("RAA_FIXTURE_LEAD_RELEASE_FILE")
 
     def fake_discovery(url, *, timeout, max_response_bytes):  # pragma: no cover
         # No discovery provider request is expected in these acceptance cases.
@@ -73,6 +76,15 @@ def _build_engine(data_dir: str) -> WorkerEngine:
                 handle.write("post\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+        if block_file:
+            # Signal that the POST has started, then block (bounded) until the
+            # test releases it or kills this process: a real in-flight POST that
+            # never produced a response. Used only by the kill-during-POST case.
+            Path(block_file).write_text("posted", encoding="utf-8")
+        if release_file:
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline and not Path(release_file).exists():
+                time.sleep(0.02)
         return LeadResponse(status=200, body_text=_completion_body(model))
 
     return WorkerEngine(
