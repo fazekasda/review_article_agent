@@ -349,6 +349,92 @@ class TestJatsIdentityFailClosed(_Base):
         self.assertIn("identifier_malformed", result["reasons"])
 
 
+class TestJatsStructureAnchoring(_Base):
+    @staticmethod
+    def _ids(*pairs, body=b"<p>Test text</p>"):
+        ids = b"".join(
+            b'<article-id pub-id-type="' + t + b'">' + v + b"</article-id>"
+            for t, v in pairs
+        )
+        return (
+            b"<article><front><article-meta>" + ids
+            + b"</article-meta></front><body>" + body + b"</body></article>"
+        )
+
+    def test_conflicting_repeated_ids_rejected_in_both_orders(self):
+        for first, second in ((b"999", b"123"), (b"123", b"999")):
+            result = self.call(
+                self._ids((b"pmid", first), (b"pmid", second)), {"pmid": "123"}
+            )
+            self.assertEqual(result["status"], "rejected", (first, second))
+            self.assertEqual(result["checks"]["identity"], "fail")
+            self.assertIn("identifier_conflict", result["reasons"])
+            self.assertNotIn("pmid", result["observed_identifiers"])
+
+    def test_conflicting_ids_rejected_even_without_expected(self):
+        result = self.call(self._ids((b"pmid", b"1"), (b"pmid", b"2")), {})
+        self.assertEqual(result["status"], "rejected")
+
+    def test_identical_repeated_ids_accepted(self):
+        result = self.call(
+            self._ids((b"pmid", b"123"), (b"pmid", b"123")), {"pmid": "123"}
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["observed_identifiers"], {"pmid": "123"})
+
+    def test_malformed_duplicate_never_ready_in_either_order(self):
+        for pair in (
+            ((b"pmid", b"abc"), (b"pmid", b"123")),
+            ((b"pmid", b"123"), (b"pmid", b"abc")),
+        ):
+            result = self.call(self._ids(*pair), {"pmid": "123"})
+            self.assertNotEqual(result["status"], "ready", pair)
+
+    def test_sub_article_cannot_establish_outer_identity_or_body(self):
+        data = (
+            b"<article><sub-article><front><article-meta>"
+            b'<article-id pub-id-type="pmid">123</article-id>'
+            b"</article-meta></front><body><p>Child text</p></body>"
+            b"</sub-article></article>"
+        )
+        result = self.call(data, {"pmid": "123"})
+        self.assertEqual(result["status"], "needs_review")
+        self.assertNotEqual(result["checks"]["identity"], "pass")
+        self.assertNotEqual(result["checks"]["full_text"], "pass")
+        self.assertEqual(result["observed_identifiers"], {})
+
+    def test_sub_article_body_does_not_satisfy_outer_body(self):
+        data = (
+            b"<article><front><article-meta>"
+            b'<article-id pub-id-type="pmid">123</article-id>'
+            b"</article-meta></front><sub-article><body><p>Child</p></body>"
+            b"</sub-article></article>"
+        )
+        result = self.call(data, {"pmid": "123"})
+        self.assertEqual(result["status"], "needs_review")
+        self.assertIn("jats_body_missing", result["reasons"])
+
+    def test_nested_ids_in_non_direct_positions_ignored(self):
+        data = (
+            b"<article><front><article-meta><contrib-group>"
+            b'<article-id pub-id-type="pmid">123</article-id></contrib-group>'
+            b"</article-meta></front><body><p>x</p></body></article>"
+        )
+        result = self.call(data, {"pmid": "123"})
+        self.assertEqual(result["status"], "needs_review")
+
+    def test_duplicate_front_or_body_is_ambiguous(self):
+        base = self._ids((b"pmid", b"123"))
+        dup_body = base.replace(b"</article>", b"<body><p>y</p></body></article>")
+        self.assertNotEqual(self.call(dup_body, {"pmid": "123"})["status"], "ready")
+        dup_front = base.replace(
+            b"<body>",
+            b'<front><article-meta><article-id pub-id-type="pmid">123</article-id>'
+            b"</article-meta></front><body>",
+        )
+        self.assertNotEqual(self.call(dup_front, {"pmid": "123"})["status"], "ready")
+
+
 class TestJatsBodyFailClosed(_Base):
     def test_missing_body_needs_review(self):
         result = self.call(jats(body=None), {"pmid": "12345678"})

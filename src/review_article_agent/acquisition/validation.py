@@ -106,6 +106,7 @@ REASON_JATS_BODY_EMPTY = "jats_body_empty"
 REASON_IDENTITY_MISMATCH = "identity_mismatch"
 REASON_IDENTITY_UNCONFIRMED = "identity_unconfirmed"
 REASON_IDENTIFIER_MALFORMED = "identifier_malformed"
+REASON_IDENTIFIER_CONFLICT = "identifier_conflict"
 
 REASONS = frozenset(
     {
@@ -132,6 +133,7 @@ REASONS = frozenset(
         REASON_JATS_BODY_MISSING,
         REASON_JATS_BODY_EMPTY,
         REASON_IDENTITY_MISMATCH,
+        REASON_IDENTIFIER_CONFLICT,
         REASON_IDENTITY_UNCONFIRMED,
         REASON_IDENTIFIER_MALFORMED,
     }
@@ -429,30 +431,33 @@ def _measure(root) -> tuple[int, int, int, str | None]:
     return nodes, max_depth, text_chars, None
 
 
-def _first_descendant(element, name: str):
-    for node in element.iter():
-        if _local(node.tag) == name:
-            return node
-    return None
+def _direct_children(element, name: str) -> list:
+    return [child for child in element if _local(child.tag) == name]
+
+
+def _only_child(element, name: str):
+    """The single direct child called ``name``; ``None`` if absent or ambiguous."""
+    found = _direct_children(element, name)
+    return found[0] if len(found) == 1 else None
 
 
 def _extract_identifiers(root):
-    """Front-matter article ids only; bibliography ids are never read.
+    """Root article's own front-matter ids only.
 
-    Returns ``(observed, malformed, has_article_meta)`` where ``observed`` maps
-    a namespace to its canonical value.
+    Only ``article-id`` direct children of the root's single ``front`` /
+    ``article-meta`` are read; sub-articles, bibliography and nested metadata
+    never establish identity.  Returns ``(observed, malformed, conflict,
+    has_article_meta)``; ``conflict`` is set when one namespace carries two
+    different canonical values (in either order).
     """
     observed: dict[str, str] = {}
     malformed = False
-    front = _first_descendant(root, "front")
-    if front is None:
-        return observed, malformed, False
-    article_meta = _first_descendant(front, "article-meta")
+    conflict = False
+    front = _only_child(root, "front")
+    article_meta = _only_child(front, "article-meta") if front is not None else None
     if article_meta is None:
-        return observed, malformed, False
-    for element in article_meta.iter():
-        if _local(element.tag) != "article-id":
-            continue
+        return observed, malformed, conflict, False
+    for element in _direct_children(article_meta, "article-id"):
         pub_id_type = element.get("pub-id-type")
         if not isinstance(pub_id_type, str):
             continue
@@ -463,15 +468,37 @@ def _extract_identifiers(root):
         if raw == "":
             continue
         try:
-            observed[namespace] = _normalize_identifier(namespace, raw)
+            value = _normalize_identifier(namespace, raw)
         except AcquisitionValidationError:
             malformed = True
-    return observed, malformed, True
+            continue
+        if namespace in observed and observed[namespace] != value:
+            conflict = True
+        observed.setdefault(namespace, value)
+    if conflict:
+        # Never expose either side of a conflicting namespace as observed.
+        counts: dict[str, set] = {}
+        for element in _direct_children(article_meta, "article-id"):
+            namespace = _PUBID_TYPE_MAP.get(
+                (element.get("pub-id-type") or "").strip().lower()
+            )
+            if namespace is None:
+                continue
+            try:
+                counts.setdefault(namespace, set()).add(
+                    _normalize_identifier(namespace, (element.text or "").strip())
+                )
+            except AcquisitionValidationError:
+                pass
+        for namespace, values in counts.items():
+            if len(values) > 1:
+                observed.pop(namespace, None)
+    return observed, malformed, conflict, True
 
 
 def _body_text_length(root) -> int | None:
-    """Non-whitespace text length inside ``body``, or ``None`` when absent."""
-    body = _first_descendant(root, "body")
+    """Non-whitespace text length inside the root's single ``body``, else ``None``."""
+    body = _only_child(root, "body")
     if body is None:
         return None
     total = 0
@@ -803,7 +830,7 @@ def _xml_result(
     kind = "jats_xml"
     checks["container"] = "pass"
 
-    observed, malformed, has_meta = _extract_identifiers(root)
+    observed, malformed, id_conflict, has_meta = _extract_identifiers(root)
     body_len = _body_text_length(root)
 
     if has_meta and body_len is not None:
@@ -829,7 +856,11 @@ def _xml_result(
     conflicts = [
         ns for ns in expected if ns in observed and observed[ns] != expected[ns]
     ]
-    if conflicts:
+    if id_conflict:
+        checks["identity"] = "fail"
+        reasons.append(REASON_IDENTIFIER_CONFLICT)
+        rejected = True
+    elif conflicts:
         checks["identity"] = "fail"
         reasons.append(REASON_IDENTITY_MISMATCH)
         rejected = True
