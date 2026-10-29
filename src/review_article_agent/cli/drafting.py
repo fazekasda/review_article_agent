@@ -11,33 +11,31 @@ approval and never authorizes execution, export, or scientific truth.
 
 * ``drafting propose`` -- write one *inert* revision from an explicit input
   envelope, an explicit caller rights record, and explicit artifact/revision ids
-  (with an optional parent revision). ``--kind workspace`` writes a per-section
-  planner/writer workspace identity; ``--kind blueprint`` writes a section
-  blueprint (over the exact current approved chain, the current workspace, and
-  the reconstructible approved package).
+  (with an optional parent revision). ``--kind workspace`` uses the workspace
+  repository; ``--kind blueprint``/``draft``/``assembly`` pass the kind through to
+  the workflow repository. An assembly is simply ``--kind assembly`` with an
+  ``{outline_ref, draft_refs}`` input envelope -- there is no separate ``assemble``
+  command.
 * ``drafting show`` -- read one exact revision back (safe structural counts and
-  opaque refs; ``--content`` is the explicit private opt-in for the raw payload).
-  ``--historical`` inspects a non-current revision without live-gate authority.
-  A blueprint result names the exact owner gate (``gate_kind`` / ``gate_id``) to
-  use with ``gate prepare`` / ``gate confirm``; this command **never** approves.
+  opaque refs; ``--content`` is the explicit private opt-in for the raw payload,
+  including draft/assembly text, Markdown, citations, and evidence).
+  ``--historical`` inspects a non-current revision without live-gate authority. A
+  blueprint result names its exact owner gate (``gate_kind`` / ``gate_id``); no
+  draft/assembly gate is invented.
 * ``drafting package`` -- assemble one approved outline section's reconstructible
   drafting package (safe counts by default; ``--content`` opts into the full
   private package).
 * ``drafting accepted`` -- require **this blueprint's own** exact named owner gate
   (``artifact_revision`` / ``drafting.blueprint``) and read back the approved
-  blueprint (safe counts by default; ``--content`` opts into the full envelope).
-  It is a **read** of an already-recorded approval: it never creates one, and a
-  ``blueprint_approved`` result still authorizes neither execution nor export.
-* ``drafting status`` -- read one current blueprint's structured status
-  (``stale`` / ``reasons`` / ``pending`` and the non-export flags); no raw
-  content is emitted.
+  blueprint. Blueprint only (there is no draft/assembly approval); it is a **read**
+  of an already-recorded approval and never creates one.
+* ``drafting status`` -- read one current revision's structured status
+  (``stale`` / ``reasons`` / ``pending`` and the non-export flags) for ``blueprint``/
+  ``draft``/``assembly``; no raw content is emitted.
 
-Only the ``workspace`` and ``blueprint`` kinds are registered today; ``draft``/
-``assembly`` kinds and the assembly command are deliberately left to the next
-bounded task once those APIs are integrated. The CLI never fabricates a runtime
-session mapping: the planner/writer mappings must already exist as app-owned rows
-(the app owns their creation); this module adds no mapping command and never
-guesses an unimplemented workflow import.
+The CLI never fabricates a runtime session mapping: the planner/writer mappings
+must already exist as app-owned rows (the app owns their creation); this module
+adds no mapping command.
 
 Privacy/safety rules mirror :mod:`review_article_agent.cli.synthesis`: projects
 are opened through the registry with ``expected_project_id`` and closed on every
@@ -45,8 +43,8 @@ path; side-inputs are read from a bounded regular file that never follows a fina
 symlink; and every failure raises :class:`DraftingControlError` with a stable
 category (``validation``/``conflict``/``storage``) and a static message that
 never reflects a path, id, rights value, session/model detail, content, or
-exception text. By default no source excerpt, prompt, session id, or model detail
-is emitted.
+exception text. By default no source excerpt, prompt, session id, model detail,
+draft/report text, Markdown, citation, or evidence is emitted.
 """
 
 from __future__ import annotations
@@ -76,9 +74,12 @@ _CATEGORY_VALIDATION = "validation"
 _CATEGORY_CONFLICT = "conflict"
 _CATEGORY_STORAGE = "storage"
 
-#: The proposal/read kinds registered today. ``draft``/``assembly`` are
-#: deliberately left to the next bounded task once those APIs are integrated.
-_KINDS = ("workspace", "blueprint")
+#: The proposal/read kinds: ``workspace`` uses the workspace repository; the
+#: rest pass through to the integrated workflow repository.
+_KINDS = ("workspace", "blueprint", "draft", "assembly")
+
+#: The workflow-backed kinds that expose a ``status`` read.
+_STATUS_KINDS = ("blueprint", "draft", "assembly")
 
 _WORKSPACE_REJECTED_MESSAGE = (
     "the drafting workspace request was rejected (a malformed or out-of-bounds "
@@ -90,27 +91,26 @@ _WORKSPACE_READ_MESSAGE = (
     "non-current revision, a failed content-integrity check, or a mapping that no "
     "longer re-derives from durable rows)."
 )
-_BLUEPRINT_REJECTED_MESSAGE = (
-    "the drafting blueprint request was rejected (a malformed or out-of-bounds "
-    "identifier, workspace/section reference, rights record, or blueprint "
-    "document; or the exact current approved chain, the current workspace, and "
-    "the reconstructible approved package are not consumable). Nothing was "
-    "written."
+_DRAFTING_REJECTED_MESSAGE = (
+    "the drafting request was rejected (a malformed or out-of-bounds identifier, "
+    "reference, rights record, or workflow document; or the exact current approved "
+    "chain, workspace, package, blueprint, or draft set is not consumable). Nothing "
+    "was written."
 )
-_BLUEPRINT_READ_MESSAGE = (
-    "the drafting blueprint revision could not be read (a missing revision, a "
-    "non-current revision, a failed content-integrity check, or a stored "
-    "workspace/package that no longer re-derives from durable rows)."
+_DRAFTING_READ_MESSAGE = (
+    "the drafting revision could not be read (a missing revision, a non-current "
+    "revision, a failed content-integrity check, or a stored snapshot that no "
+    "longer re-derives from durable rows)."
+)
+_DRAFTING_STATUS_MESSAGE = (
+    "the drafting status could not be read (a missing revision, a failed "
+    "content-integrity check, or a stored snapshot that no longer re-derives from "
+    "durable rows)."
 )
 _BLUEPRINT_NOT_APPROVED_MESSAGE = (
     "the blueprint's own named owner gate is not active and approved for this "
     "exact revision; nothing was authorized. Record the human approval with "
     "`gate prepare` / `gate confirm` first."
-)
-_BLUEPRINT_STATUS_MESSAGE = (
-    "the drafting blueprint status could not be read (a missing revision, a "
-    "failed content-integrity check, or a stored workspace/package that no longer "
-    "re-derives from durable rows)."
 )
 _PACKAGE_REJECTED_MESSAGE = (
     "the drafting package could not be assembled (the exact current approved "
@@ -154,10 +154,8 @@ def build_drafting_parser(sub: "argparse._SubParsersAction") -> None:
     drafting = sub.add_parser(
         "drafting",
         help=(
-            "propose and read per-section planner/writer workspaces and section "
-            "blueprints, assemble one section's approved drafting package, and read "
-            "one blueprint's own owner-gate approval/status (local only; no "
-            "dispatch, no approval, no export)"
+            "propose/read workspaces, blueprints, drafts, and assemblies; assemble "
+            "one section package; read a blueprint's own owner gate (local only)"
         ),
     )
     actions = drafting.add_subparsers(
@@ -165,7 +163,7 @@ def build_drafting_parser(sub: "argparse._SubParsersAction") -> None:
     )
 
     p_propose = actions.add_parser(
-        "propose", help="write one inert workspace/blueprint revision"
+        "propose", help="write one inert workspace/blueprint/draft/assembly revision"
     )
     p_propose.add_argument("--project", metavar="ID")
     p_propose.add_argument("--kind", required=True, choices=_KINDS)
@@ -178,9 +176,9 @@ def build_drafting_parser(sub: "argparse._SubParsersAction") -> None:
     p_show = actions.add_parser(
         "show",
         help=(
-            "read one exact workspace/blueprint revision (safe structural counts; "
-            "--content to opt in; --historical to inspect a non-current revision). A "
-            "blueprint result names its exact owner gate (gate_kind/gate_id)"
+            "read one exact revision (safe counts; --content to opt in; "
+            "--historical for a non-current revision). A blueprint names its exact "
+            "owner gate (gate_kind/gate_id)"
         ),
     )
     p_show.add_argument("--project", metavar="ID")
@@ -195,7 +193,7 @@ def build_drafting_parser(sub: "argparse._SubParsersAction") -> None:
     p_show.add_argument(
         "--content",
         action="store_true",
-        help="explicitly include the private raw payload (session/model pins; blueprint evidence)",
+        help="explicitly include the private raw payload (text, Markdown, citations, evidence)",
     )
 
     p_package = actions.add_parser(
@@ -215,7 +213,7 @@ def build_drafting_parser(sub: "argparse._SubParsersAction") -> None:
         "accepted",
         help=(
             "require this blueprint's own named owner gate and read it back "
-            "(read-only; never approves; safe counts unless --content)"
+            "(blueprint only; read-only; never approves)"
         ),
     )
     p_accepted.add_argument("--project", metavar="ID")
@@ -228,10 +226,10 @@ def build_drafting_parser(sub: "argparse._SubParsersAction") -> None:
     )
 
     p_status = actions.add_parser(
-        "status", help="read one current blueprint's gate/staleness status (no content)"
+        "status", help="read one current revision's gate/staleness status (no content)"
     )
     p_status.add_argument("--project", metavar="ID")
-    p_status.add_argument("--kind", required=True, choices=("blueprint",))
+    p_status.add_argument("--kind", required=True, choices=_STATUS_KINDS)
     p_status.add_argument("--artifact-id", required=True, metavar="ID")
     p_status.add_argument("--revision-id", required=True, metavar="ID")
 
@@ -283,11 +281,44 @@ def _blueprint_counts(blueprint: dict) -> dict[str, int]:
     }
 
 
+def _draft_counts(draft: dict) -> dict[str, int]:
+    """Safe structural counts for a validated draft result (no text/citations)."""
+    paragraphs = draft.get("paragraphs") or []
+    sentences = [s for p in paragraphs for s in (p.get("sentences") or [])]
+    return {
+        "paragraph_count": len(paragraphs),
+        "sentence_count": len(sentences),
+        "citation_count": len(draft.get("citations") or {}),
+    }
+
+
+def _assembly_counts(assembly: dict) -> dict[str, int]:
+    """Safe structural counts for an assembly result (no text/Markdown/citations)."""
+    sections = assembly.get("sections") or []
+    paragraphs = [p for s in sections for p in (s.get("paragraphs") or [])]
+    sentences = [s for p in paragraphs for s in (p.get("sentences") or [])]
+    return {
+        "section_count": len(sections),
+        "paragraph_count": len(paragraphs),
+        "sentence_count": len(sentences),
+        "citation_count": len(assembly.get("citations") or {}),
+    }
+
+
+def _show_payload(kind: str, result: dict) -> dict[str, Any]:
+    """Safe, per-kind structural projection of one result (never raw content)."""
+    if kind == "blueprint":
+        return {"section_id": result["section_id"], **_blueprint_counts(result)}
+    if kind == "draft":
+        return {"section_id": result["section_id"], **_draft_counts(result)}
+    return _assembly_counts(result)
+
+
 # --------------------------------------------------------------------------- #
 # handlers
 # --------------------------------------------------------------------------- #
 def drafting_propose(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
-    """Write one inert workspace/blueprint revision; never an approval."""
+    """Write one inert workspace/blueprint/draft/assembly revision; never an approval."""
     payload = _read_object(args.input_file, what="drafting input")
     rights = _read_object(args.rights_file, what="rights")
     project_id = _resolve_project_id(ctx, args.project)
@@ -315,28 +346,31 @@ def drafting_propose(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
         repo = DraftingWorkflowRepository(store)
         ref = _guard(
             lambda: repo.propose(
-                "blueprint",
+                args.kind,
                 payload,
                 artifact_id=args.artifact_id,
                 revision_id=args.revision_id,
                 rights=rights,
                 parent_revision_id=args.parent_revision_id,
             ),
-            invalid_message=_BLUEPRINT_REJECTED_MESSAGE,
+            invalid_message=_DRAFTING_REJECTED_MESSAGE,
         )
-    return {
+    summary: dict[str, Any] = {
         "ref": ref,
-        "kind": "blueprint",
+        "kind": args.kind,
         "status": _STATUS,
-        "gate_kind": GATE_KIND,
-        "gate_id": GATE_ID,
         "private_content_included": False,
         **_FALSE_FLAGS,
     }
+    if args.kind == "blueprint":
+        # Only a blueprint has an exact named owner gate; no draft/assembly gate.
+        summary["gate_kind"] = GATE_KIND
+        summary["gate_id"] = GATE_ID
+    return summary
 
 
 def drafting_show(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
-    """Read one exact workspace/blueprint revision; safe counts unless ``--content``."""
+    """Read one exact revision; safe counts unless ``--content``."""
     project_id = _resolve_project_id(ctx, args.project)
     ref = _ref(project_id, args.artifact_id, args.revision_id)
     current = not args.historical
@@ -369,24 +403,24 @@ def drafting_show(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
     with _verified_store(ctx, project_id) as store:
         repo = DraftingWorkflowRepository(store)
         payload = _guard(
-            lambda: repo.read(ref, "blueprint", current=current),
-            invalid_message=_BLUEPRINT_READ_MESSAGE,
+            lambda: repo.read(ref, args.kind, current=current),
+            invalid_message=_DRAFTING_READ_MESSAGE,
         )
     result = payload["result"]
     summary = {
         "ref": ref,
-        "kind": "blueprint",
+        "kind": args.kind,
         "status": _STATUS,
         "current": current,
-        "gate_kind": GATE_KIND,
-        "gate_id": GATE_ID,
-        "section_id": result["section_id"],
-        **_blueprint_counts(result),
+        **_show_payload(args.kind, result),
         "pending": list(result.get("pending") or []),
         "authorizes_export": False,
         "private_content_included": False,
         **_FALSE_FLAGS,
     }
+    if args.kind == "blueprint":
+        summary["gate_kind"] = GATE_KIND
+        summary["gate_id"] = GATE_ID
     if args.content:
         summary["private_content_included"] = True
         summary["payload"] = payload
@@ -456,21 +490,18 @@ def drafting_accepted(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
 
 
 def drafting_status(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
-    """Read one current blueprint's gate/staleness status; never raw content."""
+    """Read one current revision's gate/staleness status; never raw content."""
     project_id = _resolve_project_id(ctx, args.project)
     ref = _ref(project_id, args.artifact_id, args.revision_id)
     with _verified_store(ctx, project_id) as store:
         repo = DraftingWorkflowRepository(store)
         report = _guard(
             lambda: repo.status(ref, args.kind),
-            invalid_message=_BLUEPRINT_STATUS_MESSAGE,
+            invalid_message=_DRAFTING_STATUS_MESSAGE,
         )
-    return {
-        "blueprint_ref": report["blueprint_ref"],
+    summary: dict[str, Any] = {
         "kind": args.kind,
         "status": _STATUS,
-        "gate_kind": report["gate_kind"],
-        "gate_id": report["gate_id"],
         "stale": bool(report["stale"]),
         "reasons": list(report["reasons"]),
         "pending": list(report["pending"]),
@@ -478,6 +509,19 @@ def drafting_status(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
         "authorizes_export": False,
         **_FALSE_FLAGS,
     }
+    # Forward the per-kind safe refs/flags without assuming one kind's key set.
+    for key in (
+        "blueprint_ref",
+        "draft_ref",
+        "assembly_ref",
+        "outline_ref",
+        "gate_kind",
+        "gate_id",
+        "final",
+    ):
+        if key in report:
+            summary[key] = report[key]
+    return summary
 
 
 # --------------------------------------------------------------------------- #
