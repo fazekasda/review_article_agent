@@ -96,6 +96,12 @@ _SHAPE_MESSAGE = (
     "was written."
 )
 
+#: Known parser-version family by format; the suffix is unvalidated free text.
+_VERSION_FAMILY_BY_FORMAT = {
+    fmt: "step07-jats-tei/" for fmt in ("jats", "tei", "unsupported")
+}
+_VERSION_FAMILY_BY_FORMAT["pdf"] = "step07-pdf-manual/"
+
 #: Static, value-free ``(category, message)`` for each repository error code.
 _CODE_ERRORS: dict[str, tuple[str, str]] = {
     "invalid_input": (_CATEGORY_VALIDATION, _REJECTED_MESSAGE),
@@ -368,9 +374,15 @@ def parsing_parse(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
 
 
 def _report_summary(record: dict) -> dict[str, Any]:
-    """A safe report projection: no passage/section text, captions, or markers."""
+    """A safe report projection: no passage/section text, captions, or markers.
+
+    An unverifiable report (unknown-version import, or a PDF stub) is not bound
+    by a deterministic reparse, so its payload reasons/citations/counts and
+    prefix-checked version strings are never trusted into the default output.
+    """
     payload = record["payload"]
-    return {
+    verifiable = bool(record.get("verifiable"))
+    summary: dict[str, Any] = {
         "report_ref": record["report_ref"],
         "source_ref": record["source_ref"],
         "format": record["format"],
@@ -383,15 +395,29 @@ def _report_summary(record: dict) -> dict[str, Any]:
         "normalization_version_changed": record["normalization_version_changed"],
         "content_sha256": record["content_sha256"],
         "byte_size": record["byte_size"],
-        "passage_count": len(payload["passages"]),
-        "reference_count": len(payload["references"]),
-        "asset_count": len(payload["assets"]),
-        "citation_counts": payload["citations"],
-        "non_text_assets_require_review": payload["non_text_assets_require_review"],
-        "reasons": list(payload["reasons"]),
+        "verifiable": verifiable,
+        "supported": verifiable,
         "private_content_included": False,
         "authorizes_scientific_processing": False,
     }
+    if verifiable:
+        summary.update({
+            "passage_count": len(payload["passages"]),
+            "reference_count": len(payload["references"]),
+            "asset_count": len(payload["assets"]),
+            "citation_counts": payload["citations"],
+            "non_text_assets_require_review": payload["non_text_assets_require_review"],
+            "reasons": list(payload["reasons"]),
+        })
+    else:
+        summary.update({
+            "human_action_required": True,
+            "excludes_candidate": False,
+            "parser_version": _VERSION_FAMILY_BY_FORMAT.get(record["format"], "unknown"),
+            "normalization_version": None,
+            "reasons": ["parser_version_unverified"],
+        })
+    return summary
 
 
 def parsing_show(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
@@ -449,6 +475,30 @@ def parsing_locator(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
     return summary
 
 
+def _citation_summary(check: dict, verifiable: bool) -> dict[str, Any]:
+    """A safe citation-check projection: counts only, never marker structures.
+
+    An unverifiable report's links are not bound by a reparse: a static unknown.
+    """
+    if not verifiable:
+        return {
+            "passage_id": check.get("passage_id"),
+            "ok": None,
+            "total": None,
+            "unresolved_count": None,
+            "ambiguous_count": None,
+            "malformed_count": None,
+        }
+    return {
+        "passage_id": check["passage_id"],
+        "ok": check["ok"],
+        "total": check["total"],
+        "unresolved_count": len(check["unresolved"]),
+        "ambiguous_count": len(check["ambiguous"]),
+        "malformed_count": len(check["malformed"]),
+    }
+
+
 def parsing_resolve(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
     """Re-check a saved locator; safe counts unless ``--content``."""
     locator = _read_object(args.locator_file, what="locator")
@@ -459,26 +509,26 @@ def parsing_resolve(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
             lambda: repo.resolve_passage(locator), invalid_message=_REJECTED_MESSAGE
         )
     check = resolved["citation_check"]
+    verifiable = bool(resolved.get("verifiable", False))
     summary: dict[str, Any] = {
         "passage_id": resolved["passage_id"],
         "status": resolved["status"],
         "reasons": list(resolved["reasons"]),
         "locator_ok": resolved["locator_ok"],
         "historical_resolved": resolved["historical_resolved"],
+        "verifiable": verifiable,
         "report_ref": resolved["report_ref"],
         "source_ref": resolved["source_ref"],
         "current": resolved["current"],
-        "citation_check": {
-            "passage_id": check["passage_id"],
-            "ok": check["ok"],
-            "total": check["total"],
-            "unresolved_count": len(check["unresolved"]),
-            "ambiguous_count": len(check["ambiguous"]),
-            "malformed_count": len(check["malformed"]),
-        },
+        "citation_check": _citation_summary(check, verifiable),
         "private_content_included": False,
         "authorizes_scientific_processing": False,
     }
+    if not verifiable:
+        # A report this build cannot reproduce is never asserted as resolved: a
+        # human action is required and no exclusion is implied.
+        summary["human_action_required"] = True
+        summary["excludes_candidate"] = False
     if args.content:
         summary["private_content_included"] = True
         summary["citation_check"] = check

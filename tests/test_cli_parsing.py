@@ -31,6 +31,7 @@ Run::
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import sys
 import tempfile
@@ -44,6 +45,7 @@ if str(_SRC) not in sys.path:
 import review_article_agent.cli.main as cli_main  # noqa: E402
 from review_article_agent.storage import (  # noqa: E402
     ArtifactRepository,
+    DependencyRef,
     ProjectStore,
     Registry,
     paths,
@@ -413,6 +415,138 @@ class LocatorResolveValidationTest(ParsingCliBase):
             expect=cli_main.EXIT_VALIDATION,
         )
         self.assertEqual(unreadable["error"]["category"], "validation")
+
+
+# --------------------------------------------------------------------------- #
+# an unverifiable (unknown-version) generic report must not leak its payload
+# --------------------------------------------------------------------------- #
+class UnverifiedGenericReportPrivacyTest(ParsingCliBase):
+    """An unknown-version report is readable as unverified metadata only.
+
+    The repository legitimately keeps a generic, non-reproducible report readable
+    (``verifiable`` false), but its payload is *not* bound by a deterministic
+    reparse, so the default ``show``/``resolve`` output must project a safe static
+    summary and never the payload's arbitrary reasons/citations/counts (which
+    could carry private raw source or citation text).  Only an explicit
+    ``--content`` opt-in exposes the private payload.
+    """
+
+    def _add_generic_report(self):
+        self.add_document()
+        secret = "SECRET-payload-text"
+        src_sha = hashlib.sha256(JATS_BYTES).hexdigest()
+        payload = {
+            "schema_version": 1,
+            "document_type": "parsed_passages",
+            # prefix-valid but unknown family version -> not reproducible here
+            "parser_version": "step07-jats-tei/0",
+            "normalization_version": "nfc-ligature-ws/1",
+            "format": "jats",
+            "status": "parsed",
+            "source": {"sha256": src_sha, "byte_size": len(JATS_BYTES)},
+            "passages": [
+                {
+                    "passage_id": "g0001",
+                    "text": secret,
+                    "raw_text": secret,
+                    "text_sha256": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+                }
+            ],
+            "references": [],
+            "citation_links": [
+                {
+                    "passage_id": "g0001",
+                    "marker": "SECRET-marker",
+                    "targets": ["SECRET-target"],
+                    "state": "unresolved",
+                    "resolved_ref_ids": [],
+                }
+            ],
+            "citations": {"resolved": "SECRET-citation", "unresolved": "SECRET-count"},
+            "assets": [],
+            "non_text_assets_require_review": "SECRET-asset-flag",
+            "human_action_required": False,
+            "excludes_candidate": False,
+            "reasons": ["SECRET-reason"],
+            "authorizes_scientific_processing": False,
+            "limitations": "SECRET-limitation",
+        }
+        envelope = {
+            "schema_version": 1,
+            "document_type": "parsed_passages",
+            "payload": payload,
+        }
+        repo = ArtifactRepository(self.store)
+        repo.create_artifact("art-generic", kind="report", created_by="import")
+        repo.import_revision(
+            artifact_id="art-generic",
+            revision_id="rev-generic",
+            content=envelope,
+            origin_locator="generic:untrusted",
+            rights=_rights(self.project_id, "art-generic", "rev-generic"),
+            dependencies=[
+                DependencyRef(self.project_id, "art-src", "rev-src", "derived_from")
+            ],
+            acquired_by="import",
+        )
+
+    def test_unverified_generic_report_is_static_and_content_is_opt_in(self):
+        self._add_generic_report()
+
+        # show: verifiable false is visible and the summary fails closed to a
+        # human action, never an exclusion, with no arbitrary payload field.
+        show = self.cli(
+            "parsing", "show", "--project", self.project_id,
+            "--report-artifact-id", "art-generic", "--report-revision-id", "rev-generic",
+        )
+        # no arbitrary payload field (reasons/citations/counts) leaks by default
+        self.assertNotIn("SECRET", json.dumps(show))
+        # verifiable false is visible and the summary fails closed to a human
+        # action, never an exclusion
+        self.assertFalse(show["verifiable"])
+        self.assertFalse(show["supported"])
+        self.assertTrue(show["human_action_required"])
+        self.assertFalse(show["excludes_candidate"])
+        self.assertIn("parser_version_unverified", show["reasons"])
+
+        # only the explicit private opt-in exposes the full payload
+        content = self.cli(
+            "parsing", "show", "--project", self.project_id,
+            "--report-artifact-id", "art-generic", "--report-revision-id", "rev-generic",
+            "--content",
+        )
+        self.assertTrue(content["private_content_included"])
+        self.assertIn("SECRET", json.dumps(content))
+
+        # build the exact pointer via the CLI, then resolve it after a restart
+        locator = self.cli(
+            "parsing", "locator", "--project", self.project_id,
+            "--report-artifact-id", "art-generic", "--report-revision-id", "rev-generic",
+            "--passage-id", "g0001", "--content",
+        )
+        locator_path = self.write_json("generic-locator.json", locator["locator"])
+        self.store.close()
+        self.store = ProjectStore.open_at(self.app_dir)
+
+        resolved = self.cli(
+            "parsing", "resolve", "--project", self.project_id,
+            "--locator-file", locator_path,
+        )
+        self.assertEqual(resolved["status"], "unverified")
+        self.assertFalse(resolved["verifiable"])
+        self.assertTrue(resolved["human_action_required"])
+        self.assertFalse(resolved["excludes_candidate"])
+        # the citation check is a static unknown, never arbitrary marker counts
+        self.assertIsNone(resolved["citation_check"]["ok"])
+        self.assertIsNone(resolved["citation_check"]["unresolved_count"])
+        self.assertNotIn("SECRET", json.dumps(resolved))
+
+        # the raw marker structures remain behind the explicit --content opt-in
+        resolved_content = self.cli(
+            "parsing", "resolve", "--project", self.project_id,
+            "--locator-file", locator_path, "--content",
+        )
+        self.assertIn("SECRET", json.dumps(resolved_content["citation_check"]))
 
 
 if __name__ == "__main__":
