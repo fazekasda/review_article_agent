@@ -11,7 +11,7 @@
 - [x] [06 — Full-text acquisition, imports, and reconciliation](06-acquisition.md) — **complete (scoped acquisition MVP), locally verified.** Full integration code+tests at `246df21` passed **3,079 tests in 412.6 s, OK, no skips** (retained 20 scripts / 79 Python / 51 Jev / 7 integration / 58 TS, 29 contract checks, `tsc`/`compileall`/`diffcheck` clean; non-fatal SQLite `ResourceWarning`s; no CI). The exact final docs-head result is recorded in the PR. Scientific parsing/screening/digestion are **Step 07+**. See the [handoff](handoffs/06-acquisition.md).
 - [ ] [07 — Parsing, source assets, and reference structure](07-parsing.md) — **partial (scoped parsing MVP); not fully validated.** Integrated S7-CORE (stdlib XML-first structural core, locators), S7-STORE (durable report repository), and S7-CLI (personal `parsing` CLI) at `e39f91c`; XML/JATS/TEI supported. Not a full Step 07: no scientific correctness, PDF/OCR/full-text/visual extraction, human-adjudicated benchmark, or combined result is claimed — see the [handoff](handoffs/07-parsing.md).
 - [ ] [08 — Pilot, Jev screening, and exclusion audits](08-screening.md)
-- [ ] [09 — Grounded extraction, appraisal, and output audits](09-extraction.md)
+- [x] [09 — Grounded extraction, appraisal, and output audits](09-extraction.md) — XML-text MVP; [evidence and limits](handoffs/09-extraction.md).
 - [ ] [10 — Synthesis, framework, outline, and argument record](10-synthesis.md)
 - [ ] [11 — Section blueprints and evidence-grounded drafting](11-drafting.md)
 - [ ] [12 — Bounded critique and original-source fact-checking](12-review.md)
