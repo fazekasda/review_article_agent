@@ -999,3 +999,15 @@ Notes:
 * Errors use the exit categories of §3 with static, value-free messages.
 * No test or app call in this section was run against a live source or paid
   service.
+
+## 17. Section blueprints and drafting — `drafting` (Step 11, complete as a locally verified MVP)
+
+The local, private-by-default `drafting` group binds a per-section planner/writer
+workspace to existing app-owned runtime mappings over an exact approved outline and
+assembles one section's reconstructible drafting package:
+`propose|show --kind {workspace,blueprint,draft,assembly}`,
+`status --kind {blueprint,draft,assembly}`, `accepted` (blueprint gate only), and
+`package`; an assembly is simply `propose --kind assembly`. Private by default with
+`--content` opt-in; the assembly Markdown keeps the approved paragraph structure. No
+default model is selected and no live call is made. Status and disclosures:
+[Step 11 handoff](implementation/handoffs/11-drafting.md).
