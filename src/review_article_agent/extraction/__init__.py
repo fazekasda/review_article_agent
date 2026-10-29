@@ -26,7 +26,9 @@ from .schema import (
     CONTEXT_FIELDS,
     COVERAGE_DISPOSITIONS,
     DOCUMENT_TYPE,
+    EXTRACTION_EXAMPLE_PASSAGES,
     EXTRACTION_INSTRUCTIONS,
+    EXTRACTION_OUTPUT_EXAMPLE,
     LINKAGE_NOTICE,
     LINK_RELATIONS,
     LINK_STATUSES,
@@ -35,6 +37,7 @@ from .schema import (
     VALIDATION_SCOPE,
     ExtractionError,
     extraction_example,
+    raw_extraction_example,
     validate_extraction,
 )
 
@@ -45,8 +48,10 @@ __all__ = [
     "CONTEXT_FIELDS",
     "COVERAGE_DISPOSITIONS",
     "DOCUMENT_TYPE",
-    "LINKAGE_NOTICE",
+    "EXTRACTION_EXAMPLE_PASSAGES",
     "EXTRACTION_INSTRUCTIONS",
+    "EXTRACTION_OUTPUT_EXAMPLE",
+    "LINKAGE_NOTICE",
     "LINK_RELATIONS",
     "LINK_STATUSES",
     "SCHEMA_VERSION",
@@ -54,5 +59,6 @@ __all__ = [
     "VALIDATION_SCOPE",
     "ExtractionError",
     "extraction_example",
+    "raw_extraction_example",
     "validate_extraction",
 ]

@@ -9,10 +9,12 @@ import json
 import unittest
 
 from review_article_agent.extraction import (
+    EXTRACTION_EXAMPLE_PASSAGES,
     EXTRACTION_INSTRUCTIONS,
     SCHEMA_VERSION,
     ExtractionError,
     extraction_example,
+    raw_extraction_example,
     validate_extraction,
 )
 
@@ -323,6 +325,42 @@ class PrivacyAndFixtureTests(unittest.TestCase):
         self.assertTrue(result["link_summary"]["confirmed_links"])
         result["summary"] = "mutated"
         self.assertNotEqual(extraction_example()["summary"], "mutated")
+
+
+class R2RepairTests(unittest.TestCase):
+    def test_schema_version_must_be_exact_int(self):
+        for bad in (True, False, "1", 1.0, None):
+            out = valid_output()
+            out["schema_version"] = bad
+            with self.assertRaises(ExtractionError):
+                validate(out)
+        self.assertEqual(validate(valid_output())["schema_version"], 1)
+
+    def test_nonportable_and_untyped_optional_values_rejected(self):
+        out = valid_output()
+        out["findings"][0]["context"]["note"] = {"nested": 1}  # object note refused
+        with self.assertRaises(ExtractionError):
+            validate(out)
+        out = valid_output()
+        out["findings"][0]["notes"] = float("nan")  # non-finite freeform value refused
+        with self.assertRaises(ExtractionError):
+            validate(out)
+        out = valid_output()
+        out["findings"][1]["numeric_details"][0]["value"] = {"state": "known", "value": float("inf")}
+        with self.assertRaises(ExtractionError):
+            validate(out)
+
+    def test_raw_example_roundtrips_and_is_grounded(self):
+        raw = raw_extraction_example()
+        json.dumps(raw)  # raw example itself must be portable JSON
+        self.assertIs(type(raw["schema_version"]), int)
+        result = validate_extraction(raw, passages=EXTRACTION_EXAMPLE_PASSAGES, appraisal_dimensions=[])
+        by_text = {p["passage_id"]: p["text"] for p in EXTRACTION_EXAMPLE_PASSAGES}
+        for item in result["findings"]:
+            self.assertIn(item["snippet"], by_text[item["passage_id"]])  # every snippet grounded
+        number = result["findings"][1]["numeric_details"][0]["value"]["value"]
+        self.assertIn("12.5", by_text[result["findings"][1]["passage_id"]])
+        self.assertEqual(number, 12.5)
 
 
 if __name__ == "__main__":

@@ -23,9 +23,11 @@ reusable fixture; never real evidence).
 
 from __future__ import annotations
 
+import copy
 import math
 
 from ..domain.errors import ReviewAgentError
+from ..domain.records import RecordValidationError, canonical_json
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -162,7 +164,8 @@ APPRAISAL
 - Report only the configured appraisal dimensions, each with a judgement; use state unassessed when not assessed. Do NOT output any numeric score or global quality rating. A weak study is retained with its limitations -- never excluded automatically.
 
 OUTPUT
-- Keys: schema_version (1), summary (readable string), source_records, findings, coverage, and optionally studies, datasets, experiments, links, appraisal, omissions, limitations.
+- Keys: schema_version (1, integer), summary (readable string), source_records, findings, coverage, and optionally studies, datasets, experiments, links, appraisal, omissions, limitations.
+- Use the raw example (EXTRACTION_OUTPUT_EXAMPLE, grounded in EXTRACTION_EXAMPLE_PASSAGES) as the exact field-shape reference for source_records, findings, context, coverage, numeric_details, and appraisal.
 - No commentary outside the JSON object.
 """
 
@@ -213,6 +216,17 @@ def _string(value: object, *, label: str) -> str:
 
 
 def _identifier(value: object, *, label: str) -> str:
+    return _string(value, label=label)
+
+
+def _optional_string(value: object, *, label: str):
+    """Return ``value`` when it is a non-empty string, or ``None`` when absent.
+
+    Freeform note fields accept only a string or ``null``: an arbitrary object,
+    number, list, or non-finite value is refused rather than passed through.
+    """
+    if value is None:
+        return None
     return _string(value, label=label)
 
 
@@ -340,7 +354,7 @@ def _validate_context(value: object, *, label: str) -> dict:
     for name in CONTEXT_FIELDS:
         out[name] = _stated(item[name], label=f"{label}.{name}", kind="str")
     note = item.get("note")
-    return {"context": out, "note": note}
+    return {"context": out, "note": _optional_string(note, label=f"{label}.note")}
 
 
 def _validate_numeric(value: object, *, label: str) -> list:
@@ -432,7 +446,7 @@ def _validate_findings(value: object, sources: dict, passages: dict, id_lists: d
             "limitations": limitations,
             "numeric_details": numeric,
             "uncertainty": uncertainty,
-            "notes": item.get("notes"),
+            "notes": _optional_string(item.get("notes"), label=f"{label}.notes"),
             **refs,
         }
     return out
@@ -668,11 +682,23 @@ def validate_extraction(output, *, passages, appraisal_dimensions):
     :class:`ExtractionError`.  Structural validation cannot prove scientific
     correctness or completeness (see :data:`VALIDATION_SCOPE`).
     """
+    # Whole-document canonical-JSON preflight (shared domain gate): rejects
+    # non-finite floats, non-string keys, invalid surrogates, over-deep nesting
+    # (depth bound), circular references, and any non-JSON value.  The failure is
+    # re-raised as a static ExtractionError with no value leak.
+    try:
+        canonical_json(output)
+    except (RecordValidationError, ValueError, TypeError):
+        raise _fail("extraction output is not canonical JSON-portable") from None
     _require(isinstance(output, dict), "extraction output must be a JSON object")
     banned = _BANNED_TOP_KEYS & set(output)
     _require(not banned, f"extraction output must not carry universal score/exclusion keys: {sorted(banned)}")
     item = _keys(output, label="extraction", required=_REQUIRED_TOP_KEYS, optional=_OPTIONAL_TOP_KEYS)
-    _require(item["schema_version"] == SCHEMA_VERSION, f"schema_version must be {SCHEMA_VERSION}")
+    version = item["schema_version"]
+    _require(
+        isinstance(version, int) and not isinstance(version, bool) and version == SCHEMA_VERSION,
+        f"schema_version must be the integer {SCHEMA_VERSION}",
+    )
 
     summary = _string(item["summary"], label="summary")
     passages_by_id, _passages_by_asset, required = _index_passages(passages)
@@ -750,89 +776,140 @@ def _dimension_ids(appraisal_dimensions) -> tuple:
     return tuple(seen)
 
 
-def extraction_example():
-    """Return a synthetic, reusable normalized example for workflow tests.
+#: Original passage pool for the raw example below (workflow-supplied projection).
+EXTRACTION_EXAMPLE_PASSAGES = [
+    {
+        "passage_id": "p0001",
+        "source_key": "docA",
+        "text": "In mice, compound Z did not reduce tumor volume compared with vehicle.",
+        "asset_ids": ["tbl1"],
+    },
+    {
+        "passage_id": "p0002",
+        "source_key": "docA",
+        "text": "The 50 mg dose reduced tumor volume by 12.5 mm3 per mouse (n=8).",
+    },
+    {
+        "passage_id": "p0003",
+        "source_key": "docB",
+        "text": "We conclude that compound Z is broadly effective.",
+    },
+]
 
-    It is deliberately fictional and demonstrates grounding, a missing numeric
-    detail, an `author_interpretation`, a model-proposed link, and a coverage
-    omission -- never real evidence and never a correctness claim.
-    """
-    passages = [
+#: A valid **RAW** (unnormalized) model-output example, grounded in
+#: :data:`EXTRACTION_EXAMPLE_PASSAGES`.  The runtime runner can include this (with
+#: the passages) in the prompt as the exact shape reference instead of inventing
+#: its own conversion; every snippet and number is an exact substring of a
+#: supplied passage.  Fictional, never real evidence.
+EXTRACTION_OUTPUT_EXAMPLE = {
+    "schema_version": SCHEMA_VERSION,
+    "summary": "Compound Z effects in a mouse model, with a separate author interpretation.",
+    "source_records": [
+        {"source_key": "docA", "source_kind": "document", "label": "Study A", "report_ref": "report:A"},
+        {"source_key": "docB", "source_kind": "document", "label": "Study B", "report_ref": "report:B"},
+    ],
+    "studies": [{"study_id": "S1", "label": "Z tumor study"}],
+    "datasets": [{"dataset_id": "D1", "label": "Z measurements"}],
+    "experiments": [{"experiment_id": "E1", "study_id": "S1", "label": "mouse efficacy"}],
+    "findings": [
         {
-            "passage_id": "p0001",
+            "finding_id": "F1",
             "source_key": "docA",
-            "text": "In mice, compound Z did not reduce tumor volume compared with vehicle.",
-            "asset_ids": ["tbl1"],
+            "passage_id": "p0001",
+            "snippet": "did not reduce tumor volume",
+            "statement": "In mice, compound Z did not reduce tumor volume versus vehicle.",
+            "attribution": "direct_observation",
+            "citation_flag": "own_result",
+            "context": {
+                "species": {"state": "known", "value": "mouse"},
+                "population": {"state": "missing", "value": None},
+                "assay": {"state": "known", "value": "tumor volume"},
+                "outcome": {"state": "known", "value": "tumor volume"},
+                "conditions": {"state": "known", "value": "vehicle comparison"},
+            },
+            "secondary_warning": {"state": "not_applicable", "value": None},
+            "limitations": {"state": "known", "value": "single model system"},
+            "numeric_details": [],
+            "experiment_id": "E1",
         },
         {
+            "finding_id": "F2",
+            "source_key": "docA",
             "passage_id": "p0002",
-            "source_key": "docB",
-            "text": "We conclude that compound Z is broadly effective.",
+            "snippet": "reduced tumor volume by 12.5 mm3",
+            "statement": "The 50 mg dose reduced tumor volume by 12.5 mm3 per mouse.",
+            "attribution": "direct_observation",
+            "citation_flag": "own_result",
+            "context": {
+                "species": {"state": "known", "value": "mouse"},
+                "population": {"state": "known", "value": "n=8 mice"},
+                "assay": {"state": "known", "value": "tumor volume"},
+                "outcome": {"state": "known", "value": "tumor volume"},
+                "conditions": {"state": "known", "value": "50 mg dose"},
+            },
+            "secondary_warning": {"state": "not_applicable", "value": None},
+            "limitations": {"state": "known", "value": "single model system"},
+            "numeric_details": [
+                {"name": "tumor volume", "value": {"state": "known", "value": 12.5},
+                 "unit": {"state": "known", "value": "mm3"},
+                 "denominator": {"state": "known", "value": "per mouse"}}
+            ],
+            "experiment_id": "E1",
         },
-    ]
-    output = {
-        "schema_version": SCHEMA_VERSION,
-        "summary": "Compound Z effects in a mouse model, with a separate author interpretation.",
-        "source_records": [
-            {"source_key": "docA", "source_kind": "document", "label": "Study A", "report_ref": "report:A"},
-            {"source_key": "docB", "source_kind": "document", "label": "Study B", "report_ref": "report:B"},
-        ],
-        "studies": [{"study_id": "S1", "label": "Z tumor study"}],
-        "datasets": [{"dataset_id": "D1", "label": "Z measurements"}],
-        "experiments": [{"experiment_id": "E1", "study_id": "S1", "label": "mouse efficacy"}],
-        "findings": [
-            {
-                "finding_id": "F1",
-                "source_key": "docA",
-                "passage_id": "p0001",
-                "snippet": "did not reduce tumor volume",
-                "statement": "In mice, compound Z did not reduce tumor volume versus vehicle.",
-                "attribution": "direct_observation",
-                "citation_flag": "own_result",
-                "context": {
-                    "species": {"state": "known", "value": "mouse"},
-                    "population": {"state": "missing", "value": None},
-                    "assay": {"state": "known", "value": "tumor volume"},
-                    "outcome": {"state": "known", "value": "tumor volume"},
-                    "conditions": {"state": "known", "value": "vehicle comparison"},
-                },
-                "secondary_warning": {"state": "not_applicable", "value": None},
-                "limitations": {"state": "known", "value": "single model system"},
-                "numeric_details": [
-                    {"name": "tumor volume", "value": {"state": "known", "value": 12.5},
-                     "unit": {"state": "known", "value": "mm3"},
-                     "denominator": {"state": "missing", "value": None}}
-                ],
-                "experiment_id": "E1",
+        {
+            "finding_id": "F3",
+            "source_key": "docB",
+            "passage_id": "p0003",
+            "snippet": "compound Z is broadly effective",
+            "statement": "The authors assert compound Z is broadly effective.",
+            "attribution": "author_interpretation",
+            "citation_flag": "mixed",
+            "context": {
+                "species": {"state": "unknown", "value": None},
+                "population": {"state": "unknown", "value": None},
+                "assay": {"state": "missing", "value": None},
+                "outcome": {"state": "missing", "value": None},
+                "conditions": {"state": "missing", "value": None},
             },
-            {
-                "finding_id": "F2",
-                "source_key": "docB",
-                "passage_id": "p0002",
-                "snippet": "compound Z is broadly effective",
-                "statement": "The authors assert compound Z is broadly effective.",
-                "attribution": "author_interpretation",
-                "citation_flag": "mixed",
-                "context": {
-                    "species": {"state": "unknown", "value": None},
-                    "population": {"state": "unknown", "value": None},
-                    "assay": {"state": "missing", "value": None},
-                    "outcome": {"state": "missing", "value": None},
-                    "conditions": {"state": "missing", "value": None},
-                },
-                "secondary_warning": {"state": "known", "value": True},
-                "limitations": {"state": "known", "value": "author interpretation, not measured"},
-                "numeric_details": [],
-            },
-        ],
-        "coverage": [
-            {"target_kind": "passage", "target_id": "p0001", "disposition": "finding", "finding_id": "F1"},
-            {"target_kind": "passage", "target_id": "p0002", "disposition": "finding", "finding_id": "F2"},
-            {"target_kind": "asset", "target_id": "tbl1", "disposition": "omitted", "reason": "table_not_acquired"},
-        ],
-        "links": [{"from": "source:docA", "to": "study:S1", "relation": "reports", "status": "confirmed"}],
-        "appraisal": [],
-        "omissions": [{"note": "table tbl1 not acquired as an input", "target_kind": "asset", "target_id": "tbl1", "important": True}],
-        "limitations": {"state": "known", "value": "synthetic fixture; not evidence"},
-    }
-    return validate_extraction(output, passages=passages, appraisal_dimensions=[])
+            "secondary_warning": {"state": "known", "value": True},
+            "limitations": {"state": "known", "value": "author interpretation, not measured"},
+            "numeric_details": [],
+        },
+    ],
+    "coverage": [
+        {"target_kind": "passage", "target_id": "p0001", "disposition": "finding", "finding_id": "F1"},
+        {"target_kind": "passage", "target_id": "p0002", "disposition": "finding", "finding_id": "F2"},
+        {"target_kind": "passage", "target_id": "p0003", "disposition": "finding", "finding_id": "F3"},
+        {"target_kind": "asset", "target_id": "tbl1", "disposition": "omitted", "reason": "table_not_acquired"},
+    ],
+    "links": [{"from": "source:docA", "to": "study:S1", "relation": "reports", "status": "confirmed"}],
+    "appraisal": [],
+    "omissions": [
+        {"note": "table tbl1 not acquired as an input", "target_kind": "asset", "target_id": "tbl1", "important": True}
+    ],
+    "limitations": {"state": "known", "value": "synthetic fixture; not evidence"},
+}
+
+
+def raw_extraction_example():
+    """Return a fresh **RAW** (unnormalized) model-output example.
+
+    This is the shape the runtime runner should show the model (with
+    :data:`EXTRACTION_EXAMPLE_PASSAGES`), not the normalized result.  Pass it to
+    :func:`validate_extraction` to obtain the normalized form.
+    """
+    return copy.deepcopy(EXTRACTION_OUTPUT_EXAMPLE)
+
+
+def extraction_example():
+    """Return the validated, normalized form of the raw example.
+
+    It demonstrates exact-snippet grounding, a grounded numeric detail, a
+    missing context value, an `author_interpretation`, a model-proposed link, and
+    a coverage omission -- never real evidence and never a correctness claim.
+    """
+    return validate_extraction(
+        raw_extraction_example(),
+        passages=copy.deepcopy(EXTRACTION_EXAMPLE_PASSAGES),
+        appraisal_dimensions=[],
+    )
