@@ -315,6 +315,12 @@ def build_acquisition_parser(sub: "argparse._SubParsersAction") -> None:
     p_impact.add_argument("--artifact-id", required=True, metavar="ID")
     p_impact.add_argument("--revision-id", required=True, metavar="ID")
 
+    # Step 06 C2 addon (manifest + queue); imported lazily because the addon
+    # module imports this one for its shared helpers.
+    from .acquisition_manifest import build_manifest_parsers
+
+    build_manifest_parsers(acq_sub)
+
 
 # --------------------------------------------------------------------------- #
 # shared helpers
@@ -666,6 +672,10 @@ _OCCURRENCE_COMMANDS: dict[str, Callable[[argparse.Namespace, Any], Any]] = {
 def dispatch_acquisition(args: argparse.Namespace, ctx: Any) -> object | None:
     """Route one parsed ``acquisition`` invocation; ``None`` if unknown."""
     command = args.acquisition_command
+    if command in ("manifest", "queue"):
+        from .acquisition_manifest import dispatch_manifest
+
+        return dispatch_manifest(args, ctx)
     if command == "occurrence":
         handler = _OCCURRENCE_COMMANDS.get(
             getattr(args, "acquisition_occurrence_command", None)
