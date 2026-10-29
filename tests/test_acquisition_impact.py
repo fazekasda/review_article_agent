@@ -11,7 +11,9 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -19,6 +21,9 @@ if str(SRC) not in sys.path:
 
 from review_article_agent.acquisition.impact import source_impact  # noqa: E402
 from review_article_agent.domain.records import RecordValidationError  # noqa: E402
+from review_article_agent.runtime import owner_auth  # noqa: E402
+from review_article_agent.runtime.gates import prepare_gate_snapshot  # noqa: E402
+from review_article_agent.storage.human_approvals import HumanApprovalRepository  # noqa: E402
 from review_article_agent.storage import (  # noqa: E402
     ApprovalRepository,
     ArtifactRepository,
@@ -58,7 +63,7 @@ def _rights(project_id, artifact_id, revision_id):
     }
 
 
-class ImpactTest(unittest.TestCase):
+class ImpactBase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="raa-impact-")
         self.addCleanup(self._tmp.cleanup)
@@ -116,6 +121,8 @@ class ImpactTest(unittest.TestCase):
     def dump(self):
         return list(self.store.connection.iterdump())
 
+
+class ImpactTest(ImpactBase):
     def test_old_source_dependent_goes_stale_and_is_flagged(self) -> None:
         s, a, b, c = self.build()
         appr_a = self.approve(a, "a1", "g-a")
@@ -123,7 +130,7 @@ class ImpactTest(unittest.TestCase):
         self.assertEqual(self.approvals.evaluate(appr_a.approval_id).status, "active")
         self.add("document", b"s2", "s2", aid=s, parent="s1")
         before = self.dump()
-        report = source_impact(self.store, self.ref(s, "s2"))
+        report = source_impact(self.store, self.ref(s, "s2"), approvals=self.approvals)
         self.assertEqual(self.dump(), before)  # no writes
         json.dumps(report)  # JSON-safe
         self.assertTrue(report["claims_change"])
@@ -230,6 +237,84 @@ class ImpactTest(unittest.TestCase):
                                   "artifact_id": oaid, "revision_id": "o1"})["affected"],
             [],
         )
+
+
+class _FakeTty:
+    """Low-level terminal double (only terminal operations are mocked)."""
+
+    def __init__(self, replies):
+        self._replies = list(replies)
+
+    def is_tty(self):
+        return True
+
+    def write(self, text, *, deadline=None):
+        pass
+
+    def read_line(self, *, max_chars, deadline):
+        return self._replies.pop(0) if self._replies else None
+
+    def close(self):
+        pass
+
+
+class HumanGateImpactTest(ImpactBase):
+    """Real owner-capability human approvals via the default approvals source."""
+
+    def human_approve(self, aid, rid, gate_id):
+        prepared = prepare_gate_snapshot(
+            self.store,
+            self.ref(aid, rid),
+            gate_kind="pilot",
+            gate_id=gate_id,
+            decision="approved",
+            rationale="human review of the exact revision",
+        )
+        cap = owner_auth.request_owner_confirmation(prepared.owner_action())
+        return self.human.record_decision(prepared, cap)
+
+    def test_default_consults_human_approvals(self) -> None:
+        patches = [
+            mock.patch.object(owner_auth, "_new_challenge", lambda: "CHAL-1"),
+            mock.patch.object(owner_auth, "_current_owner_uid", lambda: 1000),
+            mock.patch.object(owner_auth, "_real_uid", lambda: 1000),
+            mock.patch.object(
+                owner_auth, "_utcnow",
+                lambda: datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc),
+            ),
+            mock.patch.object(owner_auth, "_monotonic", lambda: 1000.0),
+            mock.patch.object(
+                owner_auth, "_open_controlling_tty", lambda: _FakeTty(["CHAL-1"])
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.human = HumanApprovalRepository(self.store)
+        s, a, b, c = self.build()
+        c2 = self.add("document", b"c2", "c2", aid=c, parent="c1",
+                      deps=[self.ref(c, "c1", "version_of")])
+        h_a = self.human_approve(a, "a1", "gate_a")
+        h_c = self.human_approve(c2, "c2", "gate_c")
+        self.assertEqual(self.human.evaluate(h_a.approval_id).status, "active")
+        self.add("document", b"s2", "s2", aid=s, parent="s1")
+        before = self.dump()
+        report = source_impact(self.store, self.ref(s, "s2"))  # default approvals
+        self.assertEqual(self.dump(), before)
+        json.dumps(report)
+        self.assertEqual(
+            [e["ref"]["artifact_id"] for e in report["affected"]], [a, b]
+        )
+        entry = report["affected"][0]
+        self.assertEqual(len(entry["approvals"]), 1)
+        self.assertEqual(entry["approvals"][0]["approval_id"], h_a.approval_id)
+        self.assertEqual(entry["approvals"][0]["status"], "stale")
+        self.assertEqual(self.human.evaluate(h_a.approval_id).status, "stale")
+        # unrelated authentic approval (with version_of lineage) stays active
+        self.assertEqual(self.human.evaluate(h_c.approval_id).status, "active")
+        self.assertEqual(report["unaffected"], [self.ref(c, "c2")])
+        self.assertNotIn(c, [e["ref"]["artifact_id"] for e in report["affected"]])
+        self.assertFalse(report["authorizing"])
 
 
 if __name__ == "__main__":

@@ -19,8 +19,9 @@ the **actual** generic dependency records through
 revision with a live (non-``version_of``) use of an **earlier** revision of this
 source artifact, then follows live uses of those flagged revisions transitively.
 It reports the direct and transitive affected refs, the explicit unaffected refs
-and count, and (read-only, informational) the local approval statuses recomputed
-by the generic approval freshness logic.
+and count, and (read-only, informational) the named-gate human approval statuses recomputed
+by the generic human-approval freshness logic (``HumanApprovalRepository``;
+a non-authorizing fixture repository can only be injected explicitly).
 
 What it is **not**
 ------------------
@@ -42,8 +43,8 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from ..domain.records import RecordValidationError, validate_identifier
-from ..storage.approvals import ApprovalRepository
 from ..storage.artifacts import ArtifactRepository
+from ..storage.human_approvals import HumanApprovalRepository
 from ..domain.errors import StoreError
 
 _REF_KEYS = ("project_id", "artifact_id", "revision_id")
@@ -192,7 +193,7 @@ def source_impact(
         affected.values(), key=lambda e: (e["relation"] != "direct", _key(e["ref"]))
     )
     if approvals is None:
-        approvals = ApprovalRepository(store, repo)
+        approvals = HumanApprovalRepository(store, artifacts=repo)
     summaries = _approval_summaries(approvals, {k[0] for k in affected})
     for entry in affected_list:
         entry["approvals"] = summaries.get(entry["ref"]["artifact_id"], [])
