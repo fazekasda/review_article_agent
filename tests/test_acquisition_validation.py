@@ -435,6 +435,51 @@ class TestJatsStructureAnchoring(_Base):
         self.assertNotEqual(self.call(dup_front, {"pmid": "123"})["status"], "ready")
 
 
+class TestJatsBodyTailAndEmptiness(_Base):
+    HEAD = (
+        b"<article><front><article-meta>"
+        b'<article-id pub-id-type="pmid">123</article-id>'
+        b"</article-meta></front>"
+    )
+
+    def _check(self, tail_xml):
+        return self.call(self.HEAD + tail_xml + b"</article>", {"pmid": "123"})
+
+    def test_selfclosing_body_with_external_tail_not_ready(self):
+        result = self._check(b"<body/>Not article body")
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(result["checks"]["full_text"], "fail")
+        self.assertIn("jats_body_empty", result["reasons"])
+
+    def test_empty_body_with_external_tail_not_ready(self):
+        result = self._check(b"<body></body>Not article body")
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(result["checks"]["full_text"], "fail")
+
+    def test_nested_empty_structures_not_ready(self):
+        result = self._check(b"<body><sec><title/><p/><sec/></sec></body> tail")
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(result["checks"]["full_text"], "fail")
+
+    def test_invisible_only_body_not_ready(self):
+        result = self._check("<body><p>\u200b\u00a0 \ufeff</p></body>".encode())
+        self.assertEqual(result["status"], "needs_review")
+
+    def test_child_tail_inside_body_counts(self):
+        result = self._check(b"<body><p/>Inside text</body>")
+        self.assertEqual(result["status"], "ready")
+
+    def test_body_text_and_nested_child_text_count(self):
+        self.assertEqual(self._check(b"<body>Direct</body>")["status"], "ready")
+        self.assertEqual(
+            self._check(b"<body><sec><p>Deep</p></sec></body>")["status"], "ready"
+        )
+
+    def test_article_tail_text_not_body(self):
+        result = self._check(b"<body/>")
+        self.assertEqual(result["status"], "needs_review")
+
+
 class TestJatsBodyFailClosed(_Base):
     def test_missing_body_needs_review(self):
         result = self.call(jats(body=None), {"pmid": "12345678"})

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 
@@ -496,17 +497,30 @@ def _extract_identifiers(root):
     return observed, malformed, conflict, True
 
 
+def _visible_length(text: str | None) -> int:
+    """Count characters that are neither whitespace nor control/format marks."""
+    if not text:
+        return 0
+    return sum(
+        1
+        for char in text
+        if not char.isspace() and unicodedata.category(char) not in ("Cc", "Cf", "Cs")
+    )
+
+
 def _body_text_length(root) -> int | None:
-    """Non-whitespace text length inside the root's single ``body``, else ``None``."""
+    """Visible text length inside the root's single ``body``, else ``None``.
+
+    The body's own ``tail`` lies outside it and is never counted; the ``text``
+    and ``tail`` of descendants lie inside it and are.
+    """
     body = _only_child(root, "body")
     if body is None:
         return None
-    total = 0
+    total = _visible_length(body.text)
     for element in body.iter():
-        if element.text:
-            total += len(element.text.strip())
-        if element.tail:
-            total += len(element.tail.strip())
+        if element is not body:
+            total += _visible_length(element.text) + _visible_length(element.tail)
     return total
 
 
