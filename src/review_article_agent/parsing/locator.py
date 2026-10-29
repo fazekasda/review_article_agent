@@ -97,15 +97,30 @@ def passage_citation_check(parsed: dict, passage_id: str) -> dict:
     }
 
 
+def _locator_payload(locator: dict) -> dict:
+    return {
+        "passage_id": locator.get("passage_id"),
+        "section_path": list(locator.get("section_path", [])),
+        "text_sha256": locator.get("text_sha256"),
+        "source_sha256": locator.get("source_sha256"),
+        "parser_version": locator.get("parser_version"),
+        "normalization_version": locator.get("normalization_version"),
+    }
+
+
 def resolve_locator(locator: dict, parsed: dict) -> dict:
     """Re-check ``locator`` against a freshly parsed ``parsed`` document.
 
-    Detects a changed source digest, a changed parser or normalization version,
-    and a changed passage text hash.  Returns a JSON-safe mapping:
+    Validates the locator's own ``locator_sha256`` and every dependency: the
+    source digest, the parser and normalization versions, the section path, and
+    the passage's *actual* normalized-text hash (recomputed from
+    ``passage['text']``, cross-checked against the passage's internal
+    ``text_sha256``).  Returns a JSON-safe mapping:
 
-    ``status`` is ``resolved`` when every dependency matches, ``stale`` when the
-    passage exists but a dependency changed, and ``missing`` when the passage id
-    is gone.  ``citation_check`` is always the local check for that passage.
+    ``status`` is ``resolved`` only when everything matches, ``stale`` when the
+    passage exists but the locator or a dependency changed (including an
+    invalid ``locator_sha256``), and ``missing`` when the passage id is gone.
+    ``citation_check`` is always the local check for that passage.
     """
     if not isinstance(locator, dict):
         raise ParsingRequestError("locator must be a mapping")
@@ -114,6 +129,9 @@ def resolve_locator(locator: dict, parsed: dict) -> dict:
 
     passage_id = locator.get("passage_id")
     reasons: list[str] = []
+
+    if _locator_digest(_locator_payload(locator)) != locator.get("locator_sha256"):
+        reasons.append("locator_digest_invalid")
 
     source = parsed.get("source") or {}
     if source.get("sha256") != locator.get("source_sha256"):
@@ -133,8 +151,15 @@ def resolve_locator(locator: dict, parsed: dict) -> dict:
             "citation_check": passage_citation_check(parsed, passage_id or ""),
         }
 
-    if passage.get("text_sha256") != locator.get("text_sha256"):
+    if list(passage.get("section_path", [])) != list(locator.get("section_path", [])):
+        reasons.append("section_path_changed")
+    actual = hashlib.sha256(
+        (passage.get("text") or "").encode("utf-8")
+    ).hexdigest()
+    if actual != locator.get("text_sha256"):
         reasons.append("passage_text_changed")
+    if passage.get("text_sha256") != actual:
+        reasons.append("passage_text_hash_inconsistent")
 
     return {
         "passage_id": passage_id,

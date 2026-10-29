@@ -229,6 +229,21 @@ class TeiParsingTests(unittest.TestCase):
         self.assertEqual(_link_states(parsed, "p0001"), ["resolved"])
         self.assertEqual(parsed["references"][0]["ref_id"], "b1")
 
+    def test_biblstruct_reference_resolves(self):
+        data = (
+            '<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>'
+            "<div><head>Intro</head>"
+            '<p>See<ref type="bibr" target="#b1">[1]</ref>.</p></div>'
+            "</body><back><div><listBibl>"
+            '<biblStruct xml:id="b1"><monogr><title>Study</title></monogr>'
+            "</biblStruct></listBibl></div></back></text></TEI>"
+        )
+        parsed = parse_document(data.encode("utf-8"))
+        self.assertEqual(parsed["format"], "tei")
+        self.assertEqual(_link_states(parsed, "p0001"), ["resolved"])
+        self.assertTrue(parsed["references"][0]["usable"])
+
+
 
 class CitationIsolationTests(unittest.TestCase):
     def test_unrelated_malformed_bibliography_does_not_invalidate_all(self):
@@ -243,6 +258,26 @@ class CitationIsolationTests(unittest.TestCase):
         # the id-less ("malformed") bibliography entry is recorded but never
         # breaks a link that points at a valid id
         self.assertTrue(any(ref["malformed"] for ref in parsed["references"]))
+
+    def test_unusable_id_entry_is_local_malformed(self):
+        data = (
+            "<article><body><sec><title>S</title>"
+            '<p>Good<xref ref-type="bibr" rid="ok">1</xref>.</p>'
+            '<p>Bad<xref ref-type="bibr" rid="empty">2</xref>.</p>'
+            "</sec></body><back><ref-list>"
+            '<ref id="ok"><mixed-citation>Real entry.</mixed-citation></ref>'
+            '<ref id="empty"><label>2</label></ref>'
+            "</ref-list></back></article>"
+        )
+        parsed = parse_document(data.encode("utf-8"))
+        by_id = {r["ref_id"]: r for r in parsed["references"]}
+        self.assertTrue(by_id["ok"]["usable"])
+        self.assertFalse(by_id["empty"]["usable"])
+        # the label-only target is malformed *locally*, the good link survives
+        self.assertEqual(_link_states(parsed, "p0002"), ["malformed"])
+        self.assertTrue(passage_citation_check(parsed, "p0001")["ok"])
+        self.assertFalse(passage_citation_check(parsed, "p0002")["ok"])
+
 
 
 class LocatorTests(unittest.TestCase):
@@ -285,7 +320,7 @@ class LocatorTests(unittest.TestCase):
 
     def test_changed_passage_text_is_stale(self):
         mutated = json.loads(json.dumps(self.parsed))
-        _passage(mutated, "p0002")["text_sha256"] = "0" * 64
+        _passage(mutated, "p0002")["text"] += " CHANGED"
         result = resolve_locator(self.locator, mutated)
         self.assertEqual(result["status"], "stale")
         self.assertIn("passage_text_changed", result["reasons"])
@@ -296,6 +331,32 @@ class LocatorTests(unittest.TestCase):
         result = resolve_locator(self.locator, empty)
         self.assertEqual(result["status"], "missing")
         self.assertIn("passage_not_found", result["reasons"])
+
+    def test_locator_validates_digest_section_path_and_actual_text(self):
+        # text-only mutation (internal text_sha256 untouched) must not resolve
+        mutated = json.loads(json.dumps(self.parsed))
+        _passage(mutated, "p0002")["text"] += " CHANGED"
+        result = resolve_locator(self.locator, mutated)
+        self.assertEqual(result["status"], "stale")
+        self.assertIn("passage_text_changed", result["reasons"])
+
+        moved = json.loads(json.dumps(self.parsed))
+        _passage(moved, "p0002")["section_path"] = ["Elsewhere"]
+        self.assertIn("section_path_changed", resolve_locator(self.locator, moved)["reasons"])
+
+        inconsistent = json.loads(json.dumps(self.parsed))
+        _passage(inconsistent, "p0002")["text_sha256"] = "0" * 64
+        self.assertIn(
+            "passage_text_hash_inconsistent",
+            resolve_locator(self.locator, inconsistent)["reasons"],
+        )
+
+        tampered = dict(self.locator)
+        tampered["locator_sha256"] = "0" * 64
+        result = resolve_locator(tampered, self.parsed)
+        self.assertEqual(result["status"], "stale")
+        self.assertIn("locator_digest_invalid", result["reasons"])
+
 
 
 class XmlThreatTests(unittest.TestCase):
@@ -334,6 +395,23 @@ class XmlThreatTests(unittest.TestCase):
         self.assertTrue(parsed["human_action_required"])
         self.assertFalse(parsed["excludes_candidate"])
         self.assertEqual(parsed["passages"], [])
+
+    def test_empty_body_is_human_review_not_exclusion(self):
+        parsed = parse_document(b"<article><body/></article>")
+        self.assertEqual(parsed["status"], "needs_review")
+        self.assertIn("no_substantive_text", parsed["reasons"])
+        self.assertTrue(parsed["human_action_required"])
+        self.assertFalse(parsed["excludes_candidate"])
+
+    def test_source_digest_must_match_bytes(self):
+        data = JATS.encode("utf-8")
+        good = hashlib.sha256(data).hexdigest()
+        self.assertEqual(
+            parse_document(data, source_digest=good)["source"]["sha256"], good
+        )
+        with self.assertRaises(ParsingRequestError):
+            parse_document(data, source_digest="0" * 64)
+
 
 
 class PdfAdapterTests(unittest.TestCase):

@@ -89,6 +89,7 @@ REASONS = frozenset(
         "xml_not_jats_or_tei",
         "jats_doctype_removed",
         "non_text_assets_present",
+        "no_substantive_text",
     }
 )
 
@@ -288,6 +289,16 @@ def _text_of(element) -> str:
     return text
 
 
+def _text_of_children(element, skip_names: tuple = ()) -> str:
+    """Normalized text of an element's children, skipping named subtrees.
+
+    Used to read a reference entry's citation text *excluding* its label, so a
+    label-only entry reads as empty and can be flagged unusable.
+    """
+    text, _ = normalize_text(_flatten_children(element, skip_names))
+    return text
+
+
 def _element_id(element) -> str | None:
     value = element.get("id")
     if value is None:
@@ -437,12 +448,13 @@ def _jats_references(root) -> list[dict]:
         for ref in [e for e in ref_list.iter() if _local(e.tag) == "ref"]:
             ref_id = _element_id(ref)
             label = _text_of(_first(ref, "label"))
-            text = _text_of(ref)
+            text = _text_of_children(ref, ("label",))
             refs.append(
                 {
                     "ref_id": ref_id,
                     "label": label or None,
                     "text": text,
+                    "usable": bool(ref_id) and bool(text.strip()),
                     "malformed": ref_id is None,
                 }
             )
@@ -504,14 +516,18 @@ def _tei_passages(root):
 def _tei_references(root) -> list[dict]:
     refs: list[dict] = []
     for list_bibl in [e for e in root.iter() if _local(e.tag) == "listBibl"]:
-        for bibl in [e for e in list_bibl.iter() if _local(e.tag) == "bibl"]:
-            ref_id = _element_id(bibl)
-            label = _text_of(_first(bibl, "label"))
+        for entry in list_bibl.iter():
+            if _local(entry.tag) not in ("bibl", "biblStruct"):
+                continue
+            ref_id = _element_id(entry)
+            label = _text_of(_first(entry, "label"))
+            text = _text_of_children(entry, ("label",))
             refs.append(
                 {
                     "ref_id": ref_id,
                     "label": label or None,
-                    "text": _text_of(bibl),
+                    "text": text,
+                    "usable": bool(ref_id) and bool(text.strip()),
                     "malformed": ref_id is None,
                 }
             )
@@ -534,11 +550,15 @@ def _tei_assets(root) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Citation links
 # --------------------------------------------------------------------------- #
-def _link_state(targets: list[str], ref_counts: Counter) -> str:
+def _link_state(targets: list[str], ref_counts: Counter, unusable: set) -> str:
     if not targets:
         return "malformed"
     states: list[str] = []
     for target in targets:
+        if target in unusable:
+            # The target id exists but its entry has no usable citation text.
+            states.append("malformed")
+            continue
         count = ref_counts.get(target, 0)
         if count == 0:
             states.append("unresolved")
@@ -546,6 +566,8 @@ def _link_state(targets: list[str], ref_counts: Counter) -> str:
             states.append("ambiguous")
         else:
             states.append("resolved")
+    if "malformed" in states:
+        return "malformed"
     if "ambiguous" in states:
         return "ambiguous"
     if "unresolved" in states:
@@ -554,13 +576,17 @@ def _link_state(targets: list[str], ref_counts: Counter) -> str:
 
 
 def _build_links(markers: list[dict], refs: list[dict]) -> list[dict]:
-    ref_counts: Counter = Counter(
-        ref["ref_id"] for ref in refs if ref["ref_id"] is not None
-    )
+    usable_ids = [ref["ref_id"] for ref in refs if ref["ref_id"] and ref["usable"]]
+    ref_counts: Counter = Counter(usable_ids)
+    unusable = {
+        ref["ref_id"]
+        for ref in refs
+        if ref["ref_id"] and not ref["usable"]
+    }
     links: list[dict] = []
     for marker in markers:
         targets = marker.get("targets") or []
-        state = _link_state(targets, ref_counts)
+        state = _link_state(targets, ref_counts, unusable)
         resolved = (
             list(targets) if state == "resolved" else []
         )
@@ -652,11 +678,11 @@ def _reject(digest: str, byte_size: int, reasons: list[str]) -> dict:
 def parse_document(data: bytes, *, source_digest: str | None = None) -> dict:
     """Parse one XML full-text source into a JSON-safe structural map.
 
-    ``data`` is the exact stored bytes; ``source_digest`` optionally overrides
-    the computed SHA-256 (for a caller that already has the raw digest).  The
-    result follows the schema documented in this module's docstring and is
-    always JSON-compatible.  Raises :class:`ParsingRequestError` only when the
-    *request* is malformed.
+    ``data`` is the exact stored bytes; ``source_digest``, when given, must
+    exactly equal the SHA-256 of ``data`` (a mismatch is a malformed request,
+    never a silent override).  The result follows the schema documented in this
+    module's docstring and is always JSON-compatible.  Raises
+    :class:`ParsingRequestError` only when the *request* is malformed.
     """
     if isinstance(data, (bytearray, memoryview)):
         data = bytes(data)
@@ -667,7 +693,11 @@ def parse_document(data: bytes, *, source_digest: str | None = None) -> dict:
     ):
         raise ParsingRequestError("source_digest must be a non-empty string or None")
 
-    digest = source_digest if source_digest is not None else hashlib.sha256(data).hexdigest()
+    digest = hashlib.sha256(data).hexdigest()
+    if source_digest is not None and source_digest != digest:
+        raise ParsingRequestError(
+            "source_digest does not match the SHA-256 of the supplied bytes"
+        )
     byte_size = len(data)
     if byte_size == 0:
         return _reject(digest, byte_size, ["empty_input"])
@@ -725,12 +755,15 @@ def parse_document(data: bytes, *, source_digest: str | None = None) -> dict:
 
     citation_links = _build_links(markers, references)
     reasons: list[str] = ["jats_doctype_removed"] if doctype_removed else []
+    substantive = any(passage["text"].strip() for passage in passages)
+    if not substantive:
+        reasons.append("no_substantive_text")
 
     return _finalize(
         digest=digest,
         byte_size=byte_size,
         fmt=fmt,
-        status="parsed",
+        status="parsed" if substantive else "needs_review",
         passages=passages,
         references=references,
         citation_links=citation_links,
