@@ -128,6 +128,7 @@ from ..domain.records import (
     require_storage_allowed,
     validate_identifier,
     validate_ref,
+    validate_rights_record,
 )
 from ..storage.artifacts import (
     ArtifactConflictError,
@@ -136,7 +137,12 @@ from ..storage.artifacts import (
     sha256_digest,
 )
 from ..storage.human_approvals import HumanApprovalRepository
-from .validation import IDENTIFIER_NAMESPACES, AcquisitionValidationError, validate_asset
+from .validation import (
+    IDENTIFIER_NAMESPACES,
+    MAX_BYTE_SIZE,
+    AcquisitionValidationError,
+    validate_asset,
+)
 
 __all__ = [
     "DOCUMENT_TYPE",
@@ -191,6 +197,8 @@ BLOCKER_CODES = (
     "required_asset_unavailable",
     "required_asset_unknown",
     "required_asset_bytes_missing",
+    "required_asset_unreadable",
+    "required_asset_rejected",
     "required_asset_superseded",
 )
 
@@ -519,7 +527,7 @@ def _shape_of(entry: dict) -> dict:
     assets = entry["required_assets"]
     if isinstance(assets, list):
         shape["required_assets"] = [
-            {k: v for k, v in a.items() if k != "source_pin"} if isinstance(a, dict) else a
+            {k: v for k, v in a.items() if k not in ("source_pin", "availability")} if isinstance(a, dict) else a
             for a in assets
         ]
     return shape
@@ -843,11 +851,20 @@ class AcquisitionRepository:
         content = self._artifacts.read_content(revision.artifact_id, revision.revision_id)
         if sha256_digest(content) != revision.content_sha256 or len(content) != revision.byte_size:
             raise error(_M_BAD_SOURCE)
+        if revision.rights_ref.project_id != self.project_id:
+            raise error(_M_BAD_SOURCE)
         rights = self._artifacts.get_rights_record(revision.rights_ref)
         if rights is None:
             raise error(_M_BAD_SOURCE)
+        subject = {
+            "kind": "source_revision",
+            "project_id": self.project_id,
+            "artifact_id": revision.artifact_id,
+            "revision_id": revision.revision_id,
+        }
         try:
-            require_storage_allowed(rights)
+            validated = validate_rights_record(rights, self.project_id, subject=subject)
+            require_storage_allowed(validated)
         except RecordValidationError:
             raise error(_M_BAD_SOURCE) from None
         return revision, content
@@ -859,6 +876,23 @@ class AcquisitionRepository:
             "byte_size": revision.byte_size,
             "media_type": revision.media_type,
         }
+
+    @staticmethod
+    def _availability(content: bytes) -> str:
+        """Conservative availability-only check of an asset's bytes.
+
+        Never parses figures / images / opaque supplements; it only recognises
+        known-inaccessible evidence: no bytes, over the byte cap, or an HTML /
+        login response (reusing the container sniff of ``validate_asset``).
+        """
+        if len(content) == 0:
+            return "empty"
+        if len(content) > MAX_BYTE_SIZE:
+            return "oversize"
+        probe = content[3:] if content.startswith(b"\xef\xbb\xbf") else content
+        if validate_asset(probe, expected_identifiers={})["media_kind"] == "html":
+            return "html"
+        return "readable"
 
     @staticmethod
     def _expected_identifiers(candidate: dict) -> tuple[dict, bool]:
@@ -886,6 +920,7 @@ class AcquisitionRepository:
         )
         for asset in entry["required_assets"]:
             asset["source_pin"] = None
+            asset["availability"] = None
         if shape["disposition"] != USE_DISPOSITION:
             entry["_blockers"] = blockers
             return entry
@@ -924,11 +959,16 @@ class AcquisitionRepository:
         for asset in entry["required_assets"]:
             category = _asset_category(asset["kind"])
             if asset["source_ref"] is not None:
-                rev, _content = self._read_source(asset["source_ref"], current=current, error=error)
+                rev, content = self._read_source(asset["source_ref"], current=current, error=error)
                 asset["source_pin"] = self._pin(rev)
+                asset["availability"] = self._availability(content)
             if not asset["required"]:
                 continue
-            if asset["status"] == "unavailable":
+            if asset["availability"] == "empty":
+                blockers.append(_blocker(cid, category, "required_asset_unreadable", asset["asset_id"]))
+            elif asset["availability"] in ("html", "oversize"):
+                blockers.append(_blocker(cid, category, "required_asset_rejected", asset["asset_id"]))
+            elif asset["status"] == "unavailable":
                 blockers.append(_blocker(cid, category, "required_asset_unavailable", asset["asset_id"]))
             elif asset["status"] == "unknown":
                 blockers.append(_blocker(cid, category, "required_asset_unknown", asset["asset_id"]))
@@ -1029,6 +1069,7 @@ class AcquisitionRepository:
         if (
             not isinstance(parsed, dict)
             or set(parsed) != {"schema_version", "document_type", "payload"}
+            or type(parsed["schema_version"]) is not int
             or parsed["schema_version"] != MANIFEST_ENVELOPE_SCHEMA_VERSION
             or parsed["document_type"] != DOCUMENT_TYPE
         ):
@@ -1044,6 +1085,7 @@ class AcquisitionRepository:
         stored = revision.dependencies
         if (
             any(dep.role != "derived_from" for dep in stored)
+            or any(dep.project_id != self.project_id for dep in stored)
             or {(dep.artifact_id, dep.revision_id) for dep in stored} != expected
             or len(stored) != len(expected)
         ):
@@ -1068,7 +1110,8 @@ class AcquisitionRepository:
         freeze = payload["freeze"]
         entries = payload["entries"]
         if (
-            payload["payload_version"] != MANIFEST_PAYLOAD_VERSION
+            type(payload["payload_version"]) is not int
+            or payload["payload_version"] != MANIFEST_PAYLOAD_VERSION
             or not isinstance(freeze, dict)
             or set(freeze) != _FREEZE_KEYS
             or not isinstance(entries, list)

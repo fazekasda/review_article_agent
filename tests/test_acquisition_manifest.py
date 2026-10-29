@@ -419,6 +419,52 @@ class ManifestAssetTests(ManifestBase):
         self.gate(ok)
         self.acq.require_acquired()
 
+    def test_empty_or_html_required_assets_block_even_with_genuine_gate(self):
+        self.setup_frozen()
+        a, b = self.cands["111"], self.cands["222"]
+        src = self.put_source(_jats("111"))
+        cases = {
+            "empty": (b"", "required_asset_unreadable"),
+            "login": (av.LOGIN_HTML, "required_asset_rejected"),
+            "bom-html": (b"\xef\xbb\xbf" + av.PLAIN_HTML, "required_asset_rejected"),
+        }
+        for name, (data, code) in cases.items():
+            bad = self.put_source(data)
+            rev = self.make(
+                [self.entry(a, source=src, assets=[self.asset("s1", "supplement", source=bad,
+                                                              rationale="human says it is fine")]),
+                 self.entry(b, "exclude")],
+                request_id=f"m-{name}",
+            )
+            blockers = self.acq.get(self.ref_of(rev))["payload"]["blockers"]
+            self.assertEqual([(x["category"], x["code"], x["asset_id"]) for x in blockers],
+                             [("supplement", code, "s1")], name)
+            self.gate(rev)
+            with self.assertRaises(ManifestNotAcquiredError) as ctx:
+                self.acq.require_acquired()
+            self.assertIn("blockers_present", ctx.exception.reasons)
+            self.assertIn(code, [x["code"] for x in self.acq.queue(self.freeze_ref)])
+        # a non-required asset never blocks; valid opaque bytes are availability only
+        optional = self.put_source(b"")
+        opaque_fig = self.put_source(b"\x89PNG\r\n\x1a\n opaque")
+        opaque_sup = self.put_source(b"PK\x03\x04 opaque supplement archive")
+        ok = self.make(
+            [self.entry(a, source=src, assets=[
+                self.asset("f1", "figure", source=opaque_fig),
+                self.asset("s1", "supplement", source=opaque_sup),
+                self.asset("s2", "supplement", required=False, source=optional)]),
+             self.entry(b, "exclude")],
+            request_id="m-opaque",
+        )
+        doc = self.acq.get(self.ref_of(ok))
+        self.assertEqual(doc["payload"]["blockers"], [])
+        self.assertEqual(
+            sorted(x["availability"] for e in doc["payload"]["entries"] for x in e["required_assets"]),
+            ["empty", "readable", "readable"],
+        )
+        self.gate(ok)
+        self.assertTrue(self.acq.require_acquired()["acquired"])
+
     def test_contradictory_or_duplicate_assets_are_refused(self):
         self.setup_frozen()
         a, b = self.cands["111"], self.cands["222"]
@@ -585,6 +631,60 @@ class ManifestTamperTests(ManifestBase):
         bypass = self.forge(rev, drop_source)
         with self.assertRaises(ManifestCorruptionError):
             self.acq.get(self.ref_of(bypass))
+
+    def test_non_int_payload_version_is_corruption(self):
+        a, b, src, entries = self.standard()
+        rev = self.make(entries)
+        forged = self.forge(rev, lambda d: d["payload"].__setitem__("payload_version", True))
+        with self.assertRaises(ManifestCorruptionError):
+            self.acq.get(self.ref_of(forged))
+
+    def test_rights_ref_aliasing_another_subject_is_refused(self):
+        a, b, src, entries = self.standard()
+        other = self.put_source(_jats("111"))
+        rev = self.make(entries)
+        self.gate(rev)
+        self.acq.require_acquired()
+        orow = self.store.connection.execute(
+            "SELECT rights_id, rights_record_revision FROM revision WHERE artifact_id = ?",
+            (other["artifact_id"],),
+        ).fetchone()
+        conn = self.store.connection
+        conn.execute("DROP TRIGGER revision_no_update")
+        conn.execute(
+            "UPDATE revision SET rights_id = ?, rights_record_revision = ? "
+            "WHERE artifact_id = ? AND revision_id = ?",
+            (orow["rights_id"], orow["rights_record_revision"], src["artifact_id"], src["revision_id"]),
+        )
+        conn.commit()
+        with self.assertRaises(ManifestCorruptionError):
+            self.acq.get(self.ref_of(rev))
+        with self.assertRaises(ManifestNotAcquiredError):
+            self.acq.require_acquired()
+
+    def test_superseded_source_rights_fail_require_via_gate_but_not_unrelated(self):
+        self.setup_frozen()
+        a, b = self.cands["111"], self.cands["222"]
+        src1 = self.put_source(_jats("111"), artifact_id="src-r1")
+        src2 = self.put_source(_jats("111"), artifact_id="src-r2")
+        m1 = self.make([self.entry(a, source=src1), self.entry(b, "exclude")],
+                       request_id="r1", artifact_id="acq.r1")
+        m2 = self.make([self.entry(a, source=src2), self.entry(b, "exclude")],
+                       request_id="r2", artifact_id="acq.r2")
+        self.gate(m1)
+        self.gate(m2)
+        self.acq.require_acquired("acq.r1")
+        old = self.artifacts.get_rights_record(
+            self.artifacts.get_revision(src1["artifact_id"], src1["revision_id"]).rights_ref
+        )
+        newer = dict(old, record_revision=old["record_revision"] + 1)
+        self.artifacts.store_rights_record(newer)
+        with self.assertRaises(ManifestNotAcquiredError) as ctx:
+            self.acq.require_acquired("acq.r1")
+        self.assertEqual(ctx.exception.reasons, ("gate_not_active",))
+        self.acq.require_acquired("acq.r2")
+        # honest history: the superseded manifest still reads
+        self.assertEqual(self.acq.get(self.ref_of(m1))["payload"]["blockers"], [])
 
     def test_source_byte_tamper_is_detected_on_read_and_require(self):
         a, b, src, entries = self.standard()
