@@ -26,6 +26,8 @@ Run::
 
 from __future__ import annotations
 
+import unittest  # noqa: E402
+
 import test_extraction_runner as extraction_runner  # noqa: E402
 from test_acquisition_manifest import _jats  # noqa: E402
 from test_extraction_workflow import (  # noqa: E402
@@ -48,6 +50,10 @@ from review_article_agent.drafting import (  # noqa: E402
     DraftingPackageError,
     DraftingPackageRepository,
     citation_key,
+)
+from review_article_agent.drafting.package import (  # noqa: E402
+    _bibliographic_record,
+    _observed_bibliographic_fields,
 )
 from review_article_agent.domain.records import canonical_json  # noqa: E402
 from review_article_agent.extraction import workflow as extraction_workflow  # noqa: E402
@@ -480,3 +486,100 @@ class DraftingOverRealRunnerTest(extraction_runner.FullFlowIntegrationTest):
         self.assertFalse(original["source_ref_fallback"])
         self.assertTrue(original["passages"])
         self.assertEqual(package["limitations"], [])
+
+
+# --------------------------------------------------------------------------- #
+# Bibliographic metadata carry-over (pure; no store)
+# --------------------------------------------------------------------------- #
+class _Rec:
+    def __init__(self, title=None, year=None):
+        self.title = title
+        self.publication_year = year
+
+
+class _Result:
+    def __init__(self, records):
+        self.records = tuple(records)
+
+
+class _Observation:
+    def __init__(self, records):
+        self.result = _Result(records)
+
+
+class _FakeDiscovery:
+    def __init__(self, by_run):
+        self._by_run = by_run
+
+    def get_search(self, run_id):
+        return self._by_run.get(run_id)
+
+
+class BibliographicMetadataTests(unittest.TestCase):
+    """The citation record carries only verified frozen-corpus metadata."""
+
+    _CORPUS_REF = {"project_id": "P", "artifact_id": "discovery.corpus", "revision_id": "rev-c"}
+    _FREEZE_REF = {"project_id": "P", "artifact_id": "discovery.freeze", "revision_id": "rev-f"}
+
+    @staticmethod
+    def _candidate(**overrides):
+        doc = {
+            "candidate_id": "cand_x",
+            "resolved": True,
+            "tokens": [["native:pubmed", "a"], ["pmid", "111"], ["doi", "10.1/x"]],
+            "occurrences": [["run1", 0]],
+        }
+        doc.update(overrides)
+        return doc
+
+    def test_present_fields_are_carried_from_the_observation(self):
+        discovery = _FakeDiscovery({"run1": _Observation([_Rec("Real title", 2020)])})
+        observed = _observed_bibliographic_fields(self._candidate(), discovery)
+        self.assertEqual(observed, {"title": "Real title", "year": 2020})
+        record = _bibliographic_record(
+            "P", self._candidate(), self._CORPUS_REF, self._FREEZE_REF, [], observed
+        )
+        self.assertEqual(record["title"], "Real title")
+        self.assertEqual(record["year"], 2020)
+        self.assertEqual(record["identity"], {"doi": "10.1/x", "pmid": "111"})
+        self.assertEqual(record["version"], "rev-c")
+        self.assertEqual(record["candidate_id"], "cand_x")
+        # The frozen corpus carries no authors/journal; they are omitted.
+        self.assertNotIn("authors", record)
+        self.assertNotIn("journal", record)
+
+    def test_absent_fields_are_omitted_never_invented(self):
+        discovery = _FakeDiscovery({"run1": _Observation([_Rec(None, None)])})
+        observed = _observed_bibliographic_fields(self._candidate(), discovery)
+        self.assertEqual(observed, {})
+        record = _bibliographic_record(
+            "P", self._candidate(), self._CORPUS_REF, self._FREEZE_REF, [], observed
+        )
+        self.assertNotIn("title", record)
+        self.assertNotIn("year", record)
+        self.assertNotIn("authors", record)
+        self.assertNotIn("journal", record)
+
+    def test_disagreeing_occurrences_omit_the_field(self):
+        discovery = _FakeDiscovery(
+            {
+                "run1": _Observation([_Rec("Title A", 2020)]),
+                "run2": _Observation([_Rec("Title B", 2021)]),
+            }
+        )
+        candidate = self._candidate(occurrences=[["run1", 0], ["run2", 0]])
+        observed = _observed_bibliographic_fields(candidate, discovery)
+        self.assertNotIn("title", observed)
+        self.assertNotIn("year", observed)
+
+    def test_identity_only_carries_present_namespaces(self):
+        candidate = self._candidate(tokens=[["native:pubmed", "a"], ["pmid", "111"]])
+        record = _bibliographic_record(
+            "P", candidate, self._CORPUS_REF, self._FREEZE_REF, [], {}
+        )
+        self.assertEqual(record["identity"], {"pmid": "111"})
+        self.assertEqual(record["bibliographic_identifiers"], {"pmid": "111"})
+
+
+if __name__ == "__main__":
+    unittest.main()
