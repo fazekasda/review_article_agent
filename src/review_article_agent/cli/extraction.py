@@ -29,22 +29,44 @@ accepted evidence bodies are emitted.
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Any, Callable
 
 from ..domain.errors import ReviewAgentError, StoreError
+from ..domain.records import RecordValidationError, canonical_json, validate_identifier
 from ..extraction.workflow import ExtractionWorkflowRepository
+from ..runtime.jobs import JobRepository
 from ..storage import ArtifactConflictError
-from .parsing import _read_object, _resolve_project_id, _verified_store
+from ..worker import discovery as worker_discovery
+from ..worker import extraction as worker_extraction
+from ..worker.discovery import DiscoveryJobValidationError
+from ..worker.engine import PROTOCOL_VERSION
+from .jobs import (
+    JobControlError,
+    _expect_ok,
+    _job_projection,
+    _parse_identifier,
+    _resolve_project_id as _resolve_worker_project_id,
+    _rpc,
+    _start_worker,
+)
+from .parsing import _read_json_file, _read_object, _resolve_project_id, _verified_store
+from .worker import _resolve_timeout
 
 __all__ = [
     "ExtractionControlError",
     "build_extraction_parser",
     "dispatch_extraction",
+    "extraction_run_status",
+    "extraction_run_submit",
 ]
 
 _CATEGORY_VALIDATION = "validation"
 _CATEGORY_CONFLICT = "conflict"
 _CATEGORY_STORAGE = "storage"
+
+#: The local upper bound for a plain non-negative integer argument.
+_MAX_INT = 1_000_000_000
 
 _KINDS = ("config", "pilot", "batch", "audit")
 
@@ -62,6 +84,44 @@ _CONFLICT_MESSAGE = (
     "the request conflicts with existing immutable state; nothing was overwritten."
 )
 _STORAGE_MESSAGE = "a local storage operation failed; nothing was changed."
+
+# -- run submit/status (detached extraction job) ---------------------------- #
+_RUN_REF_MESSAGE = (
+    "invalid artifact or revision identifier for a run reference; it must be a "
+    "bounded opaque id. The supplied value is not shown. Run --help for usage."
+)
+_RUN_REPORT_REFS_MESSAGE = (
+    "the report-refs file must be a strict JSON list of "
+    '{"artifact_id", "revision_id"} objects with non-empty string values. '
+    "Nothing was sent."
+)
+_RUN_RIGHTS_MESSAGE = (
+    "the rights file must be a strict JSON object holding one RightsRecord for the "
+    "exact receipt revision. Nothing was sent."
+)
+_RUN_CREDENTIAL_ENV_MESSAGE = (
+    "invalid value for --credential-env; only the one approved extraction "
+    "environment variable name is accepted, and the credential value is never "
+    "supplied on the command line. The supplied value is not shown. Run --help "
+    "for usage."
+)
+_RUN_INVALID_MESSAGE = (
+    "the extraction run request was rejected by strict parameter validation (a "
+    "wrong or missing field, a malformed reference or identifier, an invalid or "
+    "ineligible rights record, or a purpose/mode that does not match the supplied "
+    "extraction/pilot reference). Nothing was sent and no job was created."
+)
+_RUN_NOT_FOUND_MESSAGE = (
+    "no recorded extraction run matches that request id in this project; nothing "
+    "was read or sent."
+)
+_RUN_MISSING_KEY_NOTICE = (
+    "the named extraction credential is not present in this CLI's environment; the "
+    "worker reads the environment variable at dispatch, so configure the worker's "
+    "environment before it runs the job (this command never restarts or "
+    "reconfigures a user's worker). The job is admitted and queued; inspect it with "
+    "`job status`."
+)
 
 
 class ExtractionControlError(Exception):
@@ -130,6 +190,66 @@ def build_extraction_parser(sub: "argparse._SubParsersAction") -> None:
         action="store_true",
         help="explicitly include the accepted evidence detail (ids, limitations, escalations)",
     )
+
+    # -- run (detached extraction/quality background job) -------------------- #
+    run = actions.add_parser(
+        "run",
+        help=(
+            "detached extraction/quality runs: submit one bounded run (queued "
+            "admission only) and read one run's recorded outcome"
+        ),
+    )
+    run_sub = run.add_subparsers(
+        dest="extraction_run_command", required=True, metavar="RUN_COMMAND"
+    )
+
+    p_run_submit = run_sub.add_parser(
+        "submit",
+        help=(
+            "submit one exact extraction/quality run job (mandatory --credential-env); "
+            "returns queued admission only"
+        ),
+    )
+    p_run_submit.add_argument("--project", metavar="ID")
+    p_run_submit.add_argument("--config-artifact-id", required=True, metavar="ID")
+    p_run_submit.add_argument("--config-revision-id", required=True, metavar="ID")
+    p_run_submit.add_argument(
+        "--report-refs-file",
+        required=True,
+        metavar="PATH",
+        help='strict JSON list of {"artifact_id","revision_id"} report references',
+    )
+    p_run_submit.add_argument("--hosted-artifact-id", required=True, metavar="ID")
+    p_run_submit.add_argument("--hosted-revision-id", required=True, metavar="ID")
+    p_run_submit.add_argument("--purpose", required=True, choices=("extraction", "quality"))
+    p_run_submit.add_argument("--mode", required=True, choices=("pilot", "bulk"))
+    p_run_submit.add_argument("--extraction-artifact-id", metavar="ID")
+    p_run_submit.add_argument("--extraction-revision-id", metavar="ID")
+    p_run_submit.add_argument("--pilot-artifact-id", metavar="ID")
+    p_run_submit.add_argument("--pilot-revision-id", metavar="ID")
+    p_run_submit.add_argument("--receipt-artifact-id", required=True, metavar="ID")
+    p_run_submit.add_argument("--receipt-revision-id", required=True, metavar="ID")
+    p_run_submit.add_argument(
+        "--rights-file",
+        required=True,
+        metavar="PATH",
+        help="explicit caller RightsRecord JSON for the exact receipt revision",
+    )
+    p_run_submit.add_argument(
+        "--credential-env",
+        required=True,
+        metavar="NAME",
+        help="the one approved environment variable name (the value is never accepted)",
+    )
+    p_run_submit.add_argument("--request-id", required=True, metavar="ID")
+    p_run_submit.add_argument("--timeout", metavar="SECONDS")
+
+    p_run_status = run_sub.add_parser(
+        "status",
+        help="safe readback of one recorded extraction/quality run (no call)",
+    )
+    p_run_status.add_argument("--project", metavar="ID")
+    p_run_status.add_argument("--request-id", required=True, metavar="ID")
 
 
 # --------------------------------------------------------------------------- #
@@ -281,6 +401,183 @@ def extraction_accepted(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# run handlers (detached extraction/quality job)
+# --------------------------------------------------------------------------- #
+def _run_ref(project_id: str, artifact_id: object, revision_id: object) -> dict:
+    """Build one exact same-project ``RefRevision`` (validated locally)."""
+    try:
+        artifact = validate_identifier(artifact_id, "artifact_id")
+        revision = validate_identifier(revision_id, "revision_id")
+    except (RecordValidationError, TypeError, ValueError):
+        raise ExtractionControlError(_CATEGORY_VALIDATION, _RUN_REF_MESSAGE) from None
+    return {
+        "project_id": project_id,
+        "artifact_id": artifact,
+        "revision_id": revision,
+    }
+
+
+def _read_report_refs(path: str) -> list:
+    """Read one strict JSON ``[{"artifact_id","revision_id"}]`` list."""
+    value = _read_json_file(path, what="report references")
+    if not isinstance(value, list) or not value:
+        raise ExtractionControlError(_CATEGORY_VALIDATION, _RUN_REPORT_REFS_MESSAGE)
+    refs: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"artifact_id", "revision_id"}:
+            raise ExtractionControlError(_CATEGORY_VALIDATION, _RUN_REPORT_REFS_MESSAGE)
+        artifact_id, revision_id = item["artifact_id"], item["revision_id"]
+        if (
+            not isinstance(artifact_id, str)
+            or not isinstance(revision_id, str)
+            or artifact_id == ""
+            or revision_id == ""
+        ):
+            raise ExtractionControlError(_CATEGORY_VALIDATION, _RUN_REPORT_REFS_MESSAGE)
+        refs.append({"artifact_id": artifact_id, "revision_id": revision_id})
+    return refs
+
+
+def _read_rights(path: str) -> dict:
+    """Read one strict JSON RightsRecord object."""
+    value = _read_json_file(path, what="rights record")
+    if not isinstance(value, dict):
+        raise ExtractionControlError(_CATEGORY_VALIDATION, _RUN_RIGHTS_MESSAGE)
+    return value
+
+
+def _check_run_payload_size(parameters: dict) -> None:
+    try:
+        encoded = canonical_json(parameters)
+    except (RecordValidationError, TypeError, ValueError):
+        raise ExtractionControlError(_CATEGORY_VALIDATION, _RUN_INVALID_MESSAGE) from None
+    from ..runtime import ipc
+
+    if len(encoded) > ipc.MAX_REQUEST_BYTES:
+        raise ExtractionControlError(_CATEGORY_VALIDATION, _RUN_INVALID_MESSAGE)
+
+
+def extraction_run_submit(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
+    """``extraction run submit`` -- submit one scoped extraction/quality run job.
+
+    Every argument is validated locally (and the assembled parameters are
+    canonicalised by the **real** extraction submission validator) **before** a
+    worker is ensured, so a bad value is a typed ``validation`` error and no daemon
+    is started and no job is created. ``--credential-env`` must name the one
+    approved variable, and the credential **value** is never accepted here. Only
+    the queued admission is returned.
+    """
+    timeout = _resolve_timeout(args)
+    project_id = _resolve_worker_project_id(ctx, args.project)
+    request_id = _parse_identifier(args.request_id)
+    if args.credential_env != worker_extraction.EXTRACT_CREDENTIAL_ENV:
+        raise JobControlError(_CATEGORY_VALIDATION, _RUN_CREDENTIAL_ENV_MESSAGE)
+    report_refs = [
+        _run_ref(project_id, item["artifact_id"], item["revision_id"])
+        for item in _read_report_refs(args.report_refs_file)
+    ]
+    rights = _read_rights(args.rights_file)
+    extraction_ref = None
+    if args.extraction_artifact_id is not None or args.extraction_revision_id is not None:
+        extraction_ref = _run_ref(
+            project_id, args.extraction_artifact_id, args.extraction_revision_id
+        )
+    pilot_ref = None
+    if args.pilot_artifact_id is not None or args.pilot_revision_id is not None:
+        pilot_ref = _run_ref(project_id, args.pilot_artifact_id, args.pilot_revision_id)
+    parameters = {
+        "config_ref": _run_ref(
+            project_id, args.config_artifact_id, args.config_revision_id
+        ),
+        "report_refs": report_refs,
+        "purpose": args.purpose,
+        "mode": args.mode,
+        "hosted_ref": _run_ref(
+            project_id, args.hosted_artifact_id, args.hosted_revision_id
+        ),
+        "extraction_ref": extraction_ref,
+        "pilot_ref": pilot_ref,
+        "artifact_id": args.receipt_artifact_id,
+        "revision_id": args.receipt_revision_id,
+        "rights": rights,
+        "credential_env": worker_extraction.EXTRACT_CREDENTIAL_ENV,
+    }
+    _check_run_payload_size(parameters)
+    try:
+        canonical = worker_discovery.validate_submission(
+            worker_discovery.MODE_EXTRACT, parameters, project_id, request_id
+        )
+    except DiscoveryJobValidationError:
+        raise ExtractionControlError(_CATEGORY_VALIDATION, _RUN_INVALID_MESSAGE) from None
+    request = {
+        "version": PROTOCOL_VERSION,
+        "op": "discovery_submit",
+        "project_id": project_id,
+        "request_id": request_id,
+        "mode": worker_discovery.MODE_EXTRACT,
+        "parameters": canonical,
+    }
+    pid = _start_worker(ctx, timeout)
+    result = _expect_ok(_rpc(ctx, pid, request, timeout))
+    job = _job_projection(result.get("job"))
+    output: dict[str, Any] = {
+        "mode": worker_discovery.MODE_EXTRACT,
+        "result_kind": worker_discovery.result_kind_for_mode(
+            worker_discovery.MODE_EXTRACT
+        ),
+        "job": job,
+        "job_id": job.get("job_id"),
+        "submitted": True,
+        "queued": True,
+        "admission_only": True,
+        "job_completion": False,
+        "key_value_accepted": False,
+        "scientific_validation": False,
+    }
+    if not os.environ.get(worker_extraction.EXTRACT_CREDENTIAL_ENV):
+        output["configuration_required"] = True
+        output["notice"] = _RUN_MISSING_KEY_NOTICE
+    else:
+        output["configuration_required"] = False
+    return output
+
+
+def extraction_run_status(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
+    """``extraction run status`` -- safe readback of one recorded run (no call).
+
+    Reads the recorded job/outcome locally from the verified store; it starts no
+    worker, issues no POST, and records no approval. The run receipt reference is
+    surfaced; the private model output is never included.
+    """
+    project_id = _resolve_project_id(ctx, args.project)
+    request_id = _parse_identifier(args.request_id)
+    with _verified_store(ctx, project_id) as store:
+        run = worker_extraction.persisted_extraction_run(store, request_id=request_id)
+        state = None
+        if run is None:
+            repo = JobRepository(store)
+            for job in repo.list():
+                if (
+                    job.request_id == request_id
+                    and job.task_kind == worker_extraction.TASK_KIND_EXTRACT
+                ):
+                    state = job.state
+                    break
+    if run is None and state is None:
+        raise ExtractionControlError(_CATEGORY_VALIDATION, _RUN_NOT_FOUND_MESSAGE)
+    return {
+        "request_id": request_id,
+        "mode": worker_extraction.MODE_EXTRACT,
+        "result_kind": worker_extraction.RESULT_KIND_EXTRACTION,
+        "run": run,
+        "job_state": state,
+        "authorizes_extraction": False,
+        "authorizes_synthesis": False,
+        "scientific_validation": False,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
 EXTRACTION_COMMANDS: dict[str, Callable[[argparse.Namespace, Any], Any]] = {
@@ -289,8 +586,20 @@ EXTRACTION_COMMANDS: dict[str, Callable[[argparse.Namespace, Any], Any]] = {
     "accepted": extraction_accepted,
 }
 
+#: The ``run`` sub-group's leaf-command map.
+EXTRACTION_RUN_COMMANDS: dict[str, Callable[[argparse.Namespace, Any], Any]] = {
+    "submit": extraction_run_submit,
+    "status": extraction_run_status,
+}
+
 
 def dispatch_extraction(args: argparse.Namespace, ctx: Any) -> object | None:
     """Route one parsed ``extraction`` invocation; ``None`` if unknown."""
-    handler = EXTRACTION_COMMANDS.get(getattr(args, "extraction_command", None))
+    command = getattr(args, "extraction_command", None)
+    if command == "run":
+        handler = EXTRACTION_RUN_COMMANDS.get(
+            getattr(args, "extraction_run_command", None)
+        )
+        return None if handler is None else handler(args, ctx)
+    handler = EXTRACTION_COMMANDS.get(command)
     return None if handler is None else handler(args, ctx)
