@@ -1,11 +1,13 @@
-# Handoff — kickoff 16: fast tests, CI, and MVP hardening (steps 1–4)
+# Handoff — kickoff 16: fast tests, CI, and MVP hardening (steps 1–10)
 
-**Status: steps 1–4 complete and verified; steps 5–10 not started.** This handoff
-covers **only** `docs/implementation/kickoffs/16-mvp-hardening.md` steps 1–4
+**Status: steps 1–10 complete and verified.** This handoff covers
+`docs/implementation/kickoffs/16-mvp-hardening.md` steps 1–10. Steps 1–4
 (working base, re-validation performance defect, GitHub Actions CI, test-suite
-diet). The user asked to **pause after step 4**, so steps 5–10 remain unticked in
-the kickoff plan. No step is ticked in `docs/implementation/README.md` (that is
-kickoff step 10).
+diet) are the sections below and are **unchanged**. Steps 5–10 (one real model
+port, `pipeline run`, real PDF text extraction, data seams, CLI groups/worker
+jobs, housekeeping) are in the [Steps 5–10](#steps-510) part. Step 10 ticks the
+kickoff plan; `07`, `08`, and `15` remain unticked in
+`docs/implementation/README.md` (partial / awaiting user review).
 
 Authority: `docs/implementation/kickoffs/16-mvp-hardening.md`,
 `docs/implementation/README.md` (completion/handoff protocol),
@@ -445,3 +447,240 @@ their branches are merged.
 | `cfd970b` | Step 2 merge (PR #22; head `8ece47f`) |
 | `27a74f2` | Step 3 merge (PR #21; final head `6242879`) |
 | `3bac35d` | `test/suite-diet` HEAD when this handoff was written |
+
+## Steps 5–10
+
+Kickoff steps 5–10 (`docs/implementation/kickoffs/16-mvp-hardening.md`) were
+implemented across merged PRs #25–#28 on `origin/main` and the `feat/pipeline-run`
+branch. Every fact below was verified against git (`git log --oneline --merges
+origin/main`, `git log --oneline`, per-commit diffs), the code, and the docs.
+
+### Scope
+
+- **Step 5 — one real model port:** a generic direct-OpenRouter generation
+  adapter plus per-role model-backed adapters, wired to the existing hosted-use /
+  rights / budget gates (no parallel authorization path).
+- **Step 6 — `pipeline run` orchestrator:** `pipeline status` / `pipeline run`.
+- **Step 7 — real PDF text extraction** through the optional `pypdf` extra.
+- **Step 8 — data seams:** bibliography metadata, extraction→synthesis, the
+  tracing acquisition port, and recomputed revalidation.
+- **Step 9 — CLI groups and worker jobs:** `review` / `tracing` / `delivery`
+  groups plus the extraction and generation worker jobs.
+- **Step 10 — housekeeping:** README, `docs/release.md` matrix, plan ticks, and
+  this handoff.
+
+### PRs and merge commits
+
+Each merged PR was merged **only after all CI checks passed at its head**
+(verified through the GitHub check rollup via `gh pr view`; the `release` job is
+correctly `SKIPPED`, and `fast (py3.11)` / `fast (py3.14)`, the 6 py3.14 `full`
+shards, the 2 py3.11 `full` shards, and `full-durations` are all `SUCCESS`).
+
+| PR | Branch | Merge commit | Head | Merged (UTC) |
+| --- | --- | --- | --- | --- |
+| #25 | `feat/cli-worker-jobs` | `8ac7c36` | `40995ca` | 2026-10-30T12:49:43Z |
+| #26 | `feat/pdf-text` | `795a13b` | `d02dd02` | 2026-10-30T12:56:20Z |
+| #27 | `feat/data-seams` | `798c717` | `d6cf438` | 2026-10-30T13:07:32Z |
+| #28 | `feat/model-port` | `40b1135` | `b93119a` | 2026-10-30T13:15:11Z |
+
+- **#25 `feat/cli-worker-jobs`** (step 9): the extraction worker job
+  `extraction_run` (`worker/extraction.py`, `cli/extraction.py`) running
+  `extraction.runner.execute_run` in the detached worker; clearer CLI errors for
+  a non-owner-private data dir / project root (0700) and for a `backup create`
+  destination inside `--data-dir` (`cli/main.py`, `domain/errors.py`,
+  `storage/paths.py`).
+- **#26 `feat/pdf-text`** (step 7): isolated `pypdf` text extraction
+  (`parsing/pdf_adapter.py`, `parsing/_pdf_text_child.py`) producing `parsed` PDF
+  reports with 1-based page locators; re-parse verification; a verified `parsed`
+  PDF feeds grounded extraction (`extraction/runner._derive_material`); CI
+  installs `pypdf==6.21.4`.
+- **#27 `feat/data-seams`** (step 8): `MetadataRecord` authors/journal carried
+  through the discovery codec v2 (backward-compatible decode of v1 records);
+  drafting citations carry real bibliographic metadata (`drafting/package.py`);
+  `bibliography_from_packages` (`delivery/export.py`); the Step 13 tracing
+  acquisition port (`tracing/acquisition_port.py`) plus real claims/sources
+  derivation (`tracing/inputs.py`); recomputing `DeliveryRepository.revalidate`.
+- **#28 `feat/model-port`** (step 5): decision 005
+  (`docs/decisions/005-generative-roles-direct-route.md`); the generic adapter
+  `runtime/generation.py`, the per-role hosted-use document `generation/hosted_use.py`,
+  and the application-boundary runner `generation/runner.py`; role adapters
+  synthesis/framework/outline (`generation/synthesis_roles.py`), blueprint/
+  section_writer with the additive `direct_hosted_use` workspace binding
+  (`generation/drafting_roles.py`), section_critic/section_repair
+  (`generation/review_roles.py`), global_reviewer/global_writer/notes_planner
+  (`generation/delivery_roles.py`); the Jev screening runner
+  (`screening/runner.py`) with `verified_dispatch` provenance.
+
+### `feat/pipeline-run` (steps 6 and 9; PR #<pending>)
+
+Branch `feat/pipeline-run`, head `0300299`. The coordinator opens the PR.
+
+- `pipeline status` / `pipeline run` (`pipeline/status.py`, `pipeline/run.py`,
+  `cli/pipeline.py`).
+- `generation run submit|status` worker job `generation_run`
+  (`worker/generation.py`, `cli/generation.py`) — **all 9 operations**:
+  `synthesis`, `framework`, `outline`, `blueprint`, `draft`, `section_review`,
+  `global_review`, `notes_plan`, `screening_case`.
+- `generation hosted-use propose|show` (`generation/hosted_use.py`).
+- `review` / `tracing` / `delivery` CLI groups (`cli/review.py`,
+  `cli/tracing.py`, `cli/delivery.py`).
+- Owner-authenticated final-approval named gate `artifact_revision` /
+  `delivery.final_approval`, plus a re-deriving `delivery export`
+  (`cli/delivery.py`).
+- Durable post-review manuscript recorded at `delivery start`
+  (`delivery/manuscript.py`, `DeliveryRepository.start_global_review`).
+- End-to-end test `tests/test_mvp_pipeline_e2e.py`: real extraction receipts →
+  repeated `pipeline run` + scripted approvals → final approval → export of **7
+  files** (`manuscript.md`, `references.bib`, `references.ris`, `companion.md`,
+  `summary.md`, `ai_declaration.md`, `export_manifest.json`) with real BibTeX/RIS
+  metadata; the manual (non-`pipeline run`) steps are listed in its docstring.
+
+### Files and public interfaces changed (steps 5–10)
+
+- `runtime/generation.py` (generic direct-OpenRouter generation adapter; `ROLES`),
+  `generation/hosted_use.py` (per-role `generation_hosted_use` document +
+  `generation.hosted_use.<role>` named gate), `generation/runner.py`
+  (`execute_generation_task`, `get_generation_outcome`).
+- `generation/synthesis_roles.py`, `generation/drafting_roles.py`,
+  `generation/review_roles.py`, `generation/delivery_roles.py` (role ports).
+- `screening/runner.py` (`execute_screening_case`).
+- `parsing/pdf_adapter.py`, `parsing/_pdf_text_child.py`, `parsing/repository.py`
+  (PDF text extraction with page locators).
+- `discovery/records.py` (`MetadataRecord` authors/journal),
+  `discovery/serialization.py` (codec v2, backward-compatible),
+  `discovery/pubmed.py` / `discovery/europepmc.py` (metadata carry-through),
+  `drafting/package.py` / `drafting/schema.py` (real citation metadata),
+  `delivery/export.py` (`bibliography_from_packages`),
+  `tracing/acquisition_port.py` (new), `tracing/inputs.py` (new),
+  `delivery/workflow.py` (recomputing `revalidate`).
+- `worker/extraction.py` (`extraction_run` job), `cli/extraction.py`,
+  `cli/main.py` (private-path/backup CLI errors), `domain/errors.py`,
+  `storage/paths.py`, `storage/registry.py`.
+- `pipeline/status.py`, `pipeline/run.py`, `cli/pipeline.py`,
+  `worker/generation.py`, `cli/generation.py`, `cli/review.py`, `cli/tracing.py`,
+  `cli/delivery.py`, `delivery/manuscript.py`.
+- `docs/decisions/005-generative-roles-direct-route.md`, `docs/generation.md`,
+  `docs/release.md`, `README.md`, `docs/implementation/README.md`,
+  the kickoff plan, and this handoff.
+- Test-only: `tests/test_mvp_pipeline_e2e.py`, `tests/test_extraction_worker.py`,
+  `tests/test_parsing_pdf_adapter.py`, `tests/test_parsing_repository.py`,
+  `tests/test_tracing_acquisition_port.py`, `tests/test_tracing_inputs.py`,
+  `tests/test_delivery_export.py`, `tests/test_delivery_workflow.py`,
+  `tests/test_discovery_serialization.py`, `tests/test_discovery_pubmed.py`,
+  `tests/test_discovery_europepmc.py`, `tests/test_cli_private_paths.py`, and the
+  generation-role worker/CLI tests.
+
+### Evidence per kickoff item (§5–§10)
+
+- **§5 (one real model port)** — **met (locally, fake transport).** One generic
+  adapter (`runtime/generation.py`) backs every model role; the per-role
+  hosted-use gate reuses the existing `gate prepare` / `gate confirm` path
+  (no parallel authorization); model output stays a proposal through the
+  existing validators/gates; tests use recorded/fake transports. Decision 005
+  records the architecture direction.
+- **§6 (`pipeline run` orchestrator)** — **met (locally).** `pipeline status` is
+  read-only and reports a stage complete only when the stage's own `require_*`
+  check passes; `pipeline run` submits the next job(s) and stops at the next
+  human gate / budget / pause / failure, and is idempotent (deterministic request
+  ids). `tests/test_mvp_pipeline_e2e.py` drives a synthetic project end-to-end by
+  repeated `pipeline run` + scripted approvals.
+- **§7 (real PDF text extraction)** — **met (locally, optional extra).**
+  `parsing/pdf_adapter.py` yields per-page passages with page locators and keeps
+  the `needs_review` state for low-quality/empty text; a verified `parsed` PDF
+  feeds grounded extraction.
+- **§8 (data seams)** — **met (locally).** Real frozen-corpus metadata flows to
+  the drafting citations and the export bibliography; synthesis consumes real
+  Step 09 receipts; the Step 13 `acquire` port resolves over already-acquired
+  sources (no network); Step 14 `revalidate` recomputes the Step 12/13 checks.
+- **§9 (CLI groups and worker jobs)** — **met (locally).** Thin `review` /
+  `tracing` / `delivery` groups with a real `delivery export`; the
+  `extraction_run` and `generation_run` worker jobs; the two CLI error fixes.
+- **§10 (housekeeping)** — **met.** README top section refreshed, `docs/release.md`
+  matrix updated, plan ticks updated where acceptance passes, and this handoff.
+
+### Commands run and results (this branch, `0300299`)
+
+Environment: Python 3.14.4, Linux, 4 CPUs.
+
+| Command | Result |
+| --- | --- |
+| `python3 scripts/run_tests.py -j 4` (fast tier) | 145 modules, **3,857 tests, 0 failures, 0 errors, 706 skipped, wall 56.7 s** |
+| `python3 scripts/run_tests.py --slow -j 4` (full tier) | 145 modules, **3,857 tests, 0 failures, 0 errors, 17 skipped, wall 294.4 s** |
+| `python3 scripts/check_contract_docs.py` | **15 ok, 0 failed** — OK |
+| `git diff --check` | clean |
+
+Full-tier slowest modules include `test_cli_jobs` 126.2 s, `test_cli_snapshot`
+117.4 s, `test_cli_human_gates` 93.4 s, `test_pipeline_run` 76.0 s,
+`test_mvp_pipeline_e2e` 64.7 s.
+
+Not run here: any live model call, the CI jobs (already green on PRs #25–#28),
+and the gated release checks.
+
+### Deviations, stubs, and limits
+
+- **Live model validation NOT run.** `OPENROUTER_API_KEY` was not available to
+  the coordinator; the user's authorized small live smoke test remains pending.
+  Every model path is verified with fake transports only.
+- **Framework `role` / `scope` aliased for the model.** The framework schema's
+  `concept.role` / `relationship.scope` keys collide with reserved names in a
+  stored proposal, so the model-facing keys are non-colliding aliases mapped back
+  to the schema field names (`generation/synthesis_roles.py`).
+- **Screening runner stores per-question artifacts.** `execute_screening_case`
+  runs one screening case per decision.
+- **Multi-source sentences traced against the first source.** A drafted sentence
+  citing several sources is traced against its first (sorted) cited source — a
+  disclosed limitation (`tracing/inputs.py`).
+- **Revalidation origin coverage is whole-state.** Step 14 `revalidate`
+  recomputes the Step 12/13 checks over the whole delivery state.
+- **Delivery `final_approval(...)` / `export(...)` library methods remain for
+  tests.** The gate-authoritative path is the CLI (`delivery approve` /
+  `delivery export`).
+- **Manual steps remain** (not automatic): brief/plan, screening pilot,
+  extraction config/pilot/audit, hosted-use approvals, the freshness decision,
+  and every gate.
+
+### Repairs
+
+S17-O4 found that the pipeline never recorded a delivery manuscript: the delivery
+global-review job read a `manuscript` key that was never set, so the export was
+impossible while `pipeline status` falsely reported complete after final
+approval. Fixed in `0300299` on the **first repair attempt** (`delivery/manuscript.py`
+records the durable post-review manuscript at `delivery start`; `pipeline/status.py`
+marks delivery complete only after a successful export).
+
+### Costs
+
+**USD 0.** No live model calls and no provider/network egress; all tests use
+deterministic fixtures.
+
+### Cleanup
+
+Task worktrees under `review_article_agent-worktrees/s16-*` and
+`s16-handoff2` are disposable once their branches are merged.
+
+### Next actions
+
+1. Coordinator opens the `feat/pipeline-run` PR and merges it after CI is green.
+2. User runs the authorized small live OpenRouter smoke test.
+3. Human review/merge of `feat/pipeline-run`; then the unticked steps `07` /
+   `08` / `15` remain for the user's decision.
+
+### Commit IDs (this part)
+
+| Commit | Work |
+| --- | --- |
+| `8ac7c36` | Step 9 merge (PR #25; head `40995ca`) — extraction worker job + CLI errors |
+| `795a13b` | Step 7 merge (PR #26; head `d02dd02`) — real PDF text extraction |
+| `798c717` | Step 8 merge (PR #27; head `d6cf438`) — data seams |
+| `40b1135` | Step 5 merge (PR #28; head `b93119a`) — one real model port |
+| `0473c3f` | `pipeline status` read-only resolver (kickoff 16 §6) |
+| `27952bd` | `review`/`tracing`/`delivery` CLI groups + real export (kickoff 16 §9) |
+| `0a5b570` | `generation_run` worker job + `generation run` CLI (kickoff 16 §9) |
+| `b8194fa` | delivery final-approval gate + re-deriving export (kickoff 16 §9) |
+| `3d89a4f` | wire global_review/notes_plan/screening_case + hosted-use CLI (kickoff 16 §5/§9) |
+| `6d55de3` | `pipeline run` orchestrator + hosted-use/budget blockers (kickoff 16 §6) |
+| `d915c1d` | `pipeline run` drives every machine stage (kickoff 16 §6) |
+| `f670aee` | housekeeping: README, release matrix, plan ticks (kickoff 16 §10) |
+| `6e81e03` | `pipeline run` end-to-end test (kickoff 16 §6/§8) |
+| `0300299` | repair: record the reviewed manuscript at `delivery start` (S17-O4) |
+| `<this handoff commit>` | extend this handoff to steps 5–10, fix README §08, tick step 10 |

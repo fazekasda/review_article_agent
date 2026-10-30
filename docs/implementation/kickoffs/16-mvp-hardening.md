@@ -11,7 +11,7 @@
 - [x] 7. Real PDF text extraction
 - [x] 8. Close the data seams (bibliography metadata, extraction → synthesis)
 - [x] 9. CLI groups for `review`, `tracing`, `delivery`, and extraction as a worker job
-- [ ] 10. Housekeeping: README, plan ticks, handoff
+- [x] 10. Housekeeping: README, plan ticks, handoff
 
 Steps 2–4 are about test time and CI and should land first (separate PRs are fine). Steps 5–9 make the MVP usable. Step 10 closes out.
 
