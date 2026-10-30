@@ -202,8 +202,13 @@ not a sandbox; a same-user process can still race the tree.
 pages yielded text, a bounded private preview, and identifiers found only when
 exactly one distinct value exists. It does **not** choose a scientific parser
 and does not claim the file is the intended paper or complete; Step 07 owns
-scientific parsing, locators, and fidelity. Without `pypdf` it reports
-`unavailable` explicitly. It runs in an isolated child process (`python -I`, no shell, a minimal
+scientific parsing, locators, and fidelity. Step 07 now performs bounded
+per-page text extraction (with page-locatored passages) through the same
+optional extra in its own isolated child; a cleanly extracted PDF report is
+usable original text for grounded extraction (its recorded `pypdf` version lets
+read-back reproduce the passages), while a `needs_review` report still blocks on
+a human. The Step 06 inspector stays diagnostic-only and is not that extractor.
+Without `pypdf` it reports `unavailable` explicitly. It runs in an isolated child process (`python -I`, no shell, a minimal
 credential-free environment of only `PYTHONIOENCODING=utf-8`, no inheritance of
 the parent environment, working directory `/`, new session) with a wall-clock timeout (at most 120 s), CPU,
 address-space and file-size limits, page and text caps, and a 256 KiB reply

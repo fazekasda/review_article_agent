@@ -110,6 +110,14 @@ PURPOSE_ROLES = {"extraction": "extractor", "quality": "fact_checker"}
 TASK_SIZE_LIMIT = 262_144
 MAX_IDENTIFIER_LEN = 512
 
+#: Fixed limitation line added to the material when any source is a PDF report,
+#: so a model can never treat extracted PDF text as reliable column-ordered text
+#: or as interpreted figures/tables.
+PDF_MATERIAL_LIMITATION = (
+    "PDF text: column order/figures/tables unverified; figures and tables "
+    "require human review"
+)
+
 _ENVELOPE_KEYS = ("schema_version", "document_type", "payload")
 _EVIDENCE_KEYS = ("ref", "verified_at")
 _REF_KEYS = ("project_id", "artifact_id", "revision_id")
@@ -426,9 +434,12 @@ def _report_passages(report: dict) -> list[dict]:
     report_ref = dict(report["report_ref"])
     report_ref_string = canonical_json(report_ref).decode("utf-8")
     source_ref = dict(report["source_ref"])
+    fmt = report.get("format")
     out: list[dict] = []
     for passage in report["payload"]["passages"]:
         original_id = passage["passage_id"]
+        page = passage.get("page")
+        page = page if isinstance(page, int) and not isinstance(page, bool) else None
         out.append(
             {
                 "passage_id": f"{artifact_id}:{original_id}",
@@ -436,6 +447,8 @@ def _report_passages(report: dict) -> list[dict]:
                 "text": passage["text"],
                 "raw_text": passage.get("raw_text"),
                 "section_path": list(passage.get("section_path", [])),
+                "page": page,
+                "format": fmt,
                 "report_ref": report_ref_string,
                 "source_ref": source_ref,
                 "locator": {
@@ -464,6 +477,8 @@ def _report_passages(report: dict) -> list[dict]:
                 "asset_ids": [f"{artifact_id}:{asset_id}:{index}"],
                 "asset_kind": asset.get("kind"),
                 "section_path": [],
+                "page": None,
+                "format": fmt,
                 "report_ref": report_ref_string,
                 "source_ref": source_ref,
                 "locator": {
@@ -512,10 +527,12 @@ def _derive_material(store, report_refs: list[dict], *, config: dict):
 
     Every report must be the current revision, produced by the configured current
     parser/normalization, and have parsed successfully (``status == "parsed"``).
-    Declared non-text assets are included as required coverage handles; a report
-    whose structural parse failed ("needs_review"/"rejected") is a human block.
-    The ORIGINAL source refs are the exact ``derived_from`` documents, checked
-    current with intact bytes and hosted-transfer rights.
+    A PDF report must additionally be ``verifiable`` (reproducible with its
+    recorded pypdf version), like an XML report's current-parser reparse. Declared
+    non-text assets are included as required coverage handles; a report whose
+    structural parse failed ("needs_review"/"rejected") is a human block. The
+    ORIGINAL source refs are the exact ``derived_from`` documents, checked current
+    with intact bytes and hosted-transfer rights.
     """
     parser = ParsingRepository(store)
     artifacts = ArtifactRepository(store)
@@ -537,6 +554,16 @@ def _derive_material(store, report_refs: list[dict], *, config: dict):
                 "report: is stale relative to the current parser/normalization version"
             )
         if report["status"] != "parsed" or report["human_action_required"]:
+            raise ExtractionRunnerError(
+                "report: the structural parse failed; unreadable original evidence "
+                "requires human action"
+            )
+        # A PDF report is usable original text only when this build can
+        # reproduce its passages (exact recorded pypdf version). An unverified
+        # PDF report (dependency absent, version drift) is refused like any other
+        # unreadable original evidence; XML reports are already reproducible when
+        # they pass the current-parser checks above.
+        if report["format"] == "pdf" and not report["verifiable"]:
             raise ExtractionRunnerError(
                 "report: the structural parse failed; unreadable original evidence "
                 "requires human action"
@@ -580,11 +607,17 @@ def _assemble_material(passages: list[dict]) -> str:
         header = "[passage {pid}] source_key={sk} section={section}".format(
             pid=passage["passage_id"], sk=passage["source_key"], section=section
         )
+        page = passage.get("page")
+        if isinstance(page, int) and not isinstance(page, bool):
+            header += f" page={page}"
         assets = passage.get("asset_ids")
         if assets:
             header += " asset_ids=[" + ",".join(assets) + "]"
         lines.append(header)
         lines.append(passage["text"])
+    if any(passage.get("format") == "pdf" for passage in passages):
+        lines.append("[limitations]")
+        lines.append(PDF_MATERIAL_LIMITATION)
     return "\n".join(lines)
 
 
