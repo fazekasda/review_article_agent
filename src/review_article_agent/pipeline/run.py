@@ -51,11 +51,21 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
+from ..delivery.workflow import (
+    FINAL_APPROVAL_GATE_ID,
+    FINAL_APPROVAL_GATE_KIND,
+    DeliveryRepository,
+)
 from ..domain.errors import ReviewAgentError
 from ..domain.records import (
     RecordValidationError,
     canonical_json,
     validate_identifier,
+)
+from ..drafting.workflow import (
+    DRAFT_DOCUMENT_TYPE,
+    DraftingWorkflowError,
+    DraftingWorkflowRepository,
 )
 from ..drafting.workspace import (
     DIRECT_BINDING_KIND,
@@ -64,10 +74,15 @@ from ..drafting.workspace import (
     SectionWorkspaceError,
     SectionWorkspaceRepository,
 )
+from ..extraction.workflow import ExtractionWorkflowRepository
+from ..review.workflow import SectionReviewError, SectionReviewRepository
 from ..runtime.generation import ROLES as GENERATION_ROLES
 from ..runtime.jobs import JobRepository, TERMINAL_JOB_STATES
 from ..storage.artifacts import ArtifactRepository
 from ..synthesis.workflow import SynthesisWorkflowError, SynthesisWorkflowRepository
+from ..tracing.acquisition_port import make_acquire_port
+from ..tracing.inputs import claims_and_sources
+from ..tracing.workflow import OriginTraceError, OriginTraceRepository, origin_coverage
 from ..worker import discovery as worker_discovery
 from ..worker import generation as worker_generation
 from ..worker.engine import PROTOCOL_VERSION
@@ -80,9 +95,12 @@ __all__ = [
     "PipelineRunError",
     "RolePlan",
     "PipelineConfig",
+    "delivery_id_for",
     "load_config",
     "plan_next",
+    "review_id_for",
     "run",
+    "trace_id_for",
 ]
 
 #: The one approved credential environment-variable name a generation job may use.
@@ -98,12 +116,28 @@ _WAIT_STOP_STATES = frozenset(TERMINAL_JOB_STATES) | frozenset({"waiting_human",
 _OUTLINE_DOCUMENT_TYPE = "synthesis_outline"
 _WORKSPACE_DOCUMENT_TYPE = "drafting_section_workspace"
 
-#: The stage -> generation operation table for the stages this module can drive.
-#: A stage absent from this table has no automatic job (its manual command is
-#: reported by ``pipeline status``).
+#: The single-operation stage -> generation operation table for the stages this
+#: module drives with exactly one deterministic generation job per stage. The
+#: stages that need more than one step (drafting/review/tracing/delivery) are
+#: handled by dedicated planners. A stage absent from every planner has no
+#: automatic job (its manual command is reported by ``pipeline status``).
 _STAGE_OPERATIONS = {
+    "synthesis.memo": "synthesis",
+    "synthesis.framework": "framework",
+    "synthesis.outline": "outline",
     "drafting.blueprint": "blueprint",
 }
+
+#: The stages whose next machine job is model-backed (used for the credential
+#: precheck). ``tracing.origins`` is deliberately absent: tracing is deterministic
+#: and local (no model, no credential).
+_GENERATION_STAGES = frozenset(
+    set(_STAGE_OPERATIONS) | {"review.sections", "delivery"}
+)
+
+#: The adapter/job result statuses that mean "the machine work stopped and a
+#: human must act"; a durable job carrying one of these stops ``run``.
+_FAILED_JOB_STATUSES = frozenset({"invalid_proposal", "model_not_completed", "blocked"})
 
 _M_BAD_CONFIG = (
     "the pipeline configuration file must be a strict JSON object naming "
@@ -172,6 +206,7 @@ class PipelineConfig:
     workspace_artifact_id: str
     workspace_revision_id: str
     rights_template: dict | None
+    tracing_policy: dict | None
 
     @classmethod
     def from_mapping(cls, value: object) -> "PipelineConfig":
@@ -184,6 +219,7 @@ class PipelineConfig:
             "workspace_artifact_id",
             "workspace_revision_id",
             "rights",
+            "tracing_policy",
         }
         if not set(value) <= allowed:
             raise PipelineConfigError(_M_BAD_CONFIG)
@@ -249,6 +285,9 @@ class PipelineConfig:
         rights = value.get("rights")
         if rights is not None and not isinstance(rights, dict):
             raise PipelineConfigError(_M_BAD_CONFIG)
+        tracing_policy = value.get("tracing_policy")
+        if tracing_policy is not None and not isinstance(tracing_policy, dict):
+            raise PipelineConfigError(_M_BAD_CONFIG)
         return cls(
             credential_env=credential_env,
             sections=sections,
@@ -260,6 +299,9 @@ class PipelineConfig:
                 workspace_revision_id, "workspace_revision_id"
             ),
             rights_template=copy.deepcopy(rights) if rights is not None else None,
+            tracing_policy=(
+                copy.deepcopy(tracing_policy) if tracing_policy is not None else None
+            ),
         )
 
 
@@ -411,7 +453,154 @@ def _request_id(stage_id: str, section_id: str, refs: list) -> str:
         {"stage": stage_id, "section": section_id, "refs": refs}
     )
     digest = hashlib.sha256(material).hexdigest()[:24]
-    return f"pipe.{stage_id}.{section_id}.{digest}"
+    # A stage-level job has no section; ``validate_identifier`` rejects an empty
+    # dot-separated segment, so a fixed placeholder keeps the id well formed.
+    segment = section_id or "stage"
+    return f"pipe.{stage_id}.{segment}.{digest}"
+
+
+def _digest(value: object) -> str:
+    return hashlib.sha256(canonical_json(value)).hexdigest()[:24]
+
+
+def review_id_for(section_id: str, draft_revision_id: str) -> str:
+    """A deterministic section-review id from the section and its draft revision."""
+    return f"review.{section_id}.{_digest([section_id, draft_revision_id])}"
+
+
+def trace_id_for(section_id: str, draft_revision_id: str) -> str:
+    """A deterministic origin-trace id from the section and its draft revision."""
+    return f"trace.{section_id}.{_digest([section_id, draft_revision_id])}"
+
+
+def delivery_id_for(project_id: str, sections: tuple[str, ...]) -> str:
+    """A deterministic delivery id from the project and its driven sections."""
+    return f"delivery.{_digest([project_id, list(sections)])}"
+
+
+# --------------------------------------------------------------------------- #
+# current approved/accepted input readers
+# --------------------------------------------------------------------------- #
+def _current_accepted_audit(store: Any) -> dict | None:
+    """The exact current accepted extraction output-audit revision, or ``None``."""
+    repo = ExtractionWorkflowRepository(store)
+    for entry in _heads(store):
+        if entry["document_type"] != "extraction_audit":
+            continue
+        ref = _ref(entry)
+        try:
+            repo.require_for_synthesis(ref)
+        except (ReviewAgentError, ValueError, KeyError):
+            continue
+        return ref
+    return None
+
+
+def _current_approved_synthesis(store: Any) -> dict | None:
+    repo = SynthesisWorkflowRepository(store)
+    for entry in _heads(store):
+        if entry["document_type"] != "synthesis_synthesis":
+            continue
+        ref = _ref(entry)
+        try:
+            repo.require_synthesis(ref)
+        except (SynthesisWorkflowError, ReviewAgentError, ValueError, KeyError):
+            continue
+        return ref
+    return None
+
+
+def _current_approved_framework(store: Any) -> dict | None:
+    repo = SynthesisWorkflowRepository(store)
+    for entry in _heads(store):
+        if entry["document_type"] != "synthesis_framework":
+            continue
+        ref = _ref(entry)
+        try:
+            repo.require_framework(ref)
+        except (SynthesisWorkflowError, ReviewAgentError, ValueError, KeyError):
+            continue
+        return ref
+    return None
+
+
+def _current_approved_blueprint(store: Any, blueprint_ref: dict) -> dict | None:
+    """``blueprint_ref`` when its exact current blueprint + own gate are approved."""
+    try:
+        DraftingWorkflowRepository(store).require_blueprint(blueprint_ref)
+    except (DraftingWorkflowError, ReviewAgentError, ValueError, KeyError):
+        return None
+    return blueprint_ref
+
+
+def _current_draft_for_blueprint(store: Any, blueprint_ref: dict) -> dict | None:
+    """The current draft revision whose approved blueprint is ``blueprint_ref``."""
+    wanted = canonical_json(
+        {
+            "project_id": blueprint_ref["project_id"],
+            "artifact_id": blueprint_ref["artifact_id"],
+            "revision_id": blueprint_ref["revision_id"],
+        }
+    )
+    repo = DraftingWorkflowRepository(store)
+    for entry in _heads(store):
+        if entry["document_type"] != DRAFT_DOCUMENT_TYPE:
+            continue
+        payload = entry["document"].get("payload") or {}
+        input_payload = payload.get("input") or {}
+        stored_blueprint = input_payload.get("blueprint_ref")
+        if not isinstance(stored_blueprint, dict):
+            continue
+        if canonical_json(
+            {
+                "project_id": stored_blueprint.get("project_id"),
+                "artifact_id": stored_blueprint.get("artifact_id"),
+                "revision_id": stored_blueprint.get("revision_id"),
+            }
+        ) != wanted:
+            continue
+        ref = _ref(entry)
+        try:
+            repo.read(ref, "draft", current=True)
+        except (DraftingWorkflowError, ReviewAgentError, ValueError, KeyError):
+            continue
+        return ref
+    return None
+
+
+def _current_complete_review(store: Any, review_id: str) -> dict | None:
+    try:
+        state = SectionReviewRepository(store).read(review_id)
+    except (SectionReviewError, ReviewAgentError, ValueError, KeyError):
+        return None
+    if not isinstance(state, dict) or state.get("status") != "complete":
+        return None
+    return state
+
+
+def _current_complete_trace(store: Any, trace_id: str) -> dict | None:
+    try:
+        state = OriginTraceRepository(store).read(trace_id)
+    except (OriginTraceError, ReviewAgentError, ValueError, KeyError):
+        return None
+    if not isinstance(state, dict) or state.get("status") != "complete":
+        return None
+    return state
+
+
+def _rights_factory(template: dict, project_id: str) -> Callable[[str, str], dict]:
+    """Rebind a rights template to each exact revision a workflow records."""
+
+    def factory(artifact_id: str, revision_id: str) -> dict:
+        return _bind_rights(template, project_id, artifact_id, revision_id)
+
+    return factory
+
+
+def _base_rights(config: PipelineConfig, project_id: str) -> dict:
+    """The configured rights template scoped to the project (subject rebound by
+    the adapter). Never invented: a missing template means "no job"."""
+    return _bind_rights(config.rights_template, project_id, "pipeline", "pipeline-r1")
 
 
 # --------------------------------------------------------------------------- #
@@ -540,6 +729,396 @@ def _plan_drafting_blueprint(
     return specs
 
 
+def _job_spec(
+    *, stage: str, section_id: str, operation: str, role: str, request_id: str,
+    parameters: dict,
+) -> dict:
+    return {
+        "kind": "generation_run",
+        "stage": stage,
+        "section_id": section_id,
+        "operation": operation,
+        "role": role,
+        "request_id": request_id,
+        "parameters": parameters,
+    }
+
+
+def _target(role: RolePlan, section_id: str | None) -> tuple[str, str]:
+    artifact_id = role.target_artifact_id
+    revision_id = role.target_revision_id or "r1"
+    if section_id is not None:
+        artifact_id = artifact_id.format(section_id=section_id)
+        revision_id = revision_id.format(section_id=section_id)
+    return artifact_id, revision_id
+
+
+def _plan_synthesis(store: Any, config: PipelineConfig) -> list[dict]:
+    """synthesis.memo -> the ``synthesis`` generation job over the accepted audit."""
+    role = config.roles.get("synthesis")
+    if role is None or config.rights_template is None or role.target_artifact_id is None:
+        return []
+    audit_ref = _current_accepted_audit(store)
+    if audit_ref is None:
+        return []
+    hosted_ref = _hosted_ref(store, role)
+    artifact_id, revision_id = _target(role, None)
+    parameters = {
+        "operation": "synthesis",
+        "audit_ref": audit_ref,
+        "hosted_ref": hosted_ref,
+        "artifact_id": artifact_id,
+        "revision_id": revision_id,
+        "rights": _bind_rights(
+            config.rights_template, store.project_id, artifact_id, revision_id
+        ),
+        "credential_env": worker_generation.GENERATION_CREDENTIAL_ENV,
+    }
+    request_id = _request_id("synthesis.memo", "", [audit_ref, hosted_ref])
+    return [
+        _job_spec(
+            stage="synthesis.memo", section_id="", operation="synthesis",
+            role=role.role, request_id=request_id, parameters=parameters,
+        )
+    ]
+
+
+def _plan_framework(store: Any, config: PipelineConfig) -> list[dict]:
+    role = config.roles.get("framework")
+    if role is None or config.rights_template is None or role.target_artifact_id is None:
+        return []
+    synthesis_ref = _current_approved_synthesis(store)
+    if synthesis_ref is None:
+        return []
+    hosted_ref = _hosted_ref(store, role)
+    artifact_id, revision_id = _target(role, None)
+    parameters = {
+        "operation": "framework",
+        "synthesis_ref": synthesis_ref,
+        "hosted_ref": hosted_ref,
+        "artifact_id": artifact_id,
+        "revision_id": revision_id,
+        "rights": _bind_rights(
+            config.rights_template, store.project_id, artifact_id, revision_id
+        ),
+        "credential_env": worker_generation.GENERATION_CREDENTIAL_ENV,
+    }
+    request_id = _request_id(
+        "synthesis.framework", "", [synthesis_ref, hosted_ref]
+    )
+    return [
+        _job_spec(
+            stage="synthesis.framework", section_id="", operation="framework",
+            role=role.role, request_id=request_id, parameters=parameters,
+        )
+    ]
+
+
+def _plan_outline(store: Any, config: PipelineConfig) -> list[dict]:
+    role = config.roles.get("outline")
+    if role is None or config.rights_template is None or role.target_artifact_id is None:
+        return []
+    synthesis_ref = _current_approved_synthesis(store)
+    framework_ref = _current_approved_framework(store)
+    if synthesis_ref is None or framework_ref is None:
+        return []
+    hosted_ref = _hosted_ref(store, role)
+    artifact_id, revision_id = _target(role, None)
+    parameters = {
+        "operation": "outline",
+        "synthesis_ref": synthesis_ref,
+        "framework_ref": framework_ref,
+        "hosted_ref": hosted_ref,
+        "artifact_id": artifact_id,
+        "revision_id": revision_id,
+        "rights": _bind_rights(
+            config.rights_template, store.project_id, artifact_id, revision_id
+        ),
+        "credential_env": worker_generation.GENERATION_CREDENTIAL_ENV,
+    }
+    request_id = _request_id(
+        "synthesis.outline", "", [synthesis_ref, framework_ref, hosted_ref]
+    )
+    return [
+        _job_spec(
+            stage="synthesis.outline", section_id="", operation="outline",
+            role=role.role, request_id=request_id, parameters=parameters,
+        )
+    ]
+
+
+def _draft_spec(
+    store: Any, config: PipelineConfig, *, section_id: str,
+    blueprint_ref: dict, writer: RolePlan,
+) -> dict:
+    hosted_ref = _hosted_ref(store, writer)
+    artifact_id, revision_id = _target(writer, section_id)
+    parameters = {
+        "operation": "draft",
+        "blueprint_ref": blueprint_ref,
+        "hosted_ref": hosted_ref,
+        "artifact_id": artifact_id,
+        "revision_id": revision_id,
+        "rights": _bind_rights(
+            config.rights_template, store.project_id, artifact_id, revision_id
+        ),
+        "credential_env": worker_generation.GENERATION_CREDENTIAL_ENV,
+    }
+    request_id = _request_id(
+        "drafting.draft", section_id, [blueprint_ref, hosted_ref]
+    )
+    return _job_spec(
+        stage="review.sections", section_id=section_id, operation="draft",
+        role=writer.role, request_id=request_id, parameters=parameters,
+    )
+
+
+def _section_review_spec(
+    store: Any, config: PipelineConfig, *, section_id: str,
+    draft_ref: dict, critic: RolePlan, repair: RolePlan,
+) -> dict:
+    review_id = review_id_for(section_id, draft_ref["revision_id"])
+    critic_ref = _hosted_ref(store, critic)
+    repair_ref = _hosted_ref(store, repair)
+    parameters = {
+        "operation": "section_review",
+        "review_id": review_id,
+        "draft_ref": draft_ref,
+        "critic_hosted_ref": critic_ref,
+        "writer_hosted_ref": repair_ref,
+        "rights": _base_rights(config, store.project_id),
+        "credential_env": worker_generation.GENERATION_CREDENTIAL_ENV,
+    }
+    request_id = _request_id(
+        "review.sections", section_id, [draft_ref, critic_ref, repair_ref]
+    )
+    return _job_spec(
+        stage="review.sections", section_id=section_id, operation="section_review",
+        role=critic.role, request_id=request_id, parameters=parameters,
+    )
+
+
+def _plan_review_sections(store: Any, config: PipelineConfig) -> list[dict]:
+    """Per section: the draft (once the blueprint is approved), then its review."""
+    blueprint = config.roles.get("blueprint")
+    writer = config.roles.get("section_writer")
+    critic = config.roles.get("section_critic")
+    repair = config.roles.get("section_repair")
+    if blueprint is None or blueprint.target_artifact_id is None:
+        return []
+    if config.rights_template is None:
+        return []
+    specs: list[dict] = []
+    for section_id in config.sections:
+        artifact_id, revision_id = _target(blueprint, section_id)
+        blueprint_ref = {
+            "project_id": store.project_id,
+            "artifact_id": artifact_id,
+            "revision_id": revision_id,
+        }
+        if _current_approved_blueprint(store, blueprint_ref) is None:
+            continue
+        draft_ref = _current_draft_for_blueprint(store, blueprint_ref)
+        if draft_ref is None:
+            if writer is not None and writer.target_artifact_id is not None:
+                specs.append(
+                    _draft_spec(
+                        store, config, section_id=section_id,
+                        blueprint_ref=blueprint_ref, writer=writer,
+                    )
+                )
+            continue
+        review_id = review_id_for(section_id, draft_ref["revision_id"])
+        if _current_complete_review(store, review_id) is not None:
+            continue
+        if critic is None or repair is None:
+            continue
+        specs.append(
+            _section_review_spec(
+                store, config, section_id=section_id, draft_ref=draft_ref,
+                critic=critic, repair=repair,
+            )
+        )
+    return specs
+
+
+def _section_inputs(
+    store: Any, config: PipelineConfig, section_id: str
+) -> tuple[dict, dict, str] | None:
+    """``(blueprint_ref, draft_ref, review_id)`` for a fully drafted+reviewed section."""
+    blueprint = config.roles.get("blueprint")
+    if blueprint is None or blueprint.target_artifact_id is None:
+        return None
+    artifact_id, revision_id = _target(blueprint, section_id)
+    blueprint_ref = {
+        "project_id": store.project_id,
+        "artifact_id": artifact_id,
+        "revision_id": revision_id,
+    }
+    draft_ref = _current_draft_for_blueprint(store, blueprint_ref)
+    if draft_ref is None:
+        return None
+    review_id = review_id_for(section_id, draft_ref["revision_id"])
+    return blueprint_ref, draft_ref, review_id
+
+
+def _plan_tracing(store: Any, config: PipelineConfig) -> list[dict]:
+    """Deterministic, local origin tracing (no model) for each driven section."""
+    if config.tracing_policy is None or config.rights_template is None:
+        return []
+    specs: list[dict] = []
+    for section_id in config.sections:
+        inputs = _section_inputs(store, config, section_id)
+        if inputs is None:
+            continue
+        _blueprint_ref, draft_ref, review_id = inputs
+        trace_id = trace_id_for(section_id, draft_ref["revision_id"])
+        if _current_complete_trace(store, trace_id) is not None:
+            continue
+        specs.append(
+            {
+                "kind": "run_tracing",
+                "stage": "tracing.origins",
+                "section_id": section_id,
+                "trace_id": trace_id,
+                "draft_ref": draft_ref,
+                "review_id": review_id,
+                "policy": copy.deepcopy(config.tracing_policy),
+                "rights_template": copy.deepcopy(config.rights_template),
+            }
+        )
+    return specs
+
+
+def _global_review_spec(
+    store: Any, config: PipelineConfig, *, delivery_id: str, delivery_ref: dict,
+    reviewer: RolePlan, writer: RolePlan,
+) -> dict:
+    reviewer_ref = _hosted_ref(store, reviewer)
+    writer_ref = _hosted_ref(store, writer)
+    parameters = {
+        "operation": "global_review",
+        "delivery_id": delivery_id,
+        "reviewer_hosted_ref": reviewer_ref,
+        "writer_hosted_ref": writer_ref,
+        "rights": _base_rights(config, store.project_id),
+        "credential_env": worker_generation.GENERATION_CREDENTIAL_ENV,
+    }
+    request_id = _request_id(
+        "delivery.global_review", "", [delivery_ref, reviewer_ref, writer_ref]
+    )
+    return _job_spec(
+        stage="delivery", section_id="", operation="global_review",
+        role=reviewer.role, request_id=request_id, parameters=parameters,
+    )
+
+
+def _notes_plan_spec(
+    store: Any, config: PipelineConfig, *, delivery_id: str, delivery_ref: dict,
+    planner: RolePlan,
+) -> dict:
+    hosted_ref = _hosted_ref(store, planner)
+    parameters = {
+        "operation": "notes_plan",
+        "delivery_id": delivery_id,
+        "hosted_ref": hosted_ref,
+        "rights": _base_rights(config, store.project_id),
+        "credential_env": worker_generation.GENERATION_CREDENTIAL_ENV,
+    }
+    request_id = _request_id("delivery.notes_plan", "", [delivery_ref, hosted_ref])
+    return _job_spec(
+        stage="delivery", section_id="", operation="notes_plan",
+        role=planner.role, request_id=request_id, parameters=parameters,
+    )
+
+
+def _plan_delivery(store: Any, config: PipelineConfig) -> list[dict]:
+    """tracing+delivery start -> global review -> notes plan -> prepare approval."""
+    reviewer = config.roles.get("global_reviewer")
+    writer = config.roles.get("global_writer")
+    if config.rights_template is None:
+        return []
+    delivery_id = delivery_id_for(store.project_id, config.sections)
+    state = DeliveryRepository(store).read(delivery_id)
+    if state is None:
+        # The deterministic, local preconditions: every section's review + trace.
+        if reviewer is None or writer is None:
+            return []
+        sections: list[dict] = []
+        origin_state: dict = {}
+        for section_id in config.sections:
+            inputs = _section_inputs(store, config, section_id)
+            if inputs is None:
+                return []
+            _blueprint_ref, draft_ref, review_id = inputs
+            trace_id = trace_id_for(section_id, draft_ref["revision_id"])
+            trace_state = _current_complete_trace(store, trace_id)
+            if trace_state is None:
+                return []
+            coverage = origin_coverage(trace_state)
+            sections.append(
+                {
+                    "section_id": section_id,
+                    "review_status": "complete",
+                    "origin_complete": coverage["complete"],
+                    "draft_ref": draft_ref,
+                    "review_id": review_id,
+                    "trace_id": trace_id,
+                }
+            )
+            origin_state = trace_state
+        return [
+            {
+                "kind": "start_delivery",
+                "stage": "delivery",
+                "delivery_id": delivery_id,
+                "sections": sections,
+                "origin_state": origin_state,
+                "rights_template": copy.deepcopy(config.rights_template),
+            }
+        ]
+    head = ArtifactRepository(store).current_revision(delivery_id)
+    delivery_ref = {
+        "project_id": store.project_id,
+        "artifact_id": delivery_id,
+        "revision_id": None if head is None else head.revision_id,
+    }
+    gr = (state.get("global_review") or {}).get("status")
+    if gr not in ("complete", "blocked"):
+        if reviewer is None or writer is None:
+            return []
+        return [
+            _global_review_spec(
+                store, config, delivery_id=delivery_id, delivery_ref=delivery_ref,
+                reviewer=reviewer, writer=writer,
+            )
+        ]
+    if gr == "blocked":
+        return []
+    if state.get("prepared_approval") is not None or state.get("approval") is not None:
+        return []
+    planner = config.roles.get("notes_planner")
+    if state.get("plan_notes") is not None and not state.get("applied_batches"):
+        if planner is not None:
+            return [
+                _notes_plan_spec(
+                    store, config, delivery_id=delivery_id,
+                    delivery_ref=delivery_ref, planner=planner,
+                )
+            ]
+        return []
+    if (state.get("freshness") or {}).get("status") != "cutoff_accepted":
+        return []
+    return [
+        {
+            "kind": "prepare_final_approval",
+            "stage": "delivery",
+            "delivery_id": delivery_id,
+            "rights_template": copy.deepcopy(config.rights_template),
+        }
+    ]
+
+
 def plan_next(
     store: Any, registry: Any, *, config: PipelineConfig
 ) -> list[dict]:
@@ -547,18 +1126,36 @@ def plan_next(
 
     Returns ``[]`` when the project is complete, blocked on a human gate / budget
     / pause / failure (a ``resolve()`` blocker), or when the current stage has no
-    configured automatic job. A returned spec is a plain dict: a
-    ``prepare_workspace`` local step or a ``generation_run`` worker job.
+    configured automatic job. The **delivery** final-approval gate is the one
+    exception: machine work (global review, approval preparation) may still remain
+    behind it, so it is planned through. A returned spec is a plain dict: a
+    ``prepare_workspace`` / ``run_tracing`` / ``start_delivery`` /
+    ``prepare_final_approval`` local step or a ``generation_run`` worker job.
     """
     state = resolve(store, registry)
-    if state["stage"] == "complete" or state["blocked_on"] is not None:
+    stage = state["stage"]
+    if stage == "complete":
         return []
-    operation = _STAGE_OPERATIONS.get(state["stage"])
-    if operation is None:
-        return []
+    blocked = state["blocked_on"]
+    if blocked is not None:
+        if not (stage == "delivery" and blocked.get("kind") == "human_gate"):
+            return []
+    operation = _STAGE_OPERATIONS.get(stage)
+    if operation == "synthesis":
+        return _plan_synthesis(store, config)
+    if operation == "framework":
+        return _plan_framework(store, config)
+    if operation == "outline":
+        return _plan_outline(store, config)
     if operation == "blueprint":
         return _plan_drafting_blueprint(store, registry, config)
-    return []  # pragma: no cover - the table is closed
+    if stage == "review.sections":
+        return _plan_review_sections(store, config)
+    if stage == "tracing.origins":
+        return _plan_tracing(store, config)
+    if stage == "delivery":
+        return _plan_delivery(store, config)
+    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -610,6 +1207,152 @@ def _execute_prepare_workspace(store: Any, spec: dict) -> None:
             "the drafting workspace could not be written from the configured "
             "hosted-use bindings; nothing was sent.",
         ) from exc
+
+
+def _execute_run_tracing(store: Any, spec: dict) -> None:
+    """Deterministic, local origin tracing (no model, no network)."""
+    try:
+        envelope = DraftingWorkflowRepository(store).read(
+            spec["draft_ref"], "draft", current=True
+        )
+        draft = envelope["result"]
+        package = envelope["package"]
+        review_state = SectionReviewRepository(store).read(spec["review_id"])
+        review_checks = (
+            review_state.get("checks") if isinstance(review_state, dict) else None
+        ) or []
+        claims, sources, source_digests = claims_and_sources(
+            store, draft=draft, package=package
+        )
+        acquire = make_acquire_port(store)
+        OriginTraceRepository(store).run(
+            spec["trace_id"],
+            claims=claims,
+            sources=sources,
+            policy=spec["policy"],
+            review_checks=review_checks,
+            acquire=acquire,
+            rights=_rights_factory(spec["rights_template"], store.project_id),
+            source_digests=source_digests,
+        )
+    except PipelineRunError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a static, value-free refusal
+        raise PipelineRunError(
+            "validation",
+            "the origin trace could not be recorded from the current draft/package/"
+            "review state; nothing further was submitted.",
+        ) from exc
+
+
+def _execute_start_delivery(store: Any, spec: dict) -> None:
+    """Start the global review from recorded review/trace state (local)."""
+    try:
+        DeliveryRepository(store).start_global_review(
+            spec["delivery_id"],
+            spec["sections"],
+            spec["origin_state"],
+            rights=_rights_factory(spec["rights_template"], store.project_id),
+        )
+    except PipelineRunError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a static, value-free refusal
+        raise PipelineRunError(
+            "validation",
+            "the global review could not be started from the recorded review/trace "
+            "state; nothing further was submitted.",
+        ) from exc
+
+
+def _origin_warnings(state: dict) -> list[dict]:
+    coverage = origin_coverage(state.get("origin_state") or {})
+    warnings: list[dict] = []
+    for warning in coverage.get("requires_human_approval") or []:
+        warnings.append(
+            {
+                "warning_id": warning.get("claim_id"),
+                "claim_id": warning.get("claim_id"),
+                "text": warning.get("warning"),
+            }
+        )
+    return warnings
+
+
+def _execute_prepare_final_approval(store: Any, spec: dict) -> str:
+    """Persist the exact-revision final-approval manifest; return its confirm line."""
+    try:
+        repo = DeliveryRepository(store)
+        state = repo.read(spec["delivery_id"])
+        if not isinstance(state, dict):
+            raise PipelineRunError(
+                "validation",
+                "the delivery state is unavailable; the final-approval manifest "
+                "could not be prepared.",
+            )
+        warnings = _origin_warnings(state)
+        accepted = [warning.get("warning_id") for warning in warnings]
+        prepared = repo.prepare_final_approval(
+            spec["delivery_id"],
+            artifact_hashes={},
+            warnings=warnings,
+            accepted_warning_ids=accepted,
+            unsupported_major_claims=[],
+            rights=_rights_factory(spec["rights_template"], store.project_id),
+        )
+    except PipelineRunError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a static, value-free refusal
+        raise PipelineRunError(
+            "validation",
+            "the exact-revision final-approval manifest could not be prepared; "
+            "nothing further was submitted.",
+        ) from exc
+    manifest_revision = prepared["revision_id"]
+    return (
+        "review-article-agent gate confirm "
+        f"--artifact-id {spec['delivery_id']} --revision-id {manifest_revision} "
+        f"--gate-kind {FINAL_APPROVAL_GATE_KIND} --gate-id {FINAL_APPROVAL_GATE_ID} "
+        "--decision approved --rationale <TEXT> "
+        "--snapshot-digest <SHA256_FROM_GATE_PREPARE>"
+    )
+
+
+def _job_failure(store: Any, request_id: str) -> dict | None:
+    """A ``failure`` blocker for a terminal, unsuccessful generation job."""
+    repo = JobRepository(store)
+    for job in repo.list():
+        if job.request_id != request_id:
+            continue
+        accepted = repo.accepted_result(job.job_id)
+        result = accepted.result if accepted is not None else None
+        status = result.get("status") if isinstance(result, dict) else None
+        if job.state == "failed" or status in _FAILED_JOB_STATUSES:
+            return {
+                "kind": "failure",
+                "detail": (
+                    "a machine job for this stage did not complete successfully "
+                    "(it was blocked, invalid, or the model did not complete); the "
+                    "pipeline stopped. Inspect the recorded job result and "
+                    "re-authorize or correct the inputs."
+                ),
+                "next_command": (
+                    "review-article-agent generation run status "
+                    f"--request-id {job.request_id}"
+                ),
+            }
+        return None
+    return None
+
+
+def _durable_failure(store: Any) -> dict | None:
+    """The most recent terminal, unsuccessful generation job's failure blocker."""
+    repo = JobRepository(store)
+    failure: dict | None = None
+    for job in repo.list():
+        candidate = _job_failure(store, job.request_id)
+        if candidate is not None:
+            failure = candidate
+    return failure
 
 
 def _next_command(state: dict) -> str | None:
@@ -698,7 +1441,7 @@ def run(
     # neither a workspace nor a job.
     if (
         state["blocked_on"] is None
-        and state["stage"] in _STAGE_OPERATIONS
+        and state["stage"] in _GENERATION_STAGES
         and config.roles
         and not environ.get(config.credential_env)
     ):
@@ -706,6 +1449,7 @@ def run(
             "validation", _M_MISSING_CREDENTIAL, code="missing_credential"
         )
 
+    prepare_command: str | None = None
     while steps < limit:
         specs = plan_next(store, registry, config=config)
         if not specs:
@@ -719,12 +1463,29 @@ def run(
 
         progressed = False
         pending_waits: list[str] = []
+        touched: list[str] = []
         for spec in specs:
             if steps >= limit:
                 break
-            if spec["kind"] == "prepare_workspace":
+            kind = spec["kind"]
+            if kind == "prepare_workspace":
                 steps += 1
                 _execute_prepare_workspace(store, spec)
+                progressed = True
+                continue
+            if kind == "run_tracing":
+                steps += 1
+                _execute_run_tracing(store, spec)
+                progressed = True
+                continue
+            if kind == "start_delivery":
+                steps += 1
+                _execute_start_delivery(store, spec)
+                progressed = True
+                continue
+            if kind == "prepare_final_approval":
+                steps += 1
+                prepare_command = _execute_prepare_final_approval(store, spec)
                 progressed = True
                 continue
             request_id = spec["request_id"]
@@ -732,6 +1493,7 @@ def run(
                 # Already submitted earlier in this same call; never re-count it
                 # as pre-existing work.
                 continue
+            touched.append(request_id)
             if _job_exists(store, request_id):
                 already_done.append(request_id)
                 continue
@@ -742,12 +1504,25 @@ def run(
             pending_waits.append(request_id)
             progressed = True
 
+        failure: dict | None = None
+        for request_id in touched:
+            failure = _job_failure(store, request_id)
+            if failure is not None:
+                break
+
         if wait and pending_waits:
             _wait_for(
                 store, pending_waits, timeout=timeout, poll=poll, sleep=sleep
             )
 
         state = resolve(store, registry)
+        if failure is None and (state.get("blocked_on") or {}).get("kind") == "failure":
+            # A blocked model job (a review that stopped) is reported by the
+            # resolver; attach the durable job readback command when one exists.
+            failure = _durable_failure(store)
+        if failure is not None:
+            state = {**state, "blocked_on": failure}
+            break
         if not progressed:
             break
 
@@ -755,7 +1530,7 @@ def run(
         "stage": state["stage"],
         "stopped_at": state.get("blocked_on"),
         "next_action": state.get("next_action"),
-        "next_command": _next_command(state),
+        "next_command": prepare_command or _next_command(state),
         "submitted": submitted,
         "already_done": already_done,
         "authorizes_execution": False,

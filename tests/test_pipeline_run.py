@@ -44,20 +44,37 @@ if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
 import test_generation_runner as gen_runner  # noqa: E402
-from test_drafting_workflow import blueprint_content  # noqa: E402
+from test_drafting_workflow import (  # noqa: E402
+    GATE_ID as BP_GATE_ID,
+    GATE_KIND as BP_GATE_KIND,
+    blueprint_content,
+)
 from test_generation_drafting_roles import DirectRolesBase  # noqa: E402
+from test_synthesis_workflow import (  # noqa: E402
+    GATE_FRAMEWORK,
+    GATE_FRAMEWORK_KIND,
+    GATE_OUTLINE,
+    GATE_OUTLINE_KIND,
+    GATE_SYNTHESIS,
+    GATE_SYNTHESIS_KIND,
+)
+from test_tracing_workflow import POLICY  # noqa: E402
 
 import review_article_agent.cli.main as cli_main  # noqa: E402
+from review_article_agent.delivery.workflow import DeliveryRepository  # noqa: E402
 from review_article_agent.drafting.package import DraftingPackageRepository  # noqa: E402
 from review_article_agent.drafting.workspace import SectionWorkspaceRepository  # noqa: E402
+from review_article_agent.generation import hosted_use  # noqa: E402
 from review_article_agent.pipeline import run as pipeline_run  # noqa: E402
 from review_article_agent.pipeline import status as pipeline_status  # noqa: E402
 from review_article_agent.pipeline.run import (  # noqa: E402
     PipelineConfig,
     PipelineConfigError,
     PipelineRunError,
+    delivery_id_for,
     plan_next,
     run,
+    trace_id_for,
 )
 from review_article_agent.runtime.jobs import JobRepository  # noqa: E402
 from review_article_agent.worker.engine import WorkerEngine  # noqa: E402
@@ -66,6 +83,8 @@ from _tiers import slow  # noqa: E402
 
 _API_KEY = gen_runner._API_KEY
 _CREDENTIAL_ENV = "OPENROUTER_API_KEY"
+_CRITIC_MODEL = "deepseek/deepseek-v4.1-flash"
+_REPAIR_MODEL = "anthropic/claude-sonnet-5-5"
 
 
 # --------------------------------------------------------------------------- #
@@ -123,6 +142,19 @@ class PipelineConfigTest(unittest.TestCase):
     def test_load_config_missing_file_is_refused(self):
         with self.assertRaises(PipelineConfigError):
             pipeline_run.load_config("/nonexistent/pipeline-config.json")
+
+    def test_tracing_policy_is_optional_and_parsed(self):
+        value = self._valid()
+        value["tracing_policy"] = dict(POLICY)
+        config = PipelineConfig.from_mapping(value)
+        self.assertEqual(config.tracing_policy, POLICY)
+        self.assertIsNone(PipelineConfig.from_mapping(self._valid()).tracing_policy)
+
+    def test_non_object_tracing_policy_is_refused(self):
+        value = self._valid()
+        value["tracing_policy"] = [1, 2, 3]
+        with self.assertRaises(PipelineConfigError):
+            PipelineConfig.from_mapping(value)
 
 
 class PipelineRunCliRegistrationTest(unittest.TestCase):
@@ -391,6 +423,369 @@ class PipelineRunBudgetTest(PipelineRunBase):
         self.assertEqual(result["submitted"], [])
         self.assertEqual(result["stopped_at"]["kind"], "budget")
         self.assertEqual(self.job_count(), 0)
+
+
+# --------------------------------------------------------------------------- #
+# Slow tier: the full automatic chain (synthesis -> ... -> delivery)
+# --------------------------------------------------------------------------- #
+def _model_framework_content():
+    """The framework content as a compliant model emits it (aliased keys)."""
+    from test_synthesis_workflow import SynthesisBase
+
+    def alias(value):
+        if isinstance(value, dict):
+            renamed = {
+                "concept_role" if k == "role" else
+                "relationship_scope" if k == "scope" else k: alias(v)
+                for k, v in value.items()
+            }
+            return renamed
+        if isinstance(value, list):
+            return [alias(item) for item in value]
+        return value
+
+    return alias(SynthesisBase.framework_content())
+
+
+@slow
+class PipelineRunFullBase(PipelineRunBase):
+    """Adds the hosted-use documents + config for every driven role."""
+
+    _EXTRA_HOSTED = {
+        "synthesis": ("hu-synthesis", None),
+        "framework": ("hu-framework", None),
+        "outline": ("hu-outline", None),
+        "section_critic": ("hu-critic", _CRITIC_MODEL),
+        "section_repair": ("hu-repair", _REPAIR_MODEL),
+        "global_reviewer": ("hu-greviewer", _CRITIC_MODEL),
+        "global_writer": ("hu-gwriter", _REPAIR_MODEL),
+        "notes_planner": ("hu-notes", None),
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        for role, (artifact_id, model) in self._EXTRA_HOSTED.items():
+            document = (
+                gen_runner._document(role)
+                if model is None
+                else gen_runner._document(role, model=model)
+            )
+            ref = hosted_use.propose_hosted_use(
+                self.store,
+                document,
+                artifact_id=artifact_id,
+                revision_id=f"{artifact_id}-r1",
+                rights=self.rights(artifact_id, f"{artifact_id}-r1"),
+            )
+            self.approve_ref(
+                ref,
+                hosted_use.HOSTED_USE_GATE_KIND,
+                hosted_use.hosted_use_gate_id(role),
+            )
+
+    def full_config_mapping(self) -> dict:
+        return {
+            "credential_env": _CREDENTIAL_ENV,
+            "sections": ["sec1"],
+            "roles": {
+                "synthesis": {
+                    "hosted_artifact_id": "hu-synthesis",
+                    "target_artifact_id": "syn",
+                    "target_revision_id": "syn-r1",
+                },
+                "framework": {
+                    "hosted_artifact_id": "hu-framework",
+                    "target_artifact_id": "fw",
+                    "target_revision_id": "fw-r1",
+                },
+                "outline": {
+                    "hosted_artifact_id": "hu-outline",
+                    "target_artifact_id": "out",
+                    "target_revision_id": "out-r1",
+                },
+                "blueprint": {
+                    "hosted_artifact_id": "hu-blueprint",
+                    "target_artifact_id": "bp-{section_id}",
+                    "target_revision_id": "bp-{section_id}-r1",
+                },
+                "section_writer": {
+                    "hosted_artifact_id": "hu-writer",
+                    "target_artifact_id": "draft-{section_id}",
+                    "target_revision_id": "draft-{section_id}-r1",
+                },
+                "section_critic": {"hosted_artifact_id": "hu-critic"},
+                "section_repair": {"hosted_artifact_id": "hu-repair"},
+                "global_reviewer": {"hosted_artifact_id": "hu-greviewer"},
+                "global_writer": {"hosted_artifact_id": "hu-gwriter"},
+                "notes_planner": {"hosted_artifact_id": "hu-notes"},
+            },
+            "workspace_artifact_id": "ws-{section_id}",
+            "workspace_revision_id": "ws-{section_id}-r1",
+            "tracing_policy": dict(POLICY),
+            "rights": gen_runner._rights(self.project_id, "template", "t0"),
+        }
+
+    def full_config(self) -> PipelineConfig:
+        return PipelineConfig.from_mapping(self.full_config_mapping())
+
+    def ref(self, artifact_id: str, revision_id: str) -> dict:
+        return {
+            "project_id": self.project_id,
+            "artifact_id": artifact_id,
+            "revision_id": revision_id,
+        }
+
+    def settle(self, engine: WorkerEngine, response) -> None:
+        """Queue one fake completion and drive the engine to settle the job."""
+        self.transport.responses.append(response)
+        self.drive(engine)
+
+
+@slow
+class PipelineRunSynthesisTest(PipelineRunFullBase):
+    def test_synthesis_to_outline_stops_at_each_gate(self):
+        self.accepted_audit()
+        config = self.full_config()
+        engine = self.engine()
+
+        # synthesis.memo: submit, settle, stop at the synthesis gate.
+        first = self.run_once(engine, config)
+        self.assertEqual(len(first["submitted"]), 1)
+        self.assertEqual(first["stage"], "synthesis.memo")
+        self.settle(engine, gen_runner._completion(self.synthesis_content()))
+        gate = self.run_once(engine, config)
+        self.assertEqual(gate["submitted"], [])
+        self.assertEqual(gate["stopped_at"]["kind"], "human_gate")
+        self.assertIn("--gate-id synthesis.memo", gate["next_command"])
+        self.approve_ref(
+            self.ref("syn", "syn-r1"), GATE_SYNTHESIS_KIND, GATE_SYNTHESIS
+        )
+
+        # framework.
+        second = self.run_once(engine, config)
+        self.assertEqual(len(second["submitted"]), 1)
+        self.settle(engine, gen_runner._completion(_model_framework_content()))
+        gate = self.run_once(engine, config)
+        self.assertEqual(gate["stopped_at"]["kind"], "human_gate")
+        self.assertIn("--gate-id synthesis.framework", gate["next_command"])
+        self.approve_ref(
+            self.ref("fw", "fw-r1"), GATE_FRAMEWORK_KIND, GATE_FRAMEWORK
+        )
+
+        # outline.
+        third = self.run_once(engine, config)
+        self.assertEqual(len(third["submitted"]), 1)
+        self.settle(engine, gen_runner._completion(self.outline_content()))
+        gate = self.run_once(engine, config)
+        self.assertEqual(gate["stopped_at"]["kind"], "human_gate")
+        self.assertIn("--gate-id synthesis.outline", gate["next_command"])
+
+    def test_re_run_before_settle_submits_nothing(self):
+        self.accepted_audit()
+        config = self.full_config()
+        engine = self.engine()
+        first = self.run_once(engine, config)
+        self.assertEqual(len(first["submitted"]), 1)
+        second = self.run_once(engine, config)
+        self.assertEqual(second["submitted"], [])
+        self.assertEqual(second["already_done"], [first["submitted"][0]])
+        self.assertEqual(self.job_count(), 1)
+
+
+@slow
+class PipelineRunDraftReviewTest(PipelineRunFullBase):
+    def _blueprint_result(self):
+        from review_article_agent.drafting.workflow import DraftingWorkflowRepository
+
+        return DraftingWorkflowRepository(self.store).read(
+            self.ref("bp-sec1", "bp-sec1-r1")
+        )["result"]
+
+    def test_draft_then_section_review(self):
+        from review_article_agent.review.workflow import SectionReviewRepository
+
+        self.approved_chain()
+        config = self.full_config()
+        engine = self.engine()
+
+        # drafting.blueprint: workspace + blueprint.
+        first = self.run_once(engine, config)
+        self.assertEqual(first["stage"], "drafting.blueprint")
+        self.assertEqual(len(first["submitted"]), 1)
+        workspace = SectionWorkspaceRepository(self.store).read(
+            self.workspace_ref()
+        )["result"]
+        package = DraftingPackageRepository(self.store).build(
+            workspace["outline_ref"], workspace["section_id"]
+        )
+        self.settle(
+            engine,
+            gen_runner._completion(
+                blueprint_content(
+                    section_id="sec1",
+                    finding_key=package["evidence"][0]["finding_key"],
+                )
+            ),
+        )
+        gate = self.run_once(engine, config)
+        self.assertEqual(gate["stopped_at"]["kind"], "human_gate")
+        self.approve_ref(self.ref("bp-sec1", "bp-sec1-r1"), BP_GATE_KIND, BP_GATE_ID)
+
+        # review.sections: the draft is planned first.
+        draft = self.run_once(engine, config)
+        self.assertEqual(draft["stage"], "review.sections")
+        self.assertEqual(len(draft["submitted"]), 1)
+        self.settle(
+            engine,
+            gen_runner._completion(_draft_content(self._blueprint_result())),
+        )
+
+        # the section review is planned next; it runs through the real critic port.
+        review = self.run_once(engine, config)
+        self.assertEqual(len(review["submitted"]), 1)
+        self.settle(engine, gen_runner._completion({"findings": []}))
+        review_id = pipeline_run.review_id_for("sec1", "draft-sec1-r1")
+        state = SectionReviewRepository(self.store).read(review_id)
+        self.assertIsNotNone(state)
+
+
+def _draft_content(blueprint):
+    from test_generation_drafting_roles import _draft_content as build
+
+    return build(blueprint)
+
+
+@slow
+class PipelineRunDeliveryTest(PipelineRunFullBase):
+    def _reach_reviewed_section(self, engine, config):
+        self.approved_chain()
+        first = self.run_once(engine, config)
+        self.assertEqual(first["stage"], "drafting.blueprint")
+        workspace = SectionWorkspaceRepository(self.store).read(
+            self.workspace_ref()
+        )["result"]
+        package = DraftingPackageRepository(self.store).build(
+            workspace["outline_ref"], workspace["section_id"]
+        )
+        self.settle(
+            engine,
+            gen_runner._completion(
+                blueprint_content(
+                    section_id="sec1",
+                    finding_key=package["evidence"][0]["finding_key"],
+                )
+            ),
+        )
+        self.run_once(engine, config)
+        self.approve_ref(self.ref("bp-sec1", "bp-sec1-r1"), BP_GATE_KIND, BP_GATE_ID)
+
+        from review_article_agent.drafting.workflow import DraftingWorkflowRepository
+
+        blueprint = DraftingWorkflowRepository(self.store).read(
+            self.ref("bp-sec1", "bp-sec1-r1")
+        )["result"]
+        self.run_once(engine, config)
+        self.settle(engine, gen_runner._completion(_draft_content(blueprint)))
+        self.run_once(engine, config)
+        self.settle(engine, gen_runner._completion({"findings": []}))
+
+    def _seed_complete_trace(self) -> str:
+        """Seed the deterministic complete origin trace for the section.
+
+        The pipeline's own tracing over this synthetic extraction fixture stops at
+        the secondary-origin human warning (the cited source is a review that
+        secondarily reports); a complete trace is the human-approved precondition
+        the delivery planning consumes, so it is seeded directly here.
+        """
+        from review_article_agent.tracing.workflow import (
+            DOCUMENT_TYPE as TRACE_DOCUMENT_TYPE,
+            SCHEMA_VERSION as TRACE_SCHEMA_VERSION,
+        )
+
+        trace_id = trace_id_for("sec1", "draft-sec1-r1")
+        self.artifacts.create_artifact(trace_id, kind="report", created_by="user")
+        self.artifacts.import_revision(
+            artifact_id=trace_id,
+            revision_id="trace-r1",
+            content=json.dumps(
+                {
+                    "schema_version": TRACE_SCHEMA_VERSION,
+                    "document_type": TRACE_DOCUMENT_TYPE,
+                    "payload": {
+                        "schema_version": TRACE_SCHEMA_VERSION,
+                        "trace_id": trace_id,
+                        "document_type": TRACE_DOCUMENT_TYPE,
+                        "status": "complete",
+                        "claims": [],
+                    },
+                }
+            ).encode("utf-8"),
+            origin_locator="tracing:seed",
+            acquired_by="user",
+            rights=self.rights(trace_id, "trace-r1"),
+        )
+        return trace_id
+
+    def test_reviewed_sections_to_final_approval_gate(self):
+        config = self.full_config()
+        engine = self.engine()
+        self._reach_reviewed_section(engine, config)
+        self._seed_complete_trace()
+
+        # delivery start (in-process) + global review job submitted.
+        result = self.run_once(engine, config)
+        self.assertTrue(
+            any(
+                spec.startswith("pipe.delivery.global_review")
+                for spec in result["submitted"]
+            ),
+            result["submitted"],
+        )
+        delivery_id = delivery_id_for(self.project_id, ("sec1",))
+        self.assertIsNotNone(DeliveryRepository(self.store).read(delivery_id))
+        self.settle(engine, gen_runner._completion({"findings": []}))
+
+        # record the human freshness cutoff, then prepare the final approval.
+        DeliveryRepository(self.store).freshness(
+            delivery_id,
+            "2026-01-01",
+            {"action": "accept_cutoff"},
+            rights=self.rights,
+        )
+        final = self.run_once(engine, config)
+        self.assertEqual(final["stopped_at"]["kind"], "human_gate")
+        self.assertIn("gate confirm", final["next_command"])
+        self.assertIn("delivery.final_approval", final["next_command"])
+
+    def test_tracing_over_secondary_fixture_stops_at_human_warning(self):
+        config = self.full_config()
+        engine = self.engine()
+        self._reach_reviewed_section(engine, config)
+        # The pipeline runs tracing in-process; the synthetic secondary source
+        # requires final human approval, so the run stops at the tracing gate.
+        result = self.run_once(engine, config)
+        self.assertEqual(result["submitted"], [])
+        self.assertEqual(result["stopped_at"]["kind"], "failure")
+
+
+@slow
+class PipelineRunFailureTest(PipelineRunFullBase):
+    def test_invalid_proposal_stops_with_failure_blocker(self):
+        audit_ref, _batch = self.accepted_audit()
+        config = self.full_config()
+        engine = self.engine()
+
+        first = self.run_once(engine, config)
+        self.assertEqual(len(first["submitted"]), 1)
+        # An invalid synthesis proposal (unknown finding key) writes nothing.
+        bad = self.synthesis_content()
+        bad["statements"][0]["evidence"] = ["c1:F999"]
+        self.settle(engine, gen_runner._completion(bad))
+
+        result = self.run_once(engine, config)
+        self.assertEqual(result["submitted"], [])
+        self.assertEqual(result["stopped_at"]["kind"], "failure")
+        self.assertIn("generation run status", result["next_command"])
 
 
 if __name__ == "__main__":  # pragma: no cover

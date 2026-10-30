@@ -1393,9 +1393,36 @@ reporting the exact next command.
   from the stage, the section, and the exact input revisions, and an id already present
   in the durable `JobRepository` is never re-submitted (the worker would replay it
   anyway).
-* A stage with no configured automatic job (discovery, acquisition, parsing, screening,
-  extraction, review, tracing, delivery, and — until configured — the synthesis stages)
-  submits nothing and reports the manual `next_command` from `pipeline status`.
+* The machine work it drives, once each stage's inputs are approved/current, is:
+
+  | Stage | Submitted/executed |
+  | --- | --- |
+  | `synthesis.memo` | `generation_run` `synthesis` (over the accepted extraction output-audit) |
+  | `synthesis.framework` | `generation_run` `framework` (over the approved synthesis) |
+  | `synthesis.outline` | `generation_run` `outline` (over the approved synthesis + framework) |
+  | `drafting.blueprint` | the per-section workspace (`prepare_workspace`) then `generation_run` `blueprint` |
+  | `review.sections` | after blueprint approval, `generation_run` `draft`; after the draft exists, `generation_run` `section_review` |
+  | `tracing.origins` | **in-process, deterministic** `tracing run` (no model) per section |
+  | `delivery` | **in-process** `delivery start`, then `generation_run` `global_review`, then (when author notes are recorded and no batch is applied) `generation_run` `notes_plan`, then **in-process** `delivery approve --prepare` |
+
+* The derived ids are deterministic: the section-review id, origin-trace id, and delivery
+  id are pure functions of the section/draft revision and the driven sections
+  (`review_id_for`, `trace_id_for`, `delivery_id_for` in
+  [`pipeline/run.py`](../src/review_article_agent/pipeline/run.py)).
+* The section review runs the real critic/repair ports from the config roles
+  `section_critic`/`section_repair`; the global review runs the real reviewer/writer ports
+  from `global_reviewer`/`global_writer`; `notes_plan` uses `notes_planner`.
+* After the final-approval manifest is prepared, `run` stops at the final-approval gate and
+  reports the exact `gate confirm` command from that preparation. The **delivery**
+  final-approval gate is the one human gate `plan_next` plans *through* (machine work such
+  as the global review and the approval preparation may still remain behind it).
+* A durable job whose result is `blocked`, `invalid_proposal`, or `model_not_completed`
+  stops the loop with a `failure` blocker whose `next_command` is the readback
+  (`generation run status --request-id <ID>`).
+* `screening_case` is **not** automatic: screening needs human pilot design, so the stage
+  submits nothing and reports the manual `next_command` from `pipeline status`. The same is
+  true of every stage absent from the table above (discovery, acquisition, parsing,
+  screening, extraction, and any stage whose config role/template is missing).
 * `--wait` polls the submitted jobs to a terminal state through the existing `job status`
   control call, bounded by `--timeout` (default 60s), before re-resolving.
 * `--max-steps` bounds the orchestration steps in one call (1..1000, default 10).
@@ -1417,34 +1444,52 @@ or a credential.
   "credential_env": "OPENROUTER_API_KEY",
   "sections": ["sec1"],
   "roles": {
-    "blueprint": {
-      "hosted_artifact_id": "hu-blueprint",
-      "hosted_revision_id": "hu-blueprint-r1",
-      "target_artifact_id": "bp-{section_id}",
-      "target_revision_id": "bp-{section_id}-r1"
-    },
-    "section_writer": {"hosted_artifact_id": "hu-writer"}
+    "synthesis": {"hosted_artifact_id": "hu-synthesis",
+                  "target_artifact_id": "syn", "target_revision_id": "syn-r1"},
+    "framework": {"hosted_artifact_id": "hu-framework",
+                  "target_artifact_id": "fw", "target_revision_id": "fw-r1"},
+    "outline": {"hosted_artifact_id": "hu-outline",
+                "target_artifact_id": "out", "target_revision_id": "out-r1"},
+    "blueprint": {"hosted_artifact_id": "hu-blueprint",
+                  "target_artifact_id": "bp-{section_id}",
+                  "target_revision_id": "bp-{section_id}-r1"},
+    "section_writer": {"hosted_artifact_id": "hu-writer",
+                       "target_artifact_id": "draft-{section_id}",
+                       "target_revision_id": "draft-{section_id}-r1"},
+    "section_critic": {"hosted_artifact_id": "hu-critic"},
+    "section_repair": {"hosted_artifact_id": "hu-repair"},
+    "global_reviewer": {"hosted_artifact_id": "hu-greviewer"},
+    "global_writer": {"hosted_artifact_id": "hu-gwriter"},
+    "notes_planner": {"hosted_artifact_id": "hu-notes"}
   },
   "workspace_artifact_id": "ws-{section_id}",
   "workspace_revision_id": "ws-{section_id}-r1",
+  "tracing_policy": { "max_hops": 4, "max_sources_per_claim": 5,
+                      "max_sources_per_project": 20, "max_resolution_retries": 1 },
   "rights": { "<a full RightsRecord template>" }
 }
 ```
 
 * `credential_env` — optional; only the one approved value `OPENROUTER_API_KEY` is
   accepted (the value is never read).
-* `sections` — the section ids the drafting stage drives.
-* `roles.<role>` — per generation role (`blueprint`, `section_writer`, ...): the
-  `hosted_artifact_id` whose **current** revision is the role's hosted-use document
-  (`hosted_revision_id` pins an exact revision instead), and the target
-  `artifact_id`/`revision_id` templates for the proposal the role writes. The string
-  `{section_id}` is substituted per section. A role absent from `roles` means "no
-  automatic job".
+* `sections` — the section ids the drafting/review/tracing/delivery stages drive.
+* `roles.<role>` — per generation role: the `hosted_artifact_id` whose **current**
+  revision is the role's hosted-use document (`hosted_revision_id` pins an exact revision
+  instead), and the target `artifact_id`/`revision_id` templates for the proposal the role
+  writes. The string `{section_id}` is substituted per section. The single-shot synthesis
+  roles (`synthesis`, `framework`, `outline`) and the drafting roles (`blueprint`,
+  `section_writer`) need target templates; the review/delivery roles
+  (`section_critic`, `section_repair`, `global_reviewer`, `global_writer`, `notes_planner`)
+  need only a hosted-use document (their workflows assign their own revision ids). A role
+  absent from `roles` means "no automatic job for that stage".
 * `workspace_artifact_id` / `workspace_revision_id` — templates for the per-section
   drafting workspace the drafting stage writes before the blueprint job.
+* `tracing_policy` — optional; the four required per-project tracing limits. Without it the
+  deterministic `tracing run` cannot complete, so the tracing stage reports its manual
+  command instead of running in-process.
 * `rights` — a full RightsRecord **template**; its project id and subject are rebound to
-  each written revision (workspace or proposal) exactly as the worker rebinds a section
-  review. Rights eligibility is not authority.
+  each written revision (workspace, proposal, trace, or delivery state) exactly as the
+  worker rebinds a section review. Rights eligibility is not authority.
 
 Malformed or extra keys are a `validation` error before anything is submitted; the path
 and contents are never echoed.
