@@ -2,7 +2,8 @@
 
 Covers ``src/review_article_agent/tracing/workflow.py`` against
 ``docs/implementation/13-origin-tracing.md``: persisted trace graphs, dependency-valid
-caching (retrace on changed claim/source-sha/policy/verdict), an unconfigured-policy
+caching (retrace on changed claim/source-sha/policy/verdict or a supplied
+upstream source digest), an unconfigured-policy
 gate, per-project budget surfacing, read-only coverage audit, correction routing, and
 section checks that never carry ``primary_verified``.
 
@@ -181,7 +182,8 @@ class TraceBase(unittest.TestCase):
     def rights(self, artifact_id, revision_id):
         return _rights(self.pid, artifact_id, revision_id)
 
-    def run_trace(self, trace_id, *, claims, sources, policy, review_checks, acquire):
+    def run_trace(self, trace_id, *, claims, sources, policy, review_checks, acquire,
+                  source_digests=None):
         return self.repo.run(
             trace_id,
             claims=claims,
@@ -190,6 +192,7 @@ class TraceBase(unittest.TestCase):
             review_checks=review_checks,
             acquire=acquire,
             rights=self.rights,
+            source_digests=source_digests,
         )
 
 
@@ -300,6 +303,39 @@ class CacheTests(TraceBase):
             acquire=acquire,
         )
         self.assertEqual(state["claims"][0]["cache"], "miss")
+
+    def test_changed_upstream_source_digest_retraces(self):
+        trace_id = self._seed()
+
+        # A supplied digest for the acquired upstream source ("primary") that
+        # differs from the cached node sha forces a cache miss and a retrace.
+        acquire = FakeAcquire({"r1": {"status": "acquired", "source": _primary()}})
+        state = self.run_trace(
+            trace_id,
+            claims=[_claim()],
+            sources={"review": _secondary_review()},
+            policy=POLICY,
+            review_checks=_checks(),
+            acquire=acquire,
+            source_digests={"primary": "changed"},
+        )
+        self.assertEqual(state["claims"][0]["cache"], "miss")
+        self.assertGreaterEqual(len(acquire.calls), 1)
+        self.assertTrue(state["invalidated"])
+
+        # The unchanged digest matches the cached node sha -> cache hit, no acquire.
+        acquire_hit = FakeAcquire({"r1": {"status": "acquired", "source": _primary()}})
+        state_hit = self.run_trace(
+            trace_id,
+            claims=[_claim()],
+            sources={"review": _secondary_review()},
+            policy=POLICY,
+            review_checks=_checks(),
+            acquire=acquire_hit,
+            source_digests={"primary": "shaP"},
+        )
+        self.assertEqual(state_hit["claims"][0]["cache"], "hit")
+        self.assertEqual(len(acquire_hit.calls), 0)
 
 
 class PolicyGateTests(TraceBase):

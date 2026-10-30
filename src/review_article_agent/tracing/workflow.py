@@ -16,7 +16,9 @@ What one ``run`` does (per ``docs/implementation/13-origin-tracing.md``)
   fingerprint it is reused with **no** acquisition calls; otherwise the claim is
   retraced and the previous fingerprint is recorded as invalidated.  A changed
   claim text, depth-0 source ``sha256``, policy, or Step 12 verdict changes the
-  fingerprint.
+  fingerprint.  Additionally, an optional ``source_digests`` mapping invalidates a
+  cached entry when a cached upstream node's sha no longer matches the current
+  digest supplied for that source.
 * **Persist after every claim**, as a new immutable artifact revision;
   :meth:`OriginTraceRepository.read` returns the latest.
 * **Section-check integration**: every Step 12 check is copied and annotated
@@ -99,6 +101,34 @@ def _claim_fingerprint(claim, root_source, policy, depth0_verdict, previous) -> 
         for atom in claim.get("atoms") or []
     ]
     return _digest([per_atom, depth0_verdict])
+
+
+def _current_source_digests(sources, source_digests) -> dict:
+    """Map ``source_key -> current sha256`` for depth-0 and known upstream sources."""
+    current: dict = {}
+    for key, source in (sources or {}).items():
+        inner = source.get("source") if isinstance(source, dict) else None
+        sha = inner.get("sha256") if isinstance(inner, dict) else None
+        if sha is not None:
+            current[key] = sha
+    if source_digests:
+        current.update(source_digests)
+    return current
+
+
+def _upstream_digest_changed(previous, current_digests) -> bool:
+    """True when a cached upstream (depth>0) node's sha differs from the current one."""
+    if not current_digests or not isinstance(previous, dict):
+        return False
+    for atom_trace in previous.get("atoms") or []:
+        nodes = (atom_trace.get("graph") or {}).get("nodes") or []
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("depth", 0) <= 0:
+                continue
+            key = node.get("source_key")
+            if key in current_digests and node.get("sha256") != current_digests[key]:
+                return True
+    return False
 
 
 def _config_required_entry(claim, fingerprint) -> dict:
@@ -307,8 +337,16 @@ class OriginTraceRepository:
         return state
 
     # -- entry point --------------------------------------------------------- #
-    def run(self, trace_id, *, claims, sources, policy, review_checks, acquire, rights):
-        """Run (or resume) one durable origin trace; return the final state."""
+    def run(self, trace_id, *, claims, sources, policy, review_checks, acquire, rights,
+            source_digests=None):
+        """Run (or resume) one durable origin trace; return the final state.
+
+        ``source_digests`` is an optional ``source_key -> current sha256`` mapping
+        covering *known upstream* sources (the depth-0 ``sources`` dict sha values
+        also count).  A cached claim whose graph references one of these sources
+        with a different sha is a cache miss: the old fingerprint is recorded in
+        ``invalidated`` and the claim is retraced.
+        """
         self._rights = rights
         artifact_id = validate_identifier(trace_id, "trace_id")
         claims = list(claims or [])
@@ -320,6 +358,7 @@ class OriginTraceRepository:
                 previous_claims[entry.get("claim_id")] = entry
 
         configured = validate_policy(policy)["status"] == "configured"
+        current_digests = _current_source_digests(sources, source_digests)
 
         calls = {"n": 0}
 
@@ -343,7 +382,11 @@ class OriginTraceRepository:
 
             if not configured:
                 entry = _config_required_entry(claim, candidate)
-            elif previous is not None and previous.get("fingerprint") == candidate:
+            elif (
+                previous is not None
+                and previous.get("fingerprint") == candidate
+                and not _upstream_digest_changed(previous, current_digests)
+            ):
                 entry = copy.deepcopy(previous)
                 entry["cache"] = "hit"
             else:
