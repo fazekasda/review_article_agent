@@ -18,12 +18,44 @@ import unittest
 from review_article_agent.domain.records import (
     ARTIFACT_KINDS,
     RecordValidationError,
+    _FORBIDDEN_ID_CHARS,
+    _has_surrogate,
     canonical_json,
     require_storage_allowed,
     validate_identifier,
     validate_ref,
     validate_rights_record,
 )
+
+
+def _validate_identifier_reference(value, field="identifier"):
+    """A verbatim copy of the pre-fast-path implementation.
+
+    Kept here as the oracle for the equivalence test: the optimized
+    :func:`validate_identifier` must accept/reject every input exactly as this
+    does, with the same error type and message and the same precedence.
+    """
+    if not isinstance(value, str):
+        _raise_ref(field, "must be a string")
+    if value == "":
+        _raise_ref(field, "must be non-empty")
+    if value != value.strip() or any(ch.isspace() for ch in value):
+        _raise_ref(field, "must not contain whitespace")
+    for ch in value:
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            _raise_ref(field, "must not contain control characters")
+        if ch in _FORBIDDEN_ID_CHARS:
+            _raise_ref(field, f"must not contain path separator {ch!r}")
+    if value in (".", "..") or ".." in value:
+        _raise_ref(field, "must not contain dot-traversal segments")
+    if value.startswith("."):
+        _raise_ref(field, "must not start with '.'")
+    return value
+
+
+def _raise_ref(label, message):
+    # Mirror ``records._raise`` exactly, including the empty-label case.
+    raise RecordValidationError(f"{label}: {message}" if label else message)
 
 
 def _pd_basis():
@@ -144,6 +176,53 @@ class CanonicalJsonTest(unittest.TestCase):
         with self.assertRaises(RecordValidationError):
             canonical_json({"a\ud800": 1})
 
+    def test_has_surrogate_accepts_ascii_and_valid_unicode(self):
+        # The isascii() fast path and the single-encode fallback must accept every
+        # non-surrogate string: ASCII, BMP non-ASCII, and astral code points.
+        for text in ("", "abc", "café", "漢", "😀", "a\u0000b", "x" * 5000):
+            self.assertFalse(_has_surrogate(text), repr(text))
+
+    def test_has_surrogate_rejects_lone_and_paired_surrogates(self):
+        for text in (
+            "\ud800",
+            "\udfff",
+            "\ud800\udc00",  # a paired surrogate in a Python str is still rejected
+            "\udc00\ud800",
+            "a\ud800b",
+            "é\ud800",
+        ):
+            self.assertTrue(_has_surrogate(text), repr(text))
+
+    def test_accepts_bmp_and_astral_values_and_keys(self):
+        self.assertEqual(
+            canonical_json({"k": "é", "漢": "😀"}).decode("utf-8"),
+            '{"k":"é","漢":"😀"}',
+        )
+
+    def test_rejects_lone_high_surrogate_in_value(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"v": "x\ud800"})
+
+    def test_rejects_lone_low_surrogate_in_value(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"v": "x\udfff"})
+
+    def test_rejects_surrogate_in_dict_key_low(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"a\udfff": 1})
+
+    def test_rejects_surrogate_nested_in_value(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"outer": [1, {"inner": "bad\ud800"}]})
+
+    def test_rejects_surrogate_nested_in_dict_key(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"outer": {"bad\ud800": 1}})
+
+    def test_rejects_paired_surrogate(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json("x\ud800\udc00")
+
     def test_rejects_cyclic_dict(self):
         cyclic = {}
         cyclic["self"] = cyclic
@@ -227,6 +306,109 @@ class IdentifierTest(unittest.TestCase):
     def test_rejects_leading_dot(self):
         with self.assertRaises(RecordValidationError):
             validate_identifier(".hidden")
+
+
+class IdentifierFastPathEquivalenceTest(unittest.TestCase):
+    """The fast path must be observationally identical to the original loops."""
+
+    @staticmethod
+    def _outcome_of(func, value, field="identifier"):
+        try:
+            return ("ok", func(value, field))
+        except Exception as exc:  # noqa: BLE001 - compare type+message generically
+            return ("err", type(exc), str(exc))
+
+    def _corpus(self):
+        values = []
+
+        # Every printable-ASCII single character, including space, plus DEL and a
+        # spread of control characters.
+        values.extend(chr(c) for c in range(0x20, 0x7F))
+        values.extend(chr(c) for c in (0x00, 0x01, 0x09, 0x0A, 0x0D, 0x1F, 0x7F))
+
+        # Representative pairs, so multi-character precedence is exercised.
+        seed = "aA0 .-_/:\\..\x00\x7f!~[]{}"
+        values.extend(a + b for a in seed for b in seed)
+
+        # Typical real identifiers (all should be accepted).
+        values.extend(
+            [
+                "cand_abc123",
+                "art-1",
+                "art-syn-A_1.2",
+                "sha256:" + "a" * 64,
+                "sha256:deadbeef",
+                "123e4567-e89b-12d3-a456-426614174000",
+                "proj-1",
+                "rev-1",
+                "RIGHTS-test-1",
+                "a.b.c",
+                "a.",
+                ".a",
+                "a-b_c:d@e+f=g~h,i;j!k#l$m%n&o(p)q[r]s{t}u<v>w?x^y|z",
+            ]
+        )
+
+        # Unicode letters must still be accepted via the slow path.
+        values.extend(["café", "naïve", "αβγ", "日本語", "ü", "Ω"])
+
+        # Unicode whitespace must still be rejected via the slow path.
+        values.extend(["\u00a0", "a\u00a0b", "\u2003", "a\u2003b", "\u3000"])
+
+        # Empty, whitespace-only, separators, dots, and non-strings.
+        values.extend(
+            [
+                "",
+                " ",
+                "  ",
+                "\t",
+                "\n",
+                "a b",
+                " abc ",
+                "abc ",
+                " abc",
+                "/",
+                "\\",
+                "a/b",
+                "a\\b",
+                "/..",
+                "..",
+                ".",
+                "...",
+                "a..b",
+                "..a",
+                "a..",
+                ".hidden",
+                "..hidden",
+            ]
+        )
+        values.extend([None, 5, 5.0, b"bytes", ("t",), ["l"], {"d": 1}, object()])
+
+        # A few long valid ids to exercise the fullmatch fast path length-wise.
+        values.append("x" * 1000)
+        values.append(("ab-cd_12" * 100))
+        return values
+
+    def test_fast_path_matches_reference_on_corpus(self):
+        for value in self._corpus():
+            with self.subTest(value=repr(value)):
+                self.assertEqual(
+                    self._outcome_of(validate_identifier, value),
+                    self._outcome_of(_validate_identifier_reference, value),
+                )
+
+    def test_fast_path_matches_reference_with_blank_field(self):
+        # ``_raise``'s empty-label branch must match too.
+        for value in ("", "a b", "a/b", ".", "..", "ok-1"):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(
+                    self._outcome_of(validate_identifier, value, field=""),
+                    self._outcome_of(_validate_identifier_reference, value, field=""),
+                )
+
+    def test_accepted_typical_ids_are_returned_unchanged(self):
+        for value in ("cand_abc123", "art-1", "sha256:" + "a" * 64, "a.b.c", "café"):
+            self.assertEqual(validate_identifier(value), value)
 
 
 class RefTest(unittest.TestCase):

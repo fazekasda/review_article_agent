@@ -130,6 +130,7 @@ from ..domain.records import (
     validate_ref,
     validate_rights_record,
 )
+from ..storage import opmemo
 from ..storage.artifacts import (
     ArtifactConflictError,
     ArtifactRepository,
@@ -389,6 +390,19 @@ def _opt_ref(value: object, project_id: str, error, message: str):
 
 def _origin_locator(request_id: str) -> str:
     return _ORIGIN_PREFIX + hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+
+
+def _memo_canonical_key(value: object) -> str | None:
+    """A stable string key for ``value``, or ``None`` when it is not keyable.
+
+    Used only to key the operation-scoped validation memo.  An unkeyable
+    argument simply skips memoization, so the original call runs unchanged and
+    no exception type or message is altered by the key construction.
+    """
+    try:
+        return canonical_json(value).decode("utf-8")
+    except Exception:  # noqa: BLE001 - any non-canonical value just skips the memo
+        return None
 
 
 def _approval_summary(status) -> dict:
@@ -763,7 +777,34 @@ class AcquisitionRepository:
         re-derivable, its freeze is still authentic and current with an unchanged
         roster, every pinned source / asset is still current with intact bytes
         and storage rights, and no blocker remains.
+
+        The result is a pure function of the transaction snapshot and the exact
+        ``(artifact_id, at_ref)`` inputs, so within one operation it is memoized
+        on those plus the connection's ``total_changes``.  A superseding/revoking
+        approval, a new freeze revision, or any other write the operation makes
+        changes ``total_changes`` and the gate is re-derived exactly as before
+        (fail-closed); the raised :class:`ManifestNotAcquiredError` is never
+        cached.
         """
+        at_key = "<current>" if at_ref is None else _memo_canonical_key(at_ref)
+        if at_key is None:
+            return self._require_acquired(artifact_id, at_ref=at_ref)
+        key = (
+            "manifest.require_acquired",
+            self.project_id,
+            str(artifact_id),
+            at_key,
+        )
+        return opmemo.memoize(
+            self._store.connection,
+            key,
+            lambda: self._require_acquired(artifact_id, at_ref=at_ref),
+        )
+
+    def _require_acquired(
+        self, artifact_id: str = DEFAULT_MANIFEST_ARTIFACT_ID, *, at_ref=None
+    ) -> dict:
+        """Uncached body of :meth:`require_acquired` (see it for the memo contract)."""
         artifact_id = _artifact_identifier(artifact_id, ManifestNotAcquiredError)
         if at_ref is None:
             revision = self._artifacts.current_revision(artifact_id)
@@ -828,7 +869,24 @@ class AcquisitionRepository:
         return document
 
     def _authentic_freeze(self, freeze_ref: dict) -> dict:
-        """Current authentic freeze at ``freeze_ref`` that is also its artifact head."""
+        """Current authentic freeze at ``freeze_ref`` that is also its artifact head.
+
+        Memoized per operation on the canonical ``freeze_ref`` plus the
+        connection's ``total_changes``: it is a pure read of durable state, so a
+        write the operation makes re-derives it exactly as before (fail-closed).
+        """
+        ref_key = _memo_canonical_key(freeze_ref)
+        if ref_key is None:
+            return self._authentic_freeze_uncached(freeze_ref)
+        key = ("manifest._authentic_freeze", self.project_id, ref_key)
+        return opmemo.memoize(
+            self._store.connection,
+            key,
+            lambda: self._authentic_freeze_uncached(freeze_ref),
+        )
+
+    def _authentic_freeze_uncached(self, freeze_ref: dict) -> dict:
+        """Uncached body of :meth:`_authentic_freeze`."""
         freeze = FreezeRepository(self._store)
         try:
             document = freeze.require_frozen(freeze_ref["artifact_id"], at_ref=freeze_ref)
@@ -1059,6 +1117,28 @@ class AcquisitionRepository:
         return None
 
     def _read(self, revision: Revision) -> dict:
+        """Decode and fully re-derive one manifest revision, memoized per operation.
+
+        A revision is immutable and the re-derivation reads only durable state,
+        so the assembled document is a pure function of the transaction snapshot
+        and the exact ``(artifact_id, revision_id)``.  It is memoized on those
+        plus the connection's ``total_changes``; any write the operation makes
+        (a superseding revision, a savepoint rollback) misses the entry and the
+        payload is re-derived exactly as before.  A raised
+        :class:`ManifestCorruptionError` is never cached.
+        """
+        key = (
+            "manifest._read",
+            self.project_id,
+            revision.artifact_id,
+            revision.revision_id,
+        )
+        return opmemo.memoize(
+            self._store.connection, key, lambda: self._read_uncached(revision)
+        )
+
+    def _read_uncached(self, revision: Revision) -> dict:
+        """Uncached body of :meth:`_read` (see it for the memo contract)."""
         content = self._artifacts.read_content(revision.artifact_id, revision.revision_id)
         if sha256_digest(content) != revision.content_sha256 or len(content) != revision.byte_size:
             raise ManifestCorruptionError(_M_CORRUPT_DIGEST)

@@ -99,6 +99,7 @@ from ..domain.records import (
 )
 from ..parsing.repository import _NestedStore
 from ..runtime.gates import MAX_GATE_SNAPSHOT_ENTRIES
+from ..storage import opmemo
 from ..storage.agent_runtime import RuntimeRepository
 from ..storage.artifacts import ArtifactRepository, DependencyRef, sha256_digest
 from ..synthesis.workflow import SynthesisWorkflowError, SynthesisWorkflowRepository
@@ -145,6 +146,29 @@ def require(condition, message=None):
         raise SectionWorkspaceError(
             message or "section workspace input, dependency, or mapping is invalid"
         )
+
+
+def _memo_key(*parts):
+    """Return a stable tuple key, or ``None`` when an argument is not keyable.
+
+    See :func:`review_article_agent.synthesis.workflow._memo_key`; an unkeyable
+    argument makes the caller run the original body uncached, so fail-closed
+    behaviour is unchanged.
+    """
+    try:
+        return tuple(
+            part if isinstance(part, str) else canonical_json(part).decode()
+            for part in parts
+        )
+    except (RecordValidationError, TypeError, ValueError):
+        return None
+
+
+def _memoize(conn, key, compute):
+    """Run ``compute`` under the operation-scoped memo, or directly if unkeyable."""
+    if key is None:
+        return compute()
+    return opmemo.memoize(conn, key, compute)
 
 
 class SectionWorkspaceRepository:
@@ -359,6 +383,25 @@ class SectionWorkspaceRepository:
 
     # -- normalized derivation (re-run against durable rows) ----------------- #
     def _normalize(self, input_payload, *, require_current):
+        # The normalized mapping is a pure function of the durable rows and the
+        # exact input payload, so within one operation it is derived once.  The
+        # key pins the payload and whether the live (current) or stored outline
+        # is required; an unkeyable payload runs uncached.
+        key = _memo_key(
+            "drafting.workspace._normalize",
+            self.store.project_id,
+            input_payload,
+            "current" if require_current else "stored",
+        )
+        return _memoize(
+            self.store.connection,
+            key,
+            lambda: self._normalize_uncached(
+                input_payload, require_current=require_current
+            ),
+        )
+
+    def _normalize_uncached(self, input_payload, *, require_current):
         require(
             isinstance(input_payload, dict)
             and set(input_payload) == set(PAYLOAD_KEYS),
@@ -451,6 +494,19 @@ class SectionWorkspaceRepository:
         stored outline revision, but requires no live gate — and never confers
         execution authority.
         """
+        key = _memo_key(
+            "drafting.workspace.read",
+            self.store.project_id,
+            self._ref(ref),
+            "current" if current else "historical",
+        )
+        return _memoize(
+            self.store.connection,
+            key,
+            lambda: self._read_rederived(ref, current=current),
+        )
+
+    def _read_rederived(self, ref, *, current):
         payload = self._read(ref, current=current)
         require(
             self._normalize(payload["input"], require_current=current)
@@ -466,6 +522,18 @@ class SectionWorkspaceRepository:
         context and the exact refs a later drafting step would pin. This confers no
         execution authority.
         """
+        key = _memo_key(
+            "drafting.workspace.require_for_drafting",
+            self.store.project_id,
+            self._ref(ref),
+        )
+        return _memoize(
+            self.store.connection,
+            key,
+            lambda: self._require_for_drafting(ref),
+        )
+
+    def _require_for_drafting(self, ref):
         payload = self.read(ref, current=True)
         outline_ref = self._ref(payload["result"]["outline_ref"])
         try:

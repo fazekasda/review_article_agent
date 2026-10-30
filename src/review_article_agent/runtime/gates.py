@@ -105,6 +105,7 @@ from ..domain.records import (
     validate_ref,
     validate_rights_record,
 )
+from ..storage import opmemo
 from ..storage.approvals import (
     SNAPSHOT_ENTRY_ROLES,
     VERSION_LINEAGE_ROLE,
@@ -613,6 +614,9 @@ def _read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
             "the store could not open a consistent read transaction; refusing to "
             "prepare or revalidate a gate snapshot from an unpinned read."
         ) from exc
+    # This call owns the outermost transaction: clear the operation-scoped
+    # validation memo on entry and on every exit path so no entry outlives it.
+    opmemo.invalidate(conn)
     try:
         yield conn
     except BaseException:
@@ -620,6 +624,7 @@ def _read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
             conn.execute("ROLLBACK")
         except sqlite3.Error:  # pragma: no cover - best effort
             pass
+        opmemo.invalidate(conn)
         raise
     try:
         conn.execute("COMMIT")
@@ -628,10 +633,12 @@ def _read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
             conn.execute("ROLLBACK")
         except sqlite3.Error:  # pragma: no cover - best effort
             pass
+        opmemo.invalidate(conn)
         raise GateSnapshotError(
             "the store could not commit the read transaction; refusing to trust "
             "an unconfirmed gate snapshot read."
         ) from exc
+    opmemo.invalidate(conn)
 
 
 def _project_id(store) -> str:
