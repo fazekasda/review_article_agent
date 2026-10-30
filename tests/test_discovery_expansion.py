@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from urllib.parse import urlsplit
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -285,6 +286,7 @@ class LimitTests(ExpansionBase):
         self.assertEqual(provider.calls, [])
         self.assertIn("source_limit", {stop.reason for stop in report.stops})
 
+    @slow
     def test_request_budget_counts_every_retry_attempt(self):
         provider = FakeProvider(
             {
@@ -304,6 +306,7 @@ class LimitTests(ExpansionBase):
         self.assertEqual(references.attempt_count, 3)
         self.assertEqual(report.to_mapping()["counts"]["request_attempts"], 4)  # 3 + 1
 
+    @slow
     def test_request_budget_interrupts_and_makes_no_further_request(self):
         provider = FakeProvider(
             {
@@ -410,6 +413,7 @@ class FailureTests(ExpansionBase):
         self.assertEqual(provider.calls, [])
         self.assertIn("before_request_refused", {s.reason for s in report.stops})
 
+    @slow
     def test_before_request_is_invoked_before_every_retry(self):
         provider = FakeProvider(
             {
@@ -626,6 +630,7 @@ class PersistenceTests(ExpansionBase):
         self.assertEqual(ExplodingProvider.calls, [])
         self.assertEqual(first.to_mapping(), replay.to_mapping())
 
+    @slow
     def test_retry_then_refusal_keeps_real_attempts_and_no_fictitious_attempt(self):
         provider = FakeProvider(
             {

@@ -59,6 +59,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -772,6 +773,7 @@ class ResultBackupBase(unittest.TestCase):
         return restored, info
 
 
+@slow
 class RoundTripTest(ResultBackupBase):
     def _record_answered(self):
         self.submit(self.dispatch_record)
@@ -1054,6 +1056,7 @@ class RoundTripTest(ResultBackupBase):
         self.assertIn("do not revalidate", message)
 
 
+@slow
 class InnerValidationTest(ResultBackupBase):
     def _backup_with_observation(self):
         self.submit(self.dispatch_record)
@@ -1119,6 +1122,7 @@ class InnerValidationTest(ResultBackupBase):
         self.assertEqual((target / "unrelated.txt").read_text(), "keep me")
 
 
+@slow
 class SchemaCompatibilityTest(ResultBackupBase):
     def new_schema_store(self, version: int, name: str) -> ProjectStore:
         """Create a store pinned at an older schema (no later tables)."""
@@ -1184,6 +1188,7 @@ class SchemaCompatibilityTest(ResultBackupBase):
         self.assertEqual(restored.schema_version, schema.STORE_SCHEMA_VERSION)
 
 
+@slow
 class DynamicHookTest(ResultBackupBase):
     def test_hook_table_is_ordered_and_threshold_keyed(self) -> None:
         minimums = [minimum for minimum, _ in backup_mod._SCHEMA_VALIDATORS]

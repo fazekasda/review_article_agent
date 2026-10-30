@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -1129,6 +1130,7 @@ class ExpansionPersistenceTest(CoreAcceptanceBase):
 # --------------------------------------------------------------------------- #
 # H. Interrupted relation: stored partial page + real attempts; reopen no network
 # --------------------------------------------------------------------------- #
+@slow
 class ExpansionInterruptedTest(CoreAcceptanceBase):
     def test_interrupted_relation_preserves_partial_and_replays_without_network(self):
         # Page 1 returns a partial reference list (hitCount 2, one entry); the

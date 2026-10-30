@@ -36,6 +36,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -873,6 +874,7 @@ class ExpandRoutesTest(DiscoveryJobRoutesBase):
         self._drive(engine)
         self.assertEqual(self._job(engine, res["job"]["job_id"])["state"], "completed")
 
+    @slow
     def test_large_graph_status_is_summary_only(self) -> None:
         # Every visited node contributes 2 relations; the status projection must
         # stay bounded and never include the edge/relation graph.
@@ -917,6 +919,7 @@ class ExpandRoutesTest(DiscoveryJobRoutesBase):
 # --------------------------------------------------------------------------- #
 # Hosted lead route
 # --------------------------------------------------------------------------- #
+@slow
 class LeadRoutesTest(DiscoveryJobRoutesBase):
     def _prepare(self, *, approved=True):
         batch_ref = self.build_lead_batch()

@@ -36,6 +36,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 TESTS = Path(__file__).resolve().parent
@@ -406,6 +407,7 @@ class RetrieveRealWorkerSmokeTest(RetrievalCliBase):
     ``acquisition retrieve show``) and stops only this fixture's worker.
     """
 
+    @slow
     def test_real_worker_writes_manual_required_report_without_get(self):
         parameters = self.acquire_parameters("smoke-1", self.no_pmcid)
         path = self.write_json("smoke-req.json", parameters)

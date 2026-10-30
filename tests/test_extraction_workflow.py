@@ -17,6 +17,7 @@ import sys
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -390,6 +391,7 @@ class PilotTests(WorkflowBase):
         self.assertEqual(pilot["blocking_failures"], [])
 
 
+@slow
 class BatchAndAuditTests(WorkflowBase):
     def _gated_pipeline(self, cases, *, adjudications=None):
         pilot_ref = self.put(

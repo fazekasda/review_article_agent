@@ -44,6 +44,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 REPO = Path(__file__).resolve().parents[1]
@@ -169,6 +170,7 @@ class _Base(unittest.TestCase):
             conn.close()
 
 
+@slow
 class GatePreparePreviewTest(_Base):
     def _project(self) -> str:
         pid = self.create_project("proj")
@@ -238,6 +240,7 @@ class GatePreparePreviewTest(_Base):
         self.assertNotIn("human note", blob)
 
 
+@slow
 class GatePrepareDeterminismTest(_Base):
     def _project(self) -> str:
         pid = self.create_project("proj")
@@ -268,6 +271,7 @@ class GatePrepareDeterminismTest(_Base):
         self.assertEqual(outline, outline_again)
 
 
+@slow
 class GatePrepareDenialTest(_Base):
     def test_exact_revision_prepares_but_stale_and_unknown_are_denied(self) -> None:
         pid = self.create_project("proj")
@@ -346,6 +350,7 @@ class GatePrepareDenialTest(_Base):
         self.assertEqual(err["error"]["category"], "storage")
 
 
+@slow
 class GatePrepareSafetyTest(_Base):
     def _project(self) -> str:
         pid = self.create_project("proj")
@@ -438,6 +443,7 @@ class GatePrepareSafetyTest(_Base):
 
 
 class GatePrepareDispatchTest(_Base):
+    @slow
     def test_help_and_subcommand_dispatch(self) -> None:
         top = self.raw("--help")
         self.assertEqual(top.returncode, 0)

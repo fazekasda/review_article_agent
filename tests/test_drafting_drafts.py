@@ -71,6 +71,7 @@ from review_article_agent.drafting.workspace import (  # noqa: E402
 )
 from review_article_agent.extraction import workflow as extraction_workflow  # noqa: E402
 from review_article_agent.storage.artifacts import DependencyRef  # noqa: E402
+from _tiers import slow
 
 
 def _role_config():
@@ -200,6 +201,7 @@ class DraftGateAndProposeTests(DraftBase):
                 self.draft_payload(bp3), artifact_id="draft-sec3", revision="draft-sec3-r1"
             )
 
+    @slow
     def test_draft_is_stored_with_its_blueprint_and_package_snapshot(self):
         _s, _f, outline_ref = self.approved_chain()
         ws_ref = self.make_workspace(outline_ref)
@@ -218,6 +220,7 @@ class DraftGateAndProposeTests(DraftBase):
         self._reopen()
         self.assertEqual(self.wf.read(d_ref, "draft"), envelope)
 
+    @slow
     def test_draft_payload_contract_is_exact(self):
         _s, _f, outline_ref = self.approved_chain()
         ws_ref = self.make_workspace(outline_ref)
@@ -230,6 +233,7 @@ class DraftGateAndProposeTests(DraftBase):
         self.assertIsNone(self.artifacts.get_artifact("draft-bad"))
 
 
+@slow
 class DraftGroundingTests(DraftBase):
     def _approved_blueprint(self, outline_ref):
         ws_ref = self.make_workspace(outline_ref)
@@ -281,6 +285,7 @@ class DraftGroundingTests(DraftBase):
         self.assertIsNone(self.artifacts.get_artifact("draft-bad"))
 
 
+@slow
 class DraftStalenessAndHistoryTests(DraftBase):
     def _approved_blueprint_and_draft(self, outline_ref):
         ws_ref = self.make_workspace(outline_ref)
@@ -413,6 +418,7 @@ class AssemblyBase(DraftBase):
         )
 
 
+@slow
 class AssemblyOrderingTests(AssemblyBase):
     def test_assembly_covers_all_sections_in_outline_order(self):
         _s, _f, outline_ref = self.two_section_chain()
@@ -515,6 +521,7 @@ class AssemblyOrderingTests(AssemblyBase):
         self.assertIsNone(self.artifacts.get_artifact("asm-bad"))
 
 
+@slow
 class AssemblyLabelTests(AssemblyBase):
     def rich_blueprint_payload(self, ws_ref, section_id="sec1"):
         ws = self.workspace.read(ws_ref)["result"]
@@ -608,6 +615,7 @@ class AssemblyLabelTests(AssemblyBase):
         )
 
 
+@slow
 class AssemblyLineageTests(AssemblyBase):
     def _import_assembly(self, payload, *, artifact_id="asm-forged", revision="asm-forged-r1"):
         """Import an assembly envelope through the generic import path.
@@ -709,6 +717,7 @@ class AssemblyLineageTests(AssemblyBase):
         self.assertFalse(report["authorizes_export"])
 
 
+@slow
 class DraftOverRealRunnerTest(_drafting_package.DraftingOverRealRunnerTest):
     """Real runner / fake transport: real receipt -> package -> gated draft.
 

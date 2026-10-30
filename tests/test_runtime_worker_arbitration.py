@@ -37,6 +37,7 @@ import unittest
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -398,6 +399,7 @@ class SameProjectSerialTest(RuntimeArbBase):
     def test_direct_call_unknown_blocks_new_synthetic_claim(self) -> None:
         self._assert_blocks_new_claim("direct_call")
 
+    @slow
     def test_reserved_and_terminal_runtime_are_not_blocking(self) -> None:
         for target in ("reserved", "completed", "failed"):
             pid = self._new_project(f"NonBlock{target[:4]}").project_id

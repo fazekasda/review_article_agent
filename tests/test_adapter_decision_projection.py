@@ -34,6 +34,7 @@ import sys
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -233,6 +234,7 @@ def assert_inert(test, mapping):
 # --------------------------------------------------------------------------- #
 # Real missing-answer failure -> canonical omitted
 # --------------------------------------------------------------------------- #
+@slow
 class MissingAnswerProjectionTest(unittest.TestCase):
     def _validated(self):
         qs = [predicate("is_original_report"), predicate("missing_q")]
@@ -268,6 +270,7 @@ class MissingAnswerProjectionTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Real provider type:error -> canonical omitted
 # --------------------------------------------------------------------------- #
+@slow
 class ProviderErrorProjectionTest(unittest.TestCase):
     def test_type_error_normalizes_to_omitted(self):
         qs = [predicate("provider_err_q")]
@@ -301,6 +304,7 @@ class ProviderErrorProjectionTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Real malformed answer -> canonical malformed (unchanged)
 # --------------------------------------------------------------------------- #
+@slow
 class MalformedProjectionTest(unittest.TestCase):
     def test_type_mismatch_stays_malformed(self):
         qs = [predicate("mal_q")]
@@ -318,6 +322,7 @@ class MalformedProjectionTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Valid answers + unsupported box + one charge
 # --------------------------------------------------------------------------- #
+@slow
 class MixedOutcomesProjectionTest(unittest.TestCase):
     def test_valid_answers_and_unsupported_box_project(self):
         qs = [
@@ -361,6 +366,7 @@ class MixedOutcomesProjectionTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # The strict mapping validator is not weakened
 # --------------------------------------------------------------------------- #
+@slow
 class StrictMappingStillRefusedTest(unittest.TestCase):
     def _omitted_mapping(self):
         qs = [predicate("missing_q")]
@@ -432,6 +438,7 @@ def run_dispatch(qs, transport):
     return jev.dispatch_plan(plan, api_key=API_KEY, transport=transport)
 
 
+@slow
 class WholeCallFailureProjectionTest(unittest.TestCase):
     """Every requested supported question is retained on a whole-call failure."""
 
@@ -545,6 +552,7 @@ class WholeCallFailureProjectionTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Missing evidence is still refused (no silent synthesis)
 # --------------------------------------------------------------------------- #
+@slow
 class MissingEvidenceRefusedTest(unittest.TestCase):
     def test_completed_envelope_missing_outcome_refused(self):
         # A completed envelope with a missing supported outcome (no validated call

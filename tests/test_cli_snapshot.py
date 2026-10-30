@@ -27,6 +27,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 REPO = Path(__file__).resolve().parents[1]
@@ -135,6 +136,7 @@ class _Base(unittest.TestCase):
         )
 
 
+@slow
 class FixtureLifecycleTest(_Base):
     def _setup(self) -> str:
         pid = self.create_project("proj")
@@ -217,6 +219,7 @@ class FixtureLifecycleTest(_Base):
             self.assertNotIn(secret_rationale, json.dumps(out))
 
 
+@slow
 class FixtureCurrentIndicatorTest(_Base):
     """`current_revision_fixture_approved` is truthful and fixture-only."""
 
@@ -312,6 +315,7 @@ class FixtureCurrentIndicatorTest(_Base):
         self.assertIs(st["current_revision_fixture_approved"], False)
 
 
+@slow
 class FixtureSafetyTest(_Base):
     def _project(self) -> str:
         pid = self.create_project("proj")
@@ -350,6 +354,7 @@ class FixtureSafetyTest(_Base):
         self.assertIn("backup", help_text)
 
 
+@slow
 class BackupRoundTripTest(_Base):
     def _project_with_approval(self) -> str:
         pid = self.create_project("proj-a")
@@ -475,6 +480,7 @@ class BackupRoundTripTest(_Base):
         self.assertEqual(first, second)
 
 
+@slow
 class BackupSafetyTest(_Base):
     def _backup(self) -> tuple[str, Path]:
         pid = self.create_project("proj-a")

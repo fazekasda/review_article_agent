@@ -36,6 +36,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -443,6 +444,7 @@ def _config_role_steps(configuration: RoleConfiguration, role: str) -> int:
     return configuration.for_role(role).steps
 
 
+@slow
 class PrepareSessionTurnTest(SessionTurnPlanTestBase):
     def test_prepares_an_immutable_deterministic_spec(self) -> None:
         scenario = self._scenario()
@@ -572,6 +574,7 @@ class PrepareSessionTurnTest(SessionTurnPlanTestBase):
         self.assertEqual(ctx.exception.code, "manager")
 
 
+@slow
 class ParentVerificationTest(SessionTurnPlanTestBase):
     def test_cross_project_task_is_refused(self) -> None:
         first = self._scenario()
@@ -635,6 +638,7 @@ class ParentVerificationTest(SessionTurnPlanTestBase):
         self.assertEqual(ctx.exception.code, "dispatch")
 
 
+@slow
 class DispatchBindingTest(SessionTurnPlanTestBase):
     def test_non_reserved_dispatch_is_refused(self) -> None:
         scenario = self._scenario()
@@ -650,6 +654,7 @@ class DispatchBindingTest(SessionTurnPlanTestBase):
         self.assertEqual(ctx.exception.code, "dispatch")
 
 
+@slow
 class MappingBindingTest(SessionTurnPlanTestBase):
     def test_mismatched_role_is_refused(self) -> None:
         scenario = self._scenario(
@@ -712,6 +717,7 @@ class MappingBindingTest(SessionTurnPlanTestBase):
         self.assertEqual(ctx.exception.code, "model")
 
 
+@slow
 class LiveReferenceTest(SessionTurnPlanTestBase):
     def test_stale_target_is_refused(self) -> None:
         scenario = self._scenario()
@@ -751,6 +757,7 @@ class LiveReferenceTest(SessionTurnPlanTestBase):
         self.assertEqual(ctx.exception.code, "task")
 
 
+@slow
 class StepAndTextBoundsTest(SessionTurnPlanTestBase):
     def test_smaller_step_limit_is_refused(self) -> None:
         scenario = self._scenario(step_limit=4)
@@ -784,6 +791,7 @@ class StepAndTextBoundsTest(SessionTurnPlanTestBase):
                 self.assertEqual(ctx.exception.code, "canonical")
 
 
+@slow
 class VersionsBindingTest(SessionTurnPlanTestBase):
     def test_versions_route_mismatch_is_refused(self) -> None:
         scenario = self._scenario(versions_route="direct_call")
@@ -822,6 +830,7 @@ class VersionsBindingTest(SessionTurnPlanTestBase):
         self.assertEqual(ctx.exception.code, "versions")
 
 
+@slow
 class CriticPlanTest(SessionTurnPlanTestBase):
     def test_fresh_critic_is_marked_and_distinct(self) -> None:
         scenario = self._scenario(
@@ -893,6 +902,7 @@ _BAD_FIELD_VALUES = {
 }
 
 
+@slow
 class SpecSelfCheckTest(SessionTurnPlanTestBase):
     """``SessionTurnSpec`` is an exact, strict, all-fields self-checking value object."""
 
@@ -1032,6 +1042,7 @@ class SpecSelfCheckTest(SessionTurnPlanTestBase):
                     dataclasses.replace(spec, **{name: bad})
 
 
+@slow
 class StrictForgeryTest(SessionTurnPlanTestBase):
     """Forged-but-projection-consistent values must still fail the strict rules.
 
@@ -1206,6 +1217,7 @@ class StrictForgeryTest(SessionTurnPlanTestBase):
         self._assert_rejected(spec, plan, message, model="not-a-model-ref")
 
 
+@slow
 class LocationReadOnlyPlanTest(SessionTurnPlanTestBase):
     """The planner uses the manager's read-only location lookup and creates nothing."""
 
@@ -1228,6 +1240,7 @@ class LocationReadOnlyPlanTest(SessionTurnPlanTestBase):
         self.assertEqual(scenario.manager.read_password_calls, 0)
 
 
+@slow
 class CriticConfigurationSanityTest(unittest.TestCase):
     """The underlying role configuration refuses a same-concrete-model critic."""
 

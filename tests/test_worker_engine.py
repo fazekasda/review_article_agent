@@ -35,6 +35,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -1130,6 +1131,7 @@ class RegistryUnavailableTest(EngineTestBase):
         self.assertTrue(self._submit_numeric("reg-2")["ok"])
 
 
+@slow
 class DetachedEntrypointTest(EngineTestBase):
     def test_detached_worker_start_status_stop(self) -> None:
         self.registry.activate_execution(self.project.project_id)

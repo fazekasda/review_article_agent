@@ -52,6 +52,7 @@ from review_article_agent.drafting import (  # noqa: E402
 from review_article_agent.domain.records import canonical_json  # noqa: E402
 from review_article_agent.extraction import workflow as extraction_workflow  # noqa: E402
 from review_article_agent.synthesis.workflow import SynthesisWorkflowRepository  # noqa: E402
+from _tiers import slow
 
 _CASE = "c1"
 _FINDING = _CASE + ":F1"
@@ -261,6 +262,7 @@ class TwoSourcePerFindingTests(DraftingPackageBase):
         self.approve_ref(outline_ref, GATE_OUTLINE_KIND, GATE_OUTLINE)
         return outline_ref
 
+    @slow
     def test_each_finding_gets_its_own_source_and_citation(self):
         outline_ref = self._two_source_chain()
         package = self.pkg.build(outline_ref, "sec1")
@@ -292,6 +294,7 @@ class TwoSourcePerFindingTests(DraftingPackageBase):
         )
 
 
+@slow
 class MetadataRejectionTests(DraftingPackageBase):
     def setUp(self):
         super().setUp()
@@ -363,6 +366,7 @@ class CitationKeyTests(DraftingPackageBase):
         self.assertTrue(first.startswith("cit_"))
         self.assertNotEqual(first, citation_key("OTHER-PROJECT", candidate_id))
 
+    @slow
     def test_key_is_stable_across_reopen(self):
         _syn, _fw, outline_ref = self.approved_chain()
         before = self.pkg.build(outline_ref, "sec1")["citations"]
@@ -372,6 +376,7 @@ class CitationKeyTests(DraftingPackageBase):
         self.assertEqual(list(before), [citation_key(self.project_id, self.cands["111"])])
 
 
+@slow
 class DraftingOverRealRunnerTest(extraction_runner.FullFlowIntegrationTest):
     """Prove the real verified receipts (per-passage source refs) feed a package.
 

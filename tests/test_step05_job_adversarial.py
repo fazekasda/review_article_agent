@@ -53,6 +53,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -361,6 +362,7 @@ class RealProcessKillDuringPostTest(DiscoveryJobRoutesBase):
             time.sleep(0.05)
         return last
 
+    @slow
     def test_kill_during_first_fake_post_before_response_never_reposts(self):
         batch_ref = self.build_lead_batch()
         self.approve_batch(batch_ref)

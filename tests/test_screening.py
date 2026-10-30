@@ -17,6 +17,7 @@ from review_article_agent.screening import workflow
 from review_article_agent.screening.workflow import classify, questions
 from review_article_agent.storage.artifacts import DependencyRef
 from review_article_agent.storage.store import ProjectStore
+from _tiers import slow
 
 
 def config():
@@ -90,6 +91,7 @@ class WorkflowTests(ManifestBase):
                 "false_exclusion": false, "rationale": "Read exact original source",
                 "corrective_action": "Revise rules and re-pilot" if false else None}}}
 
+    @slow
     def test_real_gates_audit_replay_and_restart(self):
         batch = self.make_batch()
         result = self.screening.read(batch, "batch")
@@ -201,6 +203,7 @@ class WorkflowTests(ManifestBase):
         with self.assertRaises(ScreeningError):
             self.screening.require_exclusions(audit)
 
+    @slow
     def test_false_exclusion_permanently_pauses_exact_batch(self):
         batch = self.make_batch()
         audit = self.put("audit", self.audit_input(batch, True))

@@ -28,6 +28,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -906,6 +907,7 @@ class CorpusFreezeImmutabilityTests(FreezeTestBase):
 # G. Durable backup / restore
 # --------------------------------------------------------------------------- #
 class FreezeBackupTests(FreezeTestBase):
+    @slow
     def test_authentic_freeze_survives_backup_and_restore(self):
         corpus_ref, coverage_ref, _plan, snapshot = self.freeze_setup()
         revision = self.propose(corpus_ref, coverage_ref, snapshot, request_id="f1", accept="accepted")

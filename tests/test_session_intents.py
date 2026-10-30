@@ -38,6 +38,7 @@ import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -156,6 +157,7 @@ class SessionIntentTestBase(SessionTurnPlanTestBase):
         scenario.store.connection.execute(f"DROP TRIGGER {name}")
 
 
+@slow
 class RecordAndRestartTest(SessionIntentTestBase):
     def test_records_immutable_correlation_and_reloads_after_restart(self) -> None:
         scenario = self._scenario()
@@ -208,6 +210,7 @@ class RecordAndRestartTest(SessionIntentTestBase):
         self.assertEqual(session_intent_integrity_problems(reopened.connection, pid), [])
 
 
+@slow
 class ReplayTest(SessionIntentTestBase):
     def test_identical_replay_is_idempotent_and_divergent_replay_refused(self) -> None:
         scenario = self._scenario()
@@ -235,6 +238,7 @@ class ReplayTest(SessionIntentTestBase):
         self.assertEqual(repo.verify_all_integrity(), [])
 
 
+@slow
 class RefusalTest(SessionIntentTestBase):
     def test_wrong_fence_is_refused_and_writes_nothing(self) -> None:
         scenario = self._scenario()
@@ -290,6 +294,7 @@ class RefusalTest(SessionIntentTestBase):
         self.assertEqual(repo.verify_all_integrity(), [])
 
 
+@slow
 class ForgedProjectionTest(SessionIntentTestBase):
     def test_forged_self_consistent_projections_are_refused(self) -> None:
         scenario = self._scenario()
@@ -360,6 +365,7 @@ class ForgedProjectionTest(SessionIntentTestBase):
                 self.assertEqual(self._count(scenario), 0)
 
 
+@slow
 class HistoricalReadTest(SessionIntentTestBase):
     def test_historical_read_survives_a_moved_input_head(self) -> None:
         scenario = self._scenario()
@@ -419,6 +425,7 @@ class HistoricalReadTest(SessionIntentTestBase):
         self.assertEqual(self._count(scenario), 1)
 
 
+@slow
 class CorruptionSweepTest(SessionIntentTestBase):
     def _assert_read_and_sweep_fail(self, scenario, dispatch_id, fragment=None) -> None:
         repo = SessionIntentRepository(scenario.store)
@@ -506,6 +513,7 @@ class CorruptionSweepTest(SessionIntentTestBase):
         )
 
 
+@slow
 class ImmutabilityAndUniquenessTest(SessionIntentTestBase):
     def test_rows_are_append_only(self) -> None:
         scenario, spec, _ = self._fixture()
@@ -565,6 +573,7 @@ class ImmutabilityAndUniquenessTest(SessionIntentTestBase):
         self.assertEqual(self._count(scenario), 1)
 
 
+@slow
 class MigrationTest(SessionIntentTestBase):
     def test_schema9_to_10_preserves_old_rows(self) -> None:
         root = str(self.tmp / "p9")

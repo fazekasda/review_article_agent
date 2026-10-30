@@ -38,6 +38,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -504,6 +505,7 @@ class ResultTestBase(unittest.TestCase):
         )
 
 
+@slow
 class RecordResultTest(ResultTestBase):
     def test_records_complete_set_and_rows(self) -> None:
         self.submit()
@@ -846,6 +848,7 @@ class RecordResultTest(ResultTestBase):
             row.record["cost"]["state"] = "FORGED"  # type: ignore[index]
 
 
+@slow
 class IntegrityAndHistoryTest(ResultTestBase):
     def test_ref_byte_corruption_detected_on_read(self) -> None:
         self.submit()
@@ -951,6 +954,7 @@ class IntegrityAndHistoryTest(ResultTestBase):
         self.assertTrue(any("orphan" in problem for problem in problems))
 
 
+@slow
 class RepairRegressionTest(ResultTestBase):
     """Focused T5g-R1 repairs: strict envelope ints and independent intent coverage."""
 
@@ -1341,6 +1345,7 @@ class RepairRegressionTest(ResultTestBase):
         )
 
 
+@slow
 class MigrationTest(ResultTestBase):
     def test_schema8_to_9_preserves_intent_and_rows(self) -> None:
         # A schema-8 store with a recorded intent upgrades to 9 additively.
