@@ -70,6 +70,21 @@ FAKE_MODULES = {
         "    def test_slow(self):\n"
         "        pass\n"
     ),
+    "test_sqlite_env": (
+        "import os\n"
+        "import unittest\n\n"
+        "class T(unittest.TestCase):\n"
+        "    def test_off_by_default(self):\n"
+        "        self.assertEqual(\n"
+        "            os.environ.get('RAA_TEST_SQLITE_SYNCHRONOUS'), 'OFF')\n"
+    ),
+    "test_sqlite_durable": (
+        "import os\n"
+        "import unittest\n\n"
+        "class T(unittest.TestCase):\n"
+        "    def test_absent_when_durable(self):\n"
+        "        self.assertNotIn('RAA_TEST_SQLITE_SYNCHRONOUS', os.environ)\n"
+    ),
     "test_sleep": (
         "import time\n"
         "import unittest\n\n"
@@ -147,6 +162,32 @@ class TestNormalizeModule(unittest.TestCase):
     def test_forms(self):
         for raw in ("tests.test_x", "test_x", "tests/test_x.py", "test_x.py"):
             self.assertEqual(rt.normalize_module(raw), "test_x")
+
+
+class TestBuildEnv(unittest.TestCase):
+    def test_default_sets_sqlite_off(self):
+        env = rt.build_env({}, slow=False)
+        self.assertEqual(env["RAA_TEST_SQLITE_SYNCHRONOUS"], "OFF")
+        self.assertNotIn("RAA_SLOW_TESTS", env)
+
+    def test_slow_keeps_sqlite_off(self):
+        env = rt.build_env({}, slow=True)
+        self.assertEqual(env["RAA_SLOW_TESTS"], "1")
+        self.assertEqual(env["RAA_TEST_SQLITE_SYNCHRONOUS"], "OFF")
+
+    def test_durable_sqlite_removes_variable(self):
+        env = rt.build_env(
+            {"RAA_TEST_SQLITE_SYNCHRONOUS": "OFF"}, slow=False,
+            durable_sqlite=True,
+        )
+        self.assertNotIn("RAA_TEST_SQLITE_SYNCHRONOUS", env)
+
+    def test_durable_sqlite_overrides_parent_normal(self):
+        env = rt.build_env(
+            {"RAA_TEST_SQLITE_SYNCHRONOUS": "NORMAL"}, slow=False,
+            durable_sqlite=True,
+        )
+        self.assertNotIn("RAA_TEST_SQLITE_SYNCHRONOUS", env)
 
 
 class TestFakeRepo(FakeRepoMixin, unittest.TestCase):
@@ -233,6 +274,22 @@ class TestFakeRepo(FakeRepoMixin, unittest.TestCase):
         self.assertEqual(with_slow.returncode, 0,
                          with_slow.stdout + with_slow.stderr)
         self.assertEqual(self.summary_skipped(with_slow.stdout), 0)
+
+    def test_sqlite_env_off_by_default(self):
+        repo, _ = self.make_repo(("test_sqlite_env",))
+        proc = self.run_cli(repo, "test_sqlite_env")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_durable_sqlite_flag_keeps_full(self):
+        repo, _ = self.make_repo(("test_sqlite_durable",))
+        # Without the flag the child gets OFF, so "absent" must fail.
+        default = self.run_cli(repo, "test_sqlite_durable")
+        self.assertEqual(default.returncode, 1,
+                         default.stdout + default.stderr)
+        # With --durable-sqlite the variable is removed -> production FULL.
+        durable = self.run_cli(repo, "test_sqlite_durable", "--durable-sqlite")
+        self.assertEqual(durable.returncode, 0,
+                         durable.stdout + durable.stderr)
 
     def test_budget_overrun_exit_one(self):
         repo, _ = self.make_repo(("test_sleep",))

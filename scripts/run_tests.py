@@ -21,6 +21,9 @@ with ``cwd`` set to the repo root and an environment that copies ``os.environ``,
 prepends ``src:tests`` to ``PYTHONPATH`` and sets ``PYTHONDONTWRITEBYTECODE=1``.
 ``--slow`` additionally sets ``RAA_SLOW_TESTS=1`` for the child (the slow tier
 introduced separately); without it the variable is removed from the child env.
+By default the child also gets ``RAA_TEST_SQLITE_SYNCHRONOUS=OFF``, the
+test-only hook that lowers SQLite durability for throwaway temp stores; pass
+``--durable-sqlite`` to keep the production ``PRAGMA synchronous = FULL``.
 
 Exit codes: ``0`` all passed and within budget, ``1`` any failure/timeout or a
 budget overrun, ``2`` usage error.
@@ -142,8 +145,14 @@ def parse_output(text: str) -> dict:
     }
 
 
-def build_env(base_env: dict, slow: bool) -> dict:
-    """Return the child environment for a module run."""
+def build_env(base_env: dict, slow: bool, durable_sqlite: bool = False) -> dict:
+    """Return the child environment for a module run.
+
+    By default the child gets ``RAA_TEST_SQLITE_SYNCHRONOUS=OFF``, the test-only
+    hook that lowers SQLite durability for throwaway temp stores (see
+    ``storage.schema.resolve_synchronous``). ``durable_sqlite`` restores the
+    production ``FULL`` by removing the variable from the child environment.
+    """
     env = dict(base_env)
     prefix = "src:tests"
     existing = env.get("PYTHONPATH")
@@ -153,12 +162,22 @@ def build_env(base_env: dict, slow: bool) -> dict:
         env["RAA_SLOW_TESTS"] = "1"
     else:
         env.pop("RAA_SLOW_TESTS", None)
+    if durable_sqlite:
+        env.pop("RAA_TEST_SQLITE_SYNCHRONOUS", None)
+    else:
+        env["RAA_TEST_SQLITE_SYNCHRONOUS"] = "OFF"
     return env
 
 
-def run_module(name: str, repo: str, slow: bool, timeout: float | None) -> dict:
+def run_module(
+    name: str,
+    repo: str,
+    slow: bool,
+    timeout: float | None,
+    durable_sqlite: bool = False,
+) -> dict:
     """Run one module in a subprocess and return its result dict."""
-    env = build_env(os.environ, slow)
+    env = build_env(os.environ, slow, durable_sqlite)
     cmd = [sys.executable, "-m", "unittest", f"tests.{name}"]
     start = time.monotonic()
     timed_out = False
@@ -206,14 +225,16 @@ def write_durations(path: str, results: list[dict]) -> None:
         fh.write("\n")
 
 
-def _run_all(modules, repo, jobs, slow, timeout):
+def _run_all(modules, repo, jobs, slow, timeout, durable_sqlite=False):
     """Run every module in parallel; yield results as they complete."""
     results = []
     if not modules:
         return results
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=jobs)
     futures = {
-        executor.submit(run_module, name, repo, slow, timeout): name
+        executor.submit(
+            run_module, name, repo, slow, timeout, durable_sqlite
+        ): name
         for name in modules
     }
     try:
@@ -244,6 +265,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--slow", action="store_true",
         help="set RAA_SLOW_TESTS=1 for the child processes (slow tier)",
+    )
+    parser.add_argument(
+        "--durable-sqlite", action="store_true",
+        help="keep production PRAGMA synchronous=FULL in children "
+        "(default: test-only RAA_TEST_SQLITE_SYNCHRONOUS=OFF)",
     )
     parser.add_argument(
         "--top", type=int, default=10,
@@ -291,7 +317,10 @@ def main(argv: list[str] | None = None) -> int:
 
     wall_start = time.monotonic()
     try:
-        results = _run_all(modules, repo, args.jobs, args.slow, args.timeout)
+        results = _run_all(
+            modules, repo, args.jobs, args.slow, args.timeout,
+            args.durable_sqlite,
+        )
     except KeyboardInterrupt:
         _kill_children()
         sys.stdout.write("\ninterrupted; terminating child processes\n")

@@ -18,6 +18,7 @@ including future artifact rows — is preserved across upgrades.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 from typing import Callable, Mapping
@@ -31,12 +32,50 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-#: SQL statements that must hold for every connection.
-COMMON_PRAGMAS = (
-    "PRAGMA foreign_keys = ON",
-    "PRAGMA journal_mode = WAL",
-    "PRAGMA synchronous = FULL",
-)
+#: The durability production connections use. Only the test-only hook below
+#: may lower it; see :func:`resolve_synchronous`.
+PRODUCTION_SYNCHRONOUS = "FULL"
+
+#: Test-only environment hook that lowers SQLite durability for throwaway temp
+#: stores. It weakens crash durability — a power loss or OS crash can corrupt
+#: the database — so it must **never** be set in production. See
+#: :func:`resolve_synchronous`.
+TEST_SYNCHRONOUS_ENV = "RAA_TEST_SQLITE_SYNCHRONOUS"
+
+
+def resolve_synchronous(env: Mapping[str, str] | None = None) -> str:
+    """Return the ``PRAGMA synchronous`` value for new connections.
+
+    Production is always ``FULL``. This is a **test-only** hook: when the
+    environment variable ``RAA_TEST_SQLITE_SYNCHRONOUS`` is set to exactly
+    ``OFF`` or ``NORMAL`` (case-sensitive), that weaker durability is used so
+    throwaway temp stores skip the fsyncs that dominate store-heavy test time.
+    Any other value — unset, empty, ``FULL``, wrong case, arbitrary text — and
+    a missing/unreadable environment resolve to ``FULL``. The function never
+    raises.
+    """
+    if env is None:
+        env = os.environ
+    try:
+        value = env.get(TEST_SYNCHRONOUS_ENV)
+    except Exception:  # noqa: BLE001 - connection setup must never fail here
+        return PRODUCTION_SYNCHRONOUS
+    if value in ("OFF", "NORMAL"):
+        return value
+    return PRODUCTION_SYNCHRONOUS
+
+
+def common_pragmas(synchronous: str = PRODUCTION_SYNCHRONOUS) -> tuple[str, ...]:
+    """Return the SQL pragma statements applied to every connection."""
+    return (
+        "PRAGMA foreign_keys = ON",
+        "PRAGMA journal_mode = WAL",
+        f"PRAGMA synchronous = {synchronous}",
+    )
+
+
+#: SQL statements that must hold for every connection (production defaults).
+COMMON_PRAGMAS = common_pragmas()
 
 Migration = Callable[[sqlite3.Connection], None]
 
@@ -1609,7 +1648,7 @@ def open_connection(db_path: str) -> sqlite3.Connection:
             f"could not open the local database at {db_path!r}."
         ) from exc
     conn.row_factory = sqlite3.Row
-    for pragma in COMMON_PRAGMAS:
+    for pragma in common_pragmas(resolve_synchronous()):
         try:
             conn.execute(pragma)
         except sqlite3.Error as exc:
