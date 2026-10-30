@@ -105,6 +105,7 @@ def _new_state(delivery_id) -> dict:
         "applied_batches": [],
         "revalidation_required": [],
         "approval": None,
+        "invalidated_approvals": [],
         "export": None,
     }
 
@@ -193,6 +194,14 @@ class DeliveryRepository:
         _require(state is not None, f"delivery {delivery_id!r} has not been started")
         return state
 
+    def _invalidate_approval(self, state):
+        """A later change invalidates a recorded approval (AC7)."""
+        if state.get("approval") is not None:
+            state.setdefault("invalidated_approvals", []).append(state["approval"])
+            state["approval"] = None
+            state["status"] = "in_progress"
+        return state
+
     # -- 1. global review gate ----------------------------------------------- #
     def start_global_review(self, delivery_id, sections, origin_state, rights=None):
         """Start the global review, persisting nothing if the gate is not met."""
@@ -276,6 +285,7 @@ class DeliveryRepository:
         prior = {"topups_used": (state.get("freshness") or {}).get("topups_used", 0)}
         result = freshness_checkpoint(cutoff_date, decision, prior)
         state["freshness"] = result
+        self._invalidate_approval(state)
         self._persist(state)
         return state
 
@@ -306,6 +316,7 @@ class DeliveryRepository:
                 )
         state = apply_notes_batch(state, batch_id, approval_id, edits)
         state["status"] = "in_progress"
+        self._invalidate_approval(state)
         self._persist(state)
         return state
 
@@ -325,6 +336,7 @@ class DeliveryRepository:
         state["revalidation_required"] = [
             pid for pid in state.get("revalidation_required") or [] if pid not in ids
         ]
+        self._invalidate_approval(state)
         self._persist(state)
         return state
 

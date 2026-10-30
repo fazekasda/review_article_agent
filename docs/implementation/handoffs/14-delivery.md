@@ -50,7 +50,10 @@ storage migration, no new dependency. `schema.py`/`export.py` behavior is
   `tests.test_delivery_export`).
 - AC7 (validate revisions/hashes immediately before export; any later change
   invalidates approval):
-  `ApprovalAndExportTests.test_hash_change_after_approval_refuses_export`.
+  `ApprovalAndExportTests.test_hash_change_after_approval_refuses_export`,
+  `ApprovalAndExportTests.test_later_notes_edit_invalidates_approval_and_blocks_export`
+  (a change after approval clears `state["approval"]` into
+  `invalidated_approvals` and blocks export).
 - AC8 (export disclosures only under the ratified contract and venue policy;
   never assert independent validation or submission compliance):
   `HappyPathTests.test_complete_example_delivery_and_backup_restore`
@@ -105,4 +108,4 @@ storage migration, no new dependency. `schema.py`/`export.py` behavior is
 - `python3 scripts/check_contract_docs.py` — **15 checks ok, 0 failed**.
 - `git diff --check` — clean.
 - Focused run: `PYTHONPATH=src python3 -m unittest tests.test_delivery_schema tests.test_delivery_export tests.test_delivery_workflow`
-  — **58 tests OK** (11 workflow).
+  — **59 tests OK** (12 workflow).

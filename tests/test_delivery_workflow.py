@@ -534,6 +534,44 @@ class ApprovalAndExportTests(DeliveryBase):
                 rights=self.rights,
             )
 
+    def test_later_notes_edit_invalidates_approval_and_blocks_export(self):
+        did = "delivery-invalidate"
+        self._approved(did)
+        self.repo.notes(
+            did, [{"note_id": "n1", "text": "tighten wording", "category": "wording"}],
+            rights=self.rights,
+        )
+        state = self.repo.apply_notes(
+            did,
+            batch_id="b1",
+            approval_id="appr-1",
+            edits=[
+                {
+                    "note_id": "n1",
+                    "paragraph_id": "p1",
+                    "new_text": "Body [@k1]. adjusted wording.",
+                    "kind": "wording",
+                }
+            ],
+            rights=self.rights,
+        )
+        self.assertIsNone(state["approval"])
+        self.assertEqual(len(state["invalidated_approvals"]), 1)
+        self.assertEqual(state["status"], "in_progress")
+
+        with self.assertRaises(DeliveryError):
+            self.repo.export(
+                did,
+                manuscript={"revision_id": "m1", "text": "Body [@k1]. adjusted wording."},
+                references=[_ref()],
+                corpus=CORPUS,
+                current_hashes={"art-1": "sha-1"},
+                policy={"companion_accepted": True, "journal_policy_verified": False},
+                ai_use=[],
+                out_dir=self.tmp / "export-invalidated",
+                rights=self.rights,
+            )
+
     def test_hash_change_after_approval_refuses_export(self):
         did = "delivery-hash"
         self._approved(did)
