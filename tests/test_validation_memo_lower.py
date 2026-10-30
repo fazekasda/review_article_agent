@@ -46,7 +46,6 @@ from test_extraction_workflow import WorkflowBase  # noqa: E402
 
 from review_article_agent.acquisition import manifest as manifest_mod  # noqa: E402
 from review_article_agent.discovery import freeze as freeze_mod  # noqa: E402
-from review_article_agent.extraction import workflow as workflow_mod  # noqa: E402
 from review_article_agent.extraction.workflow import (  # noqa: E402
     GATE_BATCH,
     GATE_KIND,
