@@ -269,8 +269,17 @@ is the canonical pattern.
 - The delivery roles (`global_reviewer`/`global_writer`/`notes_planner`) and
   `screening` **are** wired now (`generation/delivery_roles.py`,
   `screening/runner.py`), but there is still **no CLI** to propose a
-  `generation_hosted_use` document (Python API only) and **no worker job kind**
-  for the generation roles yet (a pipeline/orchestrator change will add them).
+  `generation_hosted_use` document (Python API only).
+- There **is** now a worker job kind for the generation roles: the detached
+  `generation_run` job (`discovery_submit` `mode=generation_run`) with the
+  `generation run submit|status` CLI. On this branch it wires the single-shot
+  `synthesis`/`framework`/`outline` (`synthesis_roles`) and `blueprint`/`draft`
+  (`drafting_roles`) operations plus `section_review` (`review_roles` ports over
+  `review/workflow.SectionReviewRepository.run`). The delivery
+  (`global_review`, `notes_plan`) and `screening_case` operations are recognized
+  but **refused** by the worker job kind as not yet supported (a validation error;
+  nothing is sent and no job is created). See [`worker.md`](worker.md) §15 and
+  [`cli.md`](cli.md) §23.
 - Live model validation of these roles is **unrun**; the user separately
   authorized one small live OpenRouter smoke test, which is not authorization to
   upload third-party papers or approve a real project.

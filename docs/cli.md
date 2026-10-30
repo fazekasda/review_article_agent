@@ -1268,3 +1268,60 @@ never dispatches a model or reaches the network.
 Errors use the exit categories of §3 with static, value-free messages, and every
 output carries `authorizes_execution=false`, `authorizes_export=false`, and
 `scientific_validation=false`.
+
+## 23. Generation role runs — `generation run` (kickoff 16 §5 addition)
+
+This section adds the detached **run** sub-group over the model-backed generation-role
+worker surface (`discovery_submit` `mode=generation_run`; see
+[`worker.md`](worker.md) §15 and the role reference [`generation.md`](generation.md)).
+The existing `job status|list|attach|pause|resume|cancel|drain|switch|reconcile`
+lifecycle commands apply to a queued run unchanged.
+
+### 19.1 `generation run submit`
+
+`generation run submit` assembles one exact `generation_run` submission and returns a
+**queued admission only** — never a completion and never a model output:
+
+```
+generation run submit \
+  --operation {synthesis,framework,outline,blueprint,draft,section_review} \
+  --credential-env OPENROUTER_API_KEY \
+  --request-id ID \
+  [--params-file PATH | <op-specific flags>] \
+  [--project ID] [--timeout SECONDS]
+```
+
+* `--params-file` is a strict JSON object holding the operation's exact parameters
+  (refs as `{"artifact_id","revision_id"}`, the `rights` record, and any optional
+  fields); the CLI fills in the project id on every reference. The op-specific flags
+  (`--<ref>-artifact-id`/`--<ref>-revision-id`, `--artifact-id`, `--revision-id`,
+  `--review-id`, `--parent-revision-id`, `--source-refs-file`, `--rights-file`) are an
+  alternative to `--params-file`.
+* The wired operations are `synthesis`/`framework`/`outline`, `blueprint`/`draft`, and
+  `section_review`. The recognized-but-unsupported operations `global_review`,
+  `notes_plan`, and `screening_case` are refused with a `validation` error before a
+  worker is ensured (nothing is sent and no job is created).
+* Every argument is validated locally, and the assembled parameters are canonicalised by
+  the **real** generation submission validator, **before** a worker is ensured — so a bad
+  value is a typed `validation` error and no daemon is started and no job is created.
+* `--credential-env` must name the one approved variable (`OPENROUTER_API_KEY`); the
+  credential **value** is never accepted, sent over IPC, persisted, or logged. The worker
+  reads the named variable from its own environment at dispatch, and the CLI warns
+  (`configuration_required`/`notice`) when the key is absent — it never restarts or
+  reconfigures a user's worker.
+* The output carries `queued=true`, `admission_only=true`, `job_completion=false`,
+  `key_value_accepted=false`, `scientific_validation=false`, and
+  `authorizes_publication=false`.
+
+### 19.2 `generation run status`
+
+`generation run status --request-id ID [--project ID]` reads one recorded run **locally**
+from the verified project store (no worker, no POST, no approval). The safe run projection
+is returned under `run` (operation/status/reason, the written `ref` / `review_id`, and a
+safe generation readback); the private model output is never included. When the run has
+not completed, `job_state` reports the durable scheduling state. The output carries
+`authorizes_publication=false` and `scientific_validation=false`. An unknown request id is
+a `validation` error.
+
+Errors use the exit categories of §3 with static, value-free messages. Status and
+disclosures: [`worker.md`](worker.md) §15 and [`generation.md`](generation.md).
