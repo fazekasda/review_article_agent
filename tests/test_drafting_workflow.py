@@ -196,7 +196,6 @@ class ProposeReadAndGateTests(BlueprintBase):
         self.assertIn(json.dumps(outline_ref, sort_keys=True), refs)
 
 
-@slow
 class OwnerGateIsolationTests(BlueprintBase):
     def test_unapproved_other_section_does_not_block(self):
         _s, _f, outline_ref = self.approved_chain()
@@ -300,7 +299,6 @@ class StalenessAndHistoryTests(BlueprintBase):
                             artifact_id="bp-sec1", revision="bp-sec1-r2", parent="bp-sec1-r1")
 
 
-@slow
 class FailClosedTests(BlueprintBase):
     def _import_blueprint(self, payload, *, artifact_id="forged-bp", revision="forged-bp-r1",
                           dependencies=()):
@@ -358,6 +356,7 @@ class FailClosedTests(BlueprintBase):
         with self.assertRaises(DraftingWorkflowError):
             self.wf.read(ref, current=False)
 
+    @slow
     def test_failed_propose_writes_nothing(self):
         _s, _f, outline_ref = self.approved_chain()
         ws_ref = self.make_workspace(outline_ref)

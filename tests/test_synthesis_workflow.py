@@ -486,7 +486,6 @@ class ImpactTests(SynthesisBase):
             self.assertEqual(impact["affected_sections"][section_id], ["global_change"])
 
 
-@slow
 class RefEqualityAndFailClosedTests(SynthesisBase):
     def _two_syntheses_one_framework(self):
         audit_ref, _batch = self.accepted_audit()

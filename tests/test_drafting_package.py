@@ -98,7 +98,6 @@ class DraftingPackageBase(SynthesisBase):
         self.pkg = DraftingPackageRepository(self.store)
 
 
-@slow
 class HappyPathTests(DraftingPackageBase):
     def test_package_is_reconstructible_and_reopens_identically(self):
         _syn, _fw, outline_ref = self.approved_chain()

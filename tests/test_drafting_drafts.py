@@ -148,7 +148,6 @@ class DraftBase(BlueprintBase):
         )
 
 
-@slow
 class DraftGateAndProposeTests(DraftBase):
     def test_kinds_extended_with_draft_and_assembly(self):
         self.assertEqual(KINDS, ("blueprint", "draft", "assembly"))
@@ -202,6 +201,7 @@ class DraftGateAndProposeTests(DraftBase):
                 self.draft_payload(bp3), artifact_id="draft-sec3", revision="draft-sec3-r1"
             )
 
+    @slow
     def test_draft_is_stored_with_its_blueprint_and_package_snapshot(self):
         _s, _f, outline_ref = self.approved_chain()
         ws_ref = self.make_workspace(outline_ref)
@@ -220,6 +220,7 @@ class DraftGateAndProposeTests(DraftBase):
         self._reopen()
         self.assertEqual(self.wf.read(d_ref, "draft"), envelope)
 
+    @slow
     def test_draft_payload_contract_is_exact(self):
         _s, _f, outline_ref = self.approved_chain()
         ws_ref = self.make_workspace(outline_ref)

@@ -607,7 +607,6 @@ class ErrorRedactionTest(DraftingCliBase):
         self.assertNotIn("Traceback", json.dumps(error))
 
 
-@slow
 class DelegationTest(DraftingCliBase):
     """The CLI delegates to the repositories; it never fabricates a mapping."""
 

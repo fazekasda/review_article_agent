@@ -33,7 +33,6 @@ import sys
 import unittest
 from pathlib import Path
 from unittest import mock
-from _tiers import slow
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
@@ -64,7 +63,6 @@ def _counting_validate_synthesis(calls):
     return wrapper
 
 
-@slow
 class UpperChainMemoTests(SynthesisBase):
     def test_require_outline_validates_synthesis_once_per_operation(self):
         # ``require_outline`` reaches ``require_synthesis`` directly, via
@@ -139,7 +137,6 @@ class UpperChainMemoTests(SynthesisBase):
 
 
 class DraftingPackageMemoTests(DraftingPackageBase):
-    @slow
     def test_package_build_validates_synthesis_once_per_operation(self):
         # A single ``build`` re-reads the whole approved chain; the memo must
         # validate the synthesis once for the whole operation.
