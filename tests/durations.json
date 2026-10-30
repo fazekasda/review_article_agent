@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "unit": "seconds",
+  "modules": {
+    "test_cli": 27.0,
+    "test_cli_drafting": 91.7,
+    "test_cli_gates": 22.8,
+    "test_cli_human_gates": 33.6,
+    "test_cli_jobs": 50.5,
+    "test_cli_snapshot": 42.6,
+    "test_drafting_drafts": 674.7,
+    "test_drafting_package": 75.7,
+    "test_drafting_workflow": 207.6,
+    "test_drafting_workspace": 116.4,
+    "test_opencode_service": 29.7,
+    "test_session_runner_acceptance": 21.9,
+    "test_step04_service_acceptance": 39.9,
+    "test_step15_e2e_manuscript": 29.4,
+    "test_synthesis_workflow": 59.2
+  }
+}
