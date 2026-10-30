@@ -110,6 +110,13 @@ ROLE_CONFIG_SCHEMA_VERSION = 1
 #: The finite set of dedicated scientific roles (``docs/specification.md``
 #: "Confirmed scientific workflow"). No role outside this set is accepted, so a
 #: typo cannot silently become an unpermissioned actor.
+#:
+#: The **generative model roles** of the direct OpenRouter route (kickoff 16 §5;
+#: :data:`review_article_agent.runtime.generation.ROLES`) are part of this same
+#: closed set: a generation task must be able to name its exact role, and the
+#: stored non-authoritative proposal records that role. ``section_critic`` and
+#: ``fact_checker`` already exist above and are shared; the remaining generation
+#: roles are appended here.
 SCIENTIFIC_ROLES: tuple[str, ...] = (
     "lead",
     "search",
@@ -120,6 +127,16 @@ SCIENTIFIC_ROLES: tuple[str, ...] = (
     "fact_checker",
     "manuscript_reviewer",
     "origin_tracer",
+    "screening",
+    "synthesis",
+    "framework",
+    "outline",
+    "blueprint",
+    "section_writer",
+    "section_repair",
+    "global_reviewer",
+    "global_writer",
+    "notes_planner",
 )
 
 #: Upper bound on any role's agent ``steps`` (finite, bounded model steps).
@@ -175,6 +192,18 @@ ROLE_DEFAULT_STEPS: dict[str, int] = {
     "fact_checker": 8,
     "manuscript_reviewer": 8,
     "origin_tracer": 10,
+    # Generative model roles (kickoff 16 §5): a single bounded direct-call step
+    # per durable request.
+    "screening": 1,
+    "synthesis": 1,
+    "framework": 1,
+    "outline": 1,
+    "blueprint": 1,
+    "section_writer": 1,
+    "section_repair": 1,
+    "global_reviewer": 1,
+    "global_writer": 1,
+    "notes_planner": 1,
 }
 
 #: One-line role descriptions (used for the agent catalog and system prompt).
@@ -214,6 +243,45 @@ ROLE_DESCRIPTIONS: dict[str, str] = {
     "origin_tracer": (
         "Traces claim-relevant citations and proposes origin attributions, "
         "warnings, and open questions."
+    ),
+    "screening": (
+        "Classifies untrusted screening material and proposes inclusion or "
+        "exclusion with reasons; never invents evidence."
+    ),
+    "synthesis": (
+        "Proposes a grounded synthesis / evidence map from untrusted material; "
+        "links every claim to its source and reports uncertainty."
+    ),
+    "framework": (
+        "Proposes a review framework from untrusted material; never invents a "
+        "claim."
+    ),
+    "outline": (
+        "Proposes a review outline from untrusted material; never invents a "
+        "claim."
+    ),
+    "blueprint": (
+        "Proposes section blueprints from untrusted material; never invents a "
+        "claim."
+    ),
+    "section_writer": (
+        "Drafts the requested section from untrusted material; never invents a "
+        "citation."
+    ),
+    "section_repair": (
+        "Proposes a bounded repair of a section from critic findings; never "
+        "invents a citation."
+    ),
+    "global_reviewer": (
+        "Reviews the assembled manuscript for consistency and gaps; reports "
+        "uncertainty and limitations."
+    ),
+    "global_writer": (
+        "Proposes global edits or notes for the manuscript; never invents a "
+        "citation."
+    ),
+    "notes_planner": (
+        "Plans review notes from untrusted material; never invents a claim."
     ),
 }
 

@@ -215,6 +215,8 @@ off-MVP-path tests; the **fast tier** excludes them. See
 - [Step 01 contracts/policies decision 002 (accepted)](docs/decisions/002-step01-contracts-and-policies.md)
 - [Runtime language decision 001 (accepted)](docs/decisions/001-runtime-language.md)
 - [Step 01 kickoff](docs/implementation/kickoffs/01-contracts.md)
+- [Generative roles on the direct OpenRouter route (operator/developer reference)](docs/generation.md)
+- [Generative roles direct-route decision 005 (accepted)](docs/decisions/005-generative-roles-direct-route.md)
 - [Implementation decision record template](docs/implementation/decision-template.md)
 
 Implementation step 04 (restricted agent roles, model adapters, and approvals; see

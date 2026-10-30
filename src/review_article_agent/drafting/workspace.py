@@ -81,6 +81,21 @@ unavailable raw mapping **fails closed** (a missing mapping is refused; a model 
 never fabricated). A historical revision (``current=False``) stays inspectable
 after global changes but **never** carries execution authority.
 
+Direct-route bindings
+---------------------
+
+Besides the session route, a workspace may bind each slot to a **direct-route**
+``generation_hosted_use`` document revision (the route the model port uses).  The
+payload then carries ``planner``/``writer`` descriptors of exactly
+``{kind: "direct_hosted_use", role, hosted_ref}``: ``role`` is the slot's
+generation role (``blueprint`` for the planner, ``section_writer`` for the
+writer) and must match the stored document's role, and the concrete model is
+taken from that document's configuration.  A direct binding records a
+deterministic, project-scoped ``binding_id`` (its per-section-exclusivity and
+distinctness key) in place of a session ``mapping_id``.  The two payload shapes
+are mutually exclusive, every existing session-route check is unchanged, and the
+direct route likewise confers no execution authority.
+
 Fixture disclosure: the tests exercise this module with synthetic runtime
 mappings recorded through the real :class:`RuntimeRepository`; no live OpenCode
 service/session is created (the production route is out of scope here).
@@ -88,6 +103,7 @@ service/session is created (the production route is out of scope here).
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 from ..domain.errors import ReviewAgentError
@@ -96,6 +112,10 @@ from ..domain.records import (
     canonical_json,
     validate_identifier,
     validate_ref,
+)
+from ..generation.hosted_use import (
+    GenerationHostedUseError,
+    validate_hosted_use_document,
 )
 from ..parsing.repository import _NestedStore
 from ..runtime.gates import MAX_GATE_SNAPSHOT_ENTRIES
@@ -110,14 +130,32 @@ DOCUMENT_TYPE = "drafting_section_workspace"
 #: The generic artifact kind for a workspace revision (C01 §5.1).
 ARTIFACT_KIND = "report"
 
-#: The exact, ordered payload keys this repository accepts.
+#: The exact, ordered payload keys this repository accepts for the **session**
+#: binding route (planner/writer pinned to app-owned runtime session mappings).
 PAYLOAD_KEYS = ("outline_ref", "section_id", "planner_mapping_id", "writer_mapping_id")
 
-#: The concrete configured scientific role bound to each slot. The planner reuses
-#: the existing ``synthesizer`` role for a planning purpose distinct from any
-#: execution role; no new scientific role is introduced.
+#: The alternative **direct-route** payload keys: each slot is bound to a
+#: ``generation_hosted_use`` document revision (role + hosted ref) instead of a
+#: runtime session mapping.  The two shapes are mutually exclusive; a payload is
+#: exactly one of them.
+DIRECT_PAYLOAD_KEYS = ("outline_ref", "section_id", "planner", "writer")
+
+#: The concrete configured scientific role bound to each slot on the session
+#: route. The planner reuses the existing ``synthesizer`` role for a planning
+#: purpose distinct from any execution role; no new scientific role is introduced.
 PLANNER_ROLE = "synthesizer"
 WRITER_ROLE = "writer"
+
+#: The concrete **generation role** each slot uses on the direct route, matching
+#: the per-role ``generation_hosted_use`` document role and the runner role.
+PLANNER_GENERATION_ROLE = "blueprint"
+WRITER_GENERATION_ROLE = "section_writer"
+
+#: The binding kind recorded for a direct-route slot.
+DIRECT_BINDING_KIND = "direct_hosted_use"
+
+#: The binding kind recorded for a session-route slot.
+SESSION_BINDING_KIND = "session"
 
 #: The two slot names, in canonical order.
 SLOTS = ("planner", "writer")
@@ -228,6 +266,8 @@ class SectionWorkspaceRepository:
             "the referenced runtime mapping has a foreign role for this slot",
         )
         return {
+            "binding_kind": SESSION_BINDING_KIND,
+            "binding_id": mapping.mapping_id,
             "purpose": purpose,
             "role": mapping.role,
             "mapping_id": mapping.mapping_id,
@@ -243,6 +283,135 @@ class SectionWorkspaceRepository:
             "config_digest": mapping.config_digest,
             "config_snapshot_id": mapping.config_snapshot_id,
         }
+
+    # -- direct-route hosted-use pin ----------------------------------------- #
+    def _direct_binding_id(self, hosted_ref):
+        """Return the deterministic, project-scoped identity of a direct binding.
+
+        Derived only from the project + the exact hosted-use revision, so it is
+        stable across revisions/reads and distinct across projects, and is the
+        per-section-exclusivity / distinctness key for the direct route (the
+        analogue of a session ``mapping_id``).
+        """
+        material = canonical_json(
+            ["drafting.direct_hosted_use", self.store.project_id, self._ref(hosted_ref)]
+        )
+        return "dhu_" + hashlib.sha256(material).hexdigest()[:32]
+
+    def _read_hosted_use_document(self, hosted_ref):
+        """Read and validate the exact hosted-use revision (bytes + document).
+
+        The stored revision's bytes are integrity-checked against its immutable
+        metadata, decoded, validated as a ``generation_hosted_use`` document, and
+        required to be its canonical encoding.  No live gate is required: like the
+        session pin, a historical workspace read stays inspectable after the gate
+        changes, and no authority is conferred here.
+        """
+        hosted_ref = self._ref(hosted_ref)
+        rev = self.artifacts.get_revision(
+            hosted_ref["artifact_id"], hosted_ref["revision_id"]
+        )
+        require(rev is not None, "the referenced hosted-use revision does not exist")
+        data = self.artifacts.read_content(
+            hosted_ref["artifact_id"], hosted_ref["revision_id"]
+        )
+        require(
+            sha256_digest(data) == rev.content_sha256 and len(data) == rev.byte_size,
+            "the referenced hosted-use revision fails content integrity",
+        )
+        try:
+            doc = json.loads(data)
+        except (ValueError, UnicodeDecodeError):
+            raise SectionWorkspaceError(
+                "the referenced hosted-use revision is not decodable"
+            ) from None
+        try:
+            document = validate_hosted_use_document(doc)
+        except GenerationHostedUseError as exc:
+            raise SectionWorkspaceError(str(exc)) from exc
+        require(
+            canonical_json(document) == data,
+            "the referenced hosted-use revision is not the canonical document encoding",
+        )
+        return document
+
+    def _pin_direct_hosted_use(self, spec, *, slot):
+        """Pin one existing direct-route hosted-use document to a slot (fail closed).
+
+        The slot descriptor is exactly ``{kind, role, hosted_ref}`` with
+        ``kind == "direct_hosted_use"``.  The role must be the slot's expected
+        generation role and must match the stored document's role; the concrete
+        model is taken from the stored document's configuration (never in-band and
+        never defaulted).  A missing, foreign, malformed, or role-mismatched
+        document is refused.
+        """
+        require(
+            isinstance(spec, dict) and set(spec) == {"kind", "role", "hosted_ref"},
+            "a direct binding must be exactly kind, role, hosted_ref",
+        )
+        require(
+            spec.get("kind") == DIRECT_BINDING_KIND,
+            "a direct binding must carry the direct_hosted_use kind",
+        )
+        expected_role = (
+            PLANNER_GENERATION_ROLE if slot == "planner" else WRITER_GENERATION_ROLE
+        )
+        role = spec.get("role")
+        require(
+            role == expected_role,
+            "the direct binding role is not the expected generation role for this slot",
+        )
+        hosted_ref = self._ref(spec["hosted_ref"])
+        document = self._read_hosted_use_document(hosted_ref)
+        require(
+            document["payload"]["role"] == role,
+            "the hosted-use document role does not match the direct binding role",
+        )
+        config = document["payload"]["config"]
+        provider_id = config["upstream_provider"]
+        model_id = config["model_id"]
+        return {
+            "binding_kind": DIRECT_BINDING_KIND,
+            "binding_id": self._direct_binding_id(hosted_ref),
+            "purpose": "planning" if slot == "planner" else "drafting",
+            "role": role,
+            "hosted_ref": hosted_ref,
+            "model": {"provider_id": provider_id, "model_id": model_id, "variant": None},
+            "model_ref": f"{provider_id}/{model_id}",
+        }
+
+    # -- payload shape ------------------------------------------------------- #
+    @staticmethod
+    def _payload_shape(input_payload):
+        """Return ``"session"``, ``"direct"``, or ``None`` for a payload."""
+        if not isinstance(input_payload, dict):
+            return None
+        keys = set(input_payload)
+        if keys == set(PAYLOAD_KEYS):
+            return "session"
+        if keys == set(DIRECT_PAYLOAD_KEYS):
+            return "direct"
+        return None
+
+    def _input_binding_id(self, input_payload, slot):
+        """Return the binding identity recorded in a stored input payload.
+
+        Used by the per-section history scan: a session slot yields its
+        ``mapping_id`` and a direct slot its deterministic hosted-use binding id.
+        A malformed/foreign descriptor raises.
+        """
+        if "planner_mapping_id" in input_payload:
+            return self._mapping_id(input_payload[f"{slot}_mapping_id"])
+        spec = input_payload[slot]
+        require(
+            isinstance(spec, dict) and set(spec) == {"kind", "role", "hosted_ref"},
+            "a stored direct binding is malformed",
+        )
+        require(
+            spec.get("kind") == DIRECT_BINDING_KIND,
+            "a stored direct binding has a foreign kind",
+        )
+        return self._direct_binding_id(spec["hosted_ref"])
 
     # -- outline section existence ------------------------------------------- #
     def _current_outline_section_ids(self, outline_ref):
@@ -352,15 +521,15 @@ class SectionWorkspaceRepository:
                         "a stored workspace has a malformed payload"
                     )
                 input_payload = payload["input"]
-                if set(input_payload) != set(PAYLOAD_KEYS):
+                if self._payload_shape(input_payload) is None:
                     raise SectionWorkspaceError(
                         "a stored workspace has a malformed input"
                     )
                 try:
                     self._ref(input_payload["outline_ref"])
                     section_id = self._section_id(input_payload["section_id"])
-                    planner_id = self._mapping_id(input_payload["planner_mapping_id"])
-                    writer_id = self._mapping_id(input_payload["writer_mapping_id"])
+                    planner_id = self._input_binding_id(input_payload, "planner")
+                    writer_id = self._input_binding_id(input_payload, "writer")
                 except (RecordValidationError, SectionWorkspaceError):
                     raise SectionWorkspaceError(
                         "a stored workspace carries a foreign or invalid reference"
@@ -376,9 +545,10 @@ class SectionWorkspaceRepository:
                 used_by_other_sections.add(planner_id)
                 used_by_other_sections.add(writer_id)
         require(
-            result["planner"]["mapping_id"] not in used_by_other_sections
-            and result["writer"]["mapping_id"] not in used_by_other_sections,
-            "a runtime mapping/session is already bound to a different section",
+            result["planner"]["binding_id"] not in used_by_other_sections
+            and result["writer"]["binding_id"] not in used_by_other_sections,
+            "a runtime mapping/session or direct hosted-use binding is already "
+            "bound to a different section",
         )
 
     # -- normalized derivation (re-run against durable rows) ----------------- #
@@ -402,11 +572,12 @@ class SectionWorkspaceRepository:
         )
 
     def _normalize_uncached(self, input_payload, *, require_current):
+        shape = self._payload_shape(input_payload)
         require(
-            isinstance(input_payload, dict)
-            and set(input_payload) == set(PAYLOAD_KEYS),
-            "a workspace payload must be exactly outline_ref, section_id, "
-            "planner_mapping_id, writer_mapping_id",
+            shape is not None,
+            "a workspace payload must be exactly the session keys "
+            "(outline_ref, section_id, planner_mapping_id, writer_mapping_id) or "
+            "the direct keys (outline_ref, section_id, planner, writer)",
         )
         outline_ref = self._ref(input_payload["outline_ref"])
         section_id = self._section_id(input_payload["section_id"])
@@ -424,17 +595,29 @@ class SectionWorkspaceRepository:
                 "the section is not present in the stored outline revision",
             )
 
-        planner = self._pin_mapping(
-            input_payload["planner_mapping_id"], role=PLANNER_ROLE, purpose="planning"
-        )
-        writer = self._pin_mapping(
-            input_payload["writer_mapping_id"], role=WRITER_ROLE, purpose="drafting"
-        )
-        require(
-            planner["mapping_id"] != writer["mapping_id"]
-            and planner["session_id"] != writer["session_id"],
-            "the planner and writer must be distinct app-owned sessions",
-        )
+        if shape == "session":
+            planner = self._pin_mapping(
+                input_payload["planner_mapping_id"],
+                role=PLANNER_ROLE,
+                purpose="planning",
+            )
+            writer = self._pin_mapping(
+                input_payload["writer_mapping_id"],
+                role=WRITER_ROLE,
+                purpose="drafting",
+            )
+            require(
+                planner["mapping_id"] != writer["mapping_id"]
+                and planner["session_id"] != writer["session_id"],
+                "the planner and writer must be distinct app-owned sessions",
+            )
+        else:
+            planner = self._pin_direct_hosted_use(input_payload["planner"], slot="planner")
+            writer = self._pin_direct_hosted_use(input_payload["writer"], slot="writer")
+            require(
+                planner["binding_id"] != writer["binding_id"],
+                "the planner and writer must be distinct direct hosted-use bindings",
+            )
         return {
             "schema_version": 1,
             "project_id": self.store.project_id,
@@ -567,9 +750,10 @@ class SectionWorkspaceRepository:
         """
         with self.store.transaction():
             require(
-                isinstance(payload, dict) and set(payload) == set(PAYLOAD_KEYS),
-                "a workspace payload must be exactly outline_ref, section_id, "
-                "planner_mapping_id, writer_mapping_id",
+                self._payload_shape(payload) is not None,
+                "a workspace payload must be exactly the session keys "
+                "(outline_ref, section_id, planner_mapping_id, writer_mapping_id) or "
+                "the direct keys (outline_ref, section_id, planner, writer)",
             )
             result = self._normalize(payload, require_current=True)
             self._require_per_section_exclusive(result)
@@ -593,7 +777,7 @@ class SectionWorkspaceRepository:
                 )
                 for slot in SLOTS:
                     require(
-                        parent_result[slot]["mapping_id"] == result[slot]["mapping_id"],
+                        parent_result[slot]["binding_id"] == result[slot]["binding_id"],
                         "an edit may not diverge the workspace runtime mapping pins",
                     )
             outline_ref = self._ref(payload["outline_ref"])
@@ -627,13 +811,18 @@ SectionWorkspace = SectionWorkspaceRepository
 
 __all__ = [
     "ARTIFACT_KIND",
+    "DIRECT_BINDING_KIND",
+    "DIRECT_PAYLOAD_KEYS",
     "DOCUMENT_TYPE",
     "NOTICE",
     "PAYLOAD_KEYS",
+    "PLANNER_GENERATION_ROLE",
     "PLANNER_ROLE",
+    "SESSION_BINDING_KIND",
     "SLOTS",
     "SectionWorkspace",
     "SectionWorkspaceError",
     "SectionWorkspaceRepository",
+    "WRITER_GENERATION_ROLE",
     "WRITER_ROLE",
 ]
