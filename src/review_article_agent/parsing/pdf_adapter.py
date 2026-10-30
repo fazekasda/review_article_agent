@@ -18,12 +18,16 @@ Behaviour:
   1-based ``page`` locators) using the shared conservative normalization
   (Unicode NFC, ligature folding, soft-hyphen removal, whitespace collapsing).
 * Quality states are conservative. Usable text yields the XML success status
-  ``parsed``; empty/blank, very short, garbled, capped (``limited``), malformed,
-  encrypted, or ``pypdf``-unavailable inputs stay ``needs_review`` with
-  ``human_action_required`` true. ``pdf_column_order_uncertain`` is always
-  reported for text: PDF text is never reliable column-ordered full text, and
-  figures/tables/supplements are not interpreted here, so
-  ``non_text_assets_require_review`` stays true.
+  ``parsed`` with ``human_action_required`` false, so a cleanly extracted PDF is
+  usable original text for grounded extraction; empty/blank, very short,
+  garbled, capped (``limited``), malformed, encrypted, or ``pypdf``-unavailable
+  inputs stay ``needs_review`` with ``human_action_required`` true.
+  ``pdf_column_order_uncertain`` is always reported for text: PDF text is never
+  reliable column-ordered full text, and figures/tables/supplements are not
+  interpreted here, so ``non_text_assets_require_review`` stays true.
+* The pypdf version that produced the text is recorded as ``pdf_parser_version``
+  so a stored report can be reproduced: re-parsing the same bytes with the same
+  pinned parser version and pypdf version must yield identical passages.
 * ``excludes_candidate`` is always false: a failed PDF can never become a
   silent empty-paper exclusion. ``authorizes_scientific_processing`` is false.
 
@@ -50,7 +54,7 @@ from .core import (
     normalize_text,
 )
 
-PDF_PARSER_VERSION = "step07-pdf-manual/2"
+PDF_PARSER_VERSION = "step07-pdf-manual/3"
 
 #: Bounds for the isolated full-text child (mirrors the Step 06 inspector).
 MAX_TEXT_PAGES = 500
@@ -116,6 +120,54 @@ def _pypdf_available() -> bool:
         return importlib.util.find_spec("pypdf") is not None
     except (ImportError, ValueError):
         return False
+
+
+def pypdf_installed_version() -> str | None:
+    """Seam: the installed pypdf distribution version, or ``None``.
+
+    Read from distribution metadata (never importing pypdf in the parent), so a
+    stored report's recorded ``pdf_parser_version`` can be checked for an exact
+    match before a reparse is trusted. Tests patch this.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except Exception:  # noqa: BLE001 - metadata is best effort only
+        return None
+    try:
+        found = version("pypdf")
+    except PackageNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 - never crash on hostile metadata
+        return None
+    return found if isinstance(found, str) and found else None
+
+
+def pdf_passages_digest(passages) -> str:
+    """Deterministic digest over a PDF report's passage identity/locator/text.
+
+    Only the reproducible structural identity (stable id, 1-based page locator,
+    kind) and the normalized-text digest are included, so a reparse is compared
+    on exactly the evidence a locator resolves against. A non-list / malformed
+    entry yields an empty string (never a match).
+    """
+    if not isinstance(passages, list):
+        return ""
+    projection: list[dict] = []
+    for passage in passages:
+        if not isinstance(passage, dict):
+            return ""
+        projection.append(
+            {
+                "passage_id": passage.get("passage_id"),
+                "page": passage.get("page"),
+                "kind": passage.get("kind"),
+                "text_sha256": passage.get("text_sha256"),
+            }
+        )
+    encoded = json.dumps(
+        projection, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _is_int(value: object) -> bool:
@@ -418,6 +470,7 @@ def _assemble(
     passages: list[dict],
     reasons: list[str],
     inspection: dict | None,
+    pdf_parser_version: str | None = None,
 ) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -433,10 +486,17 @@ def _assemble(
         "citations": {"resolved": 0, "unresolved": 0, "ambiguous": 0, "malformed": 0},
         "assets": [],
         "non_text_assets_require_review": True,
-        "human_action_required": True,
+        # Usable extracted text is original text for grounded extraction, so a
+        # cleanly ``parsed`` PDF does not itself force a per-passage human
+        # action; every non-``parsed`` state still does. Non-text assets and
+        # column order remain a review concern regardless (see the flag above).
+        "human_action_required": status != "parsed",
         "excludes_candidate": False,
         "reasons": _dedupe(reasons),
         "pdf_inspection": _sanitize_inspection(inspection),
+        # The pypdf distribution version that produced the text, so read-back
+        # can reparse with the same pinned parser and verify the passages.
+        "pdf_parser_version": pdf_parser_version,
         "authorizes_scientific_processing": False,
         "limitations": LIMITATIONS,
     }
@@ -448,11 +508,13 @@ def _from_extraction(digest: str, byte_size: int, extraction: dict) -> dict:
     status = extraction["status"]
     inspection = _inspection_from_extraction(extraction)
     reasons = _extraction_reasons(extraction)
+    parser_version = extraction.get("parser_version")
+    parser_version = parser_version if isinstance(parser_version, str) and parser_version else None
 
     if status in ("unavailable", "failed"):
         return _assemble(
             digest, byte_size, status="needs_review", passages=[], reasons=reasons,
-            inspection=inspection,
+            inspection=inspection, pdf_parser_version=parser_version,
         )
 
     raw_pages = extraction.get("pages")
@@ -486,7 +548,7 @@ def _from_extraction(digest: str, byte_size: int, extraction: dict) -> dict:
 
     return _assemble(
         digest, byte_size, status=final_status, passages=passages, reasons=reasons,
-        inspection=inspection,
+        inspection=inspection, pdf_parser_version=parser_version,
     )
 
 
@@ -500,9 +562,10 @@ def parse_pdf(data: bytes, *, inspector=None, extractor=None) -> dict:
     passages). With neither, the default is extraction when ``pypdf`` is
     available, otherwise the diagnostics path reporting the dependency missing.
 
-    The returned mapping is JSON-safe, always keeps ``excludes_candidate`` false
-    and ``human_action_required`` true, and carries page-locatored passages only
-    when usable text was extracted.
+    The returned mapping is JSON-safe, always keeps ``excludes_candidate`` false,
+    carries page-locatored passages only when usable text was extracted, and
+    requires a human action (``human_action_required`` true) for every
+    non-``parsed`` state; a cleanly ``parsed`` result is usable original text.
     """
     if isinstance(data, (bytearray, memoryview)):
         data = bytes(data)

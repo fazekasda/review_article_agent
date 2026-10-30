@@ -99,7 +99,10 @@ class InjectedExtractorTests(unittest.TestCase):
         self.assertIn("pdf_non_text_assets_unverified", result["reasons"])
         self.assertNotIn("pdf_full_extraction_unsupported", result["reasons"])
         self.assertTrue(result["non_text_assets_require_review"])
-        self.assertTrue(result["human_action_required"])
+        # Usable text is original text: no per-passage human action, but the
+        # recorded parser version is present for reproducible read-back.
+        self.assertFalse(result["human_action_required"])
+        self.assertEqual(result["pdf_parser_version"], "fake")
         self.assertFalse(result["excludes_candidate"])
         self.assertFalse(result["authorizes_scientific_processing"])
         # diagnostic envelope keeps the page-present shape and never a preview
@@ -284,7 +287,8 @@ class RealPypdfTests(unittest.TestCase):
         self.assertEqual({p["page"] for p in result["passages"]}, {1, 2})
         self.assertIn("pdf_column_order_uncertain", result["reasons"])
         self.assertTrue(result["non_text_assets_require_review"])
-        self.assertTrue(result["human_action_required"])
+        self.assertFalse(result["human_action_required"])
+        self.assertEqual(result["pdf_parser_version"], pdf_adapter.pypdf_installed_version())
         self.assertFalse(result["excludes_candidate"])
 
     def test_blank_page_pdf_needs_review(self):

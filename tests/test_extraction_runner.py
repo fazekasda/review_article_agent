@@ -33,6 +33,8 @@ from review_article_agent.parsing.core import (  # noqa: E402
     NORMALIZATION_VERSION,
     PARSER_VERSION,
 )
+from review_article_agent.parsing import repository as parsing_repository  # noqa: E402
+from review_article_agent.parsing.pdf_adapter import PDF_PARSER_VERSION  # noqa: E402
 from review_article_agent.parsing.repository import ParsingRepository  # noqa: E402
 from review_article_agent.runtime import lead, owner_auth  # noqa: E402
 from review_article_agent.runtime.gates import prepare_gate_snapshot  # noqa: E402
@@ -69,6 +71,8 @@ JATS = (
 )
 JATS_BYTES = (JATS[:JATS.index('    <table-wrap')] + JATS[JATS.index('  </sec>'):]).encode("utf-8")
 PLAIN_BYTES = b"not a structured article; unreadable"
+
+_REAL_PYPDF = __import__("importlib.util").util.find_spec("pypdf") is not None
 
 
 def _rights(project_id, artifact_id, revision_id, *, ops=None, privacy=None):
@@ -673,6 +677,83 @@ class HumanBlockTest(RunnerTestBase):
         with self.assertRaises(ExtractionRunnerError):
             self.run_extraction(request_id="run-plain", hosted_ref=hosted, report_refs=[parsed["report_ref"]])
         self.assertEqual(self.transport.call_count, 0)
+
+
+@unittest.skipUnless(_REAL_PYPDF, "optional dependency pypdf not installed ([pdf] extra)")
+class PdfMaterialTest(RunnerTestBase):
+    """A cleanly parsed PDF report is usable original text for extraction (S17-P7b)."""
+
+    def _pdf_config(self):
+        payload = _config_payload()
+        payload["parser"] = PDF_PARSER_VERSION
+        return payload
+
+    def _store_pdf_report(self, source_id, report_id):
+        from test_acquisition_pdf_inspection import build_pdf, text_stream
+
+        long_text = "The quick brown fox jumps over the lazy dog. " * 8
+        data = build_pdf(
+            [text_stream("Page one. " + long_text), text_stream("Page two. " + long_text)]
+        )
+        self.artifacts.create_artifact(source_id, kind="document", created_by="import")
+        self.artifacts.import_revision(
+            artifact_id=source_id, revision_id="rev-" + source_id, content=data,
+            media_type="application/pdf", origin_locator="import:synthetic",
+            rights=_rights(self.project_id, source_id, "rev-" + source_id), acquired_by="import",
+        )
+        source_ref = self.ref(source_id, "rev-" + source_id)
+        parsed = ParsingRepository(self.store).parse_stored_document(
+            source_ref, report_artifact_id=report_id, report_revision_id="rev-" + report_id,
+            rights=_rights(self.project_id, report_id, "rev-" + report_id),
+        )
+        return source_ref, parsed
+
+    def test_parsed_pdf_material_has_page_locators_and_limitation(self):
+        _, parsed = self._store_pdf_report("pdf-src", "pdf-rep")
+        self.assertEqual(parsed["status"], "parsed")
+        self.assertFalse(parsed["human_action_required"])
+        passages, source_refs = runner._derive_material(
+            self.store, [parsed["report_ref"]], config=self._pdf_config()
+        )
+        self.assertTrue(passages)
+        pages = {p["page"] for p in passages}
+        self.assertTrue(pages and pages <= {1, 2})
+        self.assertTrue(all(p["format"] == "pdf" for p in passages))
+        material = runner._assemble_material(passages)
+        self.assertIn("page=1", material)
+        self.assertIn("source_key=pdf-rep", material)
+        self.assertIn(runner.PDF_MATERIAL_LIMITATION, material)
+        self.assertEqual(source_refs, [self.ref("pdf-src", "rev-pdf-src")])
+
+    def test_needs_review_pdf_report_is_refused(self):
+        from test_acquisition_pdf_inspection import BLANK, build_pdf
+
+        self.artifacts.create_artifact("blank-src", kind="document", created_by="import")
+        self.artifacts.import_revision(
+            artifact_id="blank-src", revision_id="rev-blank-src", content=build_pdf([BLANK]),
+            media_type="application/pdf", origin_locator="import:synthetic",
+            rights=_rights(self.project_id, "blank-src", "rev-blank-src"), acquired_by="import",
+        )
+        parsed = ParsingRepository(self.store).parse_stored_document(
+            self.ref("blank-src", "rev-blank-src"), report_artifact_id="blank-rep",
+            report_revision_id="rev-blank-rep",
+            rights=_rights(self.project_id, "blank-rep", "rev-blank-rep"),
+        )
+        self.assertEqual(parsed["status"], "needs_review")
+        with self.assertRaises(ExtractionRunnerError):
+            runner._derive_material(self.store, [parsed["report_ref"]], config=self._pdf_config())
+
+    def test_unverified_pdf_report_is_refused(self):
+        # Simulate pypdf absent at read-back: the report reads back unverified and
+        # extraction refuses it with the existing static error.
+        _, parsed = self._store_pdf_report("pdf-src2", "pdf-rep2")
+        with mock.patch.object(parsing_repository, "pypdf_installed_version", return_value=None):
+            record = ParsingRepository(self.store).read_report(parsed["report_ref"])
+            self.assertFalse(record["verifiable"])
+            with self.assertRaises(ExtractionRunnerError):
+                runner._derive_material(
+                    self.store, [parsed["report_ref"]], config=self._pdf_config()
+                )
 
 
 # --------------------------------------------------------------------------- #
