@@ -303,9 +303,24 @@ class WorkerIPCTest(unittest.TestCase):
         stale.bind(stale_path)
         stale.close()
         stale_inode = os.stat(stale_path).st_ino
+        # Keep the stale inode alive with a hard link in a separate private
+        # directory on the same filesystem. Recovery unlinks the stale socket
+        # and binds a new one; without the link the kernel is free to hand the
+        # just-freed inode number straight back to the replacement, which made
+        # the inode-inequality assertion flaky. The link also pins the original
+        # file, so the check below proves the stale file was *replaced* rather
+        # than merely reusing its inode.
+        keep_dir = self.tmp / "stale-inode-keep"
+        os.makedirs(keep_dir, mode=0o700)
+        keep_link = keep_dir / "stale.keep"
+        os.link(stale_path, keep_link)
+        self.assertEqual(os.stat(keep_link).st_ino, stale_inode)
 
         server = self._serve()
         self.assertNotEqual(os.stat(server.socket_path).st_ino, stale_inode)
+        # The stale file itself is still held by the hard link with its
+        # original inode, so the inequality above cannot be inode reuse.
+        self.assertEqual(os.stat(keep_link).st_ino, stale_inode)
         # Bystanders untouched.
         self.assertTrue(os.path.exists(other_sock_path))
         self.assertEqual(Path(bystander).read_text(), "untouched")

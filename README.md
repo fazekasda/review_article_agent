@@ -179,6 +179,7 @@ criterion-by-criterion status is in the
 - [Step 02 CLI contract](docs/cli.md)
 - [Step 02 storage contract](docs/storage.md)
 - [Step 03 worker runtime safety contract](docs/worker.md)
+- [Continuous integration (GitHub Actions) and how to run the checks locally](docs/ci.md)
 - [Step 01 contracts/policies decision 002 (accepted)](docs/decisions/002-step01-contracts-and-policies.md)
 - [Runtime language decision 001 (accepted)](docs/decisions/001-runtime-language.md)
 - [Step 01 kickoff](docs/implementation/kickoffs/01-contracts.md)

@@ -357,6 +357,18 @@ class WheelPackagingTest(unittest.TestCase):
             text=True,
             cwd=str(build_root),
         )
+        if proc.returncode != 0 and "No module named 'setuptools'" in proc.stderr:
+            # The build backend is a declared build requirement of this
+            # project (pyproject.toml: requires = ["setuptools>=68"]). This is
+            # a real coverage failure, not something to skip: report exactly
+            # how to fix the environment.
+            self.fail(
+                "the build backend 'setuptools' is not importable in this "
+                "interpreter, so the wheel cannot be built. Install it, e.g. "
+                "`python -m pip install \"setuptools>=68\"` (CI installs it "
+                "right after setup-python). "
+                f"stderr={proc.stderr}"
+            )
         self.assertEqual(proc.returncode, 0, f"stderr={proc.stderr}")
         wheels = list((build_root / "wheelhouse").glob("*.whl"))
         self.assertEqual(len(wheels), 1, "expected exactly one wheel")
