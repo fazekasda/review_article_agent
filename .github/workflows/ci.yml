@@ -34,7 +34,7 @@ jobs:
   fast:
     name: fast (py${{ matrix.python }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     strategy:
       matrix:
         python: ['3.11', '3.14']
@@ -79,14 +79,14 @@ jobs:
             echo "no parent commit available; skipping git diff --check"
           fi
 
-      # FAST_BUDGET_SECONDS: optional wall-clock budget for the fast tier.
-      # Left empty for now; a later task will set a real value so the fast
-      # tier fails when it regresses past its target. When set it is passed
-      # straight through as --budget.
+      # FAST_BUDGET_SECONDS: wall-clock budget for the fast tier. The fast
+      # tier target is < 2 min on 4 CPUs (kickoff §4); the budget makes the
+      # step fail when the suite regresses past it. It is passed straight
+      # through as --budget to scripts/run_tests.py.
       - name: Fast test tier
         shell: bash
         env:
-          FAST_BUDGET_SECONDS: ''
+          FAST_BUDGET_SECONDS: '120'
         run: |
           args=(-j 4 --top 15 --timeout 1200)
           if [ -n "${FAST_BUDGET_SECONDS}" ]; then
@@ -104,7 +104,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && github.base_ref == 'main')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

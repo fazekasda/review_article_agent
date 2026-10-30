@@ -24,7 +24,7 @@ superseded run on the same ref. The workflow declares
 
 ## Jobs
 
-- **`fast`** (matrix: Python 3.11 and 3.14, `timeout-minutes: 30`) — the quick
+- **`fast`** (matrix: Python 3.11 and 3.14, `timeout-minutes: 10`) — the quick
   gate on every event. Steps: checkout (full history, needed for the whitespace
   check), `setup-python`, `python -m pip install "setuptools>=68"` (the build
   backend for the wheel packaging test, see below),
@@ -32,14 +32,15 @@ superseded run on the same ref. The workflow declares
   `python scripts/check_contract_docs.py`,
   `python -m unittest discover -s scripts -p 'test_*.py'`, a
   `git diff --check` whitespace check against the PR base (or `HEAD~1`), then
-  the default test tier
+  the fast test tier
   `python scripts/run_tests.py -j 4 --top 15 --timeout 1200`.
-  The env var `FAST_BUDGET_SECONDS` is the marked spot for a wall-clock budget;
-  it is empty today and, when set, is passed through as `--budget`.
+  The env var `FAST_BUDGET_SECONDS` sets the fast tier's wall-clock budget; it
+  is `'120'` (the < 2 min target from kickoff §4) and is passed through as
+  `--budget 120`, so the step fails if the tier regresses past 120 s.
 - **`full`** (PRs targeting `main`, nightly, manual) — the whole suite including
   the slow tier, sharded and balanced by the recorded per-module durations in
   `tests/durations.json`. 6 shards on Python 3.14 and 2 shards on Python 3.11
-  (`fail-fast: false`, `timeout-minutes: 45`). Each shard installs the build
+  (`fail-fast: false`, `timeout-minutes: 20`). Each shard installs the build
   backend (`python -m pip install "setuptools>=68"`) and runs
   `python scripts/run_tests.py --slow -j 4 --top 10 --timeout 1800
   --durations-out durations-<py>-<shard>.json $(python scripts/test_shards.py
@@ -76,9 +77,31 @@ python3 -m pip install "setuptools>=68"
 PYTHONPATH=src:tests python3 -m unittest tests.test_cli.WheelPackagingTest
 ```
 
+## Test tiers
+
+`scripts/run_tests.py` runs one subprocess per test *module* in parallel. The
+suite has two tiers, gated by the `RAA_SLOW_TESTS` environment variable
+(`tests/_tiers.py`):
+
+- **fast** (default; the CI `fast` job) — everything except the slow tier. The
+  slow tier is `unittest.skipUnless`-gated and is skipped unless
+  `RAA_SLOW_TESTS=1`. Target: **< 2 min** on 4 CPUs (measured ≈ 56 s locally).
+- **slow** (`--slow`; the CI `full` job) — adds tests that spawn real subprocess
+  CLI runs, a real detached worker, the mock OpenCode service, SIGKILL/recovery
+  matrices, scale runs, clean-venv installs, and other expensive or
+  off-MVP-path tests. `--slow` sets `RAA_SLOW_TESTS=1` for the children; without
+  it the variable is removed.
+
+By default the runner also sets `RAA_TEST_SQLITE_SYNCHRONOUS=OFF` for each child:
+the test-only hook that lowers SQLite durability (`PRAGMA synchronous`) for
+throwaway temp stores, which speeds the suite up. Production keeps
+`PRAGMA synchronous = FULL`; pass `--durable-sqlite` to run the children with
+the production `FULL` setting (useful when validating durability behavior
+itself).
+
 ## Running the same checks locally
 
-Fast tier (default; excludes the slow tier):
+Fast tier (default; excludes the slow tier; ≈ 1 min locally):
 
 ```bash
 python3 scripts/run_tests.py -j 4 --top 15 --timeout 1200
@@ -90,10 +113,23 @@ Full tier, including the slow tier:
 python3 scripts/run_tests.py --slow -j 4 --top 10 --timeout 1800
 ```
 
+The same fast command with the CI budget enforced locally:
+
+```bash
+python3 scripts/run_tests.py -j 4 --top 15 --timeout 1200 --budget 120
+```
+
 Run a couple of modules while iterating:
 
 ```bash
 python3 scripts/run_tests.py test_records test_registry -j 2
+```
+
+Run one module directly (bypassing the runner) and include its slow tests:
+
+```bash
+PYTHONPATH=src:tests python3 -m unittest tests.test_cli
+RAA_SLOW_TESTS=1 PYTHONPATH=src:tests python3 -m unittest tests.test_cli
 ```
 
 The other `fast` steps, by hand:
@@ -127,13 +163,24 @@ python3 scripts/run_tests.py --slow -j 4 --top 10 --timeout 1800 \
 
 ### Refreshing `tests/durations.json`
 
-The `full-durations` job merges the Python 3.14 shard timings into
+`tests/durations.json` seeds the shard balancer with one recorded duration per
+test module. It was refreshed on 2026-10-30 from a fresh full-tier measurement
+on the `task/s16-ci-guard` branch
+(`python3 scripts/run_tests.py --slow -j 4 --durations-out <out>.json`) and now
+covers every `tests/test_*.py` module (full tier ≈ 215 s on 4 CPUs). The
+`full-durations` job merges the Python 3.14 shard timings into
 `durations-merged.json`. To refresh the seeded table:
 
-1. Download the `durations-merged` artifact from a recent `full` run.
-2. Copy it over `tests/durations.json` (same schema: `{"schema": 1,
-   "unit": "seconds", "modules": {...}}`).
+1. Download the `durations-merged` artifact from a recent `full` run (or measure
+   locally as above).
+2. Write it over `tests/durations.json` (same schema: `{"schema": 1,
+   "unit": "seconds", "modules": {...}}`). Merge from only the new file so stale
+   entries are replaced rather than kept:
+   `python3 scripts/test_shards.py --merge tests/durations.json <new>.json`.
 3. Commit the refreshed file. The next `full` run re-balances shards from it.
+
+With the refreshed table the largest 6-shard estimate is well under the 20-minute
+`full` job timeout; the full tier target is **< 8 min** (kickoff §4).
 
 To merge artifacts by hand, use the same command the job uses:
 
