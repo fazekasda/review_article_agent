@@ -1222,13 +1222,13 @@ never dispatches a model or reaches the network.
 
 | Command | Synopsis |
 | --- | --- |
-| `delivery start --delivery-id ID --section ID --review-id ID --trace-id ID --rights-file PATH [--project ID]` | Start the global review from recorded review/trace states (repeat `--section`/`--review-id`/`--trace-id` in lockstep). |
+| `delivery start --delivery-id ID --section ID --review-id ID --trace-id ID [--draft-artifact-id ID --draft-revision-id ID] --rights-file PATH [--project ID]` | Start the global review from recorded review/trace states (repeat `--section`/`--review-id`/`--trace-id` in lockstep; repeat `--draft-artifact-id`/`--draft-revision-id` in lockstep to record each section's approved draft ref for the re-deriving export). |
 | `delivery freshness --delivery-id ID --cutoff-date DATE --decision {accept_cutoff,authorize_topup} [--approval-id ID] [--query-window-end DATE] --rights-file PATH` | Record the explicit freshness decision (never silently adds papers). |
 | `delivery notes add --delivery-id ID --file PATH --rights-file PATH` | Store the human-notes action plan from a JSON array file. |
 | `delivery notes apply --delivery-id ID --batch-file PATH --approval-id ID --rights-file PATH` | Apply one human-approved notes batch; a non-empty `--approval-id` is required and a batch is never auto-applied. |
 | `delivery revalidate --delivery-id ID --paragraph ID --package-file PATH [--trace-id ID] --rights-file PATH` | Re-run the Step 12/13 checks for the named paragraphs from the approved package (never trusts the caller). |
-| `delivery approve --prepare --delivery-id ID [--hashes-file PATH] [--approver LABEL]` | Print the exact-revision final-approval manifest digest and the `gate confirm` command; **records nothing**. |
-| `delivery export --delivery-id ID --out-dir PATH --package-file PATH --rights-file PATH [--hashes-file PATH] [--policy-file PATH] [--ai-use-file PATH] [--venue NAME]` | Write the export package after the exact-revision final approval. |
+| `delivery approve --prepare --delivery-id ID --rights-file PATH [--hashes-file PATH]` | Persist the exact-revision final-approval manifest as a new revision and print the manifest digest and the exact `gate prepare`/`gate confirm` commands a human must run. The CLI **records no approval** and accepts **no approver**. |
+| `delivery export --delivery-id ID --out-dir PATH --rights-file PATH [--hashes-file PATH] [--policy-file PATH] [--ai-use-file PATH] [--venue NAME]` | Re-derive the approved drafting packages from durable state and write the export package after the exact-revision final approval. |
 | `delivery status --delivery-id ID [--project ID]` | Read one delivery's safe status summary. |
 
 * `delivery start` requires every section to be review-complete and origin-complete
@@ -1242,28 +1242,36 @@ never dispatches a model or reaches the network.
   Only notes whose plan action is `local_edit`/`claim_edit` may be applied; a
   claim/citation edit (or a wording edit that changes numbers/citations) marks the
   paragraph stale for revalidation.
-* `delivery approve` **cannot yet record** the final approval through the CLI: that
-  requires owner authentication (a controlling-terminal confirmation) and a wiring
-  between the named-gate ledger and `DeliveryRepository.final_approval`. So the
-  command only runs with `--prepare`, which prints the manifest digest
-  (`manifest_digest`) and the exact `gate confirm` command, and reports the gap
-  (`approval_recorded=false`, `human_authenticated=false`). Without `--prepare` it
-  refuses with a `validation` error explaining the gap. Nothing is written.
-* `delivery export` builds `references`/`corpus` with
-  `delivery.export.bibliography_from_packages` from the approved drafting packages
-  (`--package-file`, repeatable), reads the recorded manuscript, and writes
-  `manuscript.md`, `references.bib`, `references.ris`, `companion.md`,
-  `summary.md`, `ai_declaration.md`, and `export_manifest.json`. It **refuses,
-  writing nothing**, when the approval is missing/stale for the exact revision and
-  artifact hashes (for example after a notes edit) or when a bibliography entry is
-  inconsistent with the manuscript. An `--out-dir` inside the `--data-dir` (or a
-  project's `.review_article_agent` directory) is refused like `backup create`.
-  The output reports the per-file `file_hashes` (matching the manifest's
-  `file_hashes` for the six content files) and `consistency_ok`.
+* `delivery approve --prepare` persists the exact-revision final-approval manifest
+  as a **new delivery-state revision** and prints the manifest digest
+  (`manifest_digest`), the manifest revision (`manifest_revision`), and the exact
+  `gate prepare`/`gate confirm` commands (`prepare_command`/`confirm_command`) for
+  that revision. The CLI **records no approval** and accepts **no approver**: the
+  approval is the owner-authenticated named gate
+  (`artifact_revision` / `delivery.final_approval`) that the human records
+  out-of-band on `/dev/tty` via `gate confirm`, exactly like every other stage's
+  named gate. Without `--prepare` the command refuses with a `validation` error.
+* `delivery export` re-derives each section's **approved drafting package** from
+  durable state via `drafting/workflow` (`read(..., "draft")`) over the draft ref
+  recorded at `delivery start` (there is no `--package-file`), builds
+  `references`/`corpus` with `delivery.export.bibliography_from_packages`, reads
+  the recorded manuscript, and writes `manuscript.md`, `references.bib`,
+  `references.ris`, `companion.md`, `summary.md`, `ai_declaration.md`, and
+  `export_manifest.json`. It **requires the satisfied named final approval on the
+  exact current manifest revision** and **refuses, writing nothing**, when the
+  approval is missing or the manifest changed after approval (a stale gate, for
+  example after a notes edit), when a section has no recorded drafting package, or
+  when a bibliography entry is inconsistent with the manuscript. An `--out-dir`
+  inside the `--data-dir` (or a project's `.review_article_agent` directory) is
+  refused like `backup create`. The output reports the per-file `file_hashes`
+  (matching the manifest's `file_hashes` for the six content files) and
+  `consistency_ok`.
 * `delivery status` reports the global-review status/rounds, the freshness status,
   whether notes are planned, the applied-batch count, the paragraphs still
-  requiring revalidation, and whether an approval/export is recorded. The private
-  raw state is never emitted.
+  requiring revalidation, whether a final-approval manifest is prepared
+  (`final_approval_prepared`), whether its exact-revision named gate is satisfied
+  (`final_approval_gate_satisfied`, which also sets `approval_present`), and
+  whether an export is recorded. The private raw state is never emitted.
 
 Errors use the exit categories of §3 with static, value-free messages, and every
 output carries `authorizes_execution=false`, `authorizes_export=false`, and

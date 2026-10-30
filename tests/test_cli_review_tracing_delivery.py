@@ -44,11 +44,17 @@ _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))
 
+import review_article_agent.cli.delivery as cli_delivery  # noqa: E402
 import review_article_agent.cli.main as cli_main  # noqa: E402
 import review_article_agent.cli.tracing as cli_tracing  # noqa: E402
 from review_article_agent.delivery.workflow import DeliveryRepository  # noqa: E402
 from review_article_agent.review.workflow import SectionReviewRepository  # noqa: E402
+from review_article_agent.runtime import owner_auth  # noqa: E402
+from review_article_agent.runtime.gates import prepare_gate_snapshot  # noqa: E402
 from review_article_agent.storage import ProjectStore, Registry, paths  # noqa: E402
+from review_article_agent.storage.human_approvals import (  # noqa: E402
+    HumanApprovalRepository,
+)
 from review_article_agent.tracing.workflow import OriginTraceRepository  # noqa: E402
 
 from test_delivery_workflow import (  # noqa: E402
@@ -57,6 +63,12 @@ from test_delivery_workflow import (  # noqa: E402
     SECTIONS_OK,
     _reviewer,
     _writer,
+)
+from test_human_approvals import (  # noqa: E402
+    _BASE_TIME,
+    _FakeTty,
+    _FIXED_CHALLENGE,
+    _OWNER_UID,
 )
 from test_review_workflow import (  # noqa: E402
     _CRITIC,
@@ -243,6 +255,129 @@ class CliBase(unittest.TestCase):
             accepted_warning_ids=[],
             unsupported_major_claims=[],
             approver="alice",
+            rights=self.rights,
+        )
+
+    # -- owner-authenticated named-gate helper (same seams as the gate tests) -- #
+    def record_gate(self, artifact_id: str, revision_id: str) -> None:
+        """Record one real owner-authenticated human approval over a revision.
+
+        Only the owner-auth low-level terminal/identity seams are patched (as
+        ``test_human_approvals`` does) -- never a capability bypass.
+        """
+        prepared = prepare_gate_snapshot(
+            self.store,
+            {
+                "project_id": self.pid,
+                "artifact_id": artifact_id,
+                "revision_id": revision_id,
+            },
+            gate_kind="artifact_revision",
+            gate_id="delivery.final_approval",
+            decision="approved",
+            rationale="human review of the exact delivery manifest revision",
+        )
+        with mock.patch.object(owner_auth, "_new_challenge", lambda: _FIXED_CHALLENGE), \
+             mock.patch.object(owner_auth, "_current_owner_uid", lambda: _OWNER_UID), \
+             mock.patch.object(owner_auth, "_real_uid", lambda: _OWNER_UID), \
+             mock.patch.object(owner_auth, "_utcnow", lambda: _BASE_TIME), \
+             mock.patch.object(owner_auth, "_monotonic", lambda: 1000.0), \
+             mock.patch.object(
+                 owner_auth,
+                 "_open_controlling_tty",
+                 lambda: _FakeTty(replies=[_FIXED_CHALLENGE]),
+             ):
+            capability = owner_auth.request_owner_confirmation(prepared.owner_action())
+            HumanApprovalRepository(self.store).record_decision(prepared, capability)
+
+    def make_gate_approved_delivery(self, delivery_id: str = "delivery-1") -> dict:
+        """A delivery whose exact-revision final-approval named gate is recorded.
+
+        Records each section's approved draft ref (for the re-deriving export),
+        prepares the manifest revision, and records the owner-authenticated named
+        gate over that exact revision.
+        """
+        repo = DeliveryRepository(self.store)
+        sections = [
+            {
+                "section_id": "s1",
+                "review_status": "complete",
+                "origin_complete": True,
+                "draft_ref": {
+                    "project_id": self.pid,
+                    "artifact_id": "draft-1",
+                    "revision_id": "draft-r1",
+                },
+            }
+        ]
+        repo.start_global_review(delivery_id, sections, ORIGIN_OK, rights=self.rights)
+        reviewer, _ = _reviewer(find_if_missing=False)
+        writer, _ = _writer()
+        repo.run_global_review(
+            delivery_id,
+            {
+                "revision_id": "m1",
+                "text": "Body [@k1].",
+                "paragraphs": {"p1": {"text": "Body [@k1].", "checks": "valid"}},
+            },
+            [],
+            reviewer,
+            writer,
+            rights=self.rights,
+        )
+        repo.freshness(
+            delivery_id, "2026-01-01", {"action": "accept_cutoff"}, rights=self.rights
+        )
+        prepared = repo.prepare_final_approval(
+            delivery_id,
+            artifact_hashes={"art-1": "sha-1"},
+            warnings=[],
+            accepted_warning_ids=[],
+            unsupported_major_claims=[],
+            rights=self.rights,
+        )
+        self.record_gate(delivery_id, prepared["revision_id"])
+        return prepared
+
+    def make_prepared_delivery(self, delivery_id: str = "delivery-1") -> dict:
+        """A delivery whose manifest revision is prepared but not yet approved."""
+        repo = DeliveryRepository(self.store)
+        sections = [
+            {
+                "section_id": "s1",
+                "review_status": "complete",
+                "origin_complete": True,
+                "draft_ref": {
+                    "project_id": self.pid,
+                    "artifact_id": "draft-1",
+                    "revision_id": "draft-r1",
+                },
+            }
+        ]
+        repo.start_global_review(delivery_id, sections, ORIGIN_OK, rights=self.rights)
+        reviewer, _ = _reviewer(find_if_missing=False)
+        writer, _ = _writer()
+        repo.run_global_review(
+            delivery_id,
+            {
+                "revision_id": "m1",
+                "text": "Body [@k1].",
+                "paragraphs": {"p1": {"text": "Body [@k1].", "checks": "valid"}},
+            },
+            [],
+            reviewer,
+            writer,
+            rights=self.rights,
+        )
+        repo.freshness(
+            delivery_id, "2026-01-01", {"action": "accept_cutoff"}, rights=self.rights
+        )
+        return repo.prepare_final_approval(
+            delivery_id,
+            artifact_hashes={"art-1": "sha-1"},
+            warnings=[],
+            accepted_warning_ids=[],
+            unsupported_major_claims=[],
             rights=self.rights,
         )
 
@@ -470,16 +605,25 @@ class DeliveryCliTest(CliBase):
         )
         self.assertEqual(error["error"]["category"], "validation")
 
+    def _patch_drafting_package(self):
+        """Patch the drafting read so export re-derives the approved package."""
+        return mock.patch.object(
+            cli_delivery,
+            "DraftingWorkflowRepository",
+            lambda store: mock.Mock(
+                read=lambda ref, kind: {"result": {}, "package": EXPORT_PACKAGE}
+            ),
+        )
+
     def test_export_writes_seven_files_with_matching_hashes(self):
-        self.make_approved_delivery("delivery-1")
-        package_file = self.write_json("package.json", EXPORT_PACKAGE)
+        self.make_gate_approved_delivery("delivery-1")
         rights_file = self.write_json("del-rights.json", self.rights("delivery-1", "r1"))
         out_dir = self.tmp / "export"
-        result = self.cli(
-            "delivery", "export", "--project", self.pid, "--delivery-id", "delivery-1",
-            "--out-dir", str(out_dir), "--package-file", package_file,
-            "--rights-file", rights_file,
-        )
+        with self._patch_drafting_package():
+            result = self.cli(
+                "delivery", "export", "--project", self.pid, "--delivery-id", "delivery-1",
+                "--out-dir", str(out_dir), "--rights-file", rights_file,
+            )
         self.assertEqual(result["status"], "exported")
         self.assertTrue(result["consistency_ok"])
         self.assertEqual(set(os.listdir(out_dir)), EXPORT_FILES)
@@ -497,8 +641,52 @@ class DeliveryCliTest(CliBase):
             self.assertEqual(digest, result["file_hashes"][name])
         self.assertEqual(manifest["manuscript_revision"], "m1")
 
+    def test_export_refused_without_gate_approval_and_writes_nothing(self):
+        # A delivery with recorded draft refs but no prepared manifest/gate.
+        repo = DeliveryRepository(self.store)
+        sections = [
+            {
+                "section_id": "s1",
+                "review_status": "complete",
+                "origin_complete": True,
+                "draft_ref": {
+                    "project_id": self.pid,
+                    "artifact_id": "draft-1",
+                    "revision_id": "draft-r1",
+                },
+            }
+        ]
+        repo.start_global_review("delivery-1", sections, ORIGIN_OK, rights=self.rights)
+        reviewer, _ = _reviewer(find_if_missing=False)
+        writer, _ = _writer()
+        repo.run_global_review(
+            "delivery-1",
+            {
+                "revision_id": "m1",
+                "text": "Body [@k1].",
+                "paragraphs": {"p1": {"text": "Body [@k1].", "checks": "valid"}},
+            },
+            [],
+            reviewer,
+            writer,
+            rights=self.rights,
+        )
+        repo.freshness(
+            "delivery-1", "2026-01-01", {"action": "accept_cutoff"}, rights=self.rights
+        )
+        rights_file = self.write_json("del-rights.json", self.rights("delivery-1", "r1"))
+        out_dir = self.tmp / "export-no-approval"
+        with self._patch_drafting_package():
+            error = self.cli(
+                "delivery", "export", "--project", self.pid, "--delivery-id", "delivery-1",
+                "--out-dir", str(out_dir), "--rights-file", rights_file,
+                expect=cli_main.EXIT_VALIDATION,
+            )
+        self.assertEqual(error["error"]["category"], "validation")
+        self.assertFalse(os.path.exists(out_dir))
+
     def test_export_refuses_after_notes_edit_and_writes_nothing(self):
-        self.make_approved_delivery("delivery-1")
+        self.make_gate_approved_delivery("delivery-1")
         notes_file = self.write_json(
             "notes.json",
             [{"note_id": "n1", "text": "tighten wording", "category": "wording"}],
@@ -530,45 +718,75 @@ class DeliveryCliTest(CliBase):
         )
         self.assertFalse(applied["approval_present"])
 
-        package_file = self.write_json("package.json", EXPORT_PACKAGE)
         out_dir = self.tmp / "export-refused"
-        error = self.cli(
-            "delivery", "export", "--project", self.pid, "--delivery-id", "delivery-1",
-            "--out-dir", str(out_dir), "--package-file", package_file,
-            "--rights-file", rights_file,
-            expect=cli_main.EXIT_VALIDATION,
-        )
+        with self._patch_drafting_package():
+            error = self.cli(
+                "delivery", "export", "--project", self.pid, "--delivery-id", "delivery-1",
+                "--out-dir", str(out_dir), "--rights-file", rights_file,
+                expect=cli_main.EXIT_VALIDATION,
+            )
         self.assertEqual(error["error"]["category"], "validation")
         self.assertFalse(os.path.exists(out_dir))
 
     def test_export_refuses_out_dir_inside_data_dir(self):
-        self.make_approved_delivery("delivery-1")
-        package_file = self.write_json("package.json", EXPORT_PACKAGE)
+        self.make_gate_approved_delivery("delivery-1")
         rights_file = self.write_json("del-rights.json", self.rights("delivery-1", "r1"))
         out_dir = self.state / "export"
         error = self.cli(
             "delivery", "export", "--project", self.pid, "--delivery-id", "delivery-1",
-            "--out-dir", str(out_dir), "--package-file", package_file,
-            "--rights-file", rights_file,
+            "--out-dir", str(out_dir), "--rights-file", rights_file,
             expect=cli_main.EXIT_STORAGE,
         )
         self.assertEqual(error["error"]["category"], "storage")
         self.assertFalse(os.path.exists(out_dir))
 
-    def test_approve_prepare_prints_digest_and_records_nothing(self):
-        self.make_approved_delivery("delivery-1")
+    def test_export_drops_package_file_flag(self):
+        # ``--package-file`` is removed: the packages are re-derived.
+        with self.assertRaises(cli_main.CliUsageError):
+            cli_main.build_parser().parse_args(
+                [
+                    "delivery", "export", "--delivery-id", "d", "--out-dir", "o",
+                    "--package-file", "p", "--rights-file", "r",
+                ]
+            )
+
+    def test_approve_has_no_approver_and_prepare_records_no_approval(self):
+        # No API accepts an approver string for the CLI export/approval path.
+        with self.assertRaises(cli_main.CliUsageError):
+            cli_main.build_parser().parse_args(
+                [
+                    "delivery", "approve", "--delivery-id", "d", "--prepare",
+                    "--rights-file", "r", "--approver", "alice",
+                ]
+            )
+        self.make_prepared_delivery("delivery-1")
+        rights_file = self.write_json("del-rights.json", self.rights("delivery-1", "r1"))
         prepared = self.cli(
             "delivery", "approve", "--project", self.pid, "--delivery-id", "delivery-1",
-            "--prepare",
+            "--prepare", "--rights-file", rights_file,
         )
         self.assertTrue(prepared["prepare_only"])
         self.assertFalse(prepared["approval_recorded"])
         self.assertFalse(prepared["human_authenticated"])
         self.assertRegex(prepared["manifest_digest"], r"^[0-9a-f]{64}$")
-        self.assertIn("gate confirm", prepared["next_command"])
-        # Without --prepare the command refuses and explains the gap.
+        self.assertIn("gate prepare", prepared["prepare_command"])
+        self.assertIn("gate confirm", prepared["confirm_command"])
+        self.assertIn(prepared["manifest_revision"], prepared["confirm_command"])
+        # The gate is not yet satisfied: the export is refused until a human
+        # records it (the CLI itself cannot).
+        out_dir = self.tmp / "export-unapproved"
+        with self._patch_drafting_package():
+            error = self.cli(
+                "delivery", "export", "--project", self.pid, "--delivery-id", "delivery-1",
+                "--out-dir", str(out_dir), "--rights-file", rights_file,
+                expect=cli_main.EXIT_VALIDATION,
+            )
+        self.assertEqual(error["error"]["category"], "validation")
+        self.assertFalse(os.path.exists(out_dir))
+        # Without --prepare the command refuses.
         error = self.cli(
             "delivery", "approve", "--project", self.pid, "--delivery-id", "delivery-1",
+            "--rights-file", rights_file,
             expect=cli_main.EXIT_VALIDATION,
         )
         self.assertEqual(error["error"]["category"], "validation")
