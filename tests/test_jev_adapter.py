@@ -140,23 +140,27 @@ class QuestionDefTests(unittest.TestCase):
         q = jev.QuestionDef("p", jev.PREDICATE, "i")
         self.assertEqual(q.wire_type(), "noul")
 
-    def test_choice_requires_options(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.QuestionDef("c", jev.CHOICE, "i")
-        with self.assertRaises(jev.JevValidationError):
-            jev.QuestionDef("c", jev.CHOICE, "i", options=("a",), levels=("x",))
-
-    def test_score_requires_levels(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.QuestionDef("s", jev.SCORE, "i")
-
-    def test_duplicate_options_rejected(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.QuestionDef("c", jev.CHOICE, "i", options=("a", "a"))
-
-    def test_unknown_kind_rejected(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.QuestionDef("k", "nope", "i")
+    def test_invalid_definitions_rejected(self):
+        cases = [
+            ("choice_requires_options", [
+                lambda: jev.QuestionDef("c", jev.CHOICE, "i"),
+                lambda: jev.QuestionDef("c", jev.CHOICE, "i", options=("a",), levels=("x",)),
+            ]),
+            ("score_requires_levels", [
+                lambda: jev.QuestionDef("s", jev.SCORE, "i"),
+            ]),
+            ("duplicate_options", [
+                lambda: jev.QuestionDef("c", jev.CHOICE, "i", options=("a", "a")),
+            ]),
+            ("unknown_kind", [
+                lambda: jev.QuestionDef("k", "nope", "i"),
+            ]),
+        ]
+        for label, builders in cases:
+            with self.subTest(case=label):
+                for build in builders:
+                    with self.assertRaises(jev.JevValidationError):
+                        build()
 
     def test_box_is_representable_but_unsupported(self):
         q = jev.QuestionDef("z", jev.BOX, "unsupported")
@@ -653,78 +657,61 @@ class ExactCostTests(unittest.TestCase):
         )
         return result
 
-    def test_provider_precision_preserved(self):
-        result = self._cost("0.00002037")
-        self.assertEqual(result.cost.amount_usd, "0.00002037")
-        self.assertIsInstance(result.cost.amount_usd, str)
+    def test_cost_decimal_accepted_exactly(self):
+        cases = [
+            ("provider_precision", "0.00002037", "0.00002037"),
+            # A zero cost is a known cost, never unknown, with the reserve released.
+            ("zero_is_known", "0", "0"),
+            ("small_precision", "0.000000016", "0.000000016"),
+            # A value that would lose precision as an IEEE-754 float.
+            ("no_float_roundtrip", "0.1", "0.1"),
+        ]
+        for label, raw, expected in cases:
+            with self.subTest(case=label):
+                result = self._cost(raw)
+                self.assertEqual(result.cost.amount_usd, expected)
+                self.assertIsInstance(result.cost.amount_usd, str)
+                if label == "zero_is_known":
+                    self.assertEqual(result.cost.state, "known")
+                    self.assertEqual(Decimal(result.cost.amount_usd), Decimal(0))
+                    self.assertFalse(result.cost.reserve_retained)
 
-    def test_zero_cost_is_known_not_unknown(self):
-        result = self._cost("0")
-        self.assertEqual(result.cost.state, "known")
-        self.assertEqual(result.cost.amount_usd, "0")
-        self.assertEqual(Decimal(result.cost.amount_usd), Decimal(0))
-        self.assertFalse(result.cost.reserve_retained)
-
-    def test_small_precision_preserved(self):
-        self.assertEqual(self._cost("0.000000016").cost.amount_usd, "0.000000016")
-
-    def test_no_float_roundtrip(self):
-        # A value that would lose precision as an IEEE-754 float.
-        result = self._cost("0.1")
-        self.assertEqual(result.cost.amount_usd, "0.1")
-
-    def test_invalid_cost_string_is_protocol_error(self):
-        self.assertEqual(self._cost('"0.01"').status, "protocol_error")
-
-    def test_bool_cost_is_protocol_error(self):
-        self.assertEqual(self._cost("true").status, "protocol_error")
-
-    def test_negative_cost_is_protocol_error(self):
-        self.assertEqual(self._cost("-1").status, "protocol_error")
-
-    def test_exponent_bounds_rejected(self):
-        result = self._cost("1e999")
-        self.assertEqual(result.status, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
+    def test_cost_decimal_rejected_protocol_error(self):
+        cases = [
+            ("invalid_string", '"0.01"'),
+            ("bool", "true"),
+            ("negative", "-1"),
+            ("exponent_bounds", "1e999"),
+        ]
+        for label, raw in cases:
+            with self.subTest(case=label):
+                result = self._cost(raw)
+                self.assertEqual(result.status, "protocol_error")
+                if label == "exponent_bounds":
+                    self.assertEqual(result.cost.state, "unknown")
 
 
 # --------------------------------------------------------------------------- #
 # Endpoint / redirect / proxy / key guards
 # --------------------------------------------------------------------------- #
 class GuardTests(unittest.TestCase):
-    def test_execute_blocks_other_endpoint_with_zero_calls(self):
-        transport = FakeTransport(resp(200, valid_payload()))
-        result = run(transport, endpoint="https://evil.example/collect")
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.calls_attempted, 0)
-        self.assertEqual(transport.calls, [])
-        self.assertEqual(result.cost.state, "not_incurred")
-
-    def test_execute_blocks_trailing_slash_endpoint(self):
-        transport = FakeTransport(resp(200, valid_payload()))
-        result = run(transport, endpoint=jev.ENDPOINT + "/")
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(transport.calls, [])
-
-    def test_execute_blocks_unauthorized_with_zero_calls(self):
-        transport = FakeTransport(resp(200, valid_payload()))
-        result = run(transport, authorized=False)
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.calls_attempted, 0)
-        self.assertEqual(transport.calls, [])
-
-    def test_execute_blocks_missing_key_with_zero_calls(self):
-        transport = FakeTransport(resp(200, valid_payload()))
-        result = run(transport, api_key="")
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(transport.calls, [])
-
-    def test_execute_blocks_invalid_plan_with_zero_calls(self):
-        transport = FakeTransport(resp(200, valid_payload()))
-        result = run(transport, reserve_usd="0")
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.calls_attempted, 0)
-        self.assertEqual(transport.calls, [])
+    def test_execute_blocks_unsafe_request_with_zero_calls(self):
+        cases = [
+            ("foreign_endpoint", {"endpoint": "https://evil.example/collect"}),
+            ("trailing_slash_endpoint", {"endpoint": jev.ENDPOINT + "/"}),
+            ("unauthorized", {"authorized": False}),
+            ("missing_key", {"api_key": ""}),
+            ("invalid_plan", {"reserve_usd": "0"}),
+            ("over_budget", {"reserve_usd": "1e-12"}),
+        ]
+        for label, kwargs in cases:
+            with self.subTest(case=label):
+                transport = FakeTransport(resp(200, valid_payload()))
+                result = run(transport, **kwargs)
+                self.assertEqual(result.status, "blocked")
+                self.assertEqual(result.calls_attempted, 0)
+                self.assertEqual(transport.calls, [])
+                self.assertEqual(result.cost.state, "not_incurred")
 
     def test_execute_box_only_is_blocked_with_unsupported_outcome(self):
         transport = FakeTransport(resp(200, valid_payload()))
@@ -735,13 +722,6 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(result.outcomes["z"].outcome, "unsupported")
         self.assertIsNotNone(result.outcomes["z"].diagnostic)
         self.assertIsNone(result.outcomes["z"].answer)
-
-    def test_execute_blocks_over_budget_with_zero_calls(self):
-        transport = FakeTransport(resp(200, valid_payload()))
-        result = run(transport, reserve_usd="1e-12")
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(transport.calls, [])
-        self.assertEqual(result.cost.state, "not_incurred")
 
     def test_post_decisions_refuses_other_endpoint(self):
         with self.assertRaises(jev.JevEndpointError):
@@ -818,23 +798,21 @@ class NoRetryTests(unittest.TestCase):
     def test_single_dispatch_constant(self):
         self.assertEqual(jev.MAX_DISPATCH_ATTEMPTS, 1)
 
-    def test_completed_calls_once(self):
-        transport = FakeTransport(resp(200, valid_payload()))
-        result = run(transport)
-        self.assertEqual(len(transport.calls), 1)
-        self.assertEqual(result.calls_attempted, 1)
-        self.assertTrue(result.no_automatic_retry)
-        self.assertFalse(result.idempotent_admission_proven)
-
-    def test_transport_error_calls_once(self):
-        transport = FakeTransport(raises=jev.JevTransportError("dropped"))
-        run(transport)
-        self.assertEqual(len(transport.calls), 1)
-
-    def test_api_error_calls_once(self):
-        transport = FakeTransport(resp(503, {"error": {"code": 503, "message": "x"}}))
-        run(transport)
-        self.assertEqual(len(transport.calls), 1)
+    def test_every_outcome_dispatches_once(self):
+        cases = [
+            ("completed", resp(200, valid_payload()), None),
+            ("transport_error", None, jev.JevTransportError("dropped")),
+            ("api_error", resp(503, {"error": {"code": 503, "message": "x"}}), None),
+        ]
+        for label, response, raises in cases:
+            with self.subTest(case=label):
+                transport = FakeTransport(response=response, raises=raises)
+                result = run(transport)
+                self.assertEqual(len(transport.calls), 1)
+                if label == "completed":
+                    self.assertEqual(result.calls_attempted, 1)
+                    self.assertTrue(result.no_automatic_retry)
+                    self.assertFalse(result.idempotent_admission_proven)
 
     def test_attempt_no_echoed(self):
         transport = FakeTransport(resp(200, valid_payload()))
@@ -853,25 +831,18 @@ class CostRecordTests(unittest.TestCase):
         self.assertEqual(record.route, "direct_call")
         self.assertEqual(record.accounting_bucket, "direct_call")
 
-    def test_known_requires_amount(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="known")
-
-    def test_not_incurred_rejects_amount(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="not_incurred", amount_usd="0.1")
-
-    def test_unknown_rejects_zero_amount(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="unknown", amount_usd="0")
-
-    def test_bad_state_rejected(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="bogus")
-
-    def test_bucket_mismatch_rejected(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="unknown", accounting_bucket="session_statistics")
+    def test_invalid_cost_records_rejected(self):
+        cases = [
+            ("known_requires_amount", {"state": "known"}),
+            ("not_incurred_rejects_amount", {"state": "not_incurred", "amount_usd": "0.1"}),
+            ("unknown_rejects_zero_amount", {"state": "unknown", "amount_usd": "0"}),
+            ("bad_state", {"state": "bogus"}),
+            ("bucket_mismatch", {"state": "unknown", "accounting_bucket": "session_statistics"}),
+        ]
+        for label, kwargs in cases:
+            with self.subTest(case=label):
+                with self.assertRaises(jev.JevValidationError):
+                    jev.CostRecord(**kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -965,61 +936,29 @@ class ForgedPlanTests(unittest.TestCase):
     def _valid_plan(self):
         return jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
 
-    def test_forged_model_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), model="openai/expensive-unrelated")
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_bound_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), cost_upper_bound_usd="0")
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_reserve_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), reserve_usd="0")
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_size_refused(self):
-        plan = self._valid_plan()
-        plan = dataclasses.replace(plan, request_bytes=plan.request_bytes + 1)
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_digest_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), request_sha256="00" * 32)
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_pricing_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), pricing_version="nope")
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_endpoint_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), endpoint="https://evil.example/x")
-        with self.assertRaises(jev.JevError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_non_decimal_bound_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), cost_upper_bound_usd="abc")
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_empty_questions_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), questions=())
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_non_mapping_request_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), request=[])
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
-
-    def test_forged_non_int_size_refused(self):
-        plan = dataclasses.replace(self._valid_plan(), request_bytes="big")
-        with self.assertRaises(jev.JevValidationError):
-            jev.dispatch_plan(plan, api_key=API_KEY, transport=FakeTransport())
+    def test_forged_plan_refused(self):
+        cases = [
+            ("model", {"model": "openai/expensive-unrelated"}, jev.JevValidationError),
+            ("bound", {"cost_upper_bound_usd": "0"}, jev.JevValidationError),
+            ("reserve", {"reserve_usd": "0"}, jev.JevValidationError),
+            ("size", None, jev.JevValidationError),  # request_bytes + 1
+            ("digest", {"request_sha256": "00" * 32}, jev.JevValidationError),
+            ("pricing", {"pricing_version": "nope"}, jev.JevValidationError),
+            ("endpoint", {"endpoint": "https://evil.example/x"}, jev.JevError),
+            ("non_decimal_bound", {"cost_upper_bound_usd": "abc"}, jev.JevValidationError),
+            ("empty_questions", {"questions": ()}, jev.JevValidationError),
+            ("non_mapping_request", {"request": []}, jev.JevValidationError),
+            ("non_int_size", {"request_bytes": "big"}, jev.JevValidationError),
+        ]
+        for label, overrides, exc in cases:
+            with self.subTest(case=label):
+                base = self._valid_plan()
+                if label == "size":
+                    forged = dataclasses.replace(base, request_bytes=base.request_bytes + 1)
+                else:
+                    forged = dataclasses.replace(base, **overrides)
+                with self.assertRaises(exc):
+                    jev.dispatch_plan(forged, api_key=API_KEY, transport=FakeTransport())
 
 
 class StatusClassificationTests(unittest.TestCase):
@@ -1210,29 +1149,25 @@ class DispatchBoundRepairTests(unittest.TestCase):
 
 
 class CostRecordInvariantRepairTests(unittest.TestCase):
-    def test_amount_must_be_string(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="known", amount_usd=0.001)
-
-    def test_amount_rejects_negative(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="known", amount_usd="-1")
-
-    def test_currency_must_be_usd(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="unknown", currency="EUR")
-
-    def test_reserve_retained_must_match_state(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="unknown", reserve_usd="0.25", reserve_retained=False)
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="known", amount_usd="0.1", reserve_retained=True)
-
-    def test_reserve_must_be_positive_decimal(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="unknown", reserve_usd="0", reserve_retained=True)
-        with self.assertRaises(jev.JevValidationError):
-            jev.CostRecord(state="unknown", reserve_usd=0.25, reserve_retained=True)
+    def test_cost_record_invariant_violations_rejected(self):
+        cases = [
+            ("amount_must_be_string", [{"state": "known", "amount_usd": 0.001}]),
+            ("amount_rejects_negative", [{"state": "known", "amount_usd": "-1"}]),
+            ("currency_must_be_usd", [{"state": "unknown", "currency": "EUR"}]),
+            ("reserve_retained_must_match_state", [
+                {"state": "unknown", "reserve_usd": "0.25", "reserve_retained": False},
+                {"state": "known", "amount_usd": "0.1", "reserve_retained": True},
+            ]),
+            ("reserve_must_be_positive_decimal", [
+                {"state": "unknown", "reserve_usd": "0", "reserve_retained": True},
+                {"state": "unknown", "reserve_usd": 0.25, "reserve_retained": True},
+            ]),
+        ]
+        for label, kwargs_list in cases:
+            with self.subTest(case=label):
+                for kwargs in kwargs_list:
+                    with self.assertRaises(jev.JevValidationError):
+                        jev.CostRecord(**kwargs)
 
 
 # --------------------------------------------------------------------------- #
