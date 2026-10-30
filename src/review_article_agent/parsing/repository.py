@@ -54,7 +54,12 @@ from .core import (
     parse_document,
 )
 from .locator import make_locator, resolve_locator
-from .pdf_adapter import PDF_PARSER_VERSION, parse_pdf
+from .pdf_adapter import (
+    PDF_PARSER_VERSION,
+    parse_pdf,
+    pdf_passages_digest,
+    pypdf_installed_version,
+)
 
 #: Generic-envelope document type written for a parsed report revision.
 REPORT_DOCUMENT_TYPE = DOCUMENT_TYPE
@@ -255,8 +260,11 @@ class ParsingRepository:
         payload's internal consistency (passage text digests, no exclusion
         claim), the single exact ``derived_from`` document dependency, and the
         payload source digest against the stored source bytes.  A current-parser
-        XML report is reparsed deterministically and must match.  Untrusted
-        generic-imported bogus content raises a static error and is never trusted.
+        XML report is reparsed deterministically and must match; a PDF report is
+        reparsed with the recorded pypdf version and its passage digests must
+        match (otherwise it stays ``unverified``, or fails closed when the parser
+        is available but the passages disagree).  Untrusted generic-imported bogus
+        content raises a static error and is never trusted.
         """
         return self._read_validated(self._ref(report_ref, "report_ref"))
 
@@ -421,13 +429,15 @@ class ParsingRepository:
             raise _err("report_source_hash_mismatch")
         fmt = payload["format"]
         current_parser, current_norm = _current_versions(fmt)
-        reproducible = (
-            fmt != "pdf"
-            and payload["parser_version"] == PARSER_VERSION
-            and payload["normalization_version"] == NORMALIZATION_VERSION
-        )
-        if reproducible and parse_document(source_bytes, source_digest=payload["source"]["sha256"]) != payload:
-            raise _err("report_payload_mismatch")
+        if fmt == "pdf":
+            reproducible = self._pdf_reproducible(payload, source_bytes)
+        else:
+            reproducible = (
+                payload["parser_version"] == PARSER_VERSION
+                and payload["normalization_version"] == NORMALIZATION_VERSION
+            )
+            if reproducible and parse_document(source_bytes, source_digest=payload["source"]["sha256"]) != payload:
+                raise _err("report_payload_mismatch")
         return {
             "project_id": self.project_id,
             "report_ref": dict(ref),
@@ -445,6 +455,34 @@ class ParsingRepository:
             "normalization_version_changed": payload["normalization_version"] != current_norm,
             "payload": payload,
         }
+
+    def _pdf_reproducible(self, payload: dict, source_bytes: bytes) -> bool:
+        """Reparse a PDF report and compare passages; fail closed on a mismatch.
+
+        A PDF report is reproducible only when this build has the exact ``pypdf``
+        distribution version the report recorded **and** the report was produced
+        by the current PDF parser/normalization. Otherwise it stays unverified
+        (never asserted as a resolved source/text match), exactly like an
+        unknown-version XML report. When it *is* reproducible but a fresh reparse
+        of the same bytes disagrees on the status or the passage identity/locator
+        digests, the stored report is untrusted and raises a static error.
+        """
+        recorded = payload.get("pdf_parser_version")
+        if not isinstance(recorded, str) or not recorded:
+            return False
+        if payload["parser_version"] != PDF_PARSER_VERSION:
+            return False
+        if payload["normalization_version"] != NORMALIZATION_VERSION:
+            return False
+        installed = pypdf_installed_version()
+        if installed is None or installed != recorded:
+            return False
+        fresh = parse_pdf(source_bytes)
+        if fresh.get("status") != payload["status"]:
+            raise _err("report_payload_mismatch")
+        if pdf_passages_digest(fresh.get("passages")) != pdf_passages_digest(payload["passages"]):
+            raise _err("report_payload_mismatch")
+        return True
 
     def _decode_envelope(self, content: bytes) -> dict:
         try:
@@ -500,8 +538,26 @@ class ParsingRepository:
             raise _err("report_payload_invalid")
         for passage in passages:
             self._validate_passage(passage)
-        if fmt == "pdf" and (status != "needs_review" or passages or payload["human_action_required"] is not True):
-            raise _err("report_payload_invalid")
+        if fmt == "pdf":
+            # A PDF report carries either usable extracted text (``parsed`` with
+            # page-locatored passages) or an explicit human-review state
+            # (``needs_review``). It is never ``rejected``. A ``parsed`` report
+            # does not itself force a per-passage human action -- its text is
+            # usable original text -- but it must record the exact pypdf version
+            # so read-back can reproduce it; a ``needs_review`` report still
+            # requires a human action. The global
+            # ``excludes_candidate``/``authorizes_scientific_processing`` checks
+            # above still apply, and every passage digest is validated.
+            if status not in ("parsed", "needs_review"):
+                raise _err("report_payload_invalid")
+            if status == "parsed":
+                if payload["human_action_required"] is not False:
+                    raise _err("report_payload_invalid")
+                recorded = payload.get("pdf_parser_version")
+                if not isinstance(recorded, str) or not recorded:
+                    raise _err("report_payload_invalid")
+            elif payload["human_action_required"] is not True:
+                raise _err("report_payload_invalid")
         return payload
 
     @staticmethod

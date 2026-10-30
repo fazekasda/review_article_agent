@@ -500,5 +500,102 @@ class FailedParseTests(ParsingRepositoryTestBase):
             self.assertFalse(record["excludes_candidate"])
 
 
+_REAL_PYPDF = __import__("importlib.util").util.find_spec("pypdf") is not None
+
+
+@unittest.skipUnless(_REAL_PYPDF, "optional dependency pypdf not installed ([pdf] extra)")
+class PdfReportRepositoryTests(ParsingRepositoryTestBase):
+    """A PDF report with usable extracted text is durable and readable (S17-P7)."""
+
+    def test_pdf_text_report_reads_back_with_passages(self):
+        from test_acquisition_pdf_inspection import build_pdf, text_stream
+        from review_article_agent.parsing.pdf_adapter import PDF_PARSER_VERSION
+
+        long_text = "The quick brown fox jumps over the lazy dog. " * 8
+        data = build_pdf([text_stream(long_text), text_stream(long_text)])
+        with self.new_store() as store:
+            pid = store.project_id
+            src_ref, _ = self.add_document(
+                store, "art-pdf", data, "rev-pdf", media_type="application/pdf"
+            )
+            pr = ParsingRepository(store)
+            out = pr.parse_stored_document(
+                src_ref, report_artifact_id="art-pr", report_revision_id="rev-pr",
+                rights=_rights(pid, "art-pr", "rev-pr"),
+            )
+            self.assertEqual(out["status"], "parsed")
+            self.assertEqual(out["parser_version"], PDF_PARSER_VERSION)
+            # Usable PDF text is original text for grounded extraction.
+            self.assertFalse(out["human_action_required"])
+            self.assertFalse(out["excludes_candidate"])
+            record = pr.read_report(out["report_ref"])
+            self.assertEqual(record["format"], "pdf")
+            self.assertEqual(record["status"], "parsed")
+            self.assertEqual({p["page"] for p in record["payload"]["passages"]}, {1, 2})
+            self.assertTrue(record["payload"]["non_text_assets_require_review"])
+            # read-back reproduces the passages with the recorded pypdf version
+            self.assertTrue(record["verifiable"])
+            self.assertFalse(record["parser_version_changed"])
+            self.assertFalse(record["excludes_candidate"])
+            recorded = record["payload"]["pdf_parser_version"]
+            self.assertEqual(recorded, __import__("pypdf").__version__)
+            locator = pr.make_passage_locator(out["report_ref"], "p0001")
+            resolved = pr.resolve_passage(locator)
+            self.assertEqual(resolved["status"], "resolved")
+            self.assertTrue(resolved["verifiable"])
+
+    def test_pdf_text_report_tamper_fails_closed(self):
+        from test_acquisition_pdf_inspection import build_pdf, text_stream
+        from review_article_agent.parsing.repository import REPORT_DOCUMENT_TYPE
+
+        long_text = "The quick brown fox jumps over the lazy dog. " * 8
+        data = build_pdf([text_stream(long_text), text_stream(long_text)])
+        with self.new_store() as store:
+            pid = store.project_id
+            src_ref, _ = self.add_document(
+                store, "art-pdf", data, "rev-pdf", media_type="application/pdf"
+            )
+            pr = ParsingRepository(store)
+            out = pr.parse_stored_document(
+                src_ref, report_artifact_id="art-pr", report_revision_id="rev-pr",
+                rights=_rights(pid, "art-pr", "rev-pr"),
+            )
+            base = json.loads(json.dumps(pr.read_report(out["report_ref"])["payload"]))
+            # (a) tamper the stored passage text but keep the current labels and
+            # recorded pypdf version: a deterministic reparse must catch it.
+            tampered = json.loads(json.dumps(base))
+            tampered["passages"][0]["text"] += " TAMPER"
+            tampered["passages"][0]["raw_text"] = tampered["passages"][0]["text"]
+            tampered["passages"][0]["text_sha256"] = hashlib.sha256(
+                tampered["passages"][0]["text"].encode("utf-8")
+            ).hexdigest()
+            bad_ref = self.write_generic_report(
+                store, "art-bad-pdf", "rev-bad-pdf",
+                {"schema_version": 1, "document_type": REPORT_DOCUMENT_TYPE, "payload": tampered},
+                src_ref,
+            )
+            self.assert_code("report_payload_mismatch", pr.read_report, bad_ref)
+
+            # (b) a recorded pypdf version this build does not have is accepted
+            # as a non-reproducible historical report and is UNVERIFIED, never
+            # asserted as a resolved source/text match.
+            other = json.loads(json.dumps(base))
+            other["pdf_parser_version"] = "0.0.0-not-installed"
+            unverified_ref = self.write_generic_report(
+                store, "art-unv-pdf", "rev-unv-pdf",
+                {"schema_version": 1, "document_type": REPORT_DOCUMENT_TYPE, "payload": other},
+                src_ref,
+            )
+            record = pr.read_report(unverified_ref)
+            self.assertFalse(record["verifiable"])
+            loc = dict(make_locator(other, "p0001"))
+            loc["report_ref"] = dict(unverified_ref)
+            loc["source_ref"] = dict(src_ref)
+            resolved = pr.resolve_passage(loc)
+            self.assertEqual(resolved["status"], "unverified")
+            self.assertFalse(resolved["historical_resolved"])
+            self.assertIn("parser_version_unverified", resolved["reasons"])
+
+
 if __name__ == "__main__":
     unittest.main()

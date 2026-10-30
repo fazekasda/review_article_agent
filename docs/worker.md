@@ -455,3 +455,52 @@ Extends §1–§12. The **only** official-full-text worker surface is `discovery
   transaction or lock is held across network work** (the store connection stays open);
   the safe result keeps refs/status/counts only, replays a proven result with zero I/O,
   and never silently re-sends an ambiguous outcome (tests: worker + retrieval CLI suites).
+
+## 14. Owner-controlled extraction/quality runs (Step 09 addition)
+
+Extends §1–§13. The **only** direct-extraction worker surface is `discovery_submit`
+`mode=extraction_run` over the integrated
+[`extraction/runner.py`](../src/review_article_agent/extraction/runner.py) `execute_run`
+boundary; the runner owns every gate, right, budget, ledger, schema, and escalation
+concern. The Step 09 CLI spellings are in [`cli.md`](cli.md) §18, the runner contract in
+[`implementation/09-extraction.md`](implementation/09-extraction.md), and the direct
+exception in [decision 004](decisions/004-step09-direct-extraction.md).
+
+- **Exact parameters, logical key.** `mode=extraction_run` strictly/purely validates the
+  exact parameters — `config_ref`, `report_refs` (a non-empty list of distinct same-project
+  refs), `purpose` (`extraction`/`quality`), `mode` (`pilot`/`bulk`), `hosted_ref`, the
+  optional `extraction_ref` (required for `quality`, forbidden otherwise) and `pilot_ref`
+  (required for `bulk`, forbidden otherwise), the receipt `artifact_id`/`revision_id`, the
+  caller's `rights` record, and the fixed `credential_env` name — into one
+  `extraction_run` job under the caller's `request_id`; no actor/authority flag, no
+  credential value, no model output, and no source byte. It returns a **queued admission
+  only**.
+- **Ownership.** [`worker/extraction.py`](../src/review_article_agent/worker/extraction.py)
+  (strict submission validation, the safe result projection, the replay-only read, and the
+  read seam) · [`worker/engine.py`](../src/review_article_agent/worker/engine.py)
+  (`_run_extract_dispatch`) · [`worker/discovery.py`](../src/review_article_agent/worker/discovery.py)
+  (the `MODE_EXTRACT`/`TASK_KIND_EXTRACT` delegation alongside `MODE_ACQUIRE`).
+- **One guarded POST per durable job.** The dispatch delegates to `execute_run`, which
+  re-derives the config/hosted-use revisions, revalidates the exact named `batch` gate
+  (`extraction.hosted_use.<purpose>`), every pinned source's hosted-transfer rights, the
+  execution token, and (in bulk mode) the approved pilot and the acquired manifest,
+  reserves a `direct_call` dispatch on the runtime dispatch ledger **before** the one POST,
+  and commits the receipt + proposal + accepted dispatch result + settled cost in one
+  nested transaction. A missing credential, an unapproved/stale config or hosted-use
+  revision, a denied rights record, or a gate/activation refusal performs **zero** POST.
+- **Explicit worker env name; value never persisted.** The one permitted credential name
+  is **`OPENROUTER_API_KEY`** (`worker/extraction.py` `EXTRACT_CREDENTIAL_ENV`, the same
+  variable the lead job uses). The worker reads the variable from its **own** environment
+  at dispatch; the credential **value** is never accepted over IPC, never written to the
+  DB, and never logged.
+- **Honest outcome; never a blind retry.** A terminal `completed`/`failed` outcome is
+  persisted as the job's safe accepted result, which references the run **receipt**
+  (`run_ref`) and carries no credential or raw output. An `unknown`/submitted external
+  outcome moves the job to `waiting_human` (reserve and runtime occupancy retained) and is
+  **never** re-POSTed: on restart the engine proves an existing outcome by replay from
+  durable rows with **zero** POST (`worker.extraction.replay_extract`), and an unprovable
+  attempt is escalated for an explicit owner `reconcile`.
+- **Tests.** [`tests/test_extraction_worker.py`](../tests/test_extraction_worker.py) —
+  submission validation, queued admission + asynchronous completion, receipt readback via
+  `require_run`, missing credential/gate refusals, replay-is-one-run, ambiguous-outcome
+  recovery, and the `extraction run` CLI surface.
