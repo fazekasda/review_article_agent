@@ -2,68 +2,63 @@
 
 An AI-assisted, evidence-grounded scientific review writer.
 
-A durable **local project core** exists; scientific features do not. Step 00 (the
-OpenCode integration and language spike) is **complete**: throwaway prototypes
-under `spikes/runtime/` are verified against a real disposable app-owned OpenCode
-v2.2.0 service, and on 2026-10-27 the user accepted the runtime-language decision
-(Python core with a supported, explicitly authenticated OpenCode V2 HTTP
-integration). Step 01 (contracts and technical decisions) is **complete as a
-decision/contract documentation step**: on 2026-10-27 the user dispositioned every
-P1–P6 and operational/technical item in the recorded Step 01 interview, binding to
-the reviewed revision `ee7f7ea`, and the versioned implementation contracts
-(C01 v1.4, C02 v3.2, C03 v1) carry the accepted behaviors. The behavioral
-directions are approved; the exact field/schema spelling remains a reviewable
-versioned representation, not a new human-ratification gate. Step 02 (CLI, project
-registry, artifacts, and backups) is **complete as a local foundation** (integrated
-at `5efa4f2`): a stdlib-only CLI over a path-independent project registry,
-immutable artifact revisions, non-authorizing local fixture approvals, and a
-consistent private backup/verify/restore. It implements **no** agent execution, no
-OpenCode session, and no scientific feature or scientific approval — every
-revision is a local `proposal`, and `export` is a **private local storage
-snapshot, not a manuscript export**. Step 03 (background worker, durable jobs, and
-recovery) is **complete as a synthetic slice** (integrated at `2530955`): a
-stdlib-only, owner-authenticated **detached worker** with durable job/attempt/result/
-budget state, an owner-only Unix-domain-socket control transport, explicit
-recovery/reconciliation, exactly one execution-active project globally, and a
-real-process crash/concurrency matrix. Every task is a bounded **synthetic**
-numeric/waiting-human task and the external provider is a **synthetic fixture** with
-no egress; reserves are **virtual** (actual external spend USD 0) and **no**
-exactly-once external execution is claimed. Step 04 (restricted agent roles, model
-adapters, and approvals) is now **integrated** at `8626cee` as a **restricted
-runtime**: an app-owned, version-pinned OpenCode **v2.2.0** service, a pure
-fail-closed role/proposal boundary, a thin bounded session
-`submit_session_turn`/`reconcile_session_turn` **library** path, a direct-Jev typed
-adapter with durable versioned records and an atomic commit, and app-owned exact
-named-gate human approvals through the `gate` CLI. **Only the model transport is a
-loopback fixture**: there is **no** paid provider call, provider credential, or
-network egress (actual spend **USD 0**), **no** production paid generation or hosted
-transfer is authorized, and this is **still not** a working review writer — **no**
-scientific feature, production model run, or **scientific validation is claimed**.
-Step 04 is **complete as a restricted runtime**: its full local verification passed
-at `c1f927b` (**2,105 tests, no skips**; see the
-[Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)).
-Step 05 (reproducible discovery and corpus freeze) is now **complete as a scoped
-discovery workflow**, with its **core library and personal discovery CLI**
-implemented and verified: a bounded, stdlib-only public-metadata
-transport and provider adapters; a lossless codec and schema-11 observation
-repository; a typed context read-and-gate layer; an approved-plan/seed/metadata
-import execution library; a durable cumulative candidate ledger; bounded
-bidirectional citation expansion; a deterministic coverage/work/monetary report;
-an exact human-approved freeze/search-again record; and a live-capable,
-separately-authorized direct lead-proposal runner (implemented but **unrun/not
-authorized** here; the existing app-owned OpenCode production block is unchanged).
-The `discovery` CLI group submits and inspects these as **detached background
-jobs**, including `report create|show` and `freeze
-propose|status|show|history|require`. The final full combined check passed at the
-exact source/test/docs head `f3d97fe` (**2,920 tests, no skips**; 29 contract
-checks; `tsc`/`compileall`/`diffcheck` clean) — see the
-[Step 05 handoff](docs/implementation/handoffs/05-discovery.md) and the
-[discovery API/limits](docs/discovery.md). This is **not** a review writer: no
-study identity, eligibility, extraction, topic/literature completeness, or
-review-writer capability is claimed; final PR delivery and user review/merge are
-release actions.
+`review_article_agent` is a personal, local Python CLI that carries a review project
+from brief to a final approved export, with a human approval gate between every
+stage. It is **standard-library only** (`dependencies = []`; one optional extra,
+`pypdf`, for PDF text), `requires-python >= 3.11`, stores everything in SQLite under
+a path-independent project registry, and runs long work through a detached,
+owner-authenticated background worker. At most one project is execution-active at a
+time, and no stage becomes authoritative without its exact named human gate.
 
-## Getting started (local core only)
+## What the tool does today (end to end)
+
+The machine stages are implemented and locally verified end to end:
+
+- **Discovery and freeze** (Step 05): bounded public-metadata search (PubMed, Europe
+  PMC), a cumulative candidate ledger, citation expansion, a coverage report, and an
+  exact human-approved corpus freeze.
+- **Acquisition** (Step 06): open-access JATS XML retrieval and folder import,
+  deduplication, and rights/reconciliation bookkeeping.
+- **Parsing** (Step 07): XML/JATS/TEI structural parsing with stable passage
+  locators, plus bounded per-page **PDF text extraction** through the optional
+  `pypdf` extra (page-locator passages; OCR, figures, and tables escalate to human
+  review).
+- **Screening** (Step 08): an iterative pilot, Jev screening, and exclusion audits.
+- **Extraction** (Step 09): grounded extraction runs with output audits, available as
+  a detached `extraction_run` worker job.
+- **Synthesis, outline, and drafting** (Steps 10–11): framework, outline, section
+  blueprints, and evidence-grounded drafts.
+- **Review and tracing** (Steps 12–13): bounded critique/fact-check and
+  citation-origin tracing, surfaced through the `review`/`tracing` CLI groups.
+- **Delivery** (Step 14): global review, freshness, author notes, an exact-revision
+  final approval, and a real Markdown/BibTeX/RIS export whose bibliography carries
+  the title/authors/year/journal recorded in the frozen corpus.
+- **Model-backed roles** (kickoff 16 §5): every generative role runs through one
+  small adapter on the direct OpenRouter route — see
+  [Generative roles](docs/generation.md).
+- **Orchestrator** (kickoff 16 §6): `pipeline status` reports the current stage and
+  the exact next action; `pipeline run` submits the current stage's machine jobs and
+  stops at the next human gate, budget limit, pause, or failure.
+
+## What is still manual (human work the tool will not do)
+
+- The **brief, plan, and corpus freeze** (seed/plan/freeze approvals).
+- **Screening pilot design** and **extraction pilot design**: the pilot configs and
+  thresholds are human choices, and `pipeline run` deliberately submits nothing for
+  the screening stage.
+- **Every human gate**: the owner-authenticated named approvals recorded out of band
+  on the controlling terminal through the `gate` CLI.
+- **Hosted-use approvals**: a per-role `generation_hosted_use` document plus its
+  named gate before any paid model call.
+- **Final approval** before export: the owner-authenticated exact-revision
+  `delivery.final_approval` gate; `delivery export` refuses without it.
+
+**No live model or provider call** is made by the tests or this documentation, and
+**no scientific validation is claimed**: every model output in the suite is a
+recorded or injected fake, and live model validation is **unrun** (no credential was
+available to the coordinator).
+
+## Quickstart
 
 No install is required; the core is standard-library only. Use the module entry
 point with `PYTHONPATH=src`:
@@ -74,10 +69,24 @@ $ PYTHONPATH=src python3 -m review_article_agent --data-dir ./state create ./pro
 $ PYTHONPATH=src python3 -m review_article_agent --data-dir ./state list
 ```
 
+Once a project exists, `pipeline status` reports the current stage and the exact
+next action (read-only), and `pipeline run` drives the current stage's machine jobs
+until the next human gate:
+
+```console
+$ PYTHONPATH=src python3 -m review_article_agent --data-dir ./state pipeline status --project prj_…
+$ PYTHONPATH=src python3 -m review_article_agent --data-dir ./state pipeline run --config pipeline.json --project prj_…
+```
+
 The same `main()` is also reachable as `python -m review_article_agent.cli …` and
 as an installed `review-article-agent …` console script. See the
-[CLI contract](docs/cli.md) and [storage contract](docs/storage.md) for the exact
-commands, output/exit behavior, and the limits of the private snapshot.
+[CLI contract](docs/cli.md) (§19 `pipeline status`, §24 `pipeline run`, §23
+`generation run`) and [storage contract](docs/storage.md) for the exact commands,
+output/exit behavior, and the limits of the private snapshot. The model port and the
+per-role hosted-use approval are documented in
+[Generative roles](docs/generation.md); the test tiers and CI jobs are in
+[Continuous integration](docs/ci.md) and the [Running tests](#running-tests) section
+below.
 
 ### Synthetic worker and job lifecycle (Step 03)
 
@@ -219,30 +228,11 @@ off-MVP-path tests; the **fast tier** excludes them. See
 - [Generative roles direct-route decision 005 (accepted)](docs/decisions/005-generative-roles-direct-route.md)
 - [Implementation decision record template](docs/implementation/decision-template.md)
 
-Implementation step 04 (restricted agent roles, model adapters, and approvals; see
-its [step document](docs/implementation/04-agent-runtime.md)) is now **complete as a
-restricted runtime** (integrated at `8626cee`; final full-repository verification
-passed at `c1f927b` — see the
-[Step 04 handoff](docs/implementation/handoffs/04-agent-runtime.md)). Each
-implementation session must follow its step document and
-leave a handoff report. The step-00 prototypes and the accepted decision records do
-not claim any production feature is implemented or scientifically validated: step 00
-is a spike with a bounded evidence ceiling (the model transport was a fixture; the
-native decision route and per-question live failures remain unexercised), step 01 is
-a decision/contract session, step 02 is a durable **local** core with no agent
-execution and no scientific approval, step 03 is a synthetic detached worker with no
-model, provider, or scientific approval, and step 04 is a **restricted** runtime
-whose only model transport is a loopback fixture — no scientific autonomous
-workflow, production paid generation, hosted transfer, scientific feature, or
-scientific validation is implemented or claimed. Step 05 is **complete as a
-scoped discovery workflow** with its **core library
-and personal discovery CLI implemented** — a bounded public-metadata transport,
-provider adapters, a lossless schema-11 observation repository, a typed context
-read-and-gate layer, an approved-plan/seed/import execution library, a cumulative
-candidate ledger, bounded citation expansion, a coverage/work/monetary report, an
-exact human-approved freeze/search-again record, and a live-capable hosted
-lead-proposal runner, surfaced through the `discovery` CLI (see the
-[Step 05 handoff](docs/implementation/handoffs/05-discovery.md)); the final full
-combined check passed at the head `f3d97fe` (**2,920 tests, no skips**), and final
-PR delivery and user review/merge are release actions. No scientific feature, production paid
-generation, upload, or scientific validation is implemented or claimed.
+Each implementation session must follow its step document and leave a handoff
+report. The step-00 spike and the accepted decision records do not claim any
+production feature is implemented or scientifically validated, and the tests make
+no live model or provider call. What is implemented today, what remains manual, and
+the honest limits of each capability are stated in
+[docs/release.md](docs/release.md) (feature/support matrix and scientific
+limitations) and the per-step handoffs under
+[docs/implementation/handoffs/](docs/implementation/handoffs/).

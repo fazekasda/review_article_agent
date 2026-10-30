@@ -6,11 +6,11 @@
 - [x] 2. Fix the upstream re-validation performance defect (biggest test-time win)
 - [x] 3. Add GitHub Actions CI (fast + sharded full suite)
 - [x] 4. Test-suite diet: fast/slow tiers, cheaper fixtures, prune duplicates
-- [ ] 5. One real model port (OpenRouter chat) wired into the model-backed stages
-- [ ] 6. `pipeline run` orchestrator (run until the next human gate)
-- [ ] 7. Real PDF text extraction
-- [ ] 8. Close the data seams (bibliography metadata, extraction → synthesis)
-- [ ] 9. CLI groups for `review`, `tracing`, `delivery`, and extraction as a worker job
+- [x] 5. One real model port (OpenRouter chat) wired into the model-backed stages
+- [x] 6. `pipeline run` orchestrator (run until the next human gate)
+- [x] 7. Real PDF text extraction
+- [x] 8. Close the data seams (bibliography metadata, extraction → synthesis)
+- [x] 9. CLI groups for `review`, `tracing`, `delivery`, and extraction as a worker job
 - [ ] 10. Housekeeping: README, plan ticks, handoff
 
 Steps 2–4 are about test time and CI and should land first (separate PRs are fine). Steps 5–9 make the MVP usable. Step 10 closes out.
