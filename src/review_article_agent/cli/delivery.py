@@ -16,14 +16,17 @@ approves a gate, or reaches the network.
   batch is never auto-applied.
 * ``delivery revalidate --paragraph ...`` -- re-run the Step 12/13 checks for the
   named paragraphs from the supplied approved package (never trusts the caller).
-* ``delivery approve --prepare`` -- **prepare only**: print the exact-revision
-  final-approval manifest digest and the ``gate confirm`` command a human must run.
-  The delivery final approval cannot yet be recorded through the CLI without new
-  owner-authentication wiring, so this command records nothing and reports the gap.
-* ``delivery export --delivery-id ... --out-dir ...`` -- build the bibliography
-  from the approved drafting packages and write manuscript.md/references.bib/
-  references.ris/companion.md/summary.md/ai_declaration.md/export_manifest.json.
-  It refuses (writing nothing) on a stale/missing approval and on an out-dir
+* ``delivery approve --prepare`` -- persist the exact-revision final-approval
+  manifest as a new revision and print the exact owner-authenticated ``gate
+  prepare``/``gate confirm`` commands a human must run for that revision. The CLI
+  records no approval and accepts no approver: the approval is the named gate
+  (``artifact_revision`` / ``delivery.final_approval``) recorded out-of-band.
+* ``delivery export --delivery-id ... --out-dir ...`` -- re-derive the approved
+  drafting packages from durable state, build the bibliography, and write
+  manuscript.md/references.bib/references.ris/companion.md/summary.md/
+  ai_declaration.md/export_manifest.json. It requires the satisfied named final
+  approval on the exact current manifest revision and refuses (writing nothing)
+  when it is missing/stale (for example after a notes edit) or on an out-dir
   inside the application data directory.
 * ``delivery status --delivery-id ...`` -- read one delivery's safe status summary.
 
@@ -43,13 +46,16 @@ import os
 from typing import Any, Callable
 
 from ..delivery.export import bibliography_from_packages
-from ..delivery.schema import final_approval_manifest
-from ..delivery.workflow import DeliveryRepository
+from ..delivery.workflow import (
+    FINAL_APPROVAL_GATE_ID,
+    FINAL_APPROVAL_GATE_KIND,
+    DeliveryRepository,
+)
 from ..domain.errors import ReviewAgentError, StoreError
 from ..domain.records import RecordValidationError, canonical_json
+from ..drafting.workflow import DraftingWorkflowRepository
 from ..review.workflow import SectionReviewRepository
 from ..storage import ArtifactConflictError, paths
-from ..storage.artifacts import ArtifactRepository
 from ..tracing.workflow import OriginTraceRepository, origin_coverage
 from .parsing import (
     _read_json_file,
@@ -68,9 +74,11 @@ _CATEGORY_VALIDATION = "validation"
 _CATEGORY_CONFLICT = "conflict"
 _CATEGORY_STORAGE = "storage"
 
-#: The named gate kind a human would use to authenticate a final release.
-_FINAL_RELEASE_GATE_KIND = "final_release"
-_FINAL_RELEASE_GATE_ID = "delivery.final_approval"
+#: The exact named gate a human uses to authenticate the final approval.  It
+#: reuses the existing ``artifact_revision`` gate kind (the same kind every other
+#: stage binds its proposal revision with) and the delivery-specific gate id.
+_FINAL_APPROVAL_GATE_KIND = FINAL_APPROVAL_GATE_KIND
+_FINAL_APPROVAL_GATE_ID = FINAL_APPROVAL_GATE_ID
 
 _START_REJECTED_MESSAGE = (
     "the delivery could not be started (a malformed or out-of-bounds identifier, a "
@@ -92,13 +100,15 @@ _EXPORT_REFUSED_MESSAGE = (
     "for the exact revision and artifact hashes, the bibliography is inconsistent "
     "with the manuscript, or a required input is malformed. Nothing was written."
 )
-_APPROVE_GAP_MESSAGE = (
-    "the delivery final approval cannot be recorded through the CLI yet: it "
-    "requires owner authentication (a controlling-terminal confirmation), and the "
-    "named-gate ledger is not wired to DeliveryRepository.final_approval. Run "
-    "`delivery approve --prepare` to print the manifest digest, then record the "
-    "approval through the owner-authenticated `gate confirm` path once that wiring "
-    "exists. Nothing was written."
+_APPROVE_PREPARE_REQUIRED_MESSAGE = (
+    "`delivery approve` requires --prepare: it persists the exact-revision "
+    "final-approval manifest and prints the exact `gate prepare`/`gate confirm` "
+    "commands a human must run (the CLI never records the approval itself). "
+    "Nothing was written."
+)
+_EXPORT_NO_PACKAGE_MESSAGE = (
+    "the export was refused: a section of the delivery has no recorded approved "
+    "drafting package to re-derive. Nothing was written."
 )
 _FORBIDDEN_OUTPUT_MESSAGE = (
     "the destination is inside the application data directory or a project's "
@@ -168,6 +178,18 @@ def build_delivery_parser(sub: "argparse._SubParsersAction") -> None:
         "--trace-id", action="append", required=True, metavar="ID",
         help="the recorded origin trace for the matching --section (repeatable)",
     )
+    p_start.add_argument(
+        "--draft-artifact-id", action="append", metavar="ID",
+        help=(
+            "the approved section draft artifact id for the matching --section "
+            "(repeatable; paired with --draft-revision-id). Required for the "
+            "re-deriving `delivery export`"
+        ),
+    )
+    p_start.add_argument(
+        "--draft-revision-id", action="append", metavar="ID",
+        help="the approved section draft revision id for the matching --section (repeatable)",
+    )
     p_start.add_argument("--rights-file", required=True, metavar="PATH")
 
     p_fresh = actions.add_parser(
@@ -226,8 +248,9 @@ def build_delivery_parser(sub: "argparse._SubParsersAction") -> None:
     p_approve = actions.add_parser(
         "approve",
         help=(
-            "prepare the exact-revision final approval manifest digest and the "
-            "gate confirm command (records nothing; see --prepare)"
+            "prepare the exact-revision final-approval manifest as a new revision "
+            "and print the owner-authenticated `gate prepare`/`gate confirm` "
+            "commands (see --prepare)"
         ),
     )
     p_approve.add_argument("--project", metavar="ID")
@@ -235,10 +258,13 @@ def build_delivery_parser(sub: "argparse._SubParsersAction") -> None:
     p_approve.add_argument(
         "--prepare",
         action="store_true",
-        help="print the manifest digest and the gate confirm command; records nothing",
+        help=(
+            "persist the manifest revision and print the manifest digest and the "
+            "exact gate prepare/confirm commands; the CLI records no approval"
+        ),
     )
     p_approve.add_argument("--hashes-file", metavar="PATH")
-    p_approve.add_argument("--approver", metavar="LABEL")
+    p_approve.add_argument("--rights-file", required=True, metavar="PATH")
 
     p_export = actions.add_parser(
         "export",
@@ -251,10 +277,12 @@ def build_delivery_parser(sub: "argparse._SubParsersAction") -> None:
     p_export.add_argument("--delivery-id", required=True, metavar="ID")
     p_export.add_argument("--out-dir", required=True, metavar="PATH")
     p_export.add_argument(
-        "--package-file", action="append", required=True, metavar="PATH",
-        help="an approved drafting package JSON (repeatable)",
+        "--hashes-file", metavar="PATH",
+        help=(
+            "optional consistency check: must equal the approved manifest's "
+            "artifact hashes (the manifest is authoritative)"
+        ),
     )
-    p_export.add_argument("--hashes-file", metavar="PATH")
     p_export.add_argument("--policy-file", metavar="PATH")
     p_export.add_argument("--ai-use-file", metavar="PATH")
     p_export.add_argument("--venue", metavar="NAME")
@@ -338,7 +366,7 @@ def _reject_forbidden_out_dir(ctx: Any, target: str) -> None:
 def _delivery_summary(state: dict, *, content: bool) -> dict[str, Any]:
     """A safe structural projection of one delivery state (never raw content)."""
     gr = state.get("global_review") or {}
-    approval = state.get("approval") or {}
+    approval = state.get("approval") or state.get("prepared_approval") or {}
     summary: dict[str, Any] = {
         "delivery_id": state.get("delivery_id"),
         "status": state.get("status"),
@@ -355,6 +383,7 @@ def _delivery_summary(state: dict, *, content: bool) -> dict[str, Any]:
         "applied_batch_count": len(state.get("applied_batches") or []),
         "revalidation_required": list(state.get("revalidation_required") or []),
         "approval_present": bool(state.get("approval")),
+        "final_approval_prepared": bool(state.get("prepared_approval")),
         "approval_manuscript_revision": approval.get("manuscript_revision"),
         "export_present": state.get("export") is not None,
         "private_content_included": False,
@@ -391,12 +420,21 @@ def delivery_start(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
     sections_args = list(args.section)
     review_ids = list(args.review_id)
     trace_ids = list(args.trace_id)
+    draft_artifact_ids = list(args.draft_artifact_id or [])
+    draft_revision_ids = list(args.draft_revision_id or [])
     if not (len(sections_args) == len(review_ids) == len(trace_ids)):
+        raise DeliveryControlError(_CATEGORY_VALIDATION, _REJECTED_MESSAGE)
+    draft_refs_given = bool(draft_artifact_ids or draft_revision_ids)
+    if draft_refs_given and not (
+        len(draft_artifact_ids) == len(draft_revision_ids) == len(sections_args)
+    ):
         raise DeliveryControlError(_CATEGORY_VALIDATION, _REJECTED_MESSAGE)
     with _verified_store(ctx, project_id) as store:
         sections: list[dict] = []
         origin_state: dict = {}
-        for section_id, review_id, trace_id in zip(sections_args, review_ids, trace_ids):
+        for index, (section_id, review_id, trace_id) in enumerate(
+            zip(sections_args, review_ids, trace_ids)
+        ):
             review_state = _guard(
                 lambda rid=review_id: SectionReviewRepository(store).read(rid),
                 invalid_message=_START_REJECTED_MESSAGE,
@@ -410,13 +448,18 @@ def delivery_start(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
             if trace_state is None:
                 raise DeliveryControlError(_CATEGORY_VALIDATION, _START_REJECTED_MESSAGE)
             coverage = origin_coverage(trace_state)
-            sections.append(
-                {
-                    "section_id": section_id,
-                    "review_status": review_state.get("status"),
-                    "origin_complete": coverage["complete"],
+            section: dict[str, Any] = {
+                "section_id": section_id,
+                "review_status": review_state.get("status"),
+                "origin_complete": coverage["complete"],
+            }
+            if draft_refs_given:
+                section["draft_ref"] = {
+                    "project_id": project_id,
+                    "artifact_id": draft_artifact_ids[index],
+                    "revision_id": draft_revision_ids[index],
                 }
-            )
+            sections.append(section)
             origin_state = trace_state
         state = _guard(
             lambda: DeliveryRepository(store).start_global_review(
@@ -525,10 +568,20 @@ def delivery_revalidate(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
 
 
 def delivery_approve(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
-    """Prepare the exact-revision final-approval manifest digest; record nothing."""
+    """Persist the exact-revision final-approval manifest; record no approval.
+
+    The manifest is persisted as a new delivery-state revision; the CLI then
+    prints the exact owner-authenticated ``gate prepare``/``gate confirm``
+    commands that bind the named gate (``artifact_revision`` /
+    ``delivery.final_approval``) to that revision. The CLI never records the
+    approval itself and accepts no approver.
+    """
     if not args.prepare:
-        raise DeliveryControlError(_CATEGORY_VALIDATION, _APPROVE_GAP_MESSAGE)
+        raise DeliveryControlError(
+            _CATEGORY_VALIDATION, _APPROVE_PREPARE_REQUIRED_MESSAGE
+        )
     project_id = _resolve_project_id(ctx, args.project)
+    rights = _rights_factory(_read_object(args.rights_file, what="rights"), project_id)
     with _verified_store(ctx, project_id) as store:
         repo = DeliveryRepository(store)
         state = _guard(
@@ -537,29 +590,38 @@ def delivery_approve(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
         )
         if state is None:
             raise DeliveryControlError(_CATEGORY_VALIDATION, _NOT_FOUND_MESSAGE)
-        head = ArtifactRepository(store).current_revision(args.delivery_id)
-        head_revision = None if head is None else head.revision_id
-    recorded_hashes = (state.get("approval") or {}).get("artifact_hashes") or {}
-    hashes = (
-        _read_object(args.hashes_file, what="hashes")
-        if args.hashes_file
-        else recorded_hashes
-    )
-    warnings = _origin_warnings(state)
-    accepted = [warning.get("warning_id") for warning in warnings]
-    approver = args.approver or "owner"
-    revision_id = (state.get("manuscript") or {}).get("revision_id")
-    manifest = _guard(
-        lambda: final_approval_manifest(
-            revision_id, hashes, warnings, accepted, [], approver
-        ),
-        invalid_message=_REJECTED_MESSAGE,
-    )
+        recorded_hashes = (state.get("approval") or {}).get("artifact_hashes") or {}
+        hashes = (
+            _read_object(args.hashes_file, what="hashes")
+            if args.hashes_file
+            else recorded_hashes
+        )
+        warnings = _origin_warnings(state)
+        accepted = [warning.get("warning_id") for warning in warnings]
+        prepared = _guard(
+            lambda: repo.prepare_final_approval(
+                args.delivery_id,
+                artifact_hashes=hashes,
+                warnings=warnings,
+                accepted_warning_ids=accepted,
+                unsupported_major_claims=[],
+                rights=rights,
+            ),
+            invalid_message=_REJECTED_MESSAGE,
+        )
+    manifest = prepared["manifest"]
+    manifest_revision = prepared["revision_id"]
     digest = _canonical_digest(manifest)
-    next_command = (
+    prepare_command = (
+        "review-article-agent gate prepare "
+        f"--artifact-id {args.delivery_id} --revision-id {manifest_revision} "
+        f"--gate-kind {_FINAL_APPROVAL_GATE_KIND} --gate-id {_FINAL_APPROVAL_GATE_ID} "
+        "--decision approved --rationale <TEXT>"
+    )
+    confirm_command = (
         "review-article-agent gate confirm "
-        f"--artifact-id {args.delivery_id} --revision-id {head_revision} "
-        f"--gate-kind {_FINAL_RELEASE_GATE_KIND} --gate-id {_FINAL_RELEASE_GATE_ID} "
+        f"--artifact-id {args.delivery_id} --revision-id {manifest_revision} "
+        f"--gate-kind {_FINAL_APPROVAL_GATE_KIND} --gate-id {_FINAL_APPROVAL_GATE_ID} "
         "--decision approved --rationale <TEXT> "
         "--snapshot-digest <SHA256_FROM_GATE_PREPARE>"
     )
@@ -567,30 +629,30 @@ def delivery_approve(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
         "delivery_id": args.delivery_id,
         "prepare_only": True,
         "manifest_digest": digest,
-        "manuscript_revision": revision_id,
+        "manifest_revision": manifest_revision,
+        "manuscript_revision": manifest.get("manuscript_revision"),
         "warning_count": len(warnings),
-        "approver": approver,
-        "next_command": next_command,
+        "gate_kind": _FINAL_APPROVAL_GATE_KIND,
+        "gate_id": _FINAL_APPROVAL_GATE_ID,
+        "prepare_command": prepare_command,
+        "confirm_command": confirm_command,
+        "next_command": confirm_command,
         "human_authenticated": False,
         "approval_recorded": False,
-        "gap": (
-            "no CLI path records the delivery final approval yet; it needs owner "
-            "authentication and a named-gate-to-DeliveryRepository.final_approval "
-            "wiring. Nothing was written."
-        ),
         **_FALSE_FLAGS,
     }
 
 
 def delivery_export(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
-    """Write the export package after the exact-revision final approval."""
+    """Write the export package after the exact-revision final-approval gate.
+
+    The bibliography is re-derived from the **approved drafting packages** of the
+    delivery's sections (via ``drafting/workflow`` ``read(..., "draft")``), not
+    from a caller-supplied package file; and the approval must be the satisfied
+    owner-authenticated named gate on the exact current manifest revision.
+    """
     project_id = _resolve_project_id(ctx, args.project)
     rights = _rights_factory(_read_object(args.rights_file, what="rights"), project_id)
-    packages = [_read_object(path, what="package") for path in args.package_file]
-    references, corpus = _guard(
-        lambda: bibliography_from_packages(packages),
-        invalid_message=_EXPORT_REFUSED_MESSAGE,
-    )
     policy = (
         _read_object(args.policy_file, what="policy")
         if args.policy_file
@@ -603,6 +665,9 @@ def delivery_export(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
     )
     if not isinstance(ai_use, list):
         raise DeliveryControlError(_CATEGORY_VALIDATION, _EXPORT_REFUSED_MESSAGE)
+    current_hashes = (
+        _read_object(args.hashes_file, what="hashes") if args.hashes_file else None
+    )
     out_dir = os.path.abspath(args.out_dir)
     _reject_forbidden_out_dir(ctx, out_dir)
     with _verified_store(ctx, project_id) as store:
@@ -613,26 +678,35 @@ def delivery_export(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
         )
         if state is None:
             raise DeliveryControlError(_CATEGORY_VALIDATION, _NOT_FOUND_MESSAGE)
-        manuscript = state.get("manuscript")
-        if not isinstance(manuscript, dict) or manuscript.get("revision_id") is None:
-            raise DeliveryControlError(_CATEGORY_VALIDATION, _EXPORT_REFUSED_MESSAGE)
-        current_hashes = (
-            _read_object(args.hashes_file, what="hashes")
-            if args.hashes_file
-            else (state.get("approval") or {}).get("artifact_hashes") or {}
+        sections = state.get("sections") or []
+        drafting = DraftingWorkflowRepository(store)
+        packages: list[dict] = []
+        for section in sections:
+            ref = (section or {}).get("draft_ref")
+            if not isinstance(ref, dict) or not ref.get("artifact_id"):
+                raise DeliveryControlError(
+                    _CATEGORY_VALIDATION, _EXPORT_NO_PACKAGE_MESSAGE
+                )
+            envelope = _guard(
+                lambda r=ref: drafting.read(r, "draft"),
+                invalid_message=_EXPORT_REFUSED_MESSAGE,
+            )
+            packages.append(envelope.get("package") or {})
+        references, corpus = _guard(
+            lambda: bibliography_from_packages(packages),
+            invalid_message=_EXPORT_REFUSED_MESSAGE,
         )
         record = _guard(
-            lambda: repo.export(
+            lambda: repo.export_approved(
                 args.delivery_id,
-                manuscript=manuscript,
                 references=references,
                 corpus=corpus,
-                current_hashes=current_hashes,
                 policy=policy,
                 ai_use=ai_use,
                 out_dir=out_dir,
                 venue=args.venue,
                 rights=rights,
+                current_hashes=current_hashes,
             ),
             invalid_message=_EXPORT_REFUSED_MESSAGE,
         )
@@ -651,13 +725,23 @@ def delivery_status(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
     """Read one delivery's safe status summary."""
     project_id = _resolve_project_id(ctx, args.project)
     with _verified_store(ctx, project_id) as store:
+        repo = DeliveryRepository(store)
         state = _guard(
-            lambda: DeliveryRepository(store).read(args.delivery_id),
+            lambda: repo.read(args.delivery_id),
             invalid_message=_NOT_FOUND_MESSAGE,
         )
-    if state is None:
-        raise DeliveryControlError(_CATEGORY_VALIDATION, _NOT_FOUND_MESSAGE)
-    return _delivery_summary(state, content=False)
+        if state is None:
+            raise DeliveryControlError(_CATEGORY_VALIDATION, _NOT_FOUND_MESSAGE)
+        gate_satisfied = _guard(
+            lambda: repo.final_approval_gate_satisfied(args.delivery_id),
+            invalid_message=_NOT_FOUND_MESSAGE,
+        )
+    summary = _delivery_summary(state, content=False)
+    summary["final_approval_gate_satisfied"] = bool(gate_satisfied)
+    summary["approval_present"] = bool(summary["approval_present"]) or bool(
+        gate_satisfied
+    )
+    return summary
 
 
 # --------------------------------------------------------------------------- #

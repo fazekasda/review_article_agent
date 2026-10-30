@@ -60,6 +60,10 @@ from ..acquisition.manifest import (
     ACQUISITION_GATE_KIND,
     AcquisitionRepository,
 )
+from ..delivery.workflow import (
+    FINAL_APPROVAL_GATE_ID as DELIVERY_APPROVAL_GATE_ID,
+    FINAL_APPROVAL_GATE_KIND as DELIVERY_APPROVAL_GATE_KIND,
+)
 from ..discovery.context import (
     PLAN_GATE_ID,
     PROTOCOL_GATE_KIND,
@@ -323,10 +327,21 @@ def _check_tracing(store: Any, entries: list) -> None:
 def _check_delivery(store: Any, entries: list) -> None:
     if not entries:
         raise _Incomplete("no delivery state exists yet")
+    approvals = HumanApprovalRepository(store)
     for entry in entries:
         payload = entry["document"].get("payload") or {}
-        if payload.get("status") not in ("approved", "exported"):
-            raise _Incomplete("the delivery is not finally approved")
+        if payload.get("status") in ("approved", "exported"):
+            continue
+        # A delivery whose exact-revision final-approval named gate is satisfied
+        # is finally approved even before the export revision is written.
+        delivery_id = payload.get("delivery_id")
+        if isinstance(delivery_id, str) and delivery_id and approvals.named_gate_satisfied(
+            delivery_id,
+            gate_kind=DELIVERY_APPROVAL_GATE_KIND,
+            gate_id=DELIVERY_APPROVAL_GATE_ID,
+        ):
+            continue
+        raise _Incomplete("the delivery is not finally approved")
 
 
 # --------------------------------------------------------------------------- #
@@ -640,22 +655,31 @@ STAGES: tuple[Stage, ...] = (
         id="delivery",
         title="delivery global review/approval/export",
         document_types=(_DELIVERY_DOCUMENT_TYPE,),
-        gate=None,
+        gate=(DELIVERY_APPROVAL_GATE_KIND, DELIVERY_APPROVAL_GATE_ID),
         check=_check_delivery,
         produce=_human(
             "author",
             "review-article-agent delivery start --delivery-id <DELIVERY_ID> "
             "--section <SECTION_ID> --review-id <REVIEW_ID> --trace-id <TRACE_ID> "
+            "--draft-artifact-id <DRAFT_ARTIFACT_ID> "
+            "--draft-revision-id <DRAFT_REVISION_ID> "
             "--rights-file <RIGHTS_JSON>",
             inputs={
                 "command": "delivery start --delivery-id <DELIVERY_ID> "
                 "--section <SECTION_ID> --review-id <REVIEW_ID> --trace-id <TRACE_ID> "
+                "--draft-artifact-id <DRAFT_ARTIFACT_ID> "
+                "--draft-revision-id <DRAFT_REVISION_ID> "
                 "--rights-file <RIGHTS_JSON>",
                 "library": "review_article_agent.delivery.workflow.DeliveryRepository.start_global_review",
                 "note": (
-                    "starts the global review from recorded review/trace states; "
-                    "`delivery export` writes the Markdown/BibTeX/RIS package after "
-                    "the exact-revision final approval (kickoff 16 §9)"
+                    "starts the global review from recorded review/trace states "
+                    "(recording each section's approved draft ref for the "
+                    "re-deriving export); then `delivery approve --prepare` "
+                    "persists the exact-revision final-approval manifest, the "
+                    "owner runs `gate prepare`/`gate confirm` "
+                    f"({DELIVERY_APPROVAL_GATE_KIND}/{DELIVERY_APPROVAL_GATE_ID}), "
+                    "and `delivery export` writes the Markdown/BibTeX/RIS package "
+                    "(kickoff 16 §9)"
                 ),
             },
         ),

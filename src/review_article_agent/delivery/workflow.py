@@ -44,6 +44,7 @@ import os
 from ..domain.records import validate_identifier
 from ..review.schema import fact_check
 from ..storage.artifacts import ArtifactRepository
+from ..storage.human_approvals import HumanApprovalRepository
 from ..tracing.workflow import origin_coverage
 from .export import build_disclosures, build_export_package, cited_keys
 from .schema import (
@@ -66,6 +67,14 @@ DOCUMENT_TYPE = "delivery"
 
 #: The supported generic JSON document-envelope schema version.
 SCHEMA_VERSION = 1
+
+#: The exact named owner gate (``gate_kind``, ``gate_id``) for the delivery final
+#: approval.  The manifest is bound to the exact delivery-state revision that
+#: carries it; the owner records this gate over that revision through the
+#: owner-authenticated ``gate prepare``/``gate confirm`` flow (never a
+#: caller-supplied approver string).
+FINAL_APPROVAL_GATE_KIND = "artifact_revision"
+FINAL_APPROVAL_GATE_ID = "delivery.final_approval"
 
 #: Plan actions whose items may be applied as an edit.
 _EDITABLE_ACTIONS = ("local_edit", "claim_edit")
@@ -107,6 +116,7 @@ def _new_state(delivery_id) -> dict:
         "revalidation_required": [],
         "revalidation_records": {},
         "approval": None,
+        "prepared_approval": None,
         "invalidated_approvals": [],
         "export": None,
     }
@@ -440,20 +450,9 @@ class DeliveryRepository:
         return state
 
     # -- 5. final approval --------------------------------------------------- #
-    def final_approval(
-        self,
-        delivery_id,
-        artifact_hashes,
-        warnings,
-        accepted_warning_ids,
-        unsupported_major_claims,
-        approver,
-        rights=None,
-    ):
-        """Record the exact-revision final human approval manifest."""
-        self._set_rights(rights)
-        state = self._load(delivery_id)
-
+    @staticmethod
+    def _require_final_approval_ready(state):
+        """The preconditions a final approval manifest requires (spec item 18)."""
         _require(
             state["global_review"]["status"] == "complete",
             "final approval requires a complete global review",
@@ -468,6 +467,29 @@ class DeliveryRepository:
             + repr(list(state.get("revalidation_required"))),
         )
 
+    def final_approval(
+        self,
+        delivery_id,
+        artifact_hashes,
+        warnings,
+        accepted_warning_ids,
+        unsupported_major_claims,
+        approver,
+        rights=None,
+    ):
+        """Record the exact-revision final human approval manifest.
+
+        This is the **library** recording path used by the focused workflow
+        tests; it records a caller-supplied ``approver`` label and therefore is
+        **not** the CLI/export authority.  The CLI flow uses
+        :meth:`prepare_final_approval` plus the owner-authenticated named gate
+        (:meth:`final_approval_gate_satisfied`) so no agent/model path can record
+        the approval by naming an approver.
+        """
+        self._set_rights(rights)
+        state = self._load(delivery_id)
+        self._require_final_approval_ready(state)
+
         revision_id = (state.get("manuscript") or {}).get("revision_id")
         manifest = final_approval_manifest(
             revision_id,
@@ -481,6 +503,156 @@ class DeliveryRepository:
         state["status"] = "approved"
         self._persist(state)
         return state
+
+    def prepare_final_approval(
+        self,
+        delivery_id,
+        artifact_hashes,
+        warnings,
+        accepted_warning_ids,
+        unsupported_major_claims,
+        rights=None,
+    ):
+        """Persist the exact-revision final-approval manifest as a new revision.
+
+        The manifest is stored on a **new delivery-state revision** (the exact
+        revision a human then approves), mirroring how every other stage binds a
+        named gate to its exact proposal revision.  The caller supplies no
+        approver: the approval is the owner-authenticated named gate
+        (``artifact_revision`` / ``delivery.final_approval``) recorded over the
+        returned ``revision_id`` through ``gate prepare``/``gate confirm``.
+
+        Returns ``{"state", "manifest", "revision_id"}`` where ``revision_id`` is
+        the persisted head revision the gate must target.
+        """
+        self._set_rights(rights)
+        state = self._load(delivery_id)
+        self._require_final_approval_ready(state)
+
+        revision_id = (state.get("manuscript") or {}).get("revision_id")
+        manifest = final_approval_manifest(
+            revision_id,
+            artifact_hashes,
+            warnings,
+            accepted_warning_ids,
+            unsupported_major_claims,
+            None,
+        )
+        # A re-prepare invalidates any earlier library approval; any earlier
+        # *gate* approval becomes stale automatically because the head changes.
+        self._invalidate_approval(state)
+        state["prepared_approval"] = manifest
+        state["status"] = "awaiting_final_approval"
+        self._persist(state)
+        head = self.artifacts.current_revision(
+            validate_identifier(delivery_id, "delivery_id")
+        )
+        return {
+            "state": state,
+            "manifest": manifest,
+            "revision_id": None if head is None else head.revision_id,
+        }
+
+    def final_approval_gate_satisfied(self, delivery_id):
+        """``True`` iff the delivery's exact final-approval named gate is active.
+
+        Satisfied only when the current approval for
+        ``(delivery artifact, artifact_revision, delivery.final_approval)`` is
+        ``active`` and ``approved`` for the **current** delivery revision; any
+        later revision (a notes edit, a re-prepare, an export) makes it stale and
+        returns ``False``.
+        """
+        artifact_id = validate_identifier(delivery_id, "delivery_id")
+        return HumanApprovalRepository(self.store).named_gate_satisfied(
+            artifact_id,
+            gate_kind=FINAL_APPROVAL_GATE_KIND,
+            gate_id=FINAL_APPROVAL_GATE_ID,
+        )
+
+    def export_approved(
+        self,
+        delivery_id,
+        references,
+        corpus,
+        policy,
+        ai_use,
+        out_dir,
+        venue=None,
+        rights=None,
+        current_hashes=None,
+    ):
+        """Write the export package after the exact-revision named final-approval gate.
+
+        Unlike :meth:`export` (the library path used by focused workflow tests),
+        this **requires the owner-authenticated named gate**
+        (``artifact_revision`` / ``delivery.final_approval``) to be active and
+        approved for the exact current manifest revision.  No caller-supplied
+        approver or approval manifest is accepted.  If the manifest revision
+        changed after approval (a stale gate) or no manifest was prepared, it
+        refuses and writes nothing.
+        """
+        self._set_rights(rights)
+        state = self._load(delivery_id)
+
+        manifest = state.get("prepared_approval")
+        _require(
+            isinstance(manifest, dict),
+            "export refused: no prepared final-approval manifest for the exact "
+            "revision",
+        )
+        _require(
+            self.final_approval_gate_satisfied(delivery_id),
+            "export refused: the delivery final-approval named gate is not active "
+            "and approved for the exact revision",
+        )
+
+        manuscript = state.get("manuscript")
+        _require(
+            isinstance(manuscript, dict) and manuscript.get("revision_id") is not None,
+            "export refused: no current manuscript revision",
+        )
+
+        hashes = dict(manifest.get("artifact_hashes") or {})
+        if current_hashes is not None:
+            _require(
+                current_hashes == hashes,
+                "export refused: the supplied artifact hashes differ from the "
+                "approved manifest",
+            )
+
+        origin_warnings = origin_coverage(state.get("origin_state") or {}).get(
+            "requires_human_approval"
+        ) or []
+        warnings = [
+            {
+                "claim_id": warning.get("claim_id"),
+                "cite_source_key": warning.get("cite_source_key"),
+                "text": warning.get("warning"),
+            }
+            for warning in origin_warnings
+        ]
+        disclosures = build_disclosures(policy, ai_use, venue=venue, warnings=warnings)
+
+        # Re-check the exact manifest and hashes IMMEDIATELY before writing.
+        package = build_export_package(
+            manuscript, references, corpus, manifest, hashes, disclosures
+        )
+
+        os.makedirs(str(out_dir), exist_ok=True)
+        file_hashes: dict = {}
+        for name, content in package["files"].items():
+            with open(os.path.join(str(out_dir), name), "w", encoding="utf-8") as handle:
+                handle.write(content)
+            file_hashes[name] = _sha256(content)
+
+        state["export"] = {
+            "manuscript_revision": manuscript.get("revision_id"),
+            "file_hashes": file_hashes,
+            "checks": package["checks"],
+        }
+        state["status"] = "exported"
+        self._persist(state)
+        return state["export"]
 
     # -- 6. export ----------------------------------------------------------- #
     def export(
@@ -548,6 +720,8 @@ class DeliveryRepository:
 __all__ = [
     "ARTIFACT_KIND",
     "DOCUMENT_TYPE",
+    "FINAL_APPROVAL_GATE_ID",
+    "FINAL_APPROVAL_GATE_KIND",
     "SCHEMA_VERSION",
     "DeliveryWorkflowError",
     "DeliveryRepository",
