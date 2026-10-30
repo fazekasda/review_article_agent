@@ -2,10 +2,10 @@
 
 ## Steps
 
-- [ ] 1. Set up the working base (fresh worktree from `main`, baseline check)
-- [ ] 2. Fix the upstream re-validation performance defect (biggest test-time win)
-- [ ] 3. Add GitHub Actions CI (fast + sharded full suite)
-- [ ] 4. Test-suite diet: fast/slow tiers, cheaper fixtures, prune duplicates
+- [x] 1. Set up the working base (fresh worktree from `main`, baseline check)
+- [x] 2. Fix the upstream re-validation performance defect (biggest test-time win)
+- [x] 3. Add GitHub Actions CI (fast + sharded full suite)
+- [x] 4. Test-suite diet: fast/slow tiers, cheaper fixtures, prune duplicates
 - [ ] 5. One real model port (OpenRouter chat) wired into the model-backed stages
 - [ ] 6. `pipeline run` orchestrator (run until the next human gate)
 - [ ] 7. Real PDF text extraction
