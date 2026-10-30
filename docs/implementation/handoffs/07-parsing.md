@@ -12,7 +12,9 @@
 - Focused: `tests/test_parsing_core.py` + `tests/test_parsing_repository.py` = 36, `tests/test_cli_parsing.py` = 6 → **42 passed**. Full final: **3121 tests OK, no skips**, 399.765s at `35c4f04` via `PYTHONPATH=src /tmp/opencode/step06-pdf-venv/bin/python -m unittest discover -s tests -p 'test_*.py'`. No CI configured.
 
 ## Partial MVP / not ticked
-- PDF extraction/OCR/visual/table-cell interpretation **unsupported → human review**; synthetic self-authored XML/TEI fixtures only, no representative human-adjudicated benchmark. XML structural text is supported; PDF full-text extraction is unsupported.
+- OCR/visual/table-cell interpretation **unsupported → human review**; synthetic self-authored XML/TEI fixtures only, no representative human-adjudicated benchmark. XML structural text is supported, and (S17-P7b) a cleanly parsed PDF report now feeds grounded extraction like an XML report.
+- **Update (S17-P7, kickoff §7):** `parsing/pdf_adapter.py` extracts bounded per-page text via the optional `pypdf` extra in an isolated child process, emitting normalized paragraph passages with 1-based page locators. Usable text yields `parsed`; blank/short/garbled/limited/malformed/unavailable inputs stay `needs_review`. OCR, column order, and figure/table interpretation remain unverified → human review; no automatic exclusion.
+- **Update (S17-P7b):** a cleanly `parsed` PDF report sets `human_action_required=false` (its text is usable original text) and records the exact `pypdf` version (`pdf_parser_version`) so `read_report` reproduces its passages by re-parsing the same bytes; a mismatch fails closed, while an absent/mismatched pypdf version stays `unverified`. `extraction/runner._derive_material` accepts a verified `parsed` PDF report, adds each passage's `page` locator and a fixed PDF limitation line to the material, and still refuses `needs_review` reports.
 - Stdlib Python (PSF); optional `pypdf` (BSD-3) PDF diagnostic, no weights; ≤32 MiB local input; no live trials/network/model/approval; no migration, no new deps, no hosted calls.
 
 ## Copyable usage

@@ -528,6 +528,10 @@ class BackupSafetyTest(_Base):
         err = self.cli("--data-dir", str(self.state), "backup", "create", str(inside),
                        "--project", pid, expect=4)
         self.assertEqual(err["error"]["category"], "storage")
+        # The refusal is specific and actionable, not the generic storage summary.
+        message = err["error"]["message"]
+        self.assertIn("inside the application data directory", message)
+        self.assertIn("outside", message)
         self.assertFalse(inside.exists())
 
 

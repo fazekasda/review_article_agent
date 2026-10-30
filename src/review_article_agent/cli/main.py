@@ -75,6 +75,7 @@ from .. import __version__
 from ..domain.errors import (
     InvalidProjectId,
     NoActiveProject,
+    OwnerPrivateError,
     ProjectConflict,
     ProjectNotFound,
     ProjectPathError,
@@ -180,6 +181,17 @@ class CliUsageError(Exception):
     The message is always authored/sanitized here (or copied from an argparse
     message that references only our own option/command names); a raw
     user-supplied value is never embedded.
+    """
+
+
+class ForbiddenOutputPathError(StoreError):
+    """An output/destination path is inside app-owned state and is refused.
+
+    Raised by :func:`_reject_forbidden_output_path`; the message is authored
+    here (value-free) and is surfaced verbatim by the CLI so the user learns the
+    destination must live outside the application data directory. It stays a
+    :class:`StoreError` subclass, so the storage category and exit code are
+    unchanged.
     """
 
 
@@ -715,10 +727,11 @@ def _reject_forbidden_output_path(ctx: Context, target: str) -> None:
         )
     for root in forbidden:
         if candidate == root or candidate.startswith(root + os.sep):
-            raise StoreError(
-                "refusing to write output inside an app-owned data/store "
-                "directory; choose a path outside the application data "
-                "directory and any project's .review_article_agent directory."
+            raise ForbiddenOutputPathError(
+                "the destination is inside the application data directory or a "
+                "project's .review_article_agent app-owned directory; refusing "
+                "to write there. Choose a destination outside the --data-dir "
+                "and any project's .review_article_agent directory."
             )
 
 
@@ -1341,6 +1354,16 @@ def _error_message(exc: BaseException, category: str) -> str:
             # Never echo a raw manifest / snapshot / path detail from the backup
             # layer.
             return _BACKUP_MESSAGE
+        if isinstance(exc, OwnerPrivateError):
+            # Authored in ``storage.paths``: names the offending directory, the
+            # mode it has, and the exact ``chmod`` remedy. It contains only the
+            # path the user themselves supplied (via ``--data-dir`` or a project
+            # root) and a permission mode -- no secret, identifier, or content.
+            return str(exc)
+        if isinstance(exc, ForbiddenOutputPathError):
+            # Authored in this module (``_reject_forbidden_output_path``); a
+            # static, value-free message.
+            return str(exc)
         if isinstance(exc, UnsupportedSchemaVersion):
             # ``label`` is our own curated string ("project store"/"application
             # registry"), never user input.
