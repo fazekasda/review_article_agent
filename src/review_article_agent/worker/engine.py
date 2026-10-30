@@ -105,6 +105,7 @@ from ..discovery.execution import (
 )
 from ..discovery.lead_runner import HostedLeadError
 from ..discovery.transport import DiscoveryRequestInterrupted, http_get
+from ..extraction.runner import ExtractionRunnerError
 from ..domain.errors import ProjectConflict, ReviewAgentError
 from ..domain.records import validate_identifier
 from ..runtime.dispatch import (
@@ -127,6 +128,7 @@ from ..storage.registry import Registry
 from ..storage.store import ProjectStore
 from . import acquisition as acquisition_jobs
 from . import discovery as discovery_jobs
+from . import extraction as extraction_jobs
 from .discovery import (
     AttemptCounter,
     DiscoveryJobStopped,
@@ -307,6 +309,8 @@ class WorkerEngine:
         lead_transport: Callable[..., Any] | None = None,
         lead_api_key: str | None = None,
         acquisition_transport: Callable[..., Any] | None = None,
+        extraction_transport: Callable[..., Any] | None = None,
+        extraction_api_key: str | None = None,
     ) -> None:
         self._data_dir = os.path.abspath(os.fspath(data_dir))
         self._registry = registry if registry is not None else Registry(self._data_dir)
@@ -343,6 +347,14 @@ class WorkerEngine:
         # environment only at dispatch; it is never persisted.
         self._lead_transport = lead_transport
         self._lead_api_key = lead_api_key
+        # Extraction/quality (Step 09): the default transport is the real direct
+        # extraction adapter (a single POST to the one documented endpoint); it is
+        # only ever used for an explicit, fully-guarded extraction run. A test may
+        # inject a deterministic fake transport and/or an explicit key. The
+        # credential is read from the environment only at dispatch; it is never
+        # persisted.
+        self._extraction_transport = extraction_transport
+        self._extraction_api_key = extraction_api_key
         self._discovery_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="raa-discovery"
         )
@@ -1657,6 +1669,10 @@ class WorkerEngine:
             self._run_acquire_dispatch(store, repo, project_id, job, attempt, token)
             return
 
+        if mode == discovery_jobs.MODE_EXTRACT:
+            self._run_extract_dispatch(store, repo, project_id, job, attempt, token)
+            return
+
         counter = AttemptCounter()
         transport = discovery_jobs.guard_transport(
             self._discovery_lowlevel,
@@ -1908,6 +1924,104 @@ class WorkerEngine:
         except (JobError, ReviewAgentError):
             return
         self._wait_reasons[job_id] = "discovery_lead_reconciliation_required"
+
+    def _run_extract_dispatch(
+        self,
+        store: Any,
+        repo: JobRepository,
+        project_id: str,
+        job: Job,
+        attempt: Any,
+        token: str,
+    ) -> None:
+        """Run one bounded extraction/quality job (at most one POST) and record it.
+
+        The credential is read from the **one** named environment variable at
+        dispatch (never scanned, never persisted). A missing credential, an
+        unapproved/stale config or hosted-use revision, a denied rights record, or
+        a gate/activation refusal performs **zero** POST. A terminal
+        completed/failed outcome is persisted as the job's safe accepted result
+        (referencing the run receipt); an ``unknown``/unresolved external outcome
+        moves the job to ``waiting_human`` and is **never** re-POSTed on a retry or
+        restart.
+        """
+        job_id = job.job_id
+        if self._discovery_stop_requested(repo, project_id, job_id):
+            self._discovery_fail(
+                repo, project_id, job, attempt, attempts=0, reason="stopped", escalate=False
+            )
+            return
+
+        api_key = self._extraction_api_key
+        if api_key is None:
+            api_key = os.environ.get(discovery_jobs.EXTRACT_CREDENTIAL_ENV)
+        if not isinstance(api_key, str) or api_key == "":
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=0,
+                reason="credential_missing",
+                escalate=True,
+            )
+            return
+
+        try:
+            mapping = extraction_jobs.dispatch_extract(
+                store,
+                self._registry,
+                token,
+                job,
+                api_key=api_key,
+                transport=self._extraction_transport,
+            )
+        except (ExtractionRunnerError, BudgetExceededError):
+            # A refusal raised strictly *before* any reserve/POST.
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=0,
+                reason="blocked",
+                escalate=True,
+            )
+            return
+        except BaseException:  # noqa: BLE001 - the POST may have happened: unknown
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=1,
+                reason="indeterminate",
+            )
+            return
+
+        if isinstance(mapping, dict) and mapping.get("status") in ("completed", "failed"):
+            try:
+                with self._write_guard(project_id, allow_draining=True):
+                    repo.accept_result(
+                        attempt.attempt_id,
+                        result_kind=discovery_jobs.RESULT_KIND_EXTRACTION,
+                        result=extraction_jobs.accepted_result(mapping),
+                    )
+            except (JobError, ReviewAgentError):
+                return
+            if self._discovery_is_held(repo, project_id, job_id):
+                self._wait_reasons[job_id] = "discovery_interrupted"
+            return
+
+        # An unknown/submitted external outcome: retain the reserve and the runtime
+        # occupancy, escalate to a human, and never re-POST.
+        try:
+            with self._write_guard(project_id, allow_draining=True):
+                repo.mark_ambiguous(attempt.attempt_id)
+                repo.escalate_to_human(job_id)
+        except (JobError, ReviewAgentError):
+            return
+        self._wait_reasons[job_id] = "discovery_extraction_reconciliation_required"
 
     def _discovery_fail(
         self,
