@@ -328,23 +328,28 @@ def _check_tracing(store: Any, entries: list) -> None:
 
 
 def _check_delivery(store: Any, entries: list) -> None:
+    """The delivery stage is complete only once its export has been written.
+
+    Final approval alone is not completion: the export (the actual deliverable)
+    must have run and recorded its file hashes.  A finally-approved delivery whose
+    export has not been written is reported as ``export pending`` (never
+    ``complete``), with the exact ``delivery export`` command.
+    """
     if not entries:
         raise _Incomplete("no delivery state exists yet")
-    approvals = HumanApprovalRepository(store)
     for entry in entries:
         payload = entry["document"].get("payload") or {}
-        if payload.get("status") in ("approved", "exported"):
+        if payload.get("status") == "exported" or isinstance(payload.get("export"), dict):
             continue
-        # A delivery whose exact-revision final-approval named gate is satisfied
-        # is finally approved even before the export revision is written.
-        delivery_id = payload.get("delivery_id")
-        if isinstance(delivery_id, str) and delivery_id and approvals.named_gate_satisfied(
-            delivery_id,
-            gate_kind=DELIVERY_APPROVAL_GATE_KIND,
-            gate_id=DELIVERY_APPROVAL_GATE_ID,
-        ):
-            continue
-        raise _Incomplete("the delivery is not finally approved")
+        raise _Incomplete("the delivery has not been exported yet")
+
+
+def _delivery_export_command(project_id: str, delivery_id: str) -> str:
+    return (
+        "review-article-agent delivery export "
+        f"--project {project_id} --delivery-id {delivery_id} "
+        "--out-dir <OUT_DIR> --rights-file <RIGHTS_JSON>"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -915,6 +920,29 @@ def resolve(store: Any, registry: Any = None) -> dict:
                             "gate_id": stage.gate[1],
                         },
                     }
+                    break
+                if stage.id == "delivery":
+                    # The exact-revision final approval is granted, but the export
+                    # (the deliverable) has not been written. The stage is NOT
+                    # complete: report the pending export with its exact command.
+                    delivery_id = stage_entries[0]["artifact_id"]
+                    command = _delivery_export_command(store.project_id, delivery_id)
+                    blocked_on = {
+                        "kind": "human",
+                        "detail": (
+                            "final approval granted, export pending: run "
+                            f"`{command}` to write the Markdown/BibTeX/RIS package"
+                        ),
+                        "next_command": command,
+                    }
+                    next_action = {
+                        "kind": "human",
+                        "role": "author",
+                        "inputs": {"command": command},
+                    }
+                    warnings.append(
+                        f"{stage.id}: final approval granted, export pending"
+                    )
                     break
             detail = _failure_detail(stage)
             blocked_on = {

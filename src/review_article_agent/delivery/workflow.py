@@ -43,10 +43,12 @@ import os
 
 from ..domain.records import validate_identifier
 from ..review.schema import fact_check
+from ..review.workflow import SectionReviewRepository
 from ..storage.artifacts import ArtifactRepository
 from ..storage.human_approvals import HumanApprovalRepository
 from ..tracing.workflow import origin_coverage
 from .export import build_disclosures, build_export_package, cited_keys
+from .manuscript import MANUSCRIPT_DOCUMENT_TYPE, build_manuscript
 from .schema import (
     DeliveryError,
     apply_notes_batch,
@@ -67,6 +69,12 @@ DOCUMENT_TYPE = "delivery"
 
 #: The supported generic JSON document-envelope schema version.
 SCHEMA_VERSION = 1
+
+#: The artifact-id suffix of the durable manuscript revision a delivery records.
+#: The manuscript is a separate durable artifact (not the delivery state) so its
+#: revision id is content-bound: a change of manuscript content produces a new
+#: revision id, which makes the exact-revision final approval stale.
+MANUSCRIPT_ARTIFACT_SUFFIX = ".manuscript"
 
 #: The exact named owner gate (``gate_kind``, ``gate_id``) for the delivery final
 #: approval.  The manifest is bound to the exact delivery-state revision that
@@ -214,9 +222,129 @@ class DeliveryRepository:
             state["status"] = "in_progress"
         return state
 
+    # -- manuscript ---------------------------------------------------------- #
+    def _manuscript_artifact_id(self, delivery_id):
+        artifact_id = validate_identifier(delivery_id, "delivery_id")
+        return artifact_id + MANUSCRIPT_ARTIFACT_SUFFIX
+
+    def _manuscript_head(self, delivery_id):
+        return self.artifacts.current_revision(self._manuscript_artifact_id(delivery_id))
+
+    def _manuscript_from_sections(self, sections):
+        """Build the delivery manuscript from the named review states, or ``None``.
+
+        Every section that names a ``review_id`` is read through the durable
+        section-review repository and rendered in outline section order by
+        :func:`~review_article_agent.delivery.manuscript.build_manuscript`.  If no
+        section names a review id, ``None`` is returned (the caller has no
+        reviewed sections to assemble); a named review that cannot be read is a
+        fail-closed error.
+        """
+        entries: list = []
+        for section in sections or []:
+            review_id = (section or {}).get("review_id")
+            if not review_id:
+                return None
+            review_state = SectionReviewRepository(self.store).read(review_id)
+            if not isinstance(review_state, dict):
+                raise DeliveryWorkflowError(
+                    f"the section review {review_id!r} is unavailable; the delivery "
+                    "manuscript cannot be assembled"
+                )
+            entries.append(
+                {
+                    "section_id": section.get("section_id"),
+                    "title": section.get("title") or section.get("section_id"),
+                    "review_state": review_state,
+                }
+            )
+        if not entries:
+            return None
+        return build_manuscript(entries)
+
+    def _record_manuscript(self, state, manuscript):
+        """Persist (or reuse) the durable manuscript revision and bind it in state.
+
+        The manuscript is a separate durable artifact; its revision id is bound to
+        its exact content.  When the current head already carries the same payload
+        the head revision id is reused (so an unchanged manuscript does not churn
+        the id and does not spuriously stale an approval); otherwise a new immutable
+        revision is appended.  ``state["manuscript"]`` records the exact revision id
+        and text, and ``state["paragraphs"]`` the delivery paragraph model.
+        """
+        artifact_id = self._manuscript_artifact_id(state["delivery_id"])
+        text = manuscript.get("text", "")
+        if not isinstance(text, str):
+            text = ""
+        paragraphs = {
+            str(paragraph_id): dict(paragraph)
+            for paragraph_id, paragraph in (manuscript.get("paragraphs") or {}).items()
+        }
+        sections = list(manuscript.get("sections") or [])
+        payload = {"text": text, "paragraphs": paragraphs, "sections": sections}
+
+        head = self.artifacts.current_revision(artifact_id)
+        if head is not None:
+            try:
+                current = json.loads(
+                    self.artifacts.read_content(artifact_id, head.revision_id)
+                )
+            except (ValueError, UnicodeDecodeError):
+                current = None
+            if isinstance(current, dict) and current.get("payload") == payload:
+                state["manuscript"] = {"revision_id": head.revision_id, "text": text}
+                state["paragraphs"] = paragraphs
+                return head.revision_id
+
+        self.artifacts.create_artifact(artifact_id, kind=ARTIFACT_KIND, created_by="user")
+        head = self.artifacts.current_revision(artifact_id)
+        parent = None if head is None else head.revision_id
+        revision_id = ArtifactRepository.new_revision_id()
+        self.artifacts.import_revision(
+            artifact_id=artifact_id,
+            revision_id=revision_id,
+            content={
+                "schema_version": SCHEMA_VERSION,
+                "document_type": MANUSCRIPT_DOCUMENT_TYPE,
+                "payload": payload,
+            },
+            origin_locator="delivery:manuscript",
+            acquired_by="user",
+            rights=self._rights(artifact_id, revision_id),
+            parent_revision_id=parent,
+        )
+        state["manuscript"] = {"revision_id": revision_id, "text": text}
+        state["paragraphs"] = paragraphs
+        return revision_id
+
+    def set_manuscript(self, delivery_id, manuscript, rights=None):
+        """Record a durable, content-bound manuscript revision on the delivery.
+
+        The manuscript ``{"text", "paragraphs", "sections"}`` is persisted as a
+        new immutable revision of the delivery's manuscript artifact (or the
+        existing revision id is reused when the content is unchanged).  Any
+        recorded approval is invalidated, because the approved manuscript revision
+        no longer matches.
+        """
+        self._set_rights(rights)
+        state = self._load(delivery_id)
+        self._record_manuscript(state, manuscript)
+        self._invalidate_approval(state)
+        self._persist(state)
+        return state
+
     # -- 1. global review gate ----------------------------------------------- #
-    def start_global_review(self, delivery_id, sections, origin_state, rights=None):
-        """Start the global review, persisting nothing if the gate is not met."""
+    def start_global_review(
+        self, delivery_id, sections, origin_state, rights=None, manuscript=None
+    ):
+        """Start the global review, persisting nothing if the gate is not met.
+
+        The delivery manuscript is recorded from the reviewed section drafts: each
+        section's durable ``review_id`` is read and rendered in outline section
+        order (or an explicit ``manuscript`` may be supplied).  A section list
+        without review ids records no manuscript (backward compatible with callers
+        that supply the manuscript later to :meth:`run_global_review`).
+        """
         self._set_rights(rights)
         artifact_id = validate_identifier(delivery_id, "delivery_id")
 
@@ -237,6 +365,10 @@ class DeliveryRepository:
         state["sections"] = list(sections or [])
         state["origin_state"] = origin_state
         state["status"] = "in_progress"
+        if manuscript is None:
+            manuscript = self._manuscript_from_sections(state["sections"])
+        if manuscript is not None:
+            self._record_manuscript(state, manuscript)
         self._persist(state)
         return state
 
@@ -286,7 +418,16 @@ class DeliveryRepository:
             self._persist(state)
             text = writer(text, findings)
             gr["rounds_used"] += 1
-            state["manuscript"] = {"revision_id": revision_id, "text": text}
+            if self._manuscript_head(state["delivery_id"]) is not None:
+                # A durable manuscript revision exists: a writer edit changes the
+                # content, so record a new content-bound revision id (an exact
+                # approval of the old revision is thereby made stale).
+                self._record_manuscript(
+                    state,
+                    {"text": text, "paragraphs": state.get("paragraphs") or {}},
+                )
+            else:
+                state["manuscript"] = {"revision_id": revision_id, "text": text}
             self._persist(state)
 
     # -- 3. freshness -------------------------------------------------------- #
@@ -722,6 +863,8 @@ __all__ = [
     "DOCUMENT_TYPE",
     "FINAL_APPROVAL_GATE_ID",
     "FINAL_APPROVAL_GATE_KIND",
+    "MANUSCRIPT_ARTIFACT_SUFFIX",
+    "MANUSCRIPT_DOCUMENT_TYPE",
     "SCHEMA_VERSION",
     "DeliveryWorkflowError",
     "DeliveryRepository",

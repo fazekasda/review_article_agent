@@ -42,13 +42,12 @@ extraction JSON shapes are the existing shared fixtures
 synthetic and uncopyrighted.  No live model, network, provider, or OpenCode
 session call is made.
 
-Known product gap (reported, not patched): the pipeline's ``delivery`` global
-review job records the delivery manuscript with ``revision_id = None`` (the
-worker reads ``state["manuscript"]``, which the pipeline never sets), so
-``delivery export`` (``DeliveryRepository.export_approved``) refuses with
-"no current manuscript revision".  This test therefore stops at the last passing
-stage -- the final-approval gate -- and asserts the refusal explicitly; the
-export-file assertions are not reachable until that seam is closed.
+The delivery manuscript is now recorded at ``delivery start`` from the
+**post-review** section drafts (``DeliveryRepository.start_global_review`` reads
+each section's ``review_id`` and renders the final reviewed draft as Markdown
+with Pandoc ``[@<cit_key>]`` citations).  The full tail is therefore reachable:
+final approval -> ``delivery export`` writes the seven files -> ``pipeline
+status`` reports ``complete`` only after the export.
 
 Run::
 
@@ -57,8 +56,10 @@ Run::
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -93,7 +94,6 @@ from review_article_agent.delivery.workflow import (  # noqa: E402
     FINAL_APPROVAL_GATE_ID,
     FINAL_APPROVAL_GATE_KIND,
     DeliveryRepository,
-    DeliveryWorkflowError,
 )
 from review_article_agent.drafting.package import DraftingPackageRepository  # noqa: E402
 from review_article_agent.drafting.workflow import DraftingWorkflowRepository  # noqa: E402
@@ -490,35 +490,80 @@ class MvpPipelineE2ETest(extraction_runner.FullFlowIntegrationTest):
             DeliveryRepository(self.store).final_approval_gate_satisfied(delivery_id)
         )
 
-        # --- delivery export (in-process CLI) ------------------------------- #
-        # Product gap (kickoff 16 §6/§9): the pipeline's global review job never
-        # records a delivery manuscript revision, so the re-deriving export
-        # refuses.  Assert the root cause and the exact, current behaviour.
+        # --- delivery manuscript recorded from the reviewed sections -------- #
+        # The manuscript is built from the post-review section drafts and recorded
+        # as a durable, content-bound revision at delivery start, so the export
+        # below is reachable.
         state = DeliveryRepository(self.store).read(delivery_id)
-        self.assertIsNone((state.get("manuscript") or {}).get("revision_id"))
-        with self.assertRaises(DeliveryWorkflowError) as ctx:
-            DeliveryRepository(self.store).export_approved(
-                delivery_id,
-                references=[],
-                corpus=[],
-                policy={"companion_accepted": False, "journal_policy_verified": False},
-                ai_use=[],
-                out_dir=self.tmp / "export-direct",
-                rights=self.rights,
-            )
-        self.assertIn("no current manuscript revision", str(ctx.exception))
+        manuscript = state.get("manuscript") or {}
+        self.assertIsNotNone(manuscript.get("revision_id"))
+        self.assertTrue(state.get("paragraphs"))
+        self.assertIn("[@cit_", manuscript.get("text", ""))
 
-        code, _out, err = self._run_cli(
+        # --- status: final approval alone is not completion ----------------- #
+        pending = pipeline_status.resolve(self.store)
+        self.assertEqual(pending["stage"], "delivery")
+        self.assertEqual(pending["blocked_on"]["kind"], "human")
+        self.assertIn("export pending", pending["blocked_on"]["detail"])
+        self.assertIn("delivery export", pending["blocked_on"]["next_command"])
+
+        # --- delivery export (in-process CLI) writes the package ------------ #
+        out_dir = self.tmp / "export"
+        code, out, err = self._run_cli(
             "delivery", "export", "--project", self.project_id,
-            "--delivery-id", delivery_id, "--out-dir", str(self.tmp / "export"),
+            "--delivery-id", delivery_id, "--out-dir", str(out_dir),
             "--rights-file", self._write_rights_file(),
         )
-        self.assertNotEqual(code, 0)
-        self.assertEqual(json.loads(err)["error"]["category"], "validation")
+        self.assertEqual(code, 0, err)
+        exported = json.loads(out)
+        self.assertEqual(exported["status"], "exported")
+        self.assertTrue(exported["consistency_ok"])
 
-        # The pipeline reports the project complete once the final-approval gate
-        # is satisfied -- it does not consider the export, which the manuscript
-        # gap above makes impossible for a pipeline-driven project.
+        expected = {
+            "manuscript.md",
+            "references.bib",
+            "references.ris",
+            "companion.md",
+            "summary.md",
+            "ai_declaration.md",
+            "export_manifest.json",
+        }
+        self.assertEqual(set(os.listdir(out_dir)), expected)
+
+        # The manifest hashes match the bytes actually written (the manifest
+        # covers the six content files, not itself).
+        manifest = json.loads(
+            (out_dir / "export_manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(set(manifest["file_hashes"]), expected - {"export_manifest.json"})
+        self.assertEqual(manifest["manuscript_revision"], manuscript["revision_id"])
+        for name, digest in manifest["file_hashes"].items():
+            content = (out_dir / name).read_text(encoding="utf-8")
+            self.assertEqual(
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                digest,
+                f"recorded hash mismatch for {name}",
+            )
+
+        # The bibliography/RIS carry the fixture's real frozen-corpus metadata.
+        bib = (out_dir / "references.bib").read_text(encoding="utf-8")
+        ris = (out_dir / "references.ris").read_text(encoding="utf-8")
+        self.assertIn("title = {A study of things}", bib)
+        self.assertIn("author = {Ada Lovelace and Alan Turing}", bib)
+        self.assertIn("journal = {Journal of Synthetic Studies}", bib)
+        self.assertIn("year = {2020}", bib)
+        self.assertIn("TI  - A study of things", ris)
+        self.assertIn("AU  - Ada Lovelace", ris)
+        self.assertIn("AU  - Alan Turing", ris)
+        self.assertIn("JO  - Journal of Synthetic Studies", ris)
+        self.assertIn("PY  - 2020", ris)
+
+        # The manuscript text cites the reviewed draft's verified-corpus keys as
+        # Pandoc citations, which the export reader recognises.
+        manuscript_md = (out_dir / "manuscript.md").read_text(encoding="utf-8")
+        self.assertRegex(manuscript_md, r"\[@cit_[0-9a-f]{32}\]")
+
+        # --- status is complete only after the export ----------------------- #
         self.assertEqual(pipeline_status.resolve(self.store)["stage"], "complete")
 
         # Every generation job made exactly one POST (no duplicate submissions).

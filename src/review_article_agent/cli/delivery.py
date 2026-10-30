@@ -41,6 +41,7 @@ a path, id, manuscript text, or exception text.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import os
 from typing import Any, Callable
@@ -329,21 +330,27 @@ def _rights_factory(template: dict, project_id: str) -> Callable[[str, str], dic
 
     The delivery workflow assigns its own opaque revision ids, so a static
     ``--rights-file`` cannot pre-bind the subject. The template supplies the
-    operations/basis/restrictions/privacy; the subject and ``rights_id`` are
-    rebound to the exact ``(artifact_id, revision_id)`` the repository persists.
+    operations/basis/restrictions/privacy (and any authorization); the subject,
+    the authorization's ``against_subject``, and ``rights_id`` are rebound to the
+    exact ``(artifact_id, revision_id)`` the repository persists, mirroring
+    ``pipeline.run._bind_rights`` so an authorization-bearing template validates.
     """
 
     def factory(artifact_id: str, revision_id: str) -> dict:
-        record = dict(template)
-        record["project_id"] = project_id
-        record["rights_id"] = f"RIGHTS-{revision_id}"
-        record["record_revision"] = 1
-        record["subject"] = {
+        record = copy.deepcopy(template)
+        subject = {
             "kind": "source_revision",
             "project_id": project_id,
             "artifact_id": artifact_id,
             "revision_id": revision_id,
         }
+        record["project_id"] = project_id
+        record["rights_id"] = f"RIGHTS-{revision_id}"
+        record["record_revision"] = 1
+        record["subject"] = subject
+        authorization = record.get("authorization")
+        if isinstance(authorization, dict):
+            authorization["against_subject"] = subject
         return record
 
     return factory
@@ -452,6 +459,9 @@ def delivery_start(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
                 "section_id": section_id,
                 "review_status": review_state.get("status"),
                 "origin_complete": coverage["complete"],
+                # The durable review id lets the delivery record its manuscript
+                # from the post-review section drafts (start_global_review).
+                "review_id": review_id,
             }
             if draft_refs_given:
                 section["draft_ref"] = {
