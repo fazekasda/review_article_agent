@@ -26,7 +26,9 @@ superseded run on the same ref. The workflow declares
 
 - **`fast`** (matrix: Python 3.11 and 3.14, `timeout-minutes: 30`) — the quick
   gate on every event. Steps: checkout (full history, needed for the whitespace
-  check), `setup-python`, `python -m compileall -q src scripts`,
+  check), `setup-python`, `python -m pip install "setuptools>=68"` (the build
+  backend for the wheel packaging test, see below),
+  `python -m compileall -q src scripts`,
   `python scripts/check_contract_docs.py`,
   `python -m unittest discover -s scripts -p 'test_*.py'`, a
   `git diff --check` whitespace check against the PR base (or `HEAD~1`), then
@@ -37,7 +39,8 @@ superseded run on the same ref. The workflow declares
 - **`full`** (PRs targeting `main`, nightly, manual) — the whole suite including
   the slow tier, sharded and balanced by the recorded per-module durations in
   `tests/durations.json`. 6 shards on Python 3.14 and 2 shards on Python 3.11
-  (`fail-fast: false`, `timeout-minutes: 45`). Each shard runs
+  (`fail-fast: false`, `timeout-minutes: 45`). Each shard installs the build
+  backend (`python -m pip install "setuptools>=68"`) and runs
   `python scripts/run_tests.py --slow -j 4 --top 10 --timeout 1800
   --durations-out durations-<py>-<shard>.json $(python scripts/test_shards.py
   --shards <shards> --index <shard>)` and uploads its durations JSON as an
@@ -55,6 +58,23 @@ superseded run on the same ref. The workflow declares
 
 The TypeScript spike tests (`spikes/runtime/typescript`) are deliberately **not**
 in CI.
+
+### Build backend dependency (`setuptools`)
+
+`tests/test_cli.py::WheelPackagingTest` builds a wheel offline through the
+project's declared build backend, which `pyproject.toml` names as
+`requires = ["setuptools>=68"]`. The Python 3.14 runner does not ship
+`setuptools`, so both the `fast` and `full` jobs install it explicitly
+(`python -m pip install "setuptools>=68"`) right after `setup-python`. This is
+intentional: if `setuptools` is absent the test **fails** with an actionable
+message rather than skipping, so the packaging coverage can never silently
+disappear. To reproduce locally, install the backend in the interpreter that
+runs the tests:
+
+```bash
+python3 -m pip install "setuptools>=68"
+PYTHONPATH=src:tests python3 -m unittest tests.test_cli.WheelPackagingTest
+```
 
 ## Running the same checks locally
 

@@ -49,6 +49,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # The wheel packaging test builds a wheel offline through the declared
+      # build backend (pyproject.toml: requires = ["setuptools>=68"]). The
+      # 3.14 runner ships no setuptools, so install it explicitly rather than
+      # silently skipping the coverage.
+      - name: Install build backend for the wheel packaging test
+        run: python -m pip install "setuptools>=68"
+
       - name: Byte-compile src and scripts
         run: python -m compileall -q src scripts
 
@@ -134,6 +141,13 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
+
+      # The wheel packaging test builds a wheel offline through the declared
+      # build backend (pyproject.toml: requires = ["setuptools>=68"]). The
+      # 3.14 runner ships no setuptools, so install it explicitly rather than
+      # silently skipping the coverage.
+      - name: Install build backend for the wheel packaging test
+        run: python -m pip install "setuptools>=68"
 
       - name: Run full test tier (shard ${{ matrix.shard }}/${{ matrix.shards }})
         shell: bash
