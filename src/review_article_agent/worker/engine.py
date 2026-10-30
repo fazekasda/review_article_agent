@@ -129,6 +129,7 @@ from ..storage.store import ProjectStore
 from . import acquisition as acquisition_jobs
 from . import discovery as discovery_jobs
 from . import extraction as extraction_jobs
+from . import generation as generation_jobs
 from .discovery import (
     AttemptCounter,
     DiscoveryJobStopped,
@@ -311,6 +312,8 @@ class WorkerEngine:
         acquisition_transport: Callable[..., Any] | None = None,
         extraction_transport: Callable[..., Any] | None = None,
         extraction_api_key: str | None = None,
+        generation_transport: Callable[..., Any] | None = None,
+        generation_api_key: str | None = None,
     ) -> None:
         self._data_dir = os.path.abspath(os.fspath(data_dir))
         self._registry = registry if registry is not None else Registry(self._data_dir)
@@ -355,6 +358,14 @@ class WorkerEngine:
         # persisted.
         self._extraction_transport = extraction_transport
         self._extraction_api_key = extraction_api_key
+        # Generation roles (kickoff 16 §5): the default transport is the real
+        # direct generation adapter (a single POST to the one documented endpoint);
+        # it is only ever used for an explicit, fully-guarded generation job. A
+        # test may inject a deterministic fake transport and/or an explicit key.
+        # The credential is read from the environment only at dispatch; it is never
+        # persisted.
+        self._generation_transport = generation_transport
+        self._generation_api_key = generation_api_key
         self._discovery_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="raa-discovery"
         )
@@ -1673,6 +1684,10 @@ class WorkerEngine:
             self._run_extract_dispatch(store, repo, project_id, job, attempt, token)
             return
 
+        if mode == discovery_jobs.MODE_GENERATION:
+            self._run_generate_dispatch(store, repo, project_id, job, attempt, token)
+            return
+
         counter = AttemptCounter()
         transport = discovery_jobs.guard_transport(
             self._discovery_lowlevel,
@@ -2022,6 +2037,120 @@ class WorkerEngine:
         except (JobError, ReviewAgentError):
             return
         self._wait_reasons[job_id] = "discovery_extraction_reconciliation_required"
+
+    def _run_generate_dispatch(
+        self,
+        store: Any,
+        repo: JobRepository,
+        project_id: str,
+        job: Job,
+        attempt: Any,
+        token: str,
+    ) -> None:
+        """Run one model-backed generation role job (at most one POST) and record it.
+
+        The credential is read from the **one** named environment variable at
+        dispatch (never scanned, never persisted). A missing credential, an
+        unapproved/stale hosted-use document, a denied rights record, or a
+        gate/budget/activation refusal performs **zero** POST. A terminal
+        ``proposed``/``invalid_proposal``/``model_not_completed``/
+        ``complete``/``blocked`` outcome is persisted as the job's safe accepted
+        result (referencing what the adapter wrote); anything that may have been
+        sent and has no terminal outcome moves the job to ``waiting_human`` and is
+        **never** re-POSTed on a retry or restart.
+        """
+        from ..generation.hosted_use import GenerationHostedUseError
+        from ..generation.review_roles import ReviewPortError
+        from ..generation.runner import GenerationRunnerError
+
+        job_id = job.job_id
+        if self._discovery_stop_requested(repo, project_id, job_id):
+            self._discovery_fail(
+                repo, project_id, job, attempt, attempts=0, reason="stopped", escalate=False
+            )
+            return
+
+        api_key = self._generation_api_key
+        if api_key is None:
+            api_key = os.environ.get(discovery_jobs.GENERATION_CREDENTIAL_ENV)
+        if not isinstance(api_key, str) or api_key == "":
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=0,
+                reason="credential_missing",
+                escalate=True,
+            )
+            return
+
+        try:
+            raw = generation_jobs.dispatch_generation(
+                store,
+                self._registry,
+                token,
+                job,
+                api_key=api_key,
+                transport=self._generation_transport,
+            )
+        except ReviewPortError:
+            # The review/critic/repair model call did not complete; the workflow
+            # recorded its state after every completed call, so this is a terminal
+            # result needing a human, never a crash and never a re-POST.
+            raw = {"operation": self._generation_operation(job), "status": "model_not_completed"}
+        except (GenerationRunnerError, GenerationHostedUseError, BudgetExceededError):
+            # A refusal raised strictly *before* any reserve/POST.
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=0,
+                reason="blocked",
+                escalate=True,
+            )
+            return
+        except BaseException:  # noqa: BLE001 - the POST may have happened: unknown
+            self._discovery_fail(
+                repo,
+                project_id,
+                job,
+                attempt,
+                attempts=1,
+                reason="indeterminate",
+            )
+            return
+
+        if generation_jobs.is_terminal(raw):
+            try:
+                with self._write_guard(project_id, allow_draining=True):
+                    repo.accept_result(
+                        attempt.attempt_id,
+                        result_kind=discovery_jobs.RESULT_KIND_GENERATION,
+                        result=generation_jobs.accepted_result(raw),
+                    )
+            except (JobError, ReviewAgentError):
+                return
+            if self._discovery_is_held(repo, project_id, job_id):
+                self._wait_reasons[job_id] = "discovery_interrupted"
+            return
+
+        # A non-terminal external outcome: retain the reserve and the runtime
+        # occupancy, escalate to a human, and never re-POST.
+        try:
+            with self._write_guard(project_id, allow_draining=True):
+                repo.mark_ambiguous(attempt.attempt_id)
+                repo.escalate_to_human(job_id)
+        except (JobError, ReviewAgentError):
+            return
+        self._wait_reasons[job_id] = "discovery_generation_reconciliation_required"
+
+    @staticmethod
+    def _generation_operation(job: Job) -> str | None:
+        params = job.parameters if isinstance(job.parameters, dict) else {}
+        operation = params.get("operation")
+        return operation if isinstance(operation, str) else None
 
     def _discovery_fail(
         self,

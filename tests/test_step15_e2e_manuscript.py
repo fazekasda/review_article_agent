@@ -86,6 +86,12 @@ from review_article_agent.tracing.workflow import (  # noqa: E402
 #: Every place a real stage output could not be consumed by the next API and the
 #: existing synthetic fixture is used instead.  Each is marked ``# BRIDGE:`` at
 #: its call site.
+#:
+#: **The MVP path is now covered without these bridges.**  This hand-glued chain
+#: is retained as a focused back-half demonstration, but the end-to-end MVP path
+#: (real Step 09 receipts -> ``pipeline run`` -> scripted gates -> delivery) lives
+#: in :mod:`tests.test_mvp_pipeline_e2e`; the ``synthesis_inputs`` bridge below is
+#: exactly the Step 08 "extraction -> synthesis" seam that test closes.
 BRIDGES = [
     (
         "synthesis_inputs",
@@ -95,12 +101,15 @@ BRIDGES = [
     ),
     (
         "manuscript_text",
-        "The global-review/export manuscript text is a short synthetic bridge "
-        "text: the provisional assembly Markdown carries cit_* markers, which the "
-        "export Pandoc-citation reader does not recognise. The bridge text cites "
-        "the draft package's real verified-corpus citation key so the export "
-        "bibliography (built from the package via bibliography_from_packages) "
-        "passes the consistency check.",
+        "This hand-glued chain still passes a short synthetic bridge text to "
+        "run_global_review/export. The seam it stood for is now CLOSED for the "
+        "MVP path: delivery.manuscript.build_manuscript renders the post-review "
+        "section drafts as Markdown with Pandoc [@<cit_key>] citations (the form "
+        "the export reader recognises), and pipeline run records that manuscript "
+        "at delivery start (see tests.test_mvp_pipeline_e2e). The bridge text "
+        "cites the draft package's real verified-corpus citation key so this "
+        "focused demonstration's export bibliography (built from the package via "
+        "bibliography_from_packages) still passes the consistency check.",
     ),
 ]
 
@@ -173,9 +182,10 @@ class EndToEndManuscriptTests(DraftBase):
             citation_record["journal"], "Journal of Synthetic Studies"
         )
 
-        # The manuscript-text bridge cites the package's real citation key so the
-        # export consistency check can pass (the assembly Markdown's cit_* markers
-        # are still unrecognised by the Pandoc reader -- a separate bridge).
+        # This hand-glued chain still uses a synthetic bridge text citing the
+        # package's real citation key so the export consistency check passes.  The
+        # seam is closed for the MVP path by delivery.manuscript.build_manuscript
+        # (see the manuscript_text BRIDGE note above).
         bridge_text = f"The reported effect is summarised here [@{first_citation}]."
 
         # ---------------------------------------------------------------- #

@@ -15,9 +15,9 @@ makes no scientific-validation claim. The authoritative interfaces are the
 | Python | **>= 3.11** | `pyproject.toml` `requires-python = ">=3.11"`. |
 | Tested interpreter | **CPython 3.14.4 on Linux (x86_64)** | The only interpreter the full suite and the scale run were executed on; 3.11 is supported but **unrun**. |
 | Runtime dependencies | **None** (standard library only) | `dependencies = []`; no agent framework. |
-| Optional extra | `pypdf==6.21.4` via `.[pdf]` | **Diagnostic PDF input-integrity inspection only** (Step 06). It is **not** a scientific parser; without it the inspector reports `unavailable`. |
+| Optional extra | `pypdf==6.21.4` via `.[pdf]` | **PDF text extraction** (Step 07): bounded per-page text with page locators, plus the Step 06 input-integrity inspector. It is **not** a scientific parser; OCR, figures, tables, and column order are not interpreted and escalate to human review, and without it PDF text stays `needs_review`. |
 | OpenCode service | **v2.2.0, pinned** | `runtime/service.py` `OPENCODE_PINNED_VERSION = "2.2.0"` (Step 04); the app owns a version-pinned service separate from ordinary coding sessions. |
-| Model transport in tests | **recorded fakes only** | No live model/provider call was made in any test; every model output is a recorded or injected fake. |
+| Model transport in tests | **recorded fakes only** | No live model/provider call was made in any test; every model output is a recorded or injected fake. **Live model validation is unrun** (no credential was available to the coordinator). |
 
 ## Installation, upgrade, and migration
 
@@ -65,6 +65,9 @@ The day-2 command surface (exact spellings in the [CLI contract](cli.md)):
 | Worker lifecycle | `worker start` \| `worker status` \| `worker stop` | [cli.md §9](cli.md), [worker.md](worker.md) |
 | Jobs | `job run` \| `attach` \| `status` \| `list` \| `pause` \| `resume` \| `cancel` \| `switch` \| `drain` \| `reconcile` | [cli.md §10](cli.md), [worker.md §6–§8](worker.md) |
 | Approvals | `gate …` (app-owned named-gate human approvals) | [cli.md §11](cli.md) |
+| Orchestration | `pipeline status` \| `pipeline run` | [cli.md §19](cli.md), [cli.md §24](cli.md) |
+| Model-backed roles | `generation run submit` \| `status`; `generation hosted-use propose` \| `show` | [cli.md §23](cli.md), [generation.md](generation.md) |
+| Review / tracing / delivery | `review …` \| `tracing …` \| `delivery …` | [cli.md §20–§22](cli.md) |
 | Private snapshot | `backup create` \| `verify` \| `restore` (and the `export` alias) | [cli.md §7](cli.md), [storage.md](storage.md) |
 
 Key points:
@@ -123,10 +126,11 @@ with [`specification.md`](specification.md) and the
 
 ## Feature / support matrix
 
-Capability status for Steps 02–14, derived from the handoff reports. "No CLI"
-means the capability is a library API exercised by tests, without a command-line
-surface. Every model output used anywhere below is a recorded/injected fake; no
-live model or provider call is involved.
+Capability status for Steps 02–14 and the kickoff-16 additions, derived from the
+handoff reports and the step documents. "No CLI" means the capability is a library
+API exercised by tests, without a command-line surface. Every model output used
+anywhere below is a recorded/injected fake; no live model or provider call is
+involved, and live model validation is **unrun**.
 
 | Step | Capability | Status |
 | --- | --- | --- |
@@ -135,17 +139,21 @@ live model or provider call is involved.
 | 04 | Restricted roles, model adapters, named-gate approvals, app-owned OpenCode service | **Implemented + tested** (library session path + `gate` CLI; model transport is a loopback fixture) |
 | 05 | Reproducible discovery, candidate ledger, citation expansion, coverage/freeze | **Implemented + tested** (CLI + library) |
 | 06 | Full-text acquisition, imports, reconciliation, rights | **Implemented + tested** (CLI + library; PDF inspector optional/diagnostic) |
-| 07 | Parsing, source assets, reference structure | **Partial**: XML/JATS/TEI core **implemented + tested** (CLI); PDF/OCR/visual/table-cell interpretation **not implemented** (human review) |
+| 07 | Parsing, source assets, reference structure | **Partial**: XML/JATS/TEI core **implemented + tested** (CLI); **PDF text extraction implemented** through the optional `pypdf` extra (bounded page-locator passages, conservative `parsed`/`needs_review` states); OCR/visual/table-cell interpretation **not implemented** (human review) |
 | 08 | Iterative pilot, Jev screening, exclusion audits | **Implemented + tested** (CLI + library); responses are imported/fixture, no live-dispatch binding |
 | 09 | Grounded extraction, appraisal, output audits | **Implemented + tested** (CLI + library); dispatch receipts are synthetic, no live transport |
 | 10 | Synthesis, framework, outline, argument record | **Implemented + tested** (CLI + library; synthetic upstream fixtures) |
 | 11 | Section blueprints, evidence-grounded drafting | **Implemented + tested** (CLI + library; planner/writer mappings are fixture rows) |
-| 12 | Bounded critique and original-source fact-checking | **Library-only, no CLI** (injected critic/writer ports; no live model) |
-| 13 | Citation-origin tracing | **Library-only, no CLI** (injected acquisition/depth-0 fixtures) |
-| 14 | Manuscript integration, author notes, freshness, delivery/export | **Library-only, no CLI** (injected reviewer/writer ports; pure export rules unchanged) |
+| 12 | Bounded critique and original-source fact-checking | **Implemented + tested** (`review` CLI + library); model-backed critic/repair run through `generation run submit`, test ports are fakes (no live model) |
+| 13 | Citation-origin tracing | **Implemented + tested** (`tracing` CLI + library); resolves the acquisition port over the project's already-acquired sources, no network (depth-0 attribution caveat) |
+| 14 | Manuscript integration, author notes, freshness, delivery/export | **Implemented + tested** (`delivery` CLI + library); owner-authenticated exact-revision final-approval gate and a real Markdown/BibTeX/RIS **export with a corpus-derived bibliography** (title/authors/year/journal); model ports are fakes (no live model) |
+| 16 §5 | Model-backed generative roles on the direct OpenRouter route | **Implemented + tested** (library + `generation run` worker job + `generation hosted-use` CLI); recorded/fake transports in tests, **live validation unrun** |
+| 16 §6 | Pipeline orchestrator (run until the next human gate) | **Implemented + tested** (`pipeline status` + `pipeline run` CLI + library; fake model transport; screening and pilot design stay manual) |
+| — | GitHub Actions CI (fast + sharded full suite) | **Configured + green** (`.github/workflows/ci.yml`; `fast` on 3.11/3.14, `full` 6+2 shards; see [ci.md](ci.md)) |
 
-Not implemented as of this release: PDF/OCR/visual scientific parsing, any live
-model/provider execution, real acquisition uploads, and any hosted transfer.
+Not implemented as of this release: OCR/visual/table/figure scientific parsing, any
+live model/provider execution (**live validation unrun**), real acquisition uploads,
+and any hosted transfer.
 
 ## Release checklist
 

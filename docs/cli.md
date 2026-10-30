@@ -1090,3 +1090,406 @@ has not completed, `job_state` reports the durable scheduling state. The output 
 Errors use the exit categories of §3 with static, value-free messages. Status and
 disclosures: [`worker.md`](worker.md) §14 and
 [decision 004](decisions/004-step09-direct-extraction.md).
+
+## 19. Pipeline stage status — `pipeline` (kickoff 16 §6, read-only half)
+
+The root `pipeline` group is a **read-only** local surface over
+[`pipeline/status.py`](../src/review_article_agent/pipeline/status.py). It reports,
+for one project, the project's **current pipeline stage** derived from durable state
+and the exact next action a human must take. It is the read-only half of the
+`pipeline run` orchestrator; it holds no authoritative state of its own, reuses the
+stages' existing repositories/`require_*` checks, and writes nothing.
+
+| Command | Synopsis |
+| --- | --- |
+| `pipeline status [--project ID]` | Report the current stage, the completed stages, what the project is blocked on, and the exact next action / CLI command. |
+
+`pipeline status` walks the ordered stage table (discovery plan → coverage → freeze
+→ acquisition → parsing → screening pilot/exclusions → extraction config/pilot/
+batch/outputs → synthesis → framework → outline → drafting blueprint → review →
+tracing → delivery) and stops at the first stage that is not complete. A stage is
+**complete only when its own existing `require_*`/read check passes** (for example
+`discovery.freeze.require_frozen`, `acquisition.manifest.require_acquired`,
+`synthesis.workflow.require_outline`, `drafting.workflow.require_blueprint`), so a
+reported "complete" is exactly the authority the stage itself grants. A stage with
+no proposal revision is treated as *skipped* (not the current stage) when a later
+stage has already begun.
+
+The JSON output is:
+
+```json
+{
+  "stage": "<stage id> | \"complete\"",
+  "completed": ["<stage id>", "..."],
+  "blocked_on": null | {"kind": "human_gate|missing_input|hosted_use|budget|failure|paused",
+                        "detail": "...", "next_command": "<exact CLI line or null>"},
+  "next_action": null | {"kind": "job|human", "role"/"job": "...", "inputs": {...}},
+  "warnings": ["..."],
+  "project_id": "prj_...",
+  "authorizes_execution": false,
+  "authorizes_export": false,
+  "scientific_validation": false
+}
+```
+
+* **Human gate.** When a proposal revision exists but its exact named human gate is
+  not currently active and approved, `blocked_on.kind` is `"human_gate"` and
+  `next_command` is the exact `gate confirm` line
+  (`--artifact-id`/`--revision-id`/`--gate-kind`/`--gate-id`/`--decision approved`
+  plus the required `--rationale`/`--snapshot-digest` placeholders). The `detail`
+  also names the read-only `gate prepare` command needed to obtain the snapshot
+  digest. A stale approval (a new revision after the approval) is reported as
+  awaiting the gate again.
+* **Not started.** When no proposal revision exists and no later stage has begun,
+  `blocked_on` is `null` and `next_action` describes how to produce the proposal,
+  naming the exact CLI command where one exists.
+* **CLI command.** The review, tracing, and delivery stages now report their
+  deterministic CLI command (kickoff 16 §9) in `next_action.inputs.command`
+  (`review status`, `tracing run`, `delivery start`) alongside the library entry
+  point (`SectionReviewRepository.run`, `OriginTraceRepository.run`,
+  `DeliveryRepository.start_global_review`). A model-backed stage action (the
+  section review itself) is submitted as a worker job through
+  `generation run submit`; the read/record command is the deterministic next
+  action reported here.
+
+The command never dispatches a model, session, worker job, or network request,
+records no approval, and writes nothing; re-running it over an unchanged store
+returns equal output (idempotent). The project is opened through the registry with
+an expected project id, and failures use the exit categories of §3 with static,
+value-free messages.
+
+## 20. Section review — `review` (kickoff 16 §9)
+
+The root `review` group is a **read-only, local** surface over
+[`review/workflow.py`](../src/review_article_agent/review/workflow.py). It reads a
+durable Step 12 section-review state; it never dispatches a model, records an
+approval, or exports.
+
+| Command | Synopsis |
+| --- | --- |
+| `review show --review-id ID [--project ID] [--content]` | Read one section review's safe state summary. |
+| `review status --review-id ID [--project ID] [--content]` | Read the review's status (rounds used, status, required human action). |
+
+The safe summary carries `status`, `phase`, `rounds_used` (`critique`/`fact_check`),
+`critic_calls`/`repair_calls`, `finding_count`/`check_count`, the
+`required_human_action`, the read-only validation status, and the
+`different_model`/`independent_human_verification` engine flags. The private raw
+state (draft text, findings, checks) is included only with `--content`
+(`private_content_included`). Every output carries `authorizes_execution=false`,
+`authorizes_export=false`, and `scientific_validation=false`. An unknown review id
+is a `validation` error whose message never echoes the id.
+
+The model-backed review (critic/repair) is submitted as a worker job through
+`generation run submit`; `review show`/`review status` are the deterministic
+read steps.
+
+## 21. Citation-origin tracing — `tracing` (kickoff 16 §9)
+
+The root `tracing` group is a **deterministic, local** surface over
+[`tracing/workflow.py`](../src/review_article_agent/tracing/workflow.py). It
+derives the claim/source graph from the **real** draft, its approved drafting
+package, and the recorded section-review checks, and resolves the acquisition port
+over the project's already acquired sources; it makes **no network call**.
+
+| Command | Synopsis |
+| --- | --- |
+| `tracing run --trace-id ID --draft-artifact-id ID --draft-revision-id ID [--review-id ID] [--policy-file PATH] --rights-file PATH [--project ID]` | Derive and record one origin trace (no network). |
+| `tracing show --trace-id ID [--project ID] [--content]` | Read one trace's safe state summary. |
+| `tracing coverage --trace-id ID [--project ID] [--content]` | Read the read-only `origin_coverage` audit. |
+
+* `tracing run` reads the exact draft result and its approved drafting package via
+  the drafting workflow, builds `claims`/`sources`/`source_digests` with
+  `tracing.inputs.claims_and_sources`, resolves the injected acquisition port with
+  `tracing.acquisition_port.make_acquire_port`, and records a resumable trace.
+  `--policy-file` supplies the four required per-project limits; **without it the
+  trace is `configuration_required` and nothing is acquired**.
+* `--review-id` supplies the recorded section review whose checks annotate the
+  trace; without it the checks list is empty.
+* `--rights-file` is a strict JSON `RightsRecord` **template**; the CLI rebinds its
+  subject/`rights_id` to each exact revision the workflow records (the workflow
+  assigns its own opaque revision ids).
+* `tracing coverage` reports `counts`, `requires_human_approval`, `blockers`,
+  `complete`, and `export_ready`; `edits_applied` is always `false`.
+* Every output carries the non-authorizing flags; the private raw trace state is
+  included only with `--content`.
+
+## 22. Delivery — `delivery` (kickoff 16 §9)
+
+The root `delivery` group is a **local, human-gated** surface over
+[`delivery/workflow.py`](../src/review_article_agent/delivery/workflow.py). It
+covers the deterministic/human steps and the manuscript/BibTeX/RIS export; it
+never dispatches a model or reaches the network.
+
+| Command | Synopsis |
+| --- | --- |
+| `delivery start --delivery-id ID --section ID --review-id ID --trace-id ID [--draft-artifact-id ID --draft-revision-id ID] --rights-file PATH [--project ID]` | Start the global review from recorded review/trace states (repeat `--section`/`--review-id`/`--trace-id` in lockstep; repeat `--draft-artifact-id`/`--draft-revision-id` in lockstep to record each section's approved draft ref for the re-deriving export). |
+| `delivery freshness --delivery-id ID --cutoff-date DATE --decision {accept_cutoff,authorize_topup} [--approval-id ID] [--query-window-end DATE] --rights-file PATH` | Record the explicit freshness decision (never silently adds papers). |
+| `delivery notes add --delivery-id ID --file PATH --rights-file PATH` | Store the human-notes action plan from a JSON array file. |
+| `delivery notes apply --delivery-id ID --batch-file PATH --approval-id ID --rights-file PATH` | Apply one human-approved notes batch; a non-empty `--approval-id` is required and a batch is never auto-applied. |
+| `delivery revalidate --delivery-id ID --paragraph ID --package-file PATH [--trace-id ID] --rights-file PATH` | Re-run the Step 12/13 checks for the named paragraphs from the approved package (never trusts the caller). |
+| `delivery approve --prepare --delivery-id ID --rights-file PATH [--hashes-file PATH]` | Persist the exact-revision final-approval manifest as a new revision and print the manifest digest and the exact `gate prepare`/`gate confirm` commands a human must run. The CLI **records no approval** and accepts **no approver**. |
+| `delivery export --delivery-id ID --out-dir PATH --rights-file PATH [--hashes-file PATH] [--policy-file PATH] [--ai-use-file PATH] [--venue NAME]` | Re-derive the approved drafting packages from durable state and write the export package after the exact-revision final approval. |
+| `delivery status --delivery-id ID [--project ID]` | Read one delivery's safe status summary. |
+
+* `delivery start` requires every section to be review-complete and origin-complete
+  (the workflow's `global_review_ready`/`origin_coverage` gate); the recorded
+  review status and trace coverage fill the section list. `--section`/`--review-id`/
+  `--trace-id` are paired by index and must have equal length.
+* `--rights-file` is a strict JSON `RightsRecord` **template**; the CLI rebinds its
+  subject/`rights_id` to each exact revision the workflow records.
+* `delivery notes apply --batch-file` is a JSON object
+  `{"batch_id": ID, "edits": [{"note_id", "paragraph_id", "new_text", "kind"}]}`.
+  Only notes whose plan action is `local_edit`/`claim_edit` may be applied; a
+  claim/citation edit (or a wording edit that changes numbers/citations) marks the
+  paragraph stale for revalidation.
+* `delivery approve --prepare` persists the exact-revision final-approval manifest
+  as a **new delivery-state revision** and prints the manifest digest
+  (`manifest_digest`), the manifest revision (`manifest_revision`), and the exact
+  `gate prepare`/`gate confirm` commands (`prepare_command`/`confirm_command`) for
+  that revision. The CLI **records no approval** and accepts **no approver**: the
+  approval is the owner-authenticated named gate
+  (`artifact_revision` / `delivery.final_approval`) that the human records
+  out-of-band on `/dev/tty` via `gate confirm`, exactly like every other stage's
+  named gate. Without `--prepare` the command refuses with a `validation` error.
+* `delivery export` re-derives each section's **approved drafting package** from
+  durable state via `drafting/workflow` (`read(..., "draft")`) over the draft ref
+  recorded at `delivery start` (there is no `--package-file`), builds
+  `references`/`corpus` with `delivery.export.bibliography_from_packages`, reads
+  the recorded manuscript, and writes `manuscript.md`, `references.bib`,
+  `references.ris`, `companion.md`, `summary.md`, `ai_declaration.md`, and
+  `export_manifest.json`. It **requires the satisfied named final approval on the
+  exact current manifest revision** and **refuses, writing nothing**, when the
+  approval is missing or the manifest changed after approval (a stale gate, for
+  example after a notes edit), when a section has no recorded drafting package, or
+  when a bibliography entry is inconsistent with the manuscript. An `--out-dir`
+  inside the `--data-dir` (or a project's `.review_article_agent` directory) is
+  refused like `backup create`. The output reports the per-file `file_hashes`
+  (matching the manifest's `file_hashes` for the six content files) and
+  `consistency_ok`.
+* `delivery status` reports the global-review status/rounds, the freshness status,
+  whether notes are planned, the applied-batch count, the paragraphs still
+  requiring revalidation, whether a final-approval manifest is prepared
+  (`final_approval_prepared`), whether its exact-revision named gate is satisfied
+  (`final_approval_gate_satisfied`, which also sets `approval_present`), and
+  whether an export is recorded. The private raw state is never emitted.
+
+Errors use the exit categories of §3 with static, value-free messages, and every
+output carries `authorizes_execution=false`, `authorizes_export=false`, and
+`scientific_validation=false`.
+
+## 23. Generation role runs — `generation run` (kickoff 16 §5 addition)
+
+This section adds the detached **run** sub-group over the model-backed generation-role
+worker surface (`discovery_submit` `mode=generation_run`; see
+[`worker.md`](worker.md) §15 and the role reference [`generation.md`](generation.md)).
+The existing `job status|list|attach|pause|resume|cancel|drain|switch|reconcile`
+lifecycle commands apply to a queued run unchanged.
+
+### 19.1 `generation run submit`
+
+`generation run submit` assembles one exact `generation_run` submission and returns a
+**queued admission only** — never a completion and never a model output:
+
+```
+generation run submit \
+  --operation {synthesis,framework,outline,blueprint,draft,section_review,global_review,notes_plan,screening_case} \
+  --credential-env OPENROUTER_API_KEY \
+  --request-id ID \
+  [--params-file PATH | <op-specific flags>] \
+  [--project ID] [--timeout SECONDS]
+```
+
+* `--params-file` is a strict JSON object holding the operation's exact parameters
+  (refs as `{"artifact_id","revision_id"}`, the `rights` record, and any optional
+  fields); the CLI fills in the project id on every reference. The op-specific flags
+  (`--<ref>-artifact-id`/`--<ref>-revision-id`, `--artifact-id`, `--revision-id`,
+  `--delivery-id`, `--review-id`, `--passage-id`, `--parent-revision-id`,
+  `--source-refs-file`, `--rights-file`) are an alternative to `--params-file`.
+* Every documented operation is wired: the single-shot `synthesis`/`framework`/`outline`,
+  `blueprint`/`draft`, and `section_review`; the delivery `global_review` (reads the
+  current manuscript/evidence from the recorded delivery state) and `notes_plan`
+  (proposes an author-note edit batch; never applies it); and `screening_case` (one
+  direct Jev decision committed through the decision ledger). No operation is refused.
+* Every argument is validated locally, and the assembled parameters are canonicalised by
+  the **real** generation submission validator, **before** a worker is ensured — so a bad
+  value is a typed `validation` error and no daemon is started and no job is created.
+* `--credential-env` must name the one approved variable (`OPENROUTER_API_KEY`); the
+  credential **value** is never accepted, sent over IPC, persisted, or logged. The worker
+  reads the named variable from its own environment at dispatch, and the CLI warns
+  (`configuration_required`/`notice`) when the key is absent — it never restarts or
+  reconfigures a user's worker.
+* The output carries `queued=true`, `admission_only=true`, `job_completion=false`,
+  `key_value_accepted=false`, `scientific_validation=false`, and
+  `authorizes_publication=false`.
+
+### 19.2 `generation run status`
+
+`generation run status --request-id ID [--project ID]` reads one recorded run **locally**
+from the verified project store (no worker, no POST, no approval). The safe run projection
+is returned under `run` (operation/status/reason, the written `ref` / `review_id`, and a
+safe generation readback); the private model output is never included. When the run has
+not completed, `job_state` reports the durable scheduling state. The output carries
+`authorizes_publication=false` and `scientific_validation=false`. An unknown request id is
+a `validation` error.
+
+### 19.3 `generation hosted-use propose`
+
+`generation hosted-use propose` validates and stores one per-role
+`generation_hosted_use` authorization **document** as an inert artifact revision
+(no approval is recorded and no call is made):
+
+```
+generation hosted-use propose \
+  --role {screening,synthesis,framework,outline,blueprint,section_writer,section_critic,section_repair,fact_checker,global_reviewer,global_writer,notes_planner} \
+  --config-file PATH \
+  --budget-cap-usd DECIMAL \
+  --provider-terms-ref REF --privacy-review-ref REF --pricing-evidence-ref REF \
+  --artifact-id ID --revision-id ID --rights-file PATH \
+  [--provider-terms-verified-at TS --privacy-review-verified-at TS --pricing-evidence-verified-at TS] \
+  [--notes TEXT] [--project ID]
+```
+
+* `--config-file` is a strict JSON object: the `LeadConfig` (the concrete model and
+  pricing bound for the role). `--budget-cap-usd` is an exact decimal string `> 0`.
+* Each `--<field>-ref` is a non-empty reference to the human-reviewed evidence; its
+  `verified_at` defaults to the propose instant (RFC 3339 UTC) and may be pinned with
+  `--<field>-verified-at`.
+* The document is validated by `validate_hosted_use_document` (nothing is written on a
+  malformed document) and stored by `propose_hosted_use` with the caller's
+  `--rights-file` record. The output carries `revision`, the validated `document`, and
+  a non-authorizing `gate` block whose `prepare_command`/`confirm_command` are the exact
+  `gate prepare`/`gate confirm` invocations for `--gate-kind batch
+  --gate-id generation.hosted_use.<role>` on the new revision. It records **no**
+  approval, accepts **no** secret, and carries `approval_recorded=false`.
+
+### 19.4 `generation hosted-use show`
+
+`generation hosted-use show --artifact-id ID [--revision-id ID] [--project ID]` reads one
+exact revision (the current head when `--revision-id` is omitted), validates its bytes
+with `validate_hosted_use_document`, and prints the validated `document` plus whether
+the exact `batch`/`generation.hosted_use.<role>` gate is satisfied for that revision
+(`gate_satisfied`; `false` for a superseded/stale revision). Nothing is written.
+
+Errors use the exit categories of §3 with static, value-free messages. Status and
+disclosures: [`worker.md`](worker.md) §15 and [`generation.md`](generation.md).
+
+## 24. Pipeline run — `pipeline run` (kickoff 16 §6, write half)
+
+`pipeline run` is the **write half** of the `pipeline` group (its read-only half is §19).
+For the active (or named) project it determines the current stage from durable state
+alone (reusing [`pipeline/status.py`](../src/review_article_agent/pipeline/status.py)),
+derives the **next machine job(s)** the stage needs
+([`pipeline/run.py`](../src/review_article_agent/pipeline/run.py)), submits them to the
+detached worker, and stops at the next human gate, budget limit, pause, or failure,
+reporting the exact next command.
+
+| Command | Synopsis |
+| --- | --- |
+| `pipeline run --config PATH [--project ID] [--wait] [--timeout SECONDS] [--max-steps N]` | Submit the current stage's next machine job(s) and stop at the next gate/budget/pause/failure. |
+
+* It holds **no authoritative state of its own**: every decision is re-derived from the
+  stages' existing repositories and the worker's durable jobs. Re-running it is
+  **idempotent**: each `generation_run` job carries a deterministic request id derived
+  from the stage, the section, and the exact input revisions, and an id already present
+  in the durable `JobRepository` is never re-submitted (the worker would replay it
+  anyway).
+* The machine work it drives, once each stage's inputs are approved/current, is:
+
+  | Stage | Submitted/executed |
+  | --- | --- |
+  | `synthesis.memo` | `generation_run` `synthesis` (over the accepted extraction output-audit) |
+  | `synthesis.framework` | `generation_run` `framework` (over the approved synthesis) |
+  | `synthesis.outline` | `generation_run` `outline` (over the approved synthesis + framework) |
+  | `drafting.blueprint` | the per-section workspace (`prepare_workspace`) then `generation_run` `blueprint` |
+  | `review.sections` | after blueprint approval, `generation_run` `draft`; after the draft exists, `generation_run` `section_review` |
+  | `tracing.origins` | **in-process, deterministic** `tracing run` (no model) per section |
+  | `delivery` | **in-process** `delivery start`, then `generation_run` `global_review`, then (when author notes are recorded and no batch is applied) `generation_run` `notes_plan`, then **in-process** `delivery approve --prepare` |
+
+* The derived ids are deterministic: the section-review id, origin-trace id, and delivery
+  id are pure functions of the section/draft revision and the driven sections
+  (`review_id_for`, `trace_id_for`, `delivery_id_for` in
+  [`pipeline/run.py`](../src/review_article_agent/pipeline/run.py)).
+* The section review runs the real critic/repair ports from the config roles
+  `section_critic`/`section_repair`; the global review runs the real reviewer/writer ports
+  from `global_reviewer`/`global_writer`; `notes_plan` uses `notes_planner`.
+* After the final-approval manifest is prepared, `run` stops at the final-approval gate and
+  reports the exact `gate confirm` command from that preparation. The **delivery**
+  final-approval gate is the one human gate `plan_next` plans *through* (machine work such
+  as the global review and the approval preparation may still remain behind it).
+* A durable job whose result is `blocked`, `invalid_proposal`, or `model_not_completed`
+  stops the loop with a `failure` blocker whose `next_command` is the readback
+  (`generation run status --request-id <ID>`).
+* `screening_case` is **not** automatic: screening needs human pilot design, so the stage
+  submits nothing and reports the manual `next_command` from `pipeline status`. The same is
+  true of every stage absent from the table above (discovery, acquisition, parsing,
+  screening, extraction, and any stage whose config role/template is missing).
+* `--wait` polls the submitted jobs to a terminal state through the existing `job status`
+  control call, bounded by `--timeout` (default 60s), before re-resolving.
+* `--max-steps` bounds the orchestration steps in one call (1..1000, default 10).
+* The configured credential **environment-variable name** must be present in the process
+  environment before any job is submitted; only the name is ever read (never a value), and
+  a missing credential is a `validation` refusal with **zero** jobs and no local write.
+* No secret is ever printed; the JSON output carries `submitted`, `already_done`,
+  `stopped_at` (the `pipeline status` blocker), `next_command`, `stage`,
+  `authorizes_execution=false`, and `scientific_validation=false`.
+
+### 24.1 `--config` format
+
+`--config` names a **strict** JSON object (stdlib only). It supplies the information the
+stages do not record anywhere else; the pipeline never invents a model, a rights value,
+or a credential.
+
+```json
+{
+  "credential_env": "OPENROUTER_API_KEY",
+  "sections": ["sec1"],
+  "roles": {
+    "synthesis": {"hosted_artifact_id": "hu-synthesis",
+                  "target_artifact_id": "syn", "target_revision_id": "syn-r1"},
+    "framework": {"hosted_artifact_id": "hu-framework",
+                  "target_artifact_id": "fw", "target_revision_id": "fw-r1"},
+    "outline": {"hosted_artifact_id": "hu-outline",
+                "target_artifact_id": "out", "target_revision_id": "out-r1"},
+    "blueprint": {"hosted_artifact_id": "hu-blueprint",
+                  "target_artifact_id": "bp-{section_id}",
+                  "target_revision_id": "bp-{section_id}-r1"},
+    "section_writer": {"hosted_artifact_id": "hu-writer",
+                       "target_artifact_id": "draft-{section_id}",
+                       "target_revision_id": "draft-{section_id}-r1"},
+    "section_critic": {"hosted_artifact_id": "hu-critic"},
+    "section_repair": {"hosted_artifact_id": "hu-repair"},
+    "global_reviewer": {"hosted_artifact_id": "hu-greviewer"},
+    "global_writer": {"hosted_artifact_id": "hu-gwriter"},
+    "notes_planner": {"hosted_artifact_id": "hu-notes"}
+  },
+  "workspace_artifact_id": "ws-{section_id}",
+  "workspace_revision_id": "ws-{section_id}-r1",
+  "tracing_policy": { "max_hops": 4, "max_sources_per_claim": 5,
+                      "max_sources_per_project": 20, "max_resolution_retries": 1 },
+  "rights": { "<a full RightsRecord template>" }
+}
+```
+
+* `credential_env` — optional; only the one approved value `OPENROUTER_API_KEY` is
+  accepted (the value is never read).
+* `sections` — the section ids the drafting/review/tracing/delivery stages drive.
+* `roles.<role>` — per generation role: the `hosted_artifact_id` whose **current**
+  revision is the role's hosted-use document (`hosted_revision_id` pins an exact revision
+  instead), and the target `artifact_id`/`revision_id` templates for the proposal the role
+  writes. The string `{section_id}` is substituted per section. The single-shot synthesis
+  roles (`synthesis`, `framework`, `outline`) and the drafting roles (`blueprint`,
+  `section_writer`) need target templates; the review/delivery roles
+  (`section_critic`, `section_repair`, `global_reviewer`, `global_writer`, `notes_planner`)
+  need only a hosted-use document (their workflows assign their own revision ids). A role
+  absent from `roles` means "no automatic job for that stage".
+* `workspace_artifact_id` / `workspace_revision_id` — templates for the per-section
+  drafting workspace the drafting stage writes before the blueprint job.
+* `tracing_policy` — optional; the four required per-project tracing limits. Without it the
+  deterministic `tracing run` cannot complete, so the tracing stage reports its manual
+  command instead of running in-process.
+* `rights` — a full RightsRecord **template**; its project id and subject are rebound to
+  each written revision (workspace, proposal, trace, or delivery state) exactly as the
+  worker rebinds a section review. Rights eligibility is not authority.
+
+Malformed or extra keys are a `validation` error before anything is submitted; the path
+and contents are never echoed.
