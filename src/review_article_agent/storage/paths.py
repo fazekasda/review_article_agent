@@ -30,7 +30,7 @@ import os
 import re
 import uuid
 
-from ..domain.errors import InvalidProjectId, ProjectPathError
+from ..domain.errors import InvalidProjectId, OwnerPrivateError, ProjectPathError
 
 #: App-owned directory name created inside a project root.
 APP_DIR_NAME = ".review_article_agent"
@@ -136,16 +136,22 @@ def is_owner_private(mode: int) -> bool:
 
 
 def assert_owner_private_dir(path: str, *, what: str = "app-owned directory") -> None:
-    """Refuse a directory that is not owner-private (``0o700``-equivalent)."""
+    """Refuse a directory that is not owner-private (``0o700``-equivalent).
+
+    The refusal is a :class:`OwnerPrivateError` whose message names the path, the
+    mode it currently has, and the exact ``chmod`` remedy, so a user can fix it
+    without guessing which directory is at fault.
+    """
     try:
         st = os.stat(path)
     except OSError as exc:
         raise ProjectPathError(f"{what} {path!r} cannot be inspected.") from exc
     if not is_owner_private(st.st_mode):
-        raise ProjectPathError(
-            f"{what} {path!r} is not owner-private (mode "
-            f"{st.st_mode & 0o777:04o}); refusing to use a shared directory. "
-            f"Run `chmod 700 {path}` if it is yours."
+        raise OwnerPrivateError(
+            f"the {what} {path!r} must be private to its owner (mode 0700); it "
+            f"is currently {st.st_mode & 0o777:04o}, so other users can read or "
+            f"write it. Refusing to use a shared directory. "
+            f"Run: chmod 700 {path}"
         )
 
 
@@ -158,10 +164,10 @@ def assert_owner_private_file(path: str, *, what: str = "database file") -> None
     except OSError as exc:
         raise ProjectPathError(f"{what} {path!r} cannot be inspected.") from exc
     if not is_owner_private(st.st_mode):
-        raise ProjectPathError(
-            f"{what} {path!r} is not owner-private (mode "
-            f"{st.st_mode & 0o777:04o}); refusing to use it. Run `chmod 600 "
-            f"{path}` if it is yours."
+        raise OwnerPrivateError(
+            f"the {what} {path!r} must be private to its owner (mode 0600); it "
+            f"is currently {st.st_mode & 0o777:04o}, so other users can read or "
+            f"write it. Refusing to use it. Run: chmod 600 {path}"
         )
 
 
@@ -174,20 +180,23 @@ def assert_not_symlink(path: str, *, what: str) -> None:
         )
 
 
-def ensure_owner_private_dir(path: str) -> None:
+def ensure_owner_private_dir(path: str, *, what: str = "app-owned directory") -> None:
     """Create ``path`` (and parents) if missing, owner-private (``0o700``).
 
     A pre-existing directory is **validated**, not silently accepted: if it is
     group/world accessible, or a symlink, this refuses to use it. This is only
     ever applied to app-owned directories (the store directory and the data
     directory), never to a user's project root (see :func:`ensure_directory`).
+
+    ``what`` labels the directory in the refusal message (e.g. ``"data
+    directory"``) so the user knows which directory to fix.
     """
     if os.path.islink(path):
         raise ProjectPathError(
             f"refusing to use app-owned directory {path!r}: it is a symlink."
         )
     if os.path.isdir(path):
-        assert_owner_private_dir(path)
+        assert_owner_private_dir(path, what=what)
         return
     if os.path.exists(path):
         raise ProjectPathError(

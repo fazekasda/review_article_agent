@@ -78,7 +78,10 @@ The same `main()` is reached three ways, all standard-library only:
 Data-directory precedence: **`--data-dir` > config file `data_dir` > XDG default**
 (`$XDG_DATA_HOME/review_article_agent`, else `~/.local/share/review_article_agent`).
 The data directory is created and kept **owner-private (`0700`)** by the registry
-on first use.
+on first use. A pre-existing data directory, app-owned project directory, or
+database file that is **not** owner-private is refused (never silently used or
+chmodded) with a specific message naming the path and the `chmod` remedy — see
+§3.
 
 ## 3. Output and exit codes
 
@@ -119,6 +122,23 @@ Both `usage` and `validation` deliberately share exit `2` (matching `argparse`'s
 convention); the JSON `category` distinguishes them. Snapshot failures use
 curated `storage`/`conflict` messages and **never** echo a raw manifest, snapshot,
 or exception detail.
+
+Two `storage` (exit `4`) failures carry a **specific, actionable** message rather
+than the generic storage summary, because the fix is unambiguous and needs the
+offending location named:
+
+* **Not owner-private.** An existing data directory, app-owned project
+  directory, or database file that grants group/other access is refused (never
+  silently used or chmodded). The message names the path, the mode it has, and
+  the exact remedy, e.g. `the data directory '/state' must be private to its
+  owner (mode 0700); it is currently 0755, … Run: chmod 700 /state`.
+* **Forbidden destination.** Writing a snapshot or export inside the application
+  data directory or a project's `.review_article_agent` directory is refused with
+  a message that says so and points to a destination outside `--data-dir`.
+
+Both messages contain only the path the user supplied (via `--data-dir`, a
+project root, or `--output`/`DEST`) and a permission mode — never a secret,
+identifier, payload, or traceback.
 
 ## 4. Configuration file (optional)
 
@@ -296,7 +316,7 @@ online-backup API, so committed WAL content is captured consistently.
 
 | Command | Synopsis |
 | --- | --- |
-| `backup create DEST [--project ID]` | Create a **new** private snapshot directory at `DEST`. Refused if `DEST` already exists, and refused inside the application data directory or any project's app-owned directory. |
+| `backup create DEST [--project ID]` | Create a **new** private snapshot directory at `DEST`. Refused if `DEST` already exists, and refused inside the application data directory or any project's app-owned directory (the error says so and points to a destination outside `--data-dir`; see §3). |
 | `backup verify DIR` | Read-only, fail-closed verification of a snapshot directory. Prints `{"backup": {ok, project_id, counts, …}}`. |
 | `backup restore DIR ROOT` | Verify, then atomically restore `DIR` into a **new** project `ROOT`, preserving the snapshot's exact `project_id`. |
 | `export DEST [--project ID]` | **Alias** of `backup create`: the same private local storage snapshot format. |

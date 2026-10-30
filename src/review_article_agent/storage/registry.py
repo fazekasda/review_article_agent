@@ -143,7 +143,7 @@ class Registry:
 
     # -- low-level session --------------------------------------------------- #
     def _ensure_data_dir(self) -> None:
-        paths.ensure_owner_private_dir(self._data_dir)
+        paths.ensure_owner_private_dir(self._data_dir, what="data directory")
 
     def _assert_registry_safe(self) -> None:
         paths.assert_registry_paths_safe(

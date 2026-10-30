@@ -141,3 +141,16 @@ class NoActiveProject(ProjectError):
         super().__init__(
             "no active project is selected; run `select <project_id>` first."
         )
+
+
+class OwnerPrivateError(ProjectPathError):
+    """An app-owned directory or database file is not private to its owner.
+
+    Raised when an existing directory must be ``0700`` (or an existing database
+    file ``0600``) but grants group/other access. The path is **refused** (never
+    silently used or chmodded); the message names the offending path, the mode it
+    currently has, and the exact ``chmod`` remedy. It is a
+    :class:`ProjectPathError` subclass so it keeps the storage error category and
+    exit code, but the CLI surfaces its actionable, value-free text instead of a
+    generic storage summary.
+    """
