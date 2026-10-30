@@ -112,6 +112,7 @@ from ..runtime.owner_auth import (
     action_digest,
     consume_owner_approval,
 )
+from . import opmemo
 from .agent_runtime import validate_version_set
 from .approvals import SNAPSHOT_ENTRY_ROLES, VERSION_LINEAGE_ROLE
 from .artifacts import ArtifactRepository, sha256_digest
@@ -403,6 +404,78 @@ class HumanApprovalVerification:
     problems: tuple[str, ...]
 
 
+def _record_plain(record: HumanApprovalRecord) -> dict[str, Any]:
+    """A deep-copy-safe plain view of a fully revalidated approval record.
+
+    ``HumanApprovalRecord.target`` is a :class:`types.MappingProxyType`, which
+    ``copy.deepcopy`` (used by the operation-scoped validation memo) cannot copy.
+    The memo therefore caches this plain form and a fresh record is rebuilt from
+    it on every call, so a cached value can never hand out a shared proxy.
+    """
+    return {
+        "project_id": record.project_id,
+        "approval_id": record.approval_id,
+        "target": dict(record.target),
+        "gate_kind": record.gate_kind,
+        "gate_id": record.gate_id,
+        "decision": record.decision,
+        "rationale": record.rationale,
+        "granted_at_utc": record.granted_at_utc,
+        "snapshot_id": record.snapshot_id,
+        "snapshot_digest": record.snapshot_digest,
+        "snapshot_schema_version": record.snapshot_schema_version,
+        "storage_schema_version": record.storage_schema_version,
+        "owner_auth_id": record.owner_auth_id,
+        "owner_auth_method": record.owner_auth_method,
+        "owner_auth_action_digest": record.owner_auth_action_digest,
+        "owner_uid": record.owner_uid,
+        "actor_kind": record.actor_kind,
+        "authority": record.authority,
+        "created_at_utc": record.created_at_utc,
+        "canonical": record.canonical,
+    }
+
+
+def _record_from_plain(data: Mapping[str, Any]) -> HumanApprovalRecord:
+    """Rebuild a record from its :func:`_record_plain` form."""
+    fields = dict(data)
+    fields["target"] = MappingProxyType(dict(fields["target"]))
+    return HumanApprovalRecord(**fields)
+
+
+def _status_plain(status: HumanApprovalStatus) -> dict[str, Any]:
+    """A deep-copy-safe plain view of a computed approval status.
+
+    ``HumanApprovalStatus.target`` is a :class:`types.MappingProxyType` (not
+    deep-copyable); the memo caches this plain form and the status is rebuilt per
+    call.  ``evaluate`` reads only durable DB state (current revisions, rights
+    record revisions, newer approval rows) and the wall clock is never consulted,
+    so a status is a pure function of the transaction snapshot plus its argument.
+    """
+    return {
+        "approval_id": status.approval_id,
+        "status": status.status,
+        "decision": status.decision,
+        "gate_kind": status.gate_kind,
+        "gate_id": status.gate_id,
+        "target": dict(status.target),
+        "snapshot_digest": status.snapshot_digest,
+        "owner_auth_ref": status.owner_auth_ref,
+        "authorizes_execution": status.authorizes_execution,
+        "authorizes_export": status.authorizes_export,
+        "reasons": tuple(status.reasons),
+        "superseded_by": status.superseded_by,
+    }
+
+
+def _status_from_plain(data: Mapping[str, Any]) -> HumanApprovalStatus:
+    """Rebuild a status from its :func:`_status_plain` form."""
+    fields = dict(data)
+    fields["target"] = MappingProxyType(dict(fields["target"]))
+    fields["reasons"] = tuple(fields["reasons"])
+    return HumanApprovalStatus(**fields)
+
+
 class _ReadOnlyStoreView:
     """The exact surface the repository reads from a store (never writes)."""
 
@@ -624,6 +697,28 @@ class HumanApprovalRepository:
             (self.project_id, approval_id),
         ).fetchone()
 
+    def _validated_record(self, row: sqlite3.Row) -> HumanApprovalRecord:
+        """Revalidate one stored approval row, memoized per operation.
+
+        The full structural revalidation (snapshot bytes, entry pins, owner-auth
+        binding) is deterministic for a given transaction snapshot and the exact
+        row it is handed, so within one operation it is computed once and reused.
+        The memo is keyed by ``(project_id, approval_id)`` and the connection's
+        ``total_changes`` (via :mod:`opmemo`), so any write the operation makes --
+        a superseding/revoking approval, a new revision, a savepoint rollback --
+        misses the entry and the row is revalidated exactly as before. A raised
+        :class:`HumanApprovalCorruptionError` is never cached.
+        """
+        key = (
+            "human_approvals._validate_approval_row",
+            self.project_id,
+            _safe_str(row["approval_id"]),
+        )
+        plain = opmemo.memoize(
+            self._conn(), key, lambda: _record_plain(self._validate_approval_row(row))
+        )
+        return _record_from_plain(plain)
+
     def get_approval(self, approval_id: str) -> HumanApprovalRecord | None:
         """Return one fully revalidated approval, or ``None`` if it does not exist.
 
@@ -631,7 +726,7 @@ class HumanApprovalRepository:
         malformed row is never handed to a caller unchecked.
         """
         row = self._approval_row(approval_id)
-        return None if row is None else self._validate_approval_row(row)
+        return None if row is None else self._validated_record(row)
 
     def list_approvals(self) -> list[HumanApprovalRecord]:
         rows = self._conn().execute(
@@ -639,7 +734,7 @@ class HumanApprovalRepository:
             "WHERE project_id = ? ORDER BY rowid",
             (self.project_id,),
         ).fetchall()
-        return [self._validate_approval_row(row) for row in rows]
+        return [self._validated_record(row) for row in rows]
 
     def current_approval(
         self, artifact_id: str, *, gate_kind: str, gate_id: str
@@ -658,7 +753,7 @@ class HumanApprovalRepository:
             "AND target_artifact_id = ? ORDER BY rowid DESC LIMIT 1",
             (self.project_id, gate_kind, gate_id, artifact_id),
         ).fetchone()
-        return None if row is None else self._validate_approval_row(row)
+        return None if row is None else self._validated_record(row)
 
     # -- structural revalidation --------------------------------------------- #
     def _entry_rows(self, approval_id: str) -> list[PreparedSnapshotEntry]:
@@ -1071,7 +1166,25 @@ class HumanApprovalRepository:
         * otherwise it is ``active``.
 
         The returned effect never authorizes execution or export.
+
+        The status is a pure function of the transaction snapshot and the exact
+        approval id: it reads only durable rows (the approval, its entries, the
+        pinned revisions' current heads, rights-record revisions, and newer
+        approval rows) and never consults the wall clock, so within one operation
+        the result is memoized by ``(project_id, approval_id)`` and the
+        connection's ``total_changes``.  A write the operation makes -- a
+        superseding or revoking approval, a new revision -- changes
+        ``total_changes`` and the status is recomputed, so a stale approval can
+        never be served from the memo.  Exceptions are never cached.
         """
+        key = ("human_approvals.evaluate", self.project_id, _safe_str(approval_id))
+        plain = opmemo.memoize(
+            self._conn(), key, lambda: _status_plain(self._evaluate(approval_id))
+        )
+        return _status_from_plain(plain)
+
+    def _evaluate(self, approval_id: str) -> HumanApprovalStatus:
+        """Uncached body of :meth:`evaluate` (see it for the memo contract)."""
         row = self._approval_row(approval_id)
         if row is None:
             raise RecordValidationError(f"human approval {approval_id!r} does not exist")
@@ -1085,7 +1198,7 @@ class HumanApprovalRepository:
         gate_id = _safe_str(row["gate_id"])
 
         try:
-            record = self._validate_approval_row(row)
+            record = self._validated_record(row)
         except HumanApprovalCorruptionError:
             return HumanApprovalStatus(
                 approval_id=_safe_str(row["approval_id"]),
@@ -1166,7 +1279,30 @@ class HumanApprovalRepository:
         execution, manuscript-export, scientific-correctness, or final-release
         claim. A rejection, a stale/superseded/invalidated approval, a corrupt
         row, or a different gate instance all return ``False``.
+
+        The boolean is a pure function of the transaction snapshot and the exact
+        ``(artifact_id, gate_kind, gate_id)``, so within one operation it is
+        memoized on those inputs plus the connection's ``total_changes``: a
+        revocation/supersession or a new revision written by the operation
+        changes ``total_changes`` and the answer is recomputed (fail-closed).
         """
+        key = (
+            "human_approvals.named_gate_satisfied",
+            self.project_id,
+            _safe_str(artifact_id),
+            _safe_str(gate_kind),
+            _safe_str(gate_id),
+        )
+        return opmemo.memoize(
+            self._conn(),
+            key,
+            lambda: self._named_gate_satisfied(artifact_id, gate_kind, gate_id),
+        )
+
+    def _named_gate_satisfied(
+        self, artifact_id: str, gate_kind: str, gate_id: str
+    ) -> bool:
+        """Uncached body of :meth:`named_gate_satisfied`."""
         try:
             current = self.current_approval(
                 artifact_id, gate_kind=gate_kind, gate_id=gate_id
@@ -1190,7 +1326,7 @@ class HumanApprovalRepository:
         if row is None:
             raise RecordValidationError(f"human approval {approval_id!r} does not exist")
         try:
-            record = self._validate_approval_row(row)
+            record = self._validated_record(row)
         except HumanApprovalCorruptionError:
             return HumanApprovalVerification(
                 approval_id=_safe_str(row["approval_id"]),
