@@ -56,6 +56,7 @@ from review_article_agent.drafting.workspace import (  # noqa: E402
     PLANNER_ROLE,
     WRITER_ROLE,
 )
+from _tiers import slow
 
 _FINDING = "c1:F1"
 
@@ -144,6 +145,7 @@ class BlueprintBase(WorkspaceBase):
         return self.approve_ref(ref, GATE_KIND, GATE_ID)
 
 
+@slow
 class ProposeReadAndGateTests(BlueprintBase):
     def test_propose_read_reopen_and_own_gate(self):
         _s, _f, outline_ref = self.approved_chain()
@@ -232,6 +234,7 @@ class OwnerGateIsolationTests(BlueprintBase):
             self.propose_bp(payload)
 
 
+@slow
 class StalenessAndHistoryTests(BlueprintBase):
     def test_changing_shared_framework_flags_stale_and_refuses_require(self):
         synthesis_ref, _f, outline_ref = self.approved_chain()
@@ -353,6 +356,7 @@ class FailClosedTests(BlueprintBase):
         with self.assertRaises(DraftingWorkflowError):
             self.wf.read(ref, current=False)
 
+    @slow
     def test_failed_propose_writes_nothing(self):
         _s, _f, outline_ref = self.approved_chain()
         ws_ref = self.make_workspace(outline_ref)

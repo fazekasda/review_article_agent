@@ -249,21 +249,20 @@ class TestPdfFailClosed(_Base):
         self.assertEqual(result["status"], "needs_review")
         self.assertEqual(result["checks"]["full_text"], "unknown")
 
-    def test_pdf_without_eof_is_corrupt(self):
-        result = self.call(b"%PDF-1.7\n1 0 obj\n<< >>\nendobj\n")
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("pdf_gross_corruption", result["reasons"])
-        self.assertEqual(result["checks"]["container"], "fail")
-
-    def test_pdf_without_version_digit_is_corrupt(self):
-        result = self.call(b"%PDF-\n1 0 obj\n%%EOF\n")
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("pdf_gross_corruption", result["reasons"])
-
-    def test_pdf_without_objects_is_corrupt(self):
-        result = self.call(b"%PDF-1.4\n%%EOF\n")
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("pdf_gross_corruption", result["reasons"])
+    def test_corrupt_pdf_rejected(self):
+        # One table per validator: every grossly corrupt PDF, same rejection.
+        cases = {
+            "no_eof": (b"%PDF-1.7\n1 0 obj\n<< >>\nendobj\n", True),
+            "no_version_digit": (b"%PDF-\n1 0 obj\n%%EOF\n", False),
+            "no_objects": (b"%PDF-1.4\n%%EOF\n", False),
+        }
+        for label, (payload, checks_container) in cases.items():
+            with self.subTest(case=label):
+                result = self.call(payload)
+                self.assertEqual(result["status"], "rejected")
+                self.assertIn("pdf_gross_corruption", result["reasons"])
+                if checks_container:
+                    self.assertEqual(result["checks"]["container"], "fail")
 
     def test_raw_byte_doi_never_promoted_to_identity(self):
         payload = GOOD_PDF + b"\n10.9999/not-a-real-doi-in-bytes\n"
@@ -359,21 +358,20 @@ class TestJatsHappyPath(_Base):
 
 
 class TestJatsIdentityFailClosed(_Base):
-    def test_mismatched_pmid_rejected(self):
-        result = self.call(jats(pmid=b"11111111"), {"pmid": "22222222"})
-        self.assertEqual(result["status"], "rejected")
-        self.assertEqual(result["checks"]["identity"], "fail")
-        self.assertIn("identity_mismatch", result["reasons"])
-
-    def test_mismatched_doi_rejected(self):
-        result = self.call(jats(doi=b"10.1234/wrong"), {"doi": "10.1234/right"})
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("identity_mismatch", result["reasons"])
-
-    def test_mismatched_pmcid_rejected(self):
-        result = self.call(jats(pmcid=b"PMC1"), {"pmcid": "PMC2"})
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("identity_mismatch", result["reasons"])
+    def test_mismatched_identity_rejected(self):
+        # One table per validator: each expected/observed mismatch, same outcome.
+        cases = {
+            "pmid": (jats(pmid=b"11111111"), {"pmid": "22222222"}, True),
+            "doi": (jats(doi=b"10.1234/wrong"), {"doi": "10.1234/right"}, False),
+            "pmcid": (jats(pmcid=b"PMC1"), {"pmcid": "PMC2"}, False),
+        }
+        for label, (data, expected, identity_fail) in cases.items():
+            with self.subTest(case=label):
+                result = self.call(data, expected)
+                self.assertEqual(result["status"], "rejected")
+                self.assertIn("identity_mismatch", result["reasons"])
+                if identity_fail:
+                    self.assertEqual(result["checks"]["identity"], "fail")
 
     def test_expected_namespace_absent_needs_review(self):
         result = self.call(jats(doi=None), {"doi": "10.1234/abc"})
@@ -573,68 +571,63 @@ class TestJatsBodyFailClosed(_Base):
 # AC2/AC6: malicious XML defences
 # --------------------------------------------------------------------------- #
 class TestXmlDefences(_Base):
-    def test_malformed_xml_rejected(self):
-        result = self.call(b"<?xml version='1.0'?>\n<article><front><article-meta>")
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("xml_malformed", result["reasons"])
-        self.assertEqual(result["checks"]["container"], "fail")
-
-    def test_billion_laughs_rejected(self):
-        payload = (
-            b'<?xml version="1.0"?>'
-            b'<!DOCTYPE lolz [<!ENTITY lol "lol">'
-            b'<!ENTITY lol2 "&lol;&lol;&lol;">]>'
-            b"<article>&lol2;</article>"
-        )
-        result = self.call(payload)
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("xml_entity_declaration", result["reasons"])
-
-    def test_external_entity_xxe_rejected_without_access(self):
-        payload = (
-            b'<?xml version="1.0"?>'
-            b'<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
-            b"<article>&xxe;</article>"
-        )
-        result = self.call(payload)
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("xml_entity_declaration", result["reasons"])
-
-    def test_internal_subset_without_entity_rejected(self):
-        payload = (
-            b'<?xml version="1.0"?>'
-            b"<!DOCTYPE article [ <!ELEMENT article ANY> ]>"
-            b"<article><body><p>x</p></body></article>"
-        )
-        result = self.call(payload)
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("xml_internal_subset", result["reasons"])
-
-    def test_second_doctype_rejected(self):
-        payload = (
-            b'<?xml version="1.0"?>'
-            b"<!DOCTYPE article>"
-            b"<!DOCTYPE article>"
-            b"<article><body><p>x</p></body></article>"
-        )
-        result = self.call(payload)
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("xml_doctype_rejected", result["reasons"])
-
-    def test_undefined_entity_rejected(self):
-        payload = (
-            b'<?xml version="1.0"?>'
-            b"<article><body><p>a&nbsp;b</p></body></article>"
-        )
-        result = self.call(payload)
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("xml_undefined_entity", result["reasons"])
-
-    def test_non_utf8_xml_rejected(self):
-        payload = b'<?xml version="1.0" encoding="UTF-16"?>\xff\xfe<\x00a\x00'
-        result = self.call(payload)
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("xml_not_utf8", result["reasons"])
+    def test_malicious_or_malformed_xml_rejected(self):
+        # One table per validator: every rejected XML payload and its reason.
+        cases = {
+            "malformed": (
+                b"<?xml version='1.0'?>\n<article><front><article-meta>",
+                "xml_malformed",
+                "fail",
+            ),
+            "billion_laughs": (
+                b'<?xml version="1.0"?>'
+                b'<!DOCTYPE lolz [<!ENTITY lol "lol">'
+                b'<!ENTITY lol2 "&lol;&lol;&lol;">]>'
+                b"<article>&lol2;</article>",
+                "xml_entity_declaration",
+                None,
+            ),
+            "external_entity_xxe": (
+                b'<?xml version="1.0"?>'
+                b'<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+                b"<article>&xxe;</article>",
+                "xml_entity_declaration",
+                None,
+            ),
+            "internal_subset": (
+                b'<?xml version="1.0"?>'
+                b"<!DOCTYPE article [ <!ELEMENT article ANY> ]>"
+                b"<article><body><p>x</p></body></article>",
+                "xml_internal_subset",
+                None,
+            ),
+            "second_doctype": (
+                b'<?xml version="1.0"?>'
+                b"<!DOCTYPE article>"
+                b"<!DOCTYPE article>"
+                b"<article><body><p>x</p></body></article>",
+                "xml_doctype_rejected",
+                None,
+            ),
+            "undefined_entity": (
+                b'<?xml version="1.0"?>'
+                b"<article><body><p>a&nbsp;b</p></body></article>",
+                "xml_undefined_entity",
+                None,
+            ),
+            "non_utf8": (
+                b'<?xml version="1.0" encoding="UTF-16"?>\xff\xfe<\x00a\x00',
+                "xml_not_utf8",
+                None,
+            ),
+        }
+        for label, (payload, reason, container) in cases.items():
+            with self.subTest(case=label):
+                result = self.call(payload)
+                self.assertEqual(result["status"], "rejected")
+                self.assertIn(reason, result["reasons"])
+                if container is not None:
+                    self.assertEqual(result["checks"]["container"], container)
 
     def test_non_jats_wellformed_xml_needs_review(self):
         result = self.call(b'<?xml version="1.0"?><root><a/></root>')

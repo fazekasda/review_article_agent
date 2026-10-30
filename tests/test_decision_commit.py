@@ -45,6 +45,7 @@ import unittest
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -474,6 +475,7 @@ class CommitTestBase(unittest.TestCase):
         self.assertFalse(self.store.connection.in_transaction)
 
 
+@slow
 class CompletedCommitTest(CommitTestBase):
     def test_completed_http_200_accepted_once_and_cost_settled(self) -> None:
         self.submit()
@@ -560,6 +562,7 @@ class CompletedCommitTest(CommitTestBase):
         )
 
 
+@slow
 class DefinitiveFailureCommitTest(CommitTestBase):
     def test_definitive_400_fails_not_incurred_and_is_never_a_negative(self) -> None:
         self.submit()
@@ -606,6 +609,7 @@ class DefinitiveFailureCommitTest(CommitTestBase):
                 self.assertEqual(committed.dispatch.cost_state, "not_incurred")
 
 
+@slow
 class AmbiguousOutcomeCommitTest(CommitTestBase):
     def _assert_unknown(self, result):
         self.submit()
@@ -657,6 +661,7 @@ class AmbiguousOutcomeCommitTest(CommitTestBase):
         self.assertEqual(committed.observation.cost["amount_usd"], "0.001")
 
 
+@slow
 class IdempotenceAndRefusalTest(CommitTestBase):
     def test_completed_replay_is_idempotent(self) -> None:
         self.submit()
@@ -775,6 +780,7 @@ class IdempotenceAndRefusalTest(CommitTestBase):
         self.assert_pristine()
 
 
+@slow
 class PendingInertObservationTest(CommitTestBase):
     """An inert ``record_result`` observation must never masquerade as committed."""
 
@@ -1004,6 +1010,7 @@ class PendingInertObservationTest(CommitTestBase):
         self.assertEqual(committed.dispatch.cost_amount_usd, "2.00")
 
 
+@slow
 class FaultSeamTest(CommitTestBase):
     def _install_raising_hook(self, seam):
         def hook(**_info):
@@ -1068,6 +1075,7 @@ class FaultSeamTest(CommitTestBase):
         self.assertEqual(self.counts(), (1, len(_SPECS)))
 
 
+@slow
 class SingleTransactionTest(CommitTestBase):
     def test_commit_opens_exactly_one_store_transaction(self) -> None:
         self.submit()

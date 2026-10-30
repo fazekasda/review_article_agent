@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -730,6 +731,7 @@ class TamperTests(Base):
             ex.get_report(result["report_ref"])
         self.assertEqual(caught.exception.code, "report_invalid")
 
+    @slow
     def test_forged_fields_are_rejected(self):
         cases = [
             lambda p: p.update(candidate_id=self.no_pmcid),

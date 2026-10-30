@@ -163,6 +163,38 @@ limits are in the [discovery API/limits](docs/discovery.md), and the
 criterion-by-criterion status is in the
 [Step 05 handoff](docs/implementation/handoffs/05-discovery.md).
 
+## Running tests
+
+The suite is standard-library only and needs no install. `scripts/run_tests.py`
+runs one subprocess per test module in parallel and prints the slowest modules.
+
+Fast tier (default; excludes the slow tier; < 1 min locally on 4 CPUs):
+
+```console
+$ python3 scripts/run_tests.py
+```
+
+Full tier, including the slow tier (`--slow` sets `RAA_SLOW_TESTS=1`):
+
+```console
+$ python3 scripts/run_tests.py --slow
+```
+
+Run a single module directly (add `RAA_SLOW_TESTS=1` to include its slow tests):
+
+```console
+$ PYTHONPATH=src:tests python3 -m unittest tests.test_cli
+$ RAA_SLOW_TESTS=1 PYTHONPATH=src:tests python3 -m unittest tests.test_cli
+```
+
+By default the runner sets `RAA_TEST_SQLITE_SYNCHRONOUS=OFF`, a test-only hook
+that lowers SQLite durability for throwaway temp stores; pass `--durable-sqlite`
+to keep the production `PRAGMA synchronous = FULL`. The **slow tier** holds tests
+that spawn real subprocess CLI runs, a real detached worker, the mock OpenCode
+service, SIGKILL/recovery matrices, scale runs, and otherwise expensive or
+off-MVP-path tests; the **fast tier** excludes them. See
+[docs/ci.md](docs/ci.md) for the tiers, the CI jobs, and the local equivalents.
+
 ## Planning documents
 
 - [Scientific and product baseline](docs/specification.md)

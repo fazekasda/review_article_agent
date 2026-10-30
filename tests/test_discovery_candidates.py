@@ -27,6 +27,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -905,6 +906,7 @@ class BackupRestoreTests(CandidateTestBase):
         self.assertEqual(restored.current(), before)
 
 
+@slow
 class DecisionIdScaleTests(CandidateTestBase):
     """One revision minting >= 10,000 dedup decisions must read back intact.
 

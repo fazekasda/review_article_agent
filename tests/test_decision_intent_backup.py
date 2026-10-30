@@ -52,6 +52,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -516,6 +517,7 @@ class IntentBackupBase(unittest.TestCase):
             verify_backup(dest)
 
 
+@slow
 class RoundTripTest(IntentBackupBase):
     def test_roundtrip_reserved_intent_preserves_exact_request(self) -> None:
         record = self.record_intent()
@@ -779,6 +781,7 @@ class RoundTripTest(IntentBackupBase):
             )
 
 
+@slow
 class InnerValidationTest(IntentBackupBase):
     def _backup_with_intent(self):
         record = self.record_intent()
@@ -923,6 +926,7 @@ class InnerValidationTest(IntentBackupBase):
         self.assertEqual((target / "unrelated.txt").read_text(), "keep me")
 
 
+@slow
 class SchemaCompatibilityTest(IntentBackupBase):
     def new_schema_store(self, version: int, name: str) -> ProjectStore:
         """Create a store pinned at an older schema (no later tables)."""
@@ -1039,6 +1043,7 @@ class SchemaCompatibilityTest(IntentBackupBase):
         self.assertEqual(report["store_schema_version"], schema.STORE_SCHEMA_VERSION)
 
 
+@slow
 class DynamicHookTest(IntentBackupBase):
     def test_hook_table_is_ordered_and_threshold_keyed(self) -> None:
         minimums = [minimum for minimum, _ in backup_mod._SCHEMA_VALIDATORS]

@@ -39,6 +39,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 
 class NonBlockingRequirementTest(unittest.TestCase):
@@ -964,6 +965,7 @@ class TestRealControllingTerminal(unittest.TestCase):
         self.assertNotIn("RESULT ", proc.stdout)
 
     @unittest.skipUnless(hasattr(os, "openpty"), "requires os.openpty")
+    @slow
     def test_full_pty_output_queue_write_is_bounded_not_hanging(self):
         # Real owned PTY with a filled output queue and no reader: the write must
         # fail closed at the deadline. The subprocess has a hard timeout, so a

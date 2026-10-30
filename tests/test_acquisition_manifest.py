@@ -22,6 +22,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -410,6 +411,7 @@ class ManifestRosterAndSourceTests(ManifestBase):
 # --------------------------------------------------------------------------- #
 # C. Assets
 # --------------------------------------------------------------------------- #
+@slow
 class ManifestAssetTests(ManifestBase):
     def test_invisible_required_supplement_queues_and_blocks_but_available_passes(self):
         self.setup_frozen()

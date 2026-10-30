@@ -63,8 +63,8 @@ What it deliberately does **not** do
   ``paid_budget``/bypass argument, and no field on the plan can grant authority.
   A caller cannot pass in a boolean, a token, or a budget and change the answer.
 * It **does not** authorize a production paid generation or a hosted/real-provider
-  route. :func:`assert_production_execution_supported` raises an explicit static
-  blocker for the live ``opencode_session`` and ``direct_call`` routes, because a
+  route. :data:`PRODUCTION_SUPPORTED_ROUTES` is empty, so the live
+  ``opencode_session`` and ``direct_call`` routes remain unsupported, because a
   defensible all-request-bound cost bound plus scoped hosted-use rights, privacy
   review, and provider/journal-term verification are **not implemented yet**. A
   virtual positive ``reserve_usd`` (which *is* present on every reserved dispatch)
@@ -119,10 +119,8 @@ __all__ = [
     "FixtureSessionBlocked",
     "KNOWN_EXECUTION_ROUTES",
     "PRODUCTION_SUPPORTED_ROUTES",
-    "ProductionExecutionBlocked",
     "SESSION_ROUTE",
     "assert_fixture_session_execution_allowed",
-    "assert_production_execution_supported",
 ]
 
 #: The only accepted session route (C02 §6.3). Its wire name is shared with the
@@ -214,24 +212,6 @@ _MSG_LOCATION = "session: the owned project location does not match the plan's r
 _MSG_SERVICE_INSTANCE = (
     "session: the owned service instance does not match the plan's recorded session."
 )
-_MSG_UNKNOWN_ROUTE = "route: unknown execution route."
-_MSG_SESSION_BLOCKED = (
-    "route: a production opencode_session execution is not supported yet: a "
-    "defensible all-request-bound cost proof, scoped hosted-use rights, privacy "
-    "review, and provider/journal-term verification are not implemented. A virtual "
-    "positive reserve alone is not proof."
-)
-_MSG_DIRECT_BLOCKED = (
-    "route: a production direct_call execution is not supported yet, and it would "
-    "additionally require separate cost and hosted-use authorization. A virtual "
-    "positive reserve alone is not proof."
-)
-
-#: The static blocker code/message for each known production route.
-_PRODUCTION_BLOCKERS: dict[str, tuple[str, str]] = {
-    SESSION_ROUTE: ("session_route_blocked", _MSG_SESSION_BLOCKED),
-    DIRECT_ROUTE: ("direct_route_blocked", _MSG_DIRECT_BLOCKED),
-}
 
 
 # --------------------------------------------------------------------------- #
@@ -256,10 +236,6 @@ class ExecutionBoundaryBlocked(ExecutionBoundaryError):
 
 class FixtureSessionBlocked(ExecutionBoundaryBlocked):
     """The synthetic fixture session case was not exactly satisfied."""
-
-
-class ProductionExecutionBlocked(ExecutionBoundaryBlocked):
-    """A production (live-provider) execution route is not supported yet."""
 
 
 def _block(code: str, message: str) -> "FixtureSessionBlocked":
@@ -459,22 +435,3 @@ def assert_fixture_session_execution_allowed(manager: object, spec: object) -> N
         "session",
         _MSG_LOCATION,
     )
-
-
-def assert_production_execution_supported(route: object) -> None:
-    """Raise an explicit static blocker for every currently unsupported live route.
-
-    A fixture proof authorizes **only** the synthetic fixture case; it is **not**
-    evidence that a real-provider route is authorized. Today
-    :data:`PRODUCTION_SUPPORTED_ROUTES` is empty, so this always raises a typed
-    :class:`ProductionExecutionBlocked` for the live ``opencode_session`` and
-    ``direct_call`` routes rather than pretending otherwise. A future, separately
-    reviewed implementation would add a route here; a virtual positive reserve
-    alone is not that proof.
-    """
-    if not isinstance(route, str) or route not in KNOWN_EXECUTION_ROUTES:
-        raise ProductionExecutionBlocked("route", _MSG_UNKNOWN_ROUTE)
-    if route in PRODUCTION_SUPPORTED_ROUTES:  # pragma: no cover - empty today
-        return None
-    code, message = _PRODUCTION_BLOCKERS[route]
-    raise ProductionExecutionBlocked(code, message)

@@ -33,6 +33,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -685,6 +686,7 @@ class BoundAndScaleTests(unittest.TestCase):
     def test_documented_bound_is_generous(self):
         self.assertGreaterEqual(MAX_TOTAL_OCCURRENCES, 10_000)
 
+    @slow
     def test_ten_thousand_records_scale(self):
         records = []
         for index in range(5_000):

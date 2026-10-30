@@ -49,6 +49,7 @@ import sys
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
@@ -204,6 +205,7 @@ class ParserRegistrationTest(DraftingCliBase):
 
 
 class WorkspaceProposeShowTest(DraftingCliBase):
+    @slow
     def test_propose_inert_and_show_privacy_and_content_opt_in(self):
         payload, outline_ref = self.workspace_fixture()
         proposed = self.cli_propose("workspace", payload, artifact_id="ws", revision="ws-r1")
@@ -250,6 +252,7 @@ class WorkspaceProposeShowTest(DraftingCliBase):
 
 
 class PackageTest(DraftingCliBase):
+    @slow
     def test_package_safe_counts_and_content_opt_in(self):
         _s, _f, outline_ref = self.approved_chain()
         summary = self.cli(
@@ -280,6 +283,7 @@ class PackageTest(DraftingCliBase):
 
 
 class BlueprintProposeShowTest(DraftingCliBase):
+    @slow
     def test_blueprint_propose_show_privacy_gate_and_historical(self):
         _s, _f, outline_ref = self.approved_chain()
         ws_ref = self.make_workspace(outline_ref)
@@ -342,6 +346,7 @@ class AcceptedTest(DraftingCliBase):
             artifact_id="bp", revision="bp-r1",
         )["ref"]
 
+    @slow
     def test_accepted_requires_own_gate_then_reads_approved(self):
         ref = self._make_blueprint()
         # Not approved yet: the own-gate requirement fails closed.
@@ -382,6 +387,7 @@ class AcceptedTest(DraftingCliBase):
 
 
 class StatusTest(DraftingCliBase):
+    @slow
     def test_status_reports_stale_then_not_stale(self):
         _s, _f, outline_ref = self.approved_chain()
         ws_ref = self.make_workspace(outline_ref)

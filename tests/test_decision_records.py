@@ -586,95 +586,103 @@ class MalformedValuesTest(unittest.TestCase):
     def _project_one(self, outcome, question):
         return project(result=make_result({question.question_id: outcome}), qs=[question])
 
-    def test_predicate_missing_probability_denied(self):
-        forged = answered("p", jev.PREDICATE, jev.Answer(answer_kind="predicate", wire_type="noul"))
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._project_one(forged, jev.QuestionDef("p", jev.PREDICATE, "i"))
-
-    def test_score_outside_levels_denied(self):
-        q = jev.QuestionDef("s", jev.SCORE, "i", levels=("lo", "hi"))
-        forged = answered("s", jev.SCORE, score_answer("9"))
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._project_one(forged, q)
-
-    def test_choice_outside_options_denied(self):
-        q = jev.QuestionDef("c", jev.CHOICE, "i", options=("a", "b"))
-        forged = answered("c", jev.CHOICE, choice_answer("zzz"))
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._project_one(forged, q)
-
-    def test_nonfinite_probability_denied(self):
-        forged = answered("p", jev.PREDICATE, predicate_answer("NaN"))
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._project_one(forged, jev.QuestionDef("p", jev.PREDICATE, "i"))
-
-    def test_float_probability_denied(self):
-        forged = answered(
-            "p", jev.PREDICATE,
-            jev.Answer(answer_kind="predicate", wire_type="noul", probability=0.83),
-        )
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._project_one(forged, jev.QuestionDef("p", jev.PREDICATE, "i"))
-
-    def test_undeclared_probability_key_denied(self):
-        q = jev.QuestionDef("c", jev.CHOICE, "i", options=("a", "b"))
-        forged = answered(
-            "c", jev.CHOICE,
-            choice_answer("a", probabilities={"a": "0.5", "undeclared": "0.5"}),
-        )
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._project_one(forged, q)
-
-    def test_bad_legend_key_denied(self):
-        q = jev.QuestionDef("s", jev.SCORE, "i", levels=("lo", "hi"))
-        forged = answered("s", jev.SCORE, score_answer("0", legend={"9": "oops"}))
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._project_one(forged, q)
-
-    def test_answer_kind_mismatch_denied(self):
-        forged = answered("p", jev.PREDICATE, choice_answer("a"))
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._project_one(forged, jev.QuestionDef("p", jev.PREDICATE, "i"))
+    def test_malformed_values_denied(self):
+        cases = [
+            ("predicate_missing_probability", lambda: (
+                answered("p", jev.PREDICATE, jev.Answer(answer_kind="predicate", wire_type="noul")),
+                jev.QuestionDef("p", jev.PREDICATE, "i"),
+            )),
+            ("score_outside_levels", lambda: (
+                answered("s", jev.SCORE, score_answer("9")),
+                jev.QuestionDef("s", jev.SCORE, "i", levels=("lo", "hi")),
+            )),
+            ("choice_outside_options", lambda: (
+                answered("c", jev.CHOICE, choice_answer("zzz")),
+                jev.QuestionDef("c", jev.CHOICE, "i", options=("a", "b")),
+            )),
+            ("nonfinite_probability", lambda: (
+                answered("p", jev.PREDICATE, predicate_answer("NaN")),
+                jev.QuestionDef("p", jev.PREDICATE, "i"),
+            )),
+            ("float_probability", lambda: (
+                answered(
+                    "p", jev.PREDICATE,
+                    jev.Answer(answer_kind="predicate", wire_type="noul", probability=0.83),
+                ),
+                jev.QuestionDef("p", jev.PREDICATE, "i"),
+            )),
+            ("undeclared_probability_key", lambda: (
+                answered(
+                    "c", jev.CHOICE,
+                    choice_answer("a", probabilities={"a": "0.5", "undeclared": "0.5"}),
+                ),
+                jev.QuestionDef("c", jev.CHOICE, "i", options=("a", "b")),
+            )),
+            ("bad_legend_key", lambda: (
+                answered("s", jev.SCORE, score_answer("0", legend={"9": "oops"})),
+                jev.QuestionDef("s", jev.SCORE, "i", levels=("lo", "hi")),
+            )),
+            ("answer_kind_mismatch", lambda: (
+                answered("p", jev.PREDICATE, choice_answer("a")),
+                jev.QuestionDef("p", jev.PREDICATE, "i"),
+            )),
+        ]
+        for label, build in cases:
+            with self.subTest(case=label):
+                forged, question = build()
+                with self.assertRaises(dr.DecisionRecordValidationError):
+                    self._project_one(forged, question)
 
 
 # --------------------------------------------------------------------------- #
 # Refs and versions
 # --------------------------------------------------------------------------- #
 class RefsAndVersionsTest(unittest.TestCase):
-    def test_foreign_target_project_denied(self):
-        bad = {"project_id": "proj_B", "artifact_id": "candidate_17", "revision_id": "rev_3"}
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(target=bad)
+    def test_refs_and_versions_denied(self):
+        def foreign_target():
+            return {"target": {"project_id": "proj_B", "artifact_id": "candidate_17", "revision_id": "rev_3"}}
 
-    def test_cross_project_criteria_ref_denied(self):
-        refs = refs_for(questions(), "criteria", "crit_rev")
-        refs["study_design"] = {
-            "project_id": "proj_B",
-            "artifact_id": "criteria",
-            "revision_id": "c1",
-        }
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(criteria_ref=refs)
+        def cross_project_criteria_ref():
+            refs = refs_for(questions(), "criteria", "crit_rev")
+            refs["study_design"] = {
+                "project_id": "proj_B",
+                "artifact_id": "criteria",
+                "revision_id": "c1",
+            }
+            return {"criteria_ref": refs}
 
-    def test_missing_ref_key_denied(self):
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(question_def_ref={"project_id": PROJECT, "artifact_id": "question_def"})
+        def missing_ref_key():
+            return {"question_def_ref": {"project_id": PROJECT, "artifact_id": "question_def"}}
 
-    def test_versions_adapter_unknown_denied(self):
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(versions=versions(adapter={"state": "unknown"}))
+        def versions_adapter_unknown():
+            return {"versions": versions(adapter={"state": "unknown"})}
 
-    def test_versions_route_not_direct_call_denied(self):
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(versions=versions(route="opencode_session"))
+        def versions_route_not_direct_call():
+            return {"versions": versions(route="opencode_session")}
 
-    def test_versions_missing_field_denied(self):
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(versions={"context_kind": "model_derived"})
+        def versions_missing_field():
+            return {"versions": {"context_kind": "model_derived"}}
 
-    def test_consumed_rubric_must_be_known(self):
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(versions=versions(rubric={"state": "unknown"}), consumed=("rubric",))
+        def consumed_rubric_must_be_known():
+            return {"versions": versions(rubric={"state": "unknown"}), "consumed": ("rubric",)}
+
+        def bad_consumed_slot():
+            return {"consumed": ("nope",)}
+
+        cases = [
+            ("foreign_target_project", foreign_target),
+            ("cross_project_criteria_ref", cross_project_criteria_ref),
+            ("missing_ref_key", missing_ref_key),
+            ("versions_adapter_unknown", versions_adapter_unknown),
+            ("versions_route_not_direct_call", versions_route_not_direct_call),
+            ("versions_missing_field", versions_missing_field),
+            ("consumed_rubric_must_be_known", consumed_rubric_must_be_known),
+            ("bad_consumed_slot", bad_consumed_slot),
+        ]
+        for label, build in cases:
+            with self.subTest(case=label):
+                with self.assertRaises(dr.DecisionRecordBindingError):
+                    project(**build())
 
     def test_consumed_rubric_known_is_recorded(self):
         records = project(
@@ -685,10 +693,6 @@ class RefsAndVersionsTest(unittest.TestCase):
             records[0].as_mapping()["consumed_versions"],
             ["adapter", "model", "parser", "prompt", "rubric"],
         )
-
-    def test_bad_consumed_slot_denied(self):
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(consumed=("nope",))
 
 
 # --------------------------------------------------------------------------- #
@@ -756,87 +760,108 @@ class BindingsAndHashTest(unittest.TestCase):
         records = project(bindings=self._bindings())
         self.assertEqual(len(records), 3)
 
-    def test_stale_binding_digest_denied(self):
-        bindings = self._bindings()
-        first = questions()[0]
-        bindings[first.question_id] = dataclasses.replace(
-            bindings[first.question_id], question_def_digest="0" * 64
-        )
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(bindings=bindings)
+    def test_binding_and_hash_denied(self):
+        def stale_binding_digest():
+            bindings = self._bindings()
+            first = questions()[0]
+            bindings[first.question_id] = dataclasses.replace(
+                bindings[first.question_id], question_def_digest="0" * 64
+            )
+            return {"bindings": bindings}
 
-    def test_binding_kind_mismatch_denied(self):
-        bindings = self._bindings()
-        first = questions()[0]
-        bindings[first.question_id] = dataclasses.replace(
-            bindings[first.question_id], question_kind=jev.CHOICE
-        )
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(bindings=bindings)
+        def binding_kind_mismatch():
+            bindings = self._bindings()
+            first = questions()[0]
+            bindings[first.question_id] = dataclasses.replace(
+                bindings[first.question_id], question_kind=jev.CHOICE
+            )
+            return {"bindings": bindings}
 
-    def test_missing_binding_denied(self):
-        bindings = self._bindings()
-        del bindings["study_design"]
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(bindings=bindings)
+        def missing_binding():
+            bindings = self._bindings()
+            del bindings["study_design"]
+            return {"bindings": bindings}
 
-    def test_extra_binding_denied(self):
-        bindings = self._bindings()
-        bindings["undeclared"] = dr.QuestionBinding("undeclared", jev.PREDICATE, "0" * 64)
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(bindings=bindings)
+        def extra_binding():
+            bindings = self._bindings()
+            bindings["undeclared"] = dr.QuestionBinding("undeclared", jev.PREDICATE, "0" * 64)
+            return {"bindings": bindings}
 
-    def test_stale_request_hash_denied(self):
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(expected_request_sha256="0" * 64)
+        def stale_request_hash():
+            return {"expected_request_sha256": "0" * 64}
+
+        def non_hex_request_hash():
+            return {"expected_request_sha256": "not-a-hash"}
+
+        cases = [
+            ("stale_binding_digest", stale_binding_digest),
+            ("binding_kind_mismatch", binding_kind_mismatch),
+            ("missing_binding", missing_binding),
+            ("extra_binding", extra_binding),
+            ("stale_request_hash", stale_request_hash),
+            ("non_hex_request_hash", non_hex_request_hash),
+        ]
+        for label, build in cases:
+            with self.subTest(case=label):
+                with self.assertRaises(dr.DecisionRecordBindingError):
+                    project(**build())
 
     def test_matching_request_hash_accepted(self):
         records = project(expected_request_sha256="f" * 64)
         self.assertEqual(records[0].as_mapping()["request_sha256"], "f" * 64)
-
-    def test_non_hex_request_hash_denied(self):
-        with self.assertRaises(dr.DecisionRecordBindingError):
-            project(expected_request_sha256="not-a-hash")
 
 
 # --------------------------------------------------------------------------- #
 # Result envelope coverage
 # --------------------------------------------------------------------------- #
 class ResultEnvelopeTest(unittest.TestCase):
-    def test_not_submitted_denied(self):
-        result = make_result({}, submitted=False, calls_attempted=0, status="blocked", cost=make_cost(state="not_incurred"))
-        with self.assertRaises(dr.DecisionRecordProjectionError):
-            project(result=result)
+    def test_result_envelope_denied(self):
+        def not_submitted():
+            return (
+                make_result({}, submitted=False, calls_attempted=0, status="blocked",
+                            cost=make_cost(state="not_incurred")),
+                dr.DecisionRecordProjectionError,
+            )
 
-    def test_missing_outcome_denied(self):
-        outcomes = valid_outcomes()
-        del outcomes["study_design"]
-        with self.assertRaises(dr.DecisionRecordProjectionError):
-            project(result=make_result(outcomes))
+        def missing_outcome():
+            outcomes = valid_outcomes()
+            del outcomes["study_design"]
+            return make_result(outcomes), dr.DecisionRecordProjectionError
 
-    def test_extra_outcome_denied(self):
-        outcomes = valid_outcomes()
-        outcomes["undeclared"] = answered("undeclared", jev.PREDICATE, predicate_answer())
-        with self.assertRaises(dr.DecisionRecordProjectionError):
-            project(result=make_result(outcomes))
+        def extra_outcome():
+            outcomes = valid_outcomes()
+            outcomes["undeclared"] = answered("undeclared", jev.PREDICATE, predicate_answer())
+            return make_result(outcomes), dr.DecisionRecordProjectionError
 
-    def test_foreign_endpoint_denied(self):
-        result = make_result(valid_outcomes(), endpoint="https://evil.example/decisions")
-        with self.assertRaises(dr.DecisionRecordProjectionError):
-            project(result=result)
+        def foreign_endpoint():
+            return (
+                make_result(valid_outcomes(), endpoint="https://evil.example/decisions"),
+                dr.DecisionRecordProjectionError,
+            )
 
-    def test_foreign_model_denied(self):
-        result = make_result(valid_outcomes(), model="typesafe/other")
-        with self.assertRaises(dr.DecisionRecordProjectionError):
-            project(result=result)
+        def foreign_model():
+            return make_result(valid_outcomes(), model="typesafe/other"), dr.DecisionRecordProjectionError
 
-    def test_outcome_question_kind_mismatch_denied(self):
-        outcomes = valid_outcomes()
-        outcomes["is_original_report"] = answered(
-            "is_original_report", jev.CHOICE, choice_answer("randomised")
-        )
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            project(result=make_result(outcomes))
+        def outcome_question_kind_mismatch():
+            outcomes = valid_outcomes()
+            outcomes["is_original_report"] = answered(
+                "is_original_report", jev.CHOICE, choice_answer("randomised")
+            )
+            return make_result(outcomes), dr.DecisionRecordValidationError
+
+        cases = [
+            ("not_submitted", not_submitted),
+            ("missing_outcome", missing_outcome),
+            ("extra_outcome", extra_outcome),
+            ("foreign_endpoint", foreign_endpoint),
+            ("foreign_model", foreign_model),
+            ("outcome_question_kind_mismatch", outcome_question_kind_mismatch),
+        ]
+        for label, build in cases:
+            with self.subTest(case=label):
+                result, exc = build()
+                with self.assertRaises(exc):
+                    project(result=result)
 
 
 # --------------------------------------------------------------------------- #
@@ -916,41 +941,40 @@ class RecordIdTest(unittest.TestCase):
 class StaticErrorTest(unittest.TestCase):
     CANARY = "SYNTHETIC_CANARY_LEAK"
 
-    def test_version_error_is_static(self):
-        bad = versions(model={"state": self.CANARY})
-        try:
-            project(versions=bad)
-        except dr.DecisionRecordError as exc:
-            self.assertNotIn(self.CANARY, str(exc))
-        else:  # pragma: no cover
-            self.fail("bad version accepted")
+    def test_errors_are_static(self):
+        def bad_version():
+            return project(versions=versions(model={"state": self.CANARY}))
 
-    def test_ref_error_is_static(self):
-        refs = refs_for(questions(), "question_def", "qd_rev")
-        refs["is_original_report"] = {
-            "project_id": self.CANARY,
-            "artifact_id": "x",
-            "revision_id": "r",
-        }
-        try:
-            project(question_def_ref=refs)
-        except dr.DecisionRecordError as exc:
-            self.assertNotIn(self.CANARY, str(exc))
-        else:  # pragma: no cover
-            self.fail("bad ref accepted")
+        def bad_ref():
+            refs = refs_for(questions(), "question_def", "qd_rev")
+            refs["is_original_report"] = {
+                "project_id": self.CANARY,
+                "artifact_id": "x",
+                "revision_id": "r",
+            }
+            return project(question_def_ref=refs)
 
-    def test_malformed_answer_error_is_static(self):
-        forged = answered(
-            "p", jev.PREDICATE,
-            jev.Answer(answer_kind="predicate", wire_type="noul", probability=self.CANARY),
-        )
-        try:
-            project(result=make_result({"p": forged}),
-                    qs=[jev.QuestionDef("p", jev.PREDICATE, "i")])
-        except dr.DecisionRecordError as exc:
-            self.assertNotIn(self.CANARY, str(exc))
-        else:  # pragma: no cover
-            self.fail("bad answer accepted")
+        def bad_answer():
+            forged = answered(
+                "p", jev.PREDICATE,
+                jev.Answer(answer_kind="predicate", wire_type="noul", probability=self.CANARY),
+            )
+            return project(result=make_result({"p": forged}),
+                           qs=[jev.QuestionDef("p", jev.PREDICATE, "i")])
+
+        cases = [
+            ("version_error", bad_version),
+            ("ref_error", bad_ref),
+            ("malformed_answer_error", bad_answer),
+        ]
+        for label, trigger in cases:
+            with self.subTest(case=label):
+                try:
+                    trigger()
+                except dr.DecisionRecordError as exc:
+                    self.assertNotIn(self.CANARY, str(exc))
+                else:  # pragma: no cover
+                    self.fail("bad input accepted: %s" % label)
 
 
 # --------------------------------------------------------------------------- #
@@ -1174,17 +1198,16 @@ class NumericBoundTest(unittest.TestCase):
             qs=[jev.QuestionDef("p", jev.PREDICATE, "i")],
         )
 
-    def test_tiny_zero_decimal_denied(self):
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._single_forged(Decimal("0E-1000000"))
-
-    def test_tiny_nonzero_decimal_denied(self):
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._single_forged(Decimal("1e-1000000"))
-
-    def test_huge_exponent_decimal_denied(self):
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            self._single_forged(Decimal("1E+1000000"))
+    def test_unbounded_numeric_denied(self):
+        cases = [
+            ("tiny_zero_decimal", Decimal("0E-1000000")),
+            ("tiny_nonzero_decimal", Decimal("1e-1000000")),
+            ("huge_exponent_decimal", Decimal("1E+1000000")),
+        ]
+        for label, value in cases:
+            with self.subTest(case=label):
+                with self.assertRaises(dr.DecisionRecordValidationError):
+                    self._single_forged(value)
 
     def test_num_to_str_does_not_expand_bounded_away_decimals(self):
         self.assertEqual(dr._num_to_str(Decimal("0E-1000000")), Decimal("0E-1000000"))
@@ -1290,41 +1313,41 @@ class TaskContextAndIdTest(unittest.TestCase):
 # Presence union / envelope type strictness
 # --------------------------------------------------------------------------- #
 class PresenceEnvelopeTest(unittest.TestCase):
-    def test_validator_rejects_empty_request_sha(self):
-        mapping = project()[0].as_mapping()
-        mapping["request_sha256"] = ""
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            dr.validate_decision_record_mapping(mapping)
+    def test_envelope_rejections(self):
+        def empty_request_sha(mapping):
+            mapping["request_sha256"] = ""
 
-    def test_validator_rejects_missing_reserve(self):
-        mapping = project()[0].as_mapping()
-        del mapping["cost"]["reserve_usd"]
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            dr.validate_decision_record_mapping(mapping)
+        def missing_reserve(mapping):
+            del mapping["cost"]["reserve_usd"]
+
+        def bool_schema_version(mapping):
+            mapping["schema_version"] = True
+
+        def float_schema_version(mapping):
+            # 1.0 == 1 but is not an actual int; a versioned representation must
+            # be an exact integer literal, never a float.
+            mapping["schema_version"] = 1.0
+
+        def string_schema_version(mapping):
+            mapping["schema_version"] = "1"
+
+        cases = [
+            ("empty_request_sha", empty_request_sha),
+            ("missing_reserve", missing_reserve),
+            ("bool_schema_version", bool_schema_version),
+            ("float_schema_version", float_schema_version),
+            ("string_schema_version", string_schema_version),
+        ]
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                mapping = project()[0].as_mapping()
+                mutate(mapping)
+                with self.assertRaises(dr.DecisionRecordValidationError):
+                    dr.validate_decision_record_mapping(mapping)
 
     def test_float_calls_attempted_denied(self):
         with self.assertRaises(dr.DecisionRecordProjectionError):
             project(result=make_result(valid_outcomes(), calls_attempted=1.0))
-
-    def test_bool_schema_version_denied(self):
-        mapping = project()[0].as_mapping()
-        mapping["schema_version"] = True
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            dr.validate_decision_record_mapping(mapping)
-
-    def test_float_schema_version_denied(self):
-        # 1.0 == 1 but is not an actual int; a versioned representation must be
-        # an exact integer literal, never a float.
-        mapping = project()[0].as_mapping()
-        mapping["schema_version"] = 1.0
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            dr.validate_decision_record_mapping(mapping)
-
-    def test_string_schema_version_denied(self):
-        mapping = project()[0].as_mapping()
-        mapping["schema_version"] = "1"
-        with self.assertRaises(dr.DecisionRecordValidationError):
-            dr.validate_decision_record_mapping(mapping)
 
     def test_int_schema_version_accepted(self):
         mapping = project()[0].as_mapping()

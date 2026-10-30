@@ -42,6 +42,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -1121,6 +1122,7 @@ class SyntheticRegressionTest(DiscoveryWorkerBase):
 # Lightweight real-process acceptance (unapproved plan => zero provider I/O)
 # --------------------------------------------------------------------------- #
 class DetachedProcessTest(DiscoveryWorkerBase):
+    @slow
     def test_detached_worker_admits_then_escalates_unapproved_plan(self) -> None:
         plan_ref = self.build_plan()  # never approved: no provider I/O is possible
         env = dict(os.environ)

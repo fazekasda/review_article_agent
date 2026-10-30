@@ -140,41 +140,51 @@ class CanonicalJsonTest(unittest.TestCase):
     def test_unicode_is_utf8_not_escaped(self):
         self.assertEqual(canonical_json({"k": "café"}).decode("utf-8"), '{"k":"café"}')
 
-    def test_rejects_nan(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"v": math.nan})
+    def test_rejects_malformed_values(self):
+        # One table per validator: every rejected canonical_json input, as a case.
+        def cyclic_dict():
+            value = {}
+            value["self"] = value
+            return value
 
-    def test_rejects_positive_infinity(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"v": math.inf})
+        def cyclic_list():
+            value = []
+            value.append(value)
+            return value
 
-    def test_rejects_negative_infinity(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json([-math.inf])
+        def deeply_nested():
+            payload = []
+            node = payload
+            for _ in range(500):
+                child = []
+                node.append(child)
+                node = child
+            return payload
 
-    def test_rejects_non_string_dict_key(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({1: "a"})
-
-    def test_rejects_non_string_key_nested(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"outer": {2: "a"}})
-
-    def test_rejects_unserializable_value(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"s": {1, 2, 3}})
-
-    def test_rejects_object(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json(object())
-
-    def test_rejects_surrogate_in_string(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json("x\ud800")
-
-    def test_rejects_surrogate_in_dict_key(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"a\ud800": 1})
+        cases = {
+            "nan": lambda: {"v": math.nan},
+            "positive_infinity": lambda: {"v": math.inf},
+            "negative_infinity": lambda: [-math.inf],
+            "non_string_dict_key": lambda: {1: "a"},
+            "non_string_key_nested": lambda: {"outer": {2: "a"}},
+            "unserializable_value": lambda: {"s": {1, 2, 3}},
+            "object": lambda: object(),
+            "surrogate_in_string": lambda: "x\ud800",
+            "surrogate_in_dict_key": lambda: {"a\ud800": 1},
+            "lone_high_surrogate_in_value": lambda: {"v": "x\ud800"},
+            "lone_low_surrogate_in_value": lambda: {"v": "x\udfff"},
+            "surrogate_in_dict_key_low": lambda: {"a\udfff": 1},
+            "surrogate_nested_in_value": lambda: {"outer": [1, {"inner": "bad\ud800"}]},
+            "surrogate_nested_in_dict_key": lambda: {"outer": {"bad\ud800": 1}},
+            "paired_surrogate": lambda: "x\ud800\udc00",
+            "cyclic_dict": cyclic_dict,
+            "cyclic_list": cyclic_list,
+            "deeply_nested": deeply_nested,
+        }
+        for label, factory in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(RecordValidationError):
+                    canonical_json(factory())
 
     def test_has_surrogate_accepts_ascii_and_valid_unicode(self):
         # The isascii() fast path and the single-encode fallback must accept every
@@ -199,52 +209,6 @@ class CanonicalJsonTest(unittest.TestCase):
             '{"k":"é","漢":"😀"}',
         )
 
-    def test_rejects_lone_high_surrogate_in_value(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"v": "x\ud800"})
-
-    def test_rejects_lone_low_surrogate_in_value(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"v": "x\udfff"})
-
-    def test_rejects_surrogate_in_dict_key_low(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"a\udfff": 1})
-
-    def test_rejects_surrogate_nested_in_value(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"outer": [1, {"inner": "bad\ud800"}]})
-
-    def test_rejects_surrogate_nested_in_dict_key(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json({"outer": {"bad\ud800": 1}})
-
-    def test_rejects_paired_surrogate(self):
-        with self.assertRaises(RecordValidationError):
-            canonical_json("x\ud800\udc00")
-
-    def test_rejects_cyclic_dict(self):
-        cyclic = {}
-        cyclic["self"] = cyclic
-        with self.assertRaises(RecordValidationError):
-            canonical_json(cyclic)
-
-    def test_rejects_cyclic_list(self):
-        cyclic = []
-        cyclic.append(cyclic)
-        with self.assertRaises(RecordValidationError):
-            canonical_json(cyclic)
-
-    def test_rejects_deeply_nested(self):
-        payload = []
-        node = payload
-        for _ in range(500):
-            child = []
-            node.append(child)
-            node = child
-        with self.assertRaises(RecordValidationError):
-            canonical_json(payload)
-
     def test_accepts_moderately_nested(self):
         payload = [1]
         for _ in range(30):
@@ -263,49 +227,24 @@ class IdentifierTest(unittest.TestCase):
     def test_accepts_opaque_id(self):
         self.assertEqual(validate_identifier("art-syn-A_1.2"), "art-syn-A_1.2")
 
-    def test_rejects_non_string(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier(5)
-
-    def test_rejects_empty(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier("")
-
-    def test_rejects_whitespace(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier("a b")
-
-    def test_rejects_leading_trailing_space(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier(" abc ")
-
-    def test_rejects_forward_slash(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier("a/b")
-
-    def test_rejects_backslash(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier("a\\b")
-
-    def test_rejects_control_char(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier("a\x00b")
-
-    def test_rejects_dot(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier(".")
-
-    def test_rejects_dotdot(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier("..")
-
-    def test_rejects_dot_traversal_inside(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier("a..b")
-
-    def test_rejects_leading_dot(self):
-        with self.assertRaises(RecordValidationError):
-            validate_identifier(".hidden")
+    def test_rejects_invalid_identifiers(self):
+        cases = {
+            "non_string": 5,
+            "empty": "",
+            "whitespace": "a b",
+            "leading_trailing_space": " abc ",
+            "forward_slash": "a/b",
+            "backslash": "a\\b",
+            "control_char": "a\x00b",
+            "dot": ".",
+            "dotdot": "..",
+            "dot_traversal_inside": "a..b",
+            "leading_dot": ".hidden",
+        }
+        for label, value in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(RecordValidationError):
+                    validate_identifier(value)
 
 
 class IdentifierFastPathEquivalenceTest(unittest.TestCase):
@@ -512,223 +451,162 @@ class RightsRecordRejectTest(unittest.TestCase):
         with self.assertRaises(RecordValidationError):
             validate_rights_record(rec, project_id, subject=subject)
 
-    def test_missing_mandatory_field(self):
-        rec = build_valid()
-        del rec["basis"]
-        self.assertRejected(rec)
+    def test_rejects_malformed_records(self):
+        # One table per validator: each original reject case becomes a subTest.
+        def drop(*path):
+            def mutate(rec):
+                target = rec
+                for key in path[:-1]:
+                    target = target[key]
+                del target[path[-1]]
+            return mutate
 
-    def test_missing_authorization_key_entirely(self):
-        rec = build_valid()
-        del rec["authorization"]
-        self.assertRejected(rec)
+        def put(value, *path):
+            def mutate(rec):
+                target = rec
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+            return mutate
 
-    def test_illtyped_operations(self):
-        rec = build_valid()
-        rec["operations"] = ["allowed"]
-        self.assertRejected(rec)
-
-    def test_illtyped_restrictions(self):
-        rec = build_valid()
-        rec["restrictions"] = "none"
-        self.assertRejected(rec)
-
-    def test_restrictions_entry_not_string(self):
-        rec = build_valid()
-        rec["restrictions"] = [42]
-        self.assertRejected(rec)
-
-    def test_record_revision_bool_rejected(self):
-        rec = build_valid()
-        rec["record_revision"] = True
-        self.assertRejected(rec)
-
-    def test_record_revision_zero_rejected(self):
-        rec = build_valid()
-        rec["record_revision"] = 0
-        self.assertRejected(rec)
-
-    def test_record_revision_str_rejected(self):
-        rec = build_valid()
-        rec["record_revision"] = "1"
-        self.assertRejected(rec)
-
-    def test_privacy_personal_data_bool_as_int_rejected(self):
-        rec = build_valid()
-        rec["privacy"]["personal_data"] = 0
-        self.assertRejected(rec)
-
-    def test_privacy_denial_bool_as_int_rejected(self):
-        rec = build_valid()
-        rec["privacy"]["denial"] = 0
-        self.assertRejected(rec)
-
-    def test_privacy_bad_confidentiality(self):
-        rec = build_valid()
-        rec["privacy"]["confidentiality"] = "secret"
-        self.assertRejected(rec)
-
-    def test_unknown_top_level_key_rejected(self):
-        rec = build_valid()
-        rec["approval"] = True
-        self.assertRejected(rec)
-
-    def test_hidden_actor_key_rejected(self):
-        rec = build_valid()
-        rec["approved_by"] = "human:someone"
-        self.assertRejected(rec)
-
-    def test_hidden_secret_key_rejected(self):
-        rec = build_valid()
-        rec["credential"] = "hunter2"
-        self.assertRejected(rec)
-
-    def test_unknown_nested_privacy_key_rejected(self):
-        rec = build_valid()
-        rec["privacy"]["reason"] = "because"
-        self.assertRejected(rec)
-
-    def test_unknown_nested_subject_key_rejected(self):
-        rec = build_valid()
-        rec["subject"]["extra"] = "x"
-        self.assertRejected(rec)
-
-    def test_unknown_nested_operations_key_rejected(self):
-        rec = build_valid()
-        rec["operations"]["printing"] = "allowed"
-        self.assertRejected(rec)
-
-    def test_unknown_nested_basis_key_rejected(self):
-        rec = build_valid()
-        rec["basis"]["storage"]["extra"] = "x"
-        self.assertRejected(rec)
-
-    def test_unknown_evidence_key_rejected(self):
-        rec = build_valid()
-        rec["basis"]["storage"]["evidence"]["note"] = "x"
-        self.assertRejected(rec)
-
-    def test_unknown_authorization_key_rejected(self):
-        rec = build_valid()
-        rec["authorization"]["extra"] = "x"
-        self.assertRejected(rec)
-
-    def test_bad_operation_status_enum(self):
-        rec = build_valid()
-        rec["operations"]["storage"] = "yes"
-        self.assertRejected(rec)
-
-    def test_cross_project_record_identity(self):
-        rec = build_valid()
-        self.assertRejected(rec, project_id="proj-2")
-
-    def test_cross_project_subject(self):
-        rec = build_valid()
-        rec["subject"]["project_id"] = "proj-2"
-        self.assertRejected(rec)
-
-    def test_missing_subject_project(self):
-        rec = build_valid()
-        del rec["subject"]["project_id"]
-        self.assertRejected(rec)
-
-    def test_subject_artifact_ref_with_revision_id_rejected(self):
-        rec = build_valid()
-        rec["subject"] = {
-            "kind": "subject_artifact_ref",
+        other_subject = {
+            "kind": "source_revision",
             "project_id": "proj-1",
             "artifact_id": "art-1",
-            "revision_id": "rev-1",
+            "revision_id": "rev-2",
         }
-        self.assertRejected(rec)
-
-    def test_subject_bad_kind_rejected(self):
-        rec = build_valid()
-        rec["subject"]["kind"] = "source"
-        self.assertRejected(rec)
-
-    def test_subject_parameter_mismatch(self):
-        rec = build_valid()
-        other = {"kind": "source_revision", "project_id": "proj-1", "artifact_id": "art-1", "revision_id": "rev-2"}
-        self.assertRejected(rec, subject=other)
-
-    def test_allowed_without_basis_evidence(self):
-        rec = build_valid()
-        rec["basis"]["storage"] = {
-            "kind": "public_domain",
-            "evidence": {"ref": "", "provenance": ""},
-        }
-        self.assertRejected(rec)
-
-    def test_allowed_with_unknown_basis(self):
-        rec = build_valid()
-        rec["basis"]["storage"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
-        self.assertRejected(rec)
-
-    def test_allowed_with_bad_basis_kind(self):
-        rec = build_valid()
-        rec["basis"]["storage"]["kind"] = "vibes"
-        self.assertRejected(rec)
-
-    def test_user_authorization_cannot_grant_redistribution(self):
-        rec = build_valid()
-        rec["basis"]["redistribution"] = {
+        unknown_basis = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
+        user_authorization = {
             "kind": "user_authorization",
             "evidence": {"ref": "user:own", "provenance": "interview:1"},
         }
-        self.assertRejected(rec)
 
-    def test_user_authorization_cannot_grant_hosted_transfer(self):
-        rec = build_valid()
-        rec["basis"]["hosted_transfer"] = {
-            "kind": "user_authorization",
-            "evidence": {"ref": "user:own", "provenance": "interview:1"},
-        }
-        self.assertRejected(rec)
-
-    def test_stale_authorization_binding_rejected(self):
-        rec = build_valid()
-        rec["authorization"]["against_rights_revision"] = 2
-        self.assertRejected(rec)
-
-    def test_authorization_bool_as_int_revision_rejected(self):
-        rec = build_valid()
-        rec["authorization"]["against_rights_revision"] = True
-        self.assertRejected(rec)
-
-    def test_authorization_subject_mismatch_rejected(self):
-        rec = build_valid()
-        rec["authorization"]["against_subject"]["revision_id"] = "rev-2"
-        self.assertRejected(rec)
-
-    def test_authorization_wrong_method_rejected(self):
-        rec = build_valid()
-        rec["authorization"]["method"] = "in_band"
-        self.assertRejected(rec)
-
-    def test_authorization_unknown_basis_rejected(self):
-        rec = build_valid()
-        rec["authorization"]["basis"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
-        self.assertRejected(rec)
-
-    def test_recorded_at_without_timezone_rejected(self):
-        rec = build_valid()
-        rec["recorded_at"] = "2026-10-27T00:00:00"
-        self.assertRejected(rec)
-
-    def test_recorded_at_not_timestamp(self):
-        rec = build_valid()
-        rec["recorded_at"] = "yesterday"
-        self.assertRejected(rec)
-
-    def test_input_derived_status_inconsistent_rejected(self):
-        rec = build_valid()
-        rec["derived_status"] = "inconsistent"
-        self.assertRejected(rec)
-
-    def test_input_derived_status_incomplete_rejected(self):
-        rec = build_valid()
-        rec["derived_status"] = "incomplete"
-        self.assertRejected(rec)
+        cases = [
+            ("missing_mandatory_field", drop("basis"), "proj-1", None),
+            ("missing_authorization_key_entirely", drop("authorization"), "proj-1", None),
+            ("illtyped_operations", put(["allowed"], "operations"), "proj-1", None),
+            ("illtyped_restrictions", put("none", "restrictions"), "proj-1", None),
+            ("restrictions_entry_not_string", put([42], "restrictions"), "proj-1", None),
+            ("record_revision_bool_rejected", put(True, "record_revision"), "proj-1", None),
+            ("record_revision_zero_rejected", put(0, "record_revision"), "proj-1", None),
+            ("record_revision_str_rejected", put("1", "record_revision"), "proj-1", None),
+            (
+                "privacy_personal_data_bool_as_int_rejected",
+                put(0, "privacy", "personal_data"),
+                "proj-1",
+                None,
+            ),
+            ("privacy_denial_bool_as_int_rejected", put(0, "privacy", "denial"), "proj-1", None),
+            ("privacy_bad_confidentiality", put("secret", "privacy", "confidentiality"), "proj-1", None),
+            ("unknown_top_level_key_rejected", put(True, "approval"), "proj-1", None),
+            ("hidden_actor_key_rejected", put("human:someone", "approved_by"), "proj-1", None),
+            ("hidden_secret_key_rejected", put("hunter2", "credential"), "proj-1", None),
+            ("unknown_nested_privacy_key_rejected", put("because", "privacy", "reason"), "proj-1", None),
+            ("unknown_nested_subject_key_rejected", put("x", "subject", "extra"), "proj-1", None),
+            (
+                "unknown_nested_operations_key_rejected",
+                put("allowed", "operations", "printing"),
+                "proj-1",
+                None,
+            ),
+            ("unknown_nested_basis_key_rejected", put("x", "basis", "storage", "extra"), "proj-1", None),
+            (
+                "unknown_evidence_key_rejected",
+                put("x", "basis", "storage", "evidence", "note"),
+                "proj-1",
+                None,
+            ),
+            ("unknown_authorization_key_rejected", put("x", "authorization", "extra"), "proj-1", None),
+            ("bad_operation_status_enum", put("yes", "operations", "storage"), "proj-1", None),
+            ("cross_project_record_identity", None, "proj-2", None),
+            ("cross_project_subject", put("proj-2", "subject", "project_id"), "proj-1", None),
+            ("missing_subject_project", drop("subject", "project_id"), "proj-1", None),
+            (
+                "subject_artifact_ref_with_revision_id_rejected",
+                put(
+                    {
+                        "kind": "subject_artifact_ref",
+                        "project_id": "proj-1",
+                        "artifact_id": "art-1",
+                        "revision_id": "rev-1",
+                    },
+                    "subject",
+                ),
+                "proj-1",
+                None,
+            ),
+            ("subject_bad_kind_rejected", put("source", "subject", "kind"), "proj-1", None),
+            ("subject_parameter_mismatch", None, "proj-1", other_subject),
+            (
+                "allowed_without_basis_evidence",
+                put(
+                    {"kind": "public_domain", "evidence": {"ref": "", "provenance": ""}},
+                    "basis",
+                    "storage",
+                ),
+                "proj-1",
+                None,
+            ),
+            ("allowed_with_unknown_basis", put(unknown_basis, "basis", "storage"), "proj-1", None),
+            ("allowed_with_bad_basis_kind", put("vibes", "basis", "storage", "kind"), "proj-1", None),
+            (
+                "user_authorization_cannot_grant_redistribution",
+                put(user_authorization, "basis", "redistribution"),
+                "proj-1",
+                None,
+            ),
+            (
+                "user_authorization_cannot_grant_hosted_transfer",
+                put(user_authorization, "basis", "hosted_transfer"),
+                "proj-1",
+                None,
+            ),
+            (
+                "stale_authorization_binding_rejected",
+                put(2, "authorization", "against_rights_revision"),
+                "proj-1",
+                None,
+            ),
+            (
+                "authorization_bool_as_int_revision_rejected",
+                put(True, "authorization", "against_rights_revision"),
+                "proj-1",
+                None,
+            ),
+            (
+                "authorization_subject_mismatch_rejected",
+                put("rev-2", "authorization", "against_subject", "revision_id"),
+                "proj-1",
+                None,
+            ),
+            ("authorization_wrong_method_rejected", put("in_band", "authorization", "method"), "proj-1", None),
+            (
+                "authorization_unknown_basis_rejected",
+                put(unknown_basis, "authorization", "basis"),
+                "proj-1",
+                None,
+            ),
+            ("recorded_at_without_timezone_rejected", put("2026-10-27T00:00:00", "recorded_at"), "proj-1", None),
+            ("recorded_at_not_timestamp", put("yesterday", "recorded_at"), "proj-1", None),
+            (
+                "input_derived_status_inconsistent_rejected",
+                put("inconsistent", "derived_status"),
+                "proj-1",
+                None,
+            ),
+            (
+                "input_derived_status_incomplete_rejected",
+                put("incomplete", "derived_status"),
+                "proj-1",
+                None,
+            ),
+        ]
+        for label, mutate, project_id, subject in cases:
+            with self.subTest(case=label):
+                rec = build_valid()
+                if mutate is not None:
+                    mutate(rec)
+                self.assertRejected(rec, project_id=project_id, subject=subject)
 
     def test_non_object_record_rejected(self):
         with self.assertRaises(RecordValidationError):
@@ -740,39 +618,38 @@ class StorageGateTest(unittest.TestCase):
         rec = validate_rights_record(build_valid(), "proj-1")
         self.assertIsNone(require_storage_allowed(rec))
 
-    def test_unknown_storage_blocked(self):
-        rec = build_valid()
-        rec["operations"]["storage"] = "unknown"
-        rec["basis"]["storage"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
-        rec["authorization"] = None
-        validated = validate_rights_record(rec, "proj-1")
-        with self.assertRaises(RecordValidationError):
-            require_storage_allowed(validated)
+    def test_storage_blocked_cases(self):
+        def unknown_storage(rec):
+            rec["operations"]["storage"] = "unknown"
+            rec["basis"]["storage"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
+            rec["authorization"] = None
 
-    def test_not_allowed_storage_blocked(self):
-        rec = build_valid()
-        rec["operations"]["storage"] = "not_allowed"
-        rec["basis"]["storage"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
-        rec["authorization"] = None
-        validated = validate_rights_record(rec, "proj-1")
-        with self.assertRaises(RecordValidationError):
-            require_storage_allowed(validated)
+        def not_allowed_storage(rec):
+            rec["operations"]["storage"] = "not_allowed"
+            rec["basis"]["storage"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
+            rec["authorization"] = None
 
-    def test_not_applicable_storage_never_unblocks(self):
-        rec = build_valid()
-        rec["operations"]["storage"] = "not_applicable"
-        rec["basis"]["storage"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
-        rec["authorization"] = None
-        validated = validate_rights_record(rec, "proj-1")
-        with self.assertRaises(RecordValidationError):
-            require_storage_allowed(validated)
+        def not_applicable_storage(rec):
+            rec["operations"]["storage"] = "not_applicable"
+            rec["basis"]["storage"] = {"kind": "unknown", "evidence": {"ref": "", "provenance": ""}}
+            rec["authorization"] = None
 
-    def test_private_denial_blocks_allowed_storage(self):
-        rec = build_valid()
-        rec["privacy"]["denial"] = True
-        validated = validate_rights_record(rec, "proj-1")
-        with self.assertRaises(RecordValidationError):
-            require_storage_allowed(validated)
+        def private_denial(rec):
+            rec["privacy"]["denial"] = True
+
+        cases = {
+            "unknown_storage_blocked": unknown_storage,
+            "not_allowed_storage_blocked": not_allowed_storage,
+            "not_applicable_storage_never_unblocks": not_applicable_storage,
+            "private_denial_blocks_allowed_storage": private_denial,
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                rec = build_valid()
+                mutate(rec)
+                validated = validate_rights_record(rec, "proj-1")
+                with self.assertRaises(RecordValidationError):
+                    require_storage_allowed(validated)
 
     def test_unknown_storage_record_remains_metadata_only_semantics(self):
         # A valid record whose storage is unknown is still a *valid* record, but it

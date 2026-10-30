@@ -36,6 +36,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
@@ -118,6 +119,7 @@ class ParserRegistrationTest(SynthesisCliBase):
 
 
 class ProposeShowTest(SynthesisCliBase):
+    @slow
     def test_propose_inert_and_show_privacy_and_gate_metadata(self):
         audit_ref, _batch = self.accepted_audit()
         content = self.synthesis_content(memo=_SECRET_MEMO)
@@ -180,6 +182,7 @@ class AcceptedGateTest(SynthesisCliBase):
         outline_ref = self.put_outline(synthesis_ref, framework_ref)
         return outline_ref
 
+    @slow
     def test_accepted_real_approved_chain_counts_and_content_opt_in(self):
         _s, _f, outline_ref = self.approved_chain()
         summary = self.cli(

@@ -32,6 +32,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -101,6 +102,7 @@ class FrontHalfEndToEndTest(WorkflowBase):
             rights=self.rights("s-parsed", "s-parsed-r1"),
         )["report_ref"]
 
+    @slow
     def test_front_half_chain_and_visual_escalation(self):
         # -- brief -> seed approval -> plan -> corpus -> freeze (real gates) -- #
         a, b, source, entries = self.standard()

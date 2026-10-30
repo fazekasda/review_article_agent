@@ -34,6 +34,7 @@ from pathlib import Path
 from unittest import mock
 
 from review_article_agent.acquisition import _pdf_child, pdf_inspection
+from _tiers import slow
 
 REAL_PYPDF = pdf_inspection._pypdf_available()
 
@@ -339,6 +340,7 @@ class ParentTests(unittest.TestCase):
               "encrypted": None, "page_count": None, "page_text_present": [], "text_preview": "",
               "identifiers": {"doi": None, "pmid": None, "pmcid": None}}
 
+    @slow
     def test_hostile_scalar_types_never_raise(self) -> None:
         hostile_values = [[], {}, [1], {"a": 1}, None, True, False, 1.5, 7, "x", ""]
         for field in GOOD_CHILD:

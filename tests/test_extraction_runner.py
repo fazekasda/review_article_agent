@@ -14,6 +14,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -686,6 +687,7 @@ import test_acquisition_manifest as acq_manifest  # noqa: E402
 from review_article_agent.acquisition.manifest import AcquisitionRepository  # noqa: E402
 
 
+@slow
 class FullFlowIntegrationTest(acq_manifest.ManifestBase):
     """Positive full flow over a REAL frozen corpus + acquired manifest.
 

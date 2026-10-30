@@ -43,6 +43,7 @@ import sys
 import unittest
 from pathlib import Path
 from urllib.parse import quote
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -195,6 +196,7 @@ class SessionIntentBackupBase(SessionIntentTestBase):
         return str(conn.execute("SELECT project_id FROM project").fetchone()[0])
 
 
+@slow
 class RoundTripStatesTest(SessionIntentBackupBase):
     def _assert_exact_intent(self, restored: ProjectStore, spec, record) -> None:
         reloaded = SessionIntentRepository(restored).get_intent(spec.dispatch_id)
@@ -276,6 +278,7 @@ class RoundTripStatesTest(SessionIntentBackupBase):
                 )
 
 
+@slow
 class HistoryAndReadOnlyTest(SessionIntentBackupBase):
     def test_moved_head_and_raw_snapshot_need_no_live_service_or_path(self) -> None:
         scenario = self._scenario()
@@ -318,6 +321,7 @@ class HistoryAndReadOnlyTest(SessionIntentBackupBase):
         self.assertEqual(reloaded.created_at_utc, record.created_at_utc)
 
 
+@slow
 class TamperRefusalTest(SessionIntentBackupBase):
     def _backup_fixture(self):
         scenario = self._scenario()
@@ -373,6 +377,7 @@ class TamperRefusalTest(SessionIntentBackupBase):
         self._assert_hook_rejects(dest)
 
 
+@slow
 class OrphanAndForeignTest(SessionIntentBackupBase):
     def _backup_fixture(self):
         scenario = self._scenario()
@@ -427,6 +432,7 @@ class OrphanAndForeignTest(SessionIntentBackupBase):
         self._assert_hook_rejects(dest, expect_static_message=False)
 
 
+@slow
 class SchemaCompatibilityTest(SessionIntentBackupBase):
     def _schema_store(self, version: int, name: str) -> ProjectStore:
         """Create a store pinned at an older schema (no later tables)."""
@@ -483,6 +489,7 @@ class SchemaCompatibilityTest(SessionIntentBackupBase):
         self.assertEqual(restored.schema_version, schema.STORE_SCHEMA_VERSION)
 
 
+@slow
 class DynamicHookTest(SessionIntentBackupBase):
     def test_hook_table_is_ordered_and_existing_hooks_are_unchanged(self) -> None:
         minimums = [minimum for minimum, _ in backup_mod._SCHEMA_VALIDATORS]

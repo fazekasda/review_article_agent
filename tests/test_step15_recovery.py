@@ -34,6 +34,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 TESTS = Path(__file__).resolve().parent
@@ -65,6 +66,7 @@ from review_article_agent.storage.human_approvals import (  # noqa: E402
 )
 
 
+@slow
 class Step15CliExitRecoveryTest(cli_jobs.JobCliTestCase):
     """AC3 (1): a CLI that exits after admission is observed by a new CLI."""
 
@@ -90,6 +92,7 @@ class Step15CliExitRecoveryTest(cli_jobs.JobCliTestCase):
         self.assertTrue(self.cli("--data-dir", self.state, "worker", "status")["worker"]["running"])
 
 
+@slow
 class Step15WorkerKillAndDedupTest(step03._AcceptanceBase):
     """AC3 (2,4,5) + AC4 (7): owned engine crash/duplicate/isolation matrix."""
 

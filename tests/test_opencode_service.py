@@ -54,6 +54,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -536,6 +537,7 @@ class FilesystemBoundaryTests(_ServiceCase):
 # --------------------------------------------------------------------------- #
 
 
+@slow
 class HttpBoundaryTests(unittest.TestCase):
     def test_redirect_refused_and_secret_not_forwarded(self) -> None:
         sink_hits: list[dict[str, str]] = []
@@ -630,6 +632,7 @@ class HttpBoundaryTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+@slow
 class RealServiceTests(_ServiceCase):
     def test_start_auth_version_config_and_stop(self) -> None:
         manager = self.manager()
@@ -1108,6 +1111,7 @@ class Repair2ContainmentTests(_ServiceCase):
         self.assertFalse(manager.secret_file.exists())
 
     @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+    @slow
     def test_start_uses_a_single_deadline_for_all_steps(self) -> None:
         manager = self.manager()
         seen: list[float] = []
@@ -1135,6 +1139,7 @@ class Repair2ContainmentTests(_ServiceCase):
         self.assertEqual(len(set(seen)), 1, seen)
 
     @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+    @slow
     def test_descriptor_refuses_tampered_document_and_requires_live_instance(self) -> None:
         manager = self.manager()
         manager.start()
@@ -1155,6 +1160,7 @@ class Repair2ContainmentTests(_ServiceCase):
             manager.descriptor()
 
     @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+    @slow
     def test_connection_refuses_changed_port_file(self) -> None:
         manager = self.manager()
         manager.start()
@@ -1164,6 +1170,7 @@ class Repair2ContainmentTests(_ServiceCase):
             manager.connection()
 
     @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+    @slow
     def test_idempotent_start_refuses_drifted_config_or_dirty_tree(self) -> None:
         manager = self.manager()
         manager.start()

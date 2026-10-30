@@ -46,6 +46,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 _HERE = Path(__file__).resolve().parent
 for _path in (str(_HERE.parent / "src"), str(_HERE)):  # src package + sibling helpers
@@ -125,6 +126,7 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+@slow
 class EndToEndManuscriptTests(DraftBase):
     """One disposable store: synthesis -> ... -> final approved exports."""
 

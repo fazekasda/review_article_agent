@@ -23,6 +23,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -173,6 +174,7 @@ class ManifestCliBase(ManifestBase):
         ]
 
 
+@slow
 class ManifestCliTests(ManifestCliBase):
     # -- queue / missing source -------------------------------------------- #
     def test_queue_without_manifest_lists_every_frozen_candidate(self):

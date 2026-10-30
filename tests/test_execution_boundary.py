@@ -35,6 +35,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
+from _tiers import slow
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -140,6 +141,7 @@ def _writer_config(*, provider=FIXTURE_PROVIDER, model_id=WRITER_MODEL_ID, varia
     return RoleConfiguration.from_mapping({"schema_version": 1, "roles": {"writer": role}})
 
 
+@slow
 class ExecutionBoundaryTest(scenario_helpers.SessionTurnPlanTestBase):
     # -- scenario ---------------------------------------------------------
     def _fixture_scenario(
@@ -401,22 +403,6 @@ class ExecutionBoundaryTest(scenario_helpers.SessionTurnPlanTestBase):
             eb.assert_fixture_session_execution_allowed(
                 scenario.manager, scenario.spec, authorized=True
             )
-
-    # -- production routes ------------------------------------------------
-    def test_production_routes_are_blocked(self) -> None:
-        for route, code in (
-            (eb.SESSION_ROUTE, "session_route_blocked"),
-            (eb.DIRECT_ROUTE, "direct_route_blocked"),
-        ):
-            with self.assertRaises(eb.ExecutionBoundaryBlocked) as ctx:
-                eb.assert_production_execution_supported(route)
-            self.assertEqual(ctx.exception.code, code)
-            self.assertIsInstance(ctx.exception, eb.ProductionExecutionBlocked)
-        for bogus in ("bogus", None, 1, ""):
-            with self.assertRaises(eb.ExecutionBoundaryBlocked) as ctx:
-                eb.assert_production_execution_supported(bogus)
-            self.assertEqual(ctx.exception.code, "route")
-        self.assertEqual(eb.PRODUCTION_SUPPORTED_ROUTES, frozenset())
 
     def test_declared_boundary_is_non_authorizing(self) -> None:
         self.assertFalse(eb.EXECUTION_BOUNDARY_IS_OUT_OF_BAND_APPROVAL)

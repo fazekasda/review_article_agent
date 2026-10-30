@@ -41,6 +41,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -557,6 +558,7 @@ class SessionRunnerTestBase(unittest.TestCase):
         )
 
 
+@slow
 class SubmitSessionTurnTest(SessionRunnerTestBase):
     def test_persists_exact_pins_and_correlation_before_admit(self) -> None:
         scenario = self._scenario()
@@ -714,6 +716,7 @@ class SubmitSessionTurnTest(SessionRunnerTestBase):
         self.assertEqual(manager.password_reads, 1)
 
 
+@slow
 class SubmitRefusalTest(SessionRunnerTestBase):
     def test_wrong_token_is_refused_without_client_calls(self) -> None:
         scenario = self._scenario()
@@ -799,6 +802,7 @@ class SubmitRefusalTest(SessionRunnerTestBase):
         self.assertEqual(self.client.calls, [])
 
 
+@slow
 class ReconcileSessionTurnTest(SessionRunnerTestBase):
     def _admitted(self, scenario):
         receipt = self._submit(scenario)
@@ -1171,6 +1175,7 @@ class ReconcileSessionTurnTest(SessionRunnerTestBase):
         self.assertEqual(len(self.client.calls), calls_before)
 
 
+@slow
 class SerialSlotArbitrationTest(SessionRunnerTestBase):
     def test_second_dispatch_is_blocked_before_admit_then_allowed_after_completion(self) -> None:
         first = self._scenario(request_id="req-1", call_id="call-1")

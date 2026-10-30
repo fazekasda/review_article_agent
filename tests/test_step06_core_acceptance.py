@@ -28,6 +28,7 @@ import unittest
 import urllib.request
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -401,6 +402,7 @@ class Ac4ImportsAndImpactTests(CoreBase):
 # --------------------------------------------------------------------------- #
 # AC5 - necessary supplements/figures are visible; integrity unknown is not clean
 # --------------------------------------------------------------------------- #
+@slow
 class Ac5SupplementIntegrityTests(CoreBase):
     def test_ac5_unavailable_unknown_or_login_supplement_is_visible_and_blocks(self):
         self.setup_frozen()

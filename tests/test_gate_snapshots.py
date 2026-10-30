@@ -527,23 +527,27 @@ class PrepareTest(GateSnapshotTestBase):
                     **_GATE_KW,
                 )
 
-    def test_bytes_corruption_rejected(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
+    def test_content_integrity_corruption_rejected(self) -> None:
+        # One table per validator: bytes and byte-size corruption, same error.
+        def bytes_corrupt(store):
             self._corrupt_revision(store, "a-base", "rev-base", content=b"tampered")
-            with self.assertRaises(GateContentIntegrityError):
-                prepare_gate_snapshot(
-                    store, self._target(store, "a-rep", "rev-rep"), rationale="r", **_GATE_KW
-                )
 
-    def test_byte_size_corruption_rejected(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
+        def byte_size_corrupt(store):
             self._corrupt_revision(store, "a-base", "rev-base", byte_size=999999)
-            with self.assertRaises(GateContentIntegrityError):
-                prepare_gate_snapshot(
-                    store, self._target(store, "a-rep", "rev-rep"), rationale="r", **_GATE_KW
-                )
+
+        cases = {"bytes": bytes_corrupt, "byte_size": byte_size_corrupt}
+        for label, corrupt in cases.items():
+            with self.subTest(case=label):
+                with self.new_store(f"p-{label}") as store:
+                    self._chain(store)
+                    corrupt(store)
+                    with self.assertRaises(GateContentIntegrityError):
+                        prepare_gate_snapshot(
+                            store,
+                            self._target(store, "a-rep", "rev-rep"),
+                            rationale="r",
+                            **_GATE_KW,
+                        )
 
     def test_superseded_live_input_rejected(self) -> None:
         with self.new_store() as store:
@@ -630,56 +634,50 @@ class PrepareTest(GateSnapshotTestBase):
                     store, self._target(store, "a-chain", "rev-2"), rationale="r", **_GATE_KW
                 )
 
-    def test_rights_identity_mismatch_rejected(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
+    def test_rights_pin_violations_rejected(self) -> None:
+        # One table per validator: every broken rights pin, same typed error.
+        def rights_id_mismatch(store):
             self._rewrite_rights(
-                store, "RIGHTS-rev-base", lambda rec: rec.__setitem__("rights_id", "RIGHTS-other")
+                store,
+                "RIGHTS-rev-base",
+                lambda rec: rec.__setitem__("rights_id", "RIGHTS-other"),
             )
-            with self.assertRaises(GateRightsError):
-                prepare_gate_snapshot(
-                    store, self._target(store, "a-rep", "rev-rep"), rationale="r", **_GATE_KW
-                )
 
-    def test_rights_row_subject_columns_inconsistency_rejected(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
+        def row_subject_inconsistency(store):
             self._corrupt_rights_row_subject(store, "RIGHTS-rev-base")
-            with self.assertRaises(GateRightsError):
-                prepare_gate_snapshot(
-                    store, self._target(store, "a-rep", "rev-rep"), rationale="r", **_GATE_KW
-                )
 
-    def test_rights_bytes_corruption_rejected(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
+        def bytes_corruption(store):
             self._corrupt_rights_bytes(store, "RIGHTS-rev-base")
-            with self.assertRaises(GateRightsError):
-                prepare_gate_snapshot(
-                    store, self._target(store, "a-rep", "rev-rep"), rationale="r", **_GATE_KW
-                )
 
-    def test_rights_subject_mismatch_rejected(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
+        def subject_revision_mismatch(store):
             self._rewrite_rights(
                 store,
                 "RIGHTS-rev-base",
                 lambda rec: rec["subject"].__setitem__("revision_id", "rev-other"),
             )
-            with self.assertRaises(GateRightsError):
-                prepare_gate_snapshot(
-                    store, self._target(store, "a-rep", "rev-rep"), rationale="r", **_GATE_KW
-                )
 
-    def test_superseded_rights_record_rejected(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
+        def superseded_record(store):
             self._insert_newer_rights(store, "RIGHTS-rev-base", 2)
-            with self.assertRaises(GateRightsError):
-                prepare_gate_snapshot(
-                    store, self._target(store, "a-rep", "rev-rep"), rationale="r", **_GATE_KW
-                )
+
+        cases = {
+            "rights_id_mismatch": rights_id_mismatch,
+            "row_subject_inconsistency": row_subject_inconsistency,
+            "bytes_corruption": bytes_corruption,
+            "subject_revision_mismatch": subject_revision_mismatch,
+            "superseded_record": superseded_record,
+        }
+        for label, corrupt in cases.items():
+            with self.subTest(case=label):
+                with self.new_store(f"p-{label}") as store:
+                    self._chain(store)
+                    corrupt(store)
+                    with self.assertRaises(GateRightsError):
+                        prepare_gate_snapshot(
+                            store,
+                            self._target(store, "a-rep", "rev-rep"),
+                            rationale="r",
+                            **_GATE_KW,
+                        )
 
     def test_unapproved_or_fixture_gate_kind_rejected(self) -> None:
         with self.new_store() as store:
@@ -1156,37 +1154,20 @@ class RevalidationTest(GateSnapshotTestBase):
             with self.assertRaises(PreparedGateDeniedError):
                 result.raise_for_status()
 
-    def test_revalidate_rederives_closure_and_rejects_a_dropped_pin(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
-            prepared = self._prepared_report(store)
-            forged = self._forge(prepared, entries=prepared.entries[:-1])
-            result = revalidate_prepared(store, forged)
-            self.assertEqual(result.status, "invalid")
-            self.assertFalse(result.ok)
-            self.assertIn(
-                gates._PROBLEM_CLOSURE_MISMATCH, result.problems  # noqa: SLF001
-            )
+    def test_revalidate_closure_mismatch_is_invalid(self) -> None:
+        # One table per validator: a dropped pin, a relabelled role, and an added
+        # dependency edge each re-derive a different closure and are invalid.
+        def dropped_pin(store, repo, prepared):
+            return self._forge(prepared, entries=prepared.entries[:-1])
 
-    def test_revalidate_rejects_a_relabelled_role(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
-            prepared = self._prepared_report(store)
+        def relabelled_role(store, repo, prepared):
             relabelled = dataclasses.replace(prepared.entries[1], role="target")
-            forged = self._forge(
+            return self._forge(
                 prepared,
                 entries=(prepared.entries[0], relabelled, *prepared.entries[2:]),
             )
-            result = revalidate_prepared(store, forged)
-            self.assertEqual(result.status, "invalid")
-            self.assertIn(
-                gates._PROBLEM_CLOSURE_MISMATCH, result.problems  # noqa: SLF001
-            )
 
-    def test_revalidate_detects_an_added_dependency_edge(self) -> None:
-        with self.new_store() as store:
-            repo = self._chain(store)
-            prepared = self._prepared_report(store)
+        def added_dependency_edge(store, repo, prepared):
             pid = store.project_id
             repo.create_artifact("a-extra", kind="document")
             self._import(repo, "a-extra", b"extra-bytes", "rev-extra")
@@ -1207,11 +1188,26 @@ class RevalidationTest(GateSnapshotTestBase):
                     "2026-10-28T00:00:00+00:00",
                 ),
             )
-            result = revalidate_prepared(store, prepared)
-            self.assertEqual(result.status, "invalid")
-            self.assertIn(
-                gates._PROBLEM_CLOSURE_MISMATCH, result.problems  # noqa: SLF001
-            )
+            return prepared
+
+        cases = {
+            "dropped_pin": (dropped_pin, True),
+            "relabelled_role": (relabelled_role, False),
+            "added_dependency_edge": (added_dependency_edge, False),
+        }
+        for label, (mutate, expect_not_ok) in cases.items():
+            with self.subTest(case=label):
+                with self.new_store(f"p-{label}") as store:
+                    repo = self._chain(store)
+                    prepared = self._prepared_report(store)
+                    subject = mutate(store, repo, prepared)
+                    result = revalidate_prepared(store, subject)
+                    self.assertEqual(result.status, "invalid")
+                    if expect_not_ok:
+                        self.assertFalse(result.ok)
+                    self.assertIn(
+                        gates._PROBLEM_CLOSURE_MISMATCH, result.problems  # noqa: SLF001
+                    )
 
     def test_revalidate_unsupported_snapshot_schema_is_invalid(self) -> None:
         with self.new_store() as store:
@@ -1361,47 +1357,30 @@ class RevalidationTest(GateSnapshotTestBase):
                     self.assertNotIn(canary, problem)
 
     def test_revalidate_malformed_stored_rights_is_invalid(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
-            prepared = self._prepared_report(store)
-            self._drop_update_trigger(store, "rights_record")
-            bad = b"{"
-            store.connection.execute(
-                "UPDATE rights_record SET canonical = ?, content_sha256 = ? "
-                "WHERE project_id = ? AND rights_id = ? AND record_revision = 1",
-                (bad, sha256_digest(bad), store.project_id, "RIGHTS-rev-base"),
-            )
-            result = revalidate_prepared(store, prepared)
-            self.assertEqual(result.status, "invalid")
-            for problem in result.problems:
-                self.assertNotIn("RIGHTS-rev-base", problem)
-
-    def test_revalidate_non_bytes_stored_rights_is_invalid(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
-            prepared = self._prepared_report(store)
-            self._drop_update_trigger(store, "rights_record")
-            store.connection.execute(
-                "UPDATE rights_record SET canonical = ?, content_sha256 = ? "
-                "WHERE project_id = ? AND rights_id = ? AND record_revision = 1",
-                (12345, sha256_digest(b"x"), store.project_id, "RIGHTS-rev-base"),
-            )
-            result = revalidate_prepared(store, prepared)
-            self.assertEqual(result.status, "invalid")
-
-    def test_revalidate_deeply_nested_stored_rights_is_invalid(self) -> None:
-        with self.new_store() as store:
-            self._chain(store)
-            prepared = self._prepared_report(store)
-            self._drop_update_trigger(store, "rights_record")
-            deep = b"[" * 5000 + b"]" * 5000
-            store.connection.execute(
-                "UPDATE rights_record SET canonical = ?, content_sha256 = ? "
-                "WHERE project_id = ? AND rights_id = ? AND record_revision = 1",
-                (deep, sha256_digest(deep), store.project_id, "RIGHTS-rev-base"),
-            )
-            result = revalidate_prepared(store, prepared)
-            self.assertEqual(result.status, "invalid")
+        # One table per validator: unparseable / non-bytes / over-deep stored
+        # rights canonical bytes are all invalid; problem text never echoes the id.
+        deep = b"[" * 5000 + b"]" * 5000
+        cases = {
+            "unparseable_json": (b"{", sha256_digest(b"{"), True),
+            "non_bytes": (12345, sha256_digest(b"x"), False),
+            "deeply_nested": (deep, sha256_digest(deep), False),
+        }
+        for label, (bad, digest, check_redaction) in cases.items():
+            with self.subTest(case=label):
+                with self.new_store(f"p-{label}") as store:
+                    self._chain(store)
+                    prepared = self._prepared_report(store)
+                    self._drop_update_trigger(store, "rights_record")
+                    store.connection.execute(
+                        "UPDATE rights_record SET canonical = ?, content_sha256 = ? "
+                        "WHERE project_id = ? AND rights_id = ? AND record_revision = 1",
+                        (bad, digest, store.project_id, "RIGHTS-rev-base"),
+                    )
+                    result = revalidate_prepared(store, prepared)
+                    self.assertEqual(result.status, "invalid")
+                    if check_redaction:
+                        for problem in result.problems:
+                            self.assertNotIn("RIGHTS-rev-base", problem)
 
     def test_revalidate_head_checks_live_entries_but_not_version_lineage(self) -> None:
         with self.new_store() as store:

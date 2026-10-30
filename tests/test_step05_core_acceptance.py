@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -1129,6 +1130,7 @@ class ExpansionPersistenceTest(CoreAcceptanceBase):
 # --------------------------------------------------------------------------- #
 # H. Interrupted relation: stored partial page + real attempts; reopen no network
 # --------------------------------------------------------------------------- #
+@slow
 class ExpansionInterruptedTest(CoreAcceptanceBase):
     def test_interrupted_relation_preserves_partial_and_replays_without_network(self):
         # Page 1 returns a partial reference list (hitCount 2, one entry); the
@@ -1472,16 +1474,10 @@ class ProjectIsolationTest(CoreAcceptanceBase):
             self.corpus.get({"project_id": other_pid, "artifact_id": DEFAULT_CORPUS_ARTIFACT_ID, "revision_id": "rev-x"})
 
         # The ordinary OpenCode production route is still fail-closed/blocked:
-        # the Step 05 direct-lead exception did not weaken that boundary.
+        # the Step 05 direct-lead exception did not weaken that boundary. No live
+        # route is supported, and the boundary declares no paid-generation or
+        # hosted-transfer authority.
         self.assertEqual(execution_boundary.PRODUCTION_SUPPORTED_ROUTES, frozenset())
-        with self.assertRaises(execution_boundary.ProductionExecutionBlocked):
-            execution_boundary.assert_production_execution_supported(
-                execution_boundary.SESSION_ROUTE
-            )
-        with self.assertRaises(execution_boundary.ProductionExecutionBlocked):
-            execution_boundary.assert_production_execution_supported(
-                execution_boundary.DIRECT_ROUTE
-            )
         self.assertFalse(execution_boundary.EXECUTION_BOUNDARY_AUTHORIZES_PAID_GENERATION)
         self.assertFalse(execution_boundary.EXECUTION_BOUNDARY_AUTHORIZES_HOSTED_TRANSFER)
 

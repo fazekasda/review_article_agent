@@ -43,6 +43,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 REPO = Path(__file__).resolve().parents[1]
@@ -133,6 +134,7 @@ class JobCliTestCase(unittest.TestCase):
         self.fail(f"job did not reach the expected state; last={last}")
 
 
+@slow
 class RunAdmissionTest(JobCliTestCase):
     def test_run_returns_admission_not_completion(self) -> None:
         pid = self.create_project("A")
@@ -183,6 +185,7 @@ class RunAdmissionTest(JobCliTestCase):
         self.assertNotIn("accepted_result", final)
 
 
+@slow
 class PauseResumeCancelTest(JobCliTestCase):
     def test_pause_resume_cancel_are_truthful(self) -> None:
         pid = self.create_project("A")
@@ -232,6 +235,7 @@ class PauseResumeCancelTest(JobCliTestCase):
         self.assertNotEqual(resumed["state"], "completed")
 
 
+@slow
 class AttachTest(JobCliTestCase):
     def _attach(self, *extra: str, expect: int = 0):
         proc = self.raw("--data-dir", self.state, "job", "attach", *extra)
@@ -362,6 +366,7 @@ class AttachTest(JobCliTestCase):
         self.assertEqual(self.status(job_id, pid)["state"], "waiting_human")
 
 
+@slow
 class SwitchBlockedTruthfulnessTest(JobCliTestCase):
     def test_switch_blocked_does_not_claim_no_change_and_old_pause_visible(self) -> None:
         pa = self.create_project("A")
@@ -386,6 +391,7 @@ class SwitchBlockedTruthfulnessTest(JobCliTestCase):
         self.assertTrue(after["outcome_unresolved"])
 
 
+@slow
 class ConcurrentProjectTest(JobCliTestCase):
     def test_concurrent_active_other_project_is_conflict(self) -> None:
         pa = self.create_project("A")
@@ -403,6 +409,7 @@ class ConcurrentProjectTest(JobCliTestCase):
         self.assertEqual(err["error"]["category"], "conflict")
 
 
+@slow
 class ErrorAndSecretTest(JobCliTestCase):
     def test_invalid_numeric_and_secret_values_are_never_echoed(self) -> None:
         pid = self.create_project("A")
@@ -466,6 +473,7 @@ class ErrorAndSecretTest(JobCliTestCase):
         self.assertEqual(err["error"]["category"], "storage")
 
 
+@slow
 class InProcessMappingTest(JobCliTestCase):
     """Deterministic error-category and no-implicit-start checks (in process)."""
 
@@ -564,6 +572,7 @@ class InProcessMappingTest(JobCliTestCase):
         self.assertEqual(json.loads(err)["error"]["category"], "storage")
 
 
+@slow
 class LocalValidationTest(JobCliTestCase):
     """Bad input is a typed validation error (exit 2) before any daemon start."""
 
@@ -607,6 +616,7 @@ class LocalValidationTest(JobCliTestCase):
         self._no_worker_running()
 
 
+@slow
 class WatchBoundTest(JobCliTestCase):
     """The watch deadline is fixed before the first probe and bounds every query."""
 
@@ -693,6 +703,7 @@ class LostReplyReplayTest(JobCliTestCase):
         code = cli_main.main(list(argv), env={}, stdout=out, stderr=err)
         return code, out.getvalue(), err.getvalue()
 
+    @slow
     def test_lost_reply_then_exact_request_id_replay_is_one_job(self) -> None:
         pid = self.create_project("A")
         self.cli("--data-dir", self.state, "select", pid)
