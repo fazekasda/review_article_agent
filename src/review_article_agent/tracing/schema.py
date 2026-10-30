@@ -421,7 +421,16 @@ def _edge(from_key, from_sha, to, ref_id, marker, passage_id, status, stop_reaso
     }
 
 
-def trace_atom(atom, *, root_source, policy, project_sources_used, acquire, depth0_verdict) -> dict:
+def trace_atom(
+    atom,
+    *,
+    root_source,
+    policy,
+    project_sources_used,
+    acquire,
+    depth0_verdict,
+    claim_sources_used=0,
+) -> dict:
     """Trace the origin of one atomic claim across cited sources (BFS).
 
     Never mutates its inputs and never admits upstream sources to the corpus.  An
@@ -429,6 +438,10 @@ def trace_atom(atom, *, root_source, policy, project_sources_used, acquire, dept
     ``acquire`` at all.  ``acquire(request)`` returns one of ``{"status":
     "acquired", "source": source}``, ``{"status": "pending_disposition"}``, or
     ``{"status": "unavailable"}``.
+
+    ``claim_sources_used`` is the number of sources already consumed by earlier
+    atoms of the *same* claim; it is added to the per-atom count for the
+    ``max_sources_per_claim`` check so the whole claim shares one budget.
     """
     _require(isinstance(atom, dict), "atom must be a JSON object")
     _require(isinstance(root_source, dict), "root_source must be a JSON object")
@@ -461,6 +474,14 @@ def trace_atom(atom, *, root_source, policy, project_sources_used, acquire, dept
         classification = classify_attribution(cur_atom, source)
         attribution = classification["attribution"]
         nodes_by_key[skey]["attribution"] = attribution
+        for marker in classification["unresolved_markers"]:
+            edges.append(
+                _edge(
+                    skey, ssha, None, None, marker.get("marker"),
+                    marker.get("passage_id"), "stopped", "unresolved_reference",
+                )
+            )
+            stopping.append("unresolved_reference")
         if attribution in ("own_result", "conceptual") and depth == 0:
             outcome, cite_source_key = "origin_traced", skey
             break
@@ -493,7 +514,7 @@ def trace_atom(atom, *, root_source, policy, project_sources_used, acquire, dept
             if depth + 1 > max_hops:
                 stop("max_hops")
                 continue
-            if sources_used >= max_claim:
+            if claim_sources_used + sources_used >= max_claim:
                 stop("claim_source_budget")
                 continue
             if project_sources_used + sources_used >= max_project:
@@ -561,6 +582,13 @@ def trace_atom(atom, *, root_source, policy, project_sources_used, acquire, dept
         else:
             outcome = "unsupported"
 
+    # Depth-0 support is adjudicated by Step 12 (the depth0_verdict): a claim
+    # whose cited, actually-read source is *not* supported cannot be reported as
+    # traced or as a warned secondary -- it is simply unsupported.  Traversal is
+    # unchanged, so any correction an upstream primary suggests is still recorded.
+    if depth0_verdict != "supported" and outcome in ("origin_traced", "secondary_warning"):
+        outcome, cite_source_key, warning, requires = "unsupported", None, None, False
+
     result.update(
         outcome=outcome,
         stopping_reasons=_dedupe(stopping),
@@ -584,20 +612,28 @@ def trace_claim(claim, *, root_source, policy, project_sources_used, acquire, de
     _require(isinstance(claim, dict), "claim must be a JSON object")
     atoms = claim.get("atoms")
     _require(isinstance(atoms, list) and atoms, "claim.atoms must be a non-empty JSON array")
-    traces = [
-        trace_atom(
+    traces = []
+    sources_so_far = 0
+    for atom in atoms:
+        trace = trace_atom(
             atom,
             root_source=root_source,
             policy=policy,
-            project_sources_used=project_sources_used,
+            project_sources_used=project_sources_used + sources_so_far,
             acquire=acquire,
             depth0_verdict=depth0_verdict,
+            claim_sources_used=sources_so_far,
         )
-        for atom in atoms
-    ]
+        traces.append(trace)
+        sources_so_far += trace["sources_used"]
     outcomes = {trace["outcome"] for trace in traces}
     outcome = traces[0]["outcome"] if len(outcomes) == 1 else "mixed_outcomes"
-    return {"claim_id": claim.get("claim_id"), "atoms": traces, "outcome": outcome}
+    return {
+        "claim_id": claim.get("claim_id"),
+        "atoms": traces,
+        "outcome": outcome,
+        "sources_used": sources_so_far,
+    }
 
 
 # --------------------------------------------------------------------------- #

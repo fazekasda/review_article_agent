@@ -501,6 +501,36 @@ class TraceAtomTests(unittest.TestCase):
         self.assertEqual(len(acquire.calls), 0)
         self.assertEqual(trace["requests"], [])
 
+    def test_depth0_unsupported_overrides_own_result_origin(self):
+        # Depth-0 is an own result, but Step 12 did not verify support: the atom
+        # must be "unsupported", never origin_traced.
+        review = _src("review", "shaR", [("p1", "We found that X causes Y.")])
+        acquire = _Acquire({})
+        trace = trace_atom(
+            _atom("a1", "X causes Y.", ["p1"]),
+            root_source=review, policy=POLICY, project_sources_used=0,
+            acquire=acquire, depth0_verdict="unsupported",
+        )
+        self.assertEqual(trace["outcome"], "unsupported")
+        self.assertIsNone(trace["cite_source_key"])
+        self.assertFalse(trace["requires_final_human_approval"])
+
+    def test_unresolved_marker_records_stop_reason(self):
+        review = _src(
+            "review", "shaR",
+            [("p1", "According to [1], X inhibits Y.")],
+            [_ref("r1", doi="10.1/x")],
+            [_link("p1", "[1]", "unresolved", ["r1"])],
+        )
+        acquire = _Acquire({})
+        trace = trace_atom(
+            _atom("a1", "X inhibits Y.", ["p1"]),
+            root_source=review, policy=POLICY, project_sources_used=0,
+            acquire=acquire, depth0_verdict="supported",
+        )
+        self.assertIn("unresolved_reference", trace["stopping_reasons"])
+        self.assertEqual(len(acquire.calls), 0)
+
 
 class TraceClaimTests(unittest.TestCase):
     def test_compound_claim_mixed_outcomes(self):
@@ -524,6 +554,41 @@ class TraceClaimTests(unittest.TestCase):
         self.assertEqual(trace["outcome"], "mixed_outcomes")
         self.assertEqual(trace["atoms"][0]["outcome"], "origin_traced")
         self.assertEqual(trace["atoms"][1]["outcome"], "secondary_warning")
+
+    def test_claim_budget_shared_across_atoms(self):
+        policy = dict(POLICY)
+        policy["max_sources_per_claim"] = 1
+        review = _src(
+            "review", "shaR",
+            [
+                ("p1", "As reported [1], P causes Q."),
+                ("p2", "As reported [2], M causes N."),
+            ],
+            [_ref("r1", doi="10.a"), _ref("r2", doi="10.b")],
+            [
+                _link("p1", "[1]", "resolved", ["r1"]),
+                _link("p2", "[2]", "resolved", ["r2"]),
+            ],
+        )
+        acquire = _Acquire({
+            "r1": {"status": "acquired", "source": _src("primary1", "sha1", [("p1", "We found P causes Q.")])},
+            "r2": {"status": "acquired", "source": _src("primary2", "sha2", [("p1", "We found M causes N.")])},
+        })
+        claim = {
+            "claim_id": "c1",
+            "atoms": [
+                _atom("a1", "P causes Q.", ["p1"]),
+                _atom("a2", "M causes N.", ["p2"]),
+            ],
+        }
+        trace = trace_claim(
+            claim, root_source=review, policy=policy, project_sources_used=0,
+            acquire=acquire, depth0_verdict="supported",
+        )
+        self.assertEqual(trace["atoms"][0]["outcome"], "origin_traced")
+        self.assertIn("claim_source_budget", trace["atoms"][1]["stopping_reasons"])
+        self.assertEqual(trace["sources_used"], 1)
+        self.assertEqual(len(acquire.calls), 1)
 
 
 class FingerprintTests(unittest.TestCase):
