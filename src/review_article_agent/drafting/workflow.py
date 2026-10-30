@@ -1131,9 +1131,7 @@ class DraftingWorkflowRepository:
                 )
                 for slot in ("planner", "writer"):
                     require(
-                        parent_ws[slot]["mapping_id"] == workspace[slot]["mapping_id"]
-                        and parent_ws[slot]["session_id"]
-                        == workspace[slot]["session_id"],
+                        parent_ws[slot]["binding_id"] == workspace[slot]["binding_id"],
                         "an edit may not diverge the workspace runtime mapping pins",
                     )
             deps = [
