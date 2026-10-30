@@ -39,9 +39,11 @@ stage has already begun; this mirrors the real workflow, where some stages
 begun, the first stage without a proposal is the current one.
 
 Exact CLI commands are reported only for actions that already exist in
-:mod:`review_article_agent.cli`; where no CLI exists yet (review, tracing,
-delivery) ``next_command`` is ``None`` and the detail names the library entry
-point.
+:mod:`review_article_agent.cli`; the review, tracing, and delivery stages now
+report their deterministic CLI command (kickoff 16 §9) and name the library entry
+point alongside it. A model-backed stage action (for example the section review
+itself) is submitted as a worker job through ``generation run submit``; the
+read/record CLI command is the deterministic next action reported here.
 
 Re-running the resolver is idempotent: it writes nothing, so two calls over an
 unchanged store return equal output.
@@ -598,11 +600,15 @@ STAGES: tuple[Stage, ...] = (
         check=_check_review,
         produce=_human(
             "author",
-            None,
+            "review-article-agent review status --review-id <REVIEW_ID>",
             inputs={
-                "command": None,
+                "command": "review status --review-id <REVIEW_ID>",
                 "library": "review_article_agent.review.workflow.SectionReviewRepository.run",
-                "note": "no CLI exists yet for review (kickoff 16 §9); run the review library directly",
+                "note": (
+                    "the model-backed section review runs as a worker job "
+                    "(`generation run submit`); `review show`/`review status` read "
+                    "the recorded state (kickoff 16 §9)"
+                ),
             },
         ),
     ),
@@ -614,11 +620,19 @@ STAGES: tuple[Stage, ...] = (
         check=_check_tracing,
         produce=_human(
             "author",
-            None,
+            "review-article-agent tracing run --trace-id <TRACE_ID> "
+            "--draft-artifact-id <ID> --draft-revision-id <ID> "
+            "--review-id <REVIEW_ID> --policy-file <POLICY_JSON> --rights-file <RIGHTS_JSON>",
             inputs={
-                "command": None,
+                "command": "tracing run --trace-id <TRACE_ID> --draft-artifact-id <ID> "
+                "--draft-revision-id <ID> --review-id <REVIEW_ID> "
+                "--policy-file <POLICY_JSON> --rights-file <RIGHTS_JSON>",
                 "library": "review_article_agent.tracing.workflow.OriginTraceRepository.run",
-                "note": "no CLI exists yet for tracing (kickoff 16 §9); run the tracing library directly",
+                "note": (
+                    "deterministic and local: derives claims/sources from the real "
+                    "draft/package/review state and the already acquired sources; "
+                    "no network (kickoff 16 §9)"
+                ),
             },
         ),
     ),
@@ -630,11 +644,19 @@ STAGES: tuple[Stage, ...] = (
         check=_check_delivery,
         produce=_human(
             "author",
-            None,
+            "review-article-agent delivery start --delivery-id <DELIVERY_ID> "
+            "--section <SECTION_ID> --review-id <REVIEW_ID> --trace-id <TRACE_ID> "
+            "--rights-file <RIGHTS_JSON>",
             inputs={
-                "command": None,
+                "command": "delivery start --delivery-id <DELIVERY_ID> "
+                "--section <SECTION_ID> --review-id <REVIEW_ID> --trace-id <TRACE_ID> "
+                "--rights-file <RIGHTS_JSON>",
                 "library": "review_article_agent.delivery.workflow.DeliveryRepository.start_global_review",
-                "note": "no CLI exists yet for delivery (kickoff 16 §9); run the delivery library directly",
+                "note": (
+                    "starts the global review from recorded review/trace states; "
+                    "`delivery export` writes the Markdown/BibTeX/RIS package after "
+                    "the exact-revision final approval (kickoff 16 §9)"
+                ),
             },
         ),
     ),

@@ -1143,13 +1143,128 @@ The JSON output is:
 * **Not started.** When no proposal revision exists and no later stage has begun,
   `blocked_on` is `null` and `next_action` describes how to produce the proposal,
   naming the exact CLI command where one exists.
-* **No CLI yet.** Where no CLI exists for the action (review, tracing, delivery;
-  kickoff 16 §9), `next_command` is `null` and the `detail`/`inputs` name the library
-  entry point (`SectionReviewRepository.run`, `OriginTraceRepository.run`,
-  `DeliveryRepository.start_global_review`).
+* **CLI command.** The review, tracing, and delivery stages now report their
+  deterministic CLI command (kickoff 16 §9) in `next_action.inputs.command`
+  (`review status`, `tracing run`, `delivery start`) alongside the library entry
+  point (`SectionReviewRepository.run`, `OriginTraceRepository.run`,
+  `DeliveryRepository.start_global_review`). A model-backed stage action (the
+  section review itself) is submitted as a worker job through
+  `generation run submit`; the read/record command is the deterministic next
+  action reported here.
 
 The command never dispatches a model, session, worker job, or network request,
 records no approval, and writes nothing; re-running it over an unchanged store
 returns equal output (idempotent). The project is opened through the registry with
 an expected project id, and failures use the exit categories of §3 with static,
 value-free messages.
+
+## 20. Section review — `review` (kickoff 16 §9)
+
+The root `review` group is a **read-only, local** surface over
+[`review/workflow.py`](../src/review_article_agent/review/workflow.py). It reads a
+durable Step 12 section-review state; it never dispatches a model, records an
+approval, or exports.
+
+| Command | Synopsis |
+| --- | --- |
+| `review show --review-id ID [--project ID] [--content]` | Read one section review's safe state summary. |
+| `review status --review-id ID [--project ID] [--content]` | Read the review's status (rounds used, status, required human action). |
+
+The safe summary carries `status`, `phase`, `rounds_used` (`critique`/`fact_check`),
+`critic_calls`/`repair_calls`, `finding_count`/`check_count`, the
+`required_human_action`, the read-only validation status, and the
+`different_model`/`independent_human_verification` engine flags. The private raw
+state (draft text, findings, checks) is included only with `--content`
+(`private_content_included`). Every output carries `authorizes_execution=false`,
+`authorizes_export=false`, and `scientific_validation=false`. An unknown review id
+is a `validation` error whose message never echoes the id.
+
+The model-backed review (critic/repair) is submitted as a worker job through
+`generation run submit`; `review show`/`review status` are the deterministic
+read steps.
+
+## 21. Citation-origin tracing — `tracing` (kickoff 16 §9)
+
+The root `tracing` group is a **deterministic, local** surface over
+[`tracing/workflow.py`](../src/review_article_agent/tracing/workflow.py). It
+derives the claim/source graph from the **real** draft, its approved drafting
+package, and the recorded section-review checks, and resolves the acquisition port
+over the project's already acquired sources; it makes **no network call**.
+
+| Command | Synopsis |
+| --- | --- |
+| `tracing run --trace-id ID --draft-artifact-id ID --draft-revision-id ID [--review-id ID] [--policy-file PATH] --rights-file PATH [--project ID]` | Derive and record one origin trace (no network). |
+| `tracing show --trace-id ID [--project ID] [--content]` | Read one trace's safe state summary. |
+| `tracing coverage --trace-id ID [--project ID] [--content]` | Read the read-only `origin_coverage` audit. |
+
+* `tracing run` reads the exact draft result and its approved drafting package via
+  the drafting workflow, builds `claims`/`sources`/`source_digests` with
+  `tracing.inputs.claims_and_sources`, resolves the injected acquisition port with
+  `tracing.acquisition_port.make_acquire_port`, and records a resumable trace.
+  `--policy-file` supplies the four required per-project limits; **without it the
+  trace is `configuration_required` and nothing is acquired**.
+* `--review-id` supplies the recorded section review whose checks annotate the
+  trace; without it the checks list is empty.
+* `--rights-file` is a strict JSON `RightsRecord` **template**; the CLI rebinds its
+  subject/`rights_id` to each exact revision the workflow records (the workflow
+  assigns its own opaque revision ids).
+* `tracing coverage` reports `counts`, `requires_human_approval`, `blockers`,
+  `complete`, and `export_ready`; `edits_applied` is always `false`.
+* Every output carries the non-authorizing flags; the private raw trace state is
+  included only with `--content`.
+
+## 22. Delivery — `delivery` (kickoff 16 §9)
+
+The root `delivery` group is a **local, human-gated** surface over
+[`delivery/workflow.py`](../src/review_article_agent/delivery/workflow.py). It
+covers the deterministic/human steps and the manuscript/BibTeX/RIS export; it
+never dispatches a model or reaches the network.
+
+| Command | Synopsis |
+| --- | --- |
+| `delivery start --delivery-id ID --section ID --review-id ID --trace-id ID --rights-file PATH [--project ID]` | Start the global review from recorded review/trace states (repeat `--section`/`--review-id`/`--trace-id` in lockstep). |
+| `delivery freshness --delivery-id ID --cutoff-date DATE --decision {accept_cutoff,authorize_topup} [--approval-id ID] [--query-window-end DATE] --rights-file PATH` | Record the explicit freshness decision (never silently adds papers). |
+| `delivery notes add --delivery-id ID --file PATH --rights-file PATH` | Store the human-notes action plan from a JSON array file. |
+| `delivery notes apply --delivery-id ID --batch-file PATH --approval-id ID --rights-file PATH` | Apply one human-approved notes batch; a non-empty `--approval-id` is required and a batch is never auto-applied. |
+| `delivery revalidate --delivery-id ID --paragraph ID --package-file PATH [--trace-id ID] --rights-file PATH` | Re-run the Step 12/13 checks for the named paragraphs from the approved package (never trusts the caller). |
+| `delivery approve --prepare --delivery-id ID [--hashes-file PATH] [--approver LABEL]` | Print the exact-revision final-approval manifest digest and the `gate confirm` command; **records nothing**. |
+| `delivery export --delivery-id ID --out-dir PATH --package-file PATH --rights-file PATH [--hashes-file PATH] [--policy-file PATH] [--ai-use-file PATH] [--venue NAME]` | Write the export package after the exact-revision final approval. |
+| `delivery status --delivery-id ID [--project ID]` | Read one delivery's safe status summary. |
+
+* `delivery start` requires every section to be review-complete and origin-complete
+  (the workflow's `global_review_ready`/`origin_coverage` gate); the recorded
+  review status and trace coverage fill the section list. `--section`/`--review-id`/
+  `--trace-id` are paired by index and must have equal length.
+* `--rights-file` is a strict JSON `RightsRecord` **template**; the CLI rebinds its
+  subject/`rights_id` to each exact revision the workflow records.
+* `delivery notes apply --batch-file` is a JSON object
+  `{"batch_id": ID, "edits": [{"note_id", "paragraph_id", "new_text", "kind"}]}`.
+  Only notes whose plan action is `local_edit`/`claim_edit` may be applied; a
+  claim/citation edit (or a wording edit that changes numbers/citations) marks the
+  paragraph stale for revalidation.
+* `delivery approve` **cannot yet record** the final approval through the CLI: that
+  requires owner authentication (a controlling-terminal confirmation) and a wiring
+  between the named-gate ledger and `DeliveryRepository.final_approval`. So the
+  command only runs with `--prepare`, which prints the manifest digest
+  (`manifest_digest`) and the exact `gate confirm` command, and reports the gap
+  (`approval_recorded=false`, `human_authenticated=false`). Without `--prepare` it
+  refuses with a `validation` error explaining the gap. Nothing is written.
+* `delivery export` builds `references`/`corpus` with
+  `delivery.export.bibliography_from_packages` from the approved drafting packages
+  (`--package-file`, repeatable), reads the recorded manuscript, and writes
+  `manuscript.md`, `references.bib`, `references.ris`, `companion.md`,
+  `summary.md`, `ai_declaration.md`, and `export_manifest.json`. It **refuses,
+  writing nothing**, when the approval is missing/stale for the exact revision and
+  artifact hashes (for example after a notes edit) or when a bibliography entry is
+  inconsistent with the manuscript. An `--out-dir` inside the `--data-dir` (or a
+  project's `.review_article_agent` directory) is refused like `backup create`.
+  The output reports the per-file `file_hashes` (matching the manifest's
+  `file_hashes` for the six content files) and `consistency_ok`.
+* `delivery status` reports the global-review status/rounds, the freshness status,
+  whether notes are planned, the applied-batch count, the paragraphs still
+  requiring revalidation, and whether an approval/export is recorded. The private
+  raw state is never emitted.
+
+Errors use the exit categories of §3 with static, value-free messages, and every
+output carries `authorizes_execution=false`, `authorizes_export=false`, and
+`scientific_validation=false`.

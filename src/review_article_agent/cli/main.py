@@ -158,6 +158,21 @@ from .drafting import (
     build_drafting_parser,
     dispatch_drafting,
 )
+from .review import (
+    ReviewControlError,
+    build_review_parser,
+    dispatch_review,
+)
+from .tracing import (
+    TracingControlError,
+    build_tracing_parser,
+    dispatch_tracing,
+)
+from .delivery import (
+    DeliveryControlError,
+    build_delivery_parser,
+    dispatch_delivery,
+)
 from .pipeline import (
     PipelineControlError,
     build_pipeline_parser,
@@ -322,6 +337,9 @@ def build_parser() -> argparse.ArgumentParser:
     build_extraction_parser(sub)
     build_synthesis_parser(sub)
     build_drafting_parser(sub)
+    build_review_parser(sub)
+    build_tracing_parser(sub)
+    build_delivery_parser(sub)
     build_pipeline_parser(sub)
 
     return parser
@@ -1084,6 +1102,27 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
                 f"unknown drafting command {args.drafting_command!r}"
             )
         return result
+    if args.command == "review":
+        result = dispatch_review(args, ctx)
+        if result is None:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(
+                f"unknown review command {args.review_command!r}"
+            )
+        return result
+    if args.command == "tracing":
+        result = dispatch_tracing(args, ctx)
+        if result is None:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(
+                f"unknown tracing command {args.tracing_command!r}"
+            )
+        return result
+    if args.command == "delivery":
+        result = dispatch_delivery(args, ctx)
+        if result is None:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(
+                f"unknown delivery command {args.delivery_command!r}"
+            )
+        return result
     if args.command == "pipeline":
         result = dispatch_pipeline(args, ctx)
         if result is None:  # pragma: no cover - argparse enforces choices
@@ -1219,6 +1258,26 @@ _PIPELINE_CATEGORY_EXITS = {
 }
 
 
+#: Review/tracing/delivery read/record error categories mapped to the CLI's stable
+#: exit codes. Each raises its own control error with a curated, value-free
+#: message; a failure records nothing and authorizes nothing.
+_REVIEW_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+_TRACING_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+_DELIVERY_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+
+
 def _redirect_broken_stdout(out: TextIO) -> None:
     """Point a broken stdout stream's file descriptor at the null device.
 
@@ -1310,6 +1369,12 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
         return exc.category, _DRAFTING_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, PipelineControlError):
         return exc.category, _PIPELINE_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, ReviewControlError):
+        return exc.category, _REVIEW_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, TracingControlError):
+        return exc.category, _TRACING_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, DeliveryControlError):
+        return exc.category, _DELIVERY_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1366,6 +1431,15 @@ def _error_message(exc: BaseException, category: str) -> str:
         return str(exc)
     if isinstance(exc, PipelineControlError):
         # Authored in ``cli.pipeline``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, ReviewControlError):
+        # Authored in ``cli.review``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, TracingControlError):
+        # Authored in ``cli.tracing``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, DeliveryControlError):
+        # Authored in ``cli.delivery``; a static, curated, value-free message.
         return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):

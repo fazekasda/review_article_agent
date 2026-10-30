@@ -222,8 +222,9 @@ class DraftingReviewStageTest(DraftBase):
         self.assertIsNone(result["blocked_on"])
         self.assertIn("drafting.blueprint", result["completed"])
         self.assertIn("review.sections", result["completed"])
-        # No CLI exists for tracing yet: the next action names the library.
-        self.assertIsNone(result["next_action"]["inputs"]["command"])
+        # The tracing CLI now exists: the next action names the deterministic
+        # command and the library entry point.
+        self.assertIn("tracing run", result["next_action"]["inputs"]["command"])
         self.assertIn(
             "OriginTraceRepository.run", result["next_action"]["inputs"]["library"]
         )
