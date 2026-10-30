@@ -106,6 +106,7 @@ import json
 from ..domain.errors import ReviewAgentError
 from ..domain.records import RecordValidationError, canonical_json, validate_ref
 from ..parsing.repository import _NestedStore
+from ..storage import opmemo
 from ..storage.artifacts import ArtifactRepository, DependencyRef, sha256_digest
 from ..storage.human_approvals import HumanApprovalRepository
 from ..synthesis.workflow import SynthesisWorkflowError, SynthesisWorkflowRepository
@@ -272,6 +273,29 @@ def require(condition, message=None):
             message
             or "drafting input, dependency, or approval is invalid or stale"
         )
+
+
+def _memo_key(*parts):
+    """Return a stable tuple key, or ``None`` when an argument is not keyable.
+
+    See :func:`review_article_agent.synthesis.workflow._memo_key`; an unkeyable
+    argument makes the caller run the original body uncached, so fail-closed
+    behaviour is unchanged.
+    """
+    try:
+        return tuple(
+            part if isinstance(part, str) else canonical_json(part).decode()
+            for part in parts
+        )
+    except (RecordValidationError, TypeError, ValueError):
+        return None
+
+
+def _memoize(conn, key, compute):
+    """Run ``compute`` under the operation-scoped memo, or directly if unkeyable."""
+    if key is None:
+        return compute()
+    return opmemo.memoize(conn, key, compute)
 
 
 class DraftingWorkflowRepository:
@@ -886,22 +910,34 @@ class DraftingWorkflowRepository:
         never satisfies the gate.  Everything runs in one transaction.
         """
         with self._nested.transaction():
-            ref = self._ref(ref)
-            payload = self.read(ref, "blueprint", current=True)
-            require(
-                self._gate_satisfied(ref),
-                "the blueprint's own named owner gate is not active and approved",
+            key = _memo_key(
+                "drafting.workflow.require_blueprint",
+                self.store.project_id,
+                self._ref(ref),
             )
-            return {
-                **payload,
-                "blueprint_ref": ref,
-                "gate_kind": GATE_KIND,
-                "gate_id": GATE_ID,
-                "approved": True,
-                "authorizes_execution": False,
-                "authorizes_export": False,
-                "notice": NOTICE,
-            }
+            return _memoize(
+                self.store.connection,
+                key,
+                lambda: self._require_blueprint(ref),
+            )
+
+    def _require_blueprint(self, ref):
+        ref = self._ref(ref)
+        payload = self.read(ref, "blueprint", current=True)
+        require(
+            self._gate_satisfied(ref),
+            "the blueprint's own named owner gate is not active and approved",
+        )
+        return {
+            **payload,
+            "blueprint_ref": ref,
+            "gate_kind": GATE_KIND,
+            "gate_id": GATE_ID,
+            "approved": True,
+            "authorizes_execution": False,
+            "authorizes_export": False,
+            "notice": NOTICE,
+        }
 
     def status(self, ref, kind="blueprint"):
         """Return a safe, structured status for one current drafting revision.

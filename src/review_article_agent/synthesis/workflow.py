@@ -43,6 +43,7 @@ from ..extraction.workflow import (
 )
 from ..parsing.repository import _NestedStore
 from ..runtime.gates import MAX_GATE_SNAPSHOT_ENTRIES
+from ..storage import opmemo
 from ..storage.artifacts import ArtifactRepository, DependencyRef, sha256_digest
 from ..storage.human_approvals import HumanApprovalRepository
 from .schema import (
@@ -99,6 +100,36 @@ def require(condition, message=None):
             message
             or "synthesis workflow input, dependency, or approval is invalid or stale"
         )
+
+
+def _memo_key(*parts):
+    """Return a stable tuple key, or ``None`` when an argument is not keyable.
+
+    Each part is a string or a portable-JSON value; a non-string is canonicalised
+    with :func:`canonical_json`.  A value that is not portable JSON (so would not
+    re-read identically from the store) makes the whole call unkeyable, and the
+    caller then runs the original body uncached -- fail-closed behaviour is
+    unchanged.
+    """
+    try:
+        return tuple(
+            part if isinstance(part, str) else canonical_json(part).decode()
+            for part in parts
+        )
+    except (RecordValidationError, TypeError, ValueError):
+        return None
+
+
+def _memoize(conn, key, compute):
+    """Run ``compute`` under the operation-scoped memo, or directly if unkeyable.
+
+    The memo only reuses a result inside one transaction and drops it at every
+    transaction boundary (see :mod:`review_article_agent.storage.opmemo`); a
+    ``None`` key means "do not memoize this call".
+    """
+    if key is None:
+        return compute()
+    return opmemo.memoize(conn, key, compute)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,6 +209,20 @@ class SynthesisWorkflowRepository:
 
     # -- normalized derivation (re-run the pure schema on durable inputs) ----- #
     def _normalize(self, kind, input_payload):
+        # The validated result is a pure function of the durable inputs and the
+        # database snapshot, so within one operation it is computed once.  The
+        # key is the proposal kind plus the exact stored input payload; an
+        # unkeyable payload simply runs uncached.
+        key = _memo_key(
+            "synthesis._normalize", self.store.project_id, kind, input_payload
+        )
+        return _memoize(
+            self.store.connection,
+            key,
+            lambda: self._normalize_uncached(kind, input_payload),
+        )
+
+    def _normalize_uncached(self, kind, input_payload):
         if kind == "synthesis":
             evidence = ExtractionWorkflowRepository(self.store).require_for_synthesis(
                 input_payload["audit_ref"]
@@ -418,61 +463,97 @@ class SynthesisWorkflowRepository:
     def require_synthesis(self, ref):
         """Require one accepted synthesis: normalized, unblocked, and gate-approved."""
         with _NestedStore(self.store).transaction():
-            payload = self._read(ref, "synthesis")
-            require(self._normalize("synthesis", payload["input"]) == payload["result"])
-            # A blocked statement result is refused regardless of any in-band
-            # ``status`` value; authority is the named gate only.
-            blocked = [s["statement_id"] for s in payload["result"]["statements"] if s["blocked"]]
-            require(not blocked, "synthesis has a blocked statement result")
-            self._approved(ref, "synthesis")
-            return payload["result"]
+            key = _memo_key(
+                "synthesis.require_synthesis", self.store.project_id, self._ref(ref)
+            )
+            return _memoize(
+                self.store.connection, key, lambda: self._require_synthesis(ref)
+            )
+
+    def _require_synthesis(self, ref):
+        payload = self._read(ref, "synthesis")
+        require(self._normalize("synthesis", payload["input"]) == payload["result"])
+        # A blocked statement result is refused regardless of any in-band
+        # ``status`` value; authority is the named gate only.
+        blocked = [s["statement_id"] for s in payload["result"]["statements"] if s["blocked"]]
+        require(not blocked, "synthesis has a blocked statement result")
+        self._approved(ref, "synthesis")
+        return payload["result"]
 
     def require_framework(self, ref):
         """Require an accepted framework: accepted synthesis, no unclassified, gate."""
         with _NestedStore(self.store).transaction():
-            payload = self._read(ref, "framework")
-            require(self._normalize("framework", payload["input"]) == payload["result"])
-            self.require_synthesis(payload["input"]["synthesis_ref"])
-            require(
-                not payload["result"]["unclassified_concepts"],
-                "framework has unclassified concepts",
+            key = _memo_key(
+                "synthesis.require_framework", self.store.project_id, self._ref(ref)
             )
-            self._approved(ref, "framework")
-            return payload["result"]
+            return _memoize(
+                self.store.connection, key, lambda: self._require_framework(ref)
+            )
+
+    def _require_framework(self, ref):
+        payload = self._read(ref, "framework")
+        require(self._normalize("framework", payload["input"]) == payload["result"])
+        self.require_synthesis(payload["input"]["synthesis_ref"])
+        require(
+            not payload["result"]["unclassified_concepts"],
+            "framework has unclassified concepts",
+        )
+        self._approved(ref, "framework")
+        return payload["result"]
 
     def require_outline(self, ref):
         """Require an accepted outline over the same accepted synthesis/framework."""
         with _NestedStore(self.store).transaction():
-            payload = self._read(ref, "outline")
-            require(self._normalize("outline", payload["input"]) == payload["result"])
-            self.require_synthesis(payload["input"]["synthesis_ref"])
-            self.require_framework(payload["input"]["framework_ref"])
-            self._approved(ref, "outline")
-            return payload["result"]
+            key = _memo_key(
+                "synthesis.require_outline", self.store.project_id, self._ref(ref)
+            )
+            return _memoize(
+                self.store.connection, key, lambda: self._require_outline(ref)
+            )
+
+    def _require_outline(self, ref):
+        payload = self._read(ref, "outline")
+        require(self._normalize("outline", payload["input"]) == payload["result"])
+        self.require_synthesis(payload["input"]["synthesis_ref"])
+        self.require_framework(payload["input"]["framework_ref"])
+        self._approved(ref, "outline")
+        return payload["result"]
 
     def require_for_blueprints(self, outline_ref):
         """Return exact approved refs and structured context for future Step 11."""
         with _NestedStore(self.store).transaction():
-            outline_ref = self._ref(outline_ref)
-            outline_payload = self._read(outline_ref, "outline")
-            self.require_outline(outline_ref)
-            synthesis_ref = self._ref(outline_payload["input"]["synthesis_ref"])
-            framework_ref = self._ref(outline_payload["input"]["framework_ref"])
-            synthesis_payload = self._read(synthesis_ref, "synthesis")
-            framework_payload = self._read(framework_ref, "framework")
-            return {
-                "accepted": True,
-                "outline_ref": dict(outline_ref),
-                "framework_ref": framework_ref,
-                "synthesis_ref": synthesis_ref,
-                "audit_ref": self._ref(synthesis_payload["input"]["audit_ref"]),
-                "outline": outline_payload["result"],
-                "framework": framework_payload["result"],
-                "synthesis": synthesis_payload["result"],
-                "gates_satisfied": [GATE_SYNTHESIS, GATE_FRAMEWORK, GATE_OUTLINE],
-                "authority": "named_gate_only",
-                "notice": NOTICE,
-            }
+            key = _memo_key(
+                "synthesis.require_for_blueprints",
+                self.store.project_id,
+                self._ref(outline_ref),
+            )
+            return _memoize(
+                self.store.connection,
+                key,
+                lambda: self._require_for_blueprints(outline_ref),
+            )
+
+    def _require_for_blueprints(self, outline_ref):
+        outline_ref = self._ref(outline_ref)
+        outline_payload = self._read(outline_ref, "outline")
+        self.require_outline(outline_ref)
+        synthesis_ref = self._ref(outline_payload["input"]["synthesis_ref"])
+        framework_ref = self._ref(outline_payload["input"]["framework_ref"])
+        synthesis_payload = self._read(synthesis_ref, "synthesis")
+        framework_payload = self._read(framework_ref, "framework")
+        return {
+            "accepted": True,
+            "outline_ref": dict(outline_ref),
+            "framework_ref": framework_ref,
+            "synthesis_ref": synthesis_ref,
+            "audit_ref": self._ref(synthesis_payload["input"]["audit_ref"]),
+            "outline": outline_payload["result"],
+            "framework": framework_payload["result"],
+            "synthesis": synthesis_payload["result"],
+            "gates_satisfied": [GATE_SYNTHESIS, GATE_FRAMEWORK, GATE_OUTLINE],
+            "authority": "named_gate_only",
+            "notice": NOTICE,
+        }
 
     # -- writes -------------------------------------------------------------- #
     def propose(self, kind, payload, *, artifact_id, revision_id, rights, parent_revision_id=None):

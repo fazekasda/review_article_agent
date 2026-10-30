@@ -64,6 +64,7 @@ from ..discovery.candidates import CandidateError, CandidateRepository
 from ..domain.errors import ReviewAgentError
 from ..domain.records import RecordValidationError, canonical_json, validate_ref
 from ..extraction.workflow import ExtractionWorkflowError, ExtractionWorkflowRepository
+from ..storage import opmemo
 from ..synthesis.workflow import SynthesisWorkflowError, SynthesisWorkflowRepository
 
 #: Package envelope schema version.
@@ -112,6 +113,29 @@ def citation_key(project_id, candidate_id):
     """
     material = canonical_json(["drafting.citation", project_id, candidate_id])
     return "cit_" + hashlib.sha256(material).hexdigest()[:32]
+
+
+def _memo_key(*parts):
+    """Return a stable tuple key, or ``None`` when an argument is not keyable.
+
+    See :func:`review_article_agent.synthesis.workflow._memo_key`; an unkeyable
+    argument makes the caller run the original body uncached, so fail-closed
+    behaviour is unchanged.
+    """
+    try:
+        return tuple(
+            part if isinstance(part, str) else canonical_json(part).decode()
+            for part in parts
+        )
+    except (RecordValidationError, TypeError, ValueError):
+        return None
+
+
+def _memoize(conn, key, compute):
+    """Run ``compute`` under the operation-scoped memo, or directly if unkeyable."""
+    if key is None:
+        return compute()
+    return opmemo.memoize(conn, key, compute)
 
 
 def _ambiguity(tokens):
@@ -361,185 +385,198 @@ class DraftingPackageRepository:
 
     def _build(self, outline_ref, section_id):
         with self.store.transaction():
-            context = SynthesisWorkflowRepository(self.store).require_for_blueprints(
-                outline_ref
+            key = _memo_key(
+                "drafting.package._build",
+                self.project_id,
+                validate_ref(outline_ref, self.project_id),
+                section_id,
+            )
+            return _memoize(
+                self.store.connection,
+                key,
+                lambda: self._build_uncached(outline_ref, section_id),
             )
 
-            outline = context["outline"]
-            section = next(
-                (s for s in outline["sections"] if s["section_id"] == section_id), None
+    def _build_uncached(self, outline_ref, section_id):
+        context = SynthesisWorkflowRepository(self.store).require_for_blueprints(
+            outline_ref
+        )
+
+        outline = context["outline"]
+        section = next(
+            (s for s in outline["sections"] if s["section_id"] == section_id), None
+        )
+        if section is None:
+            raise DraftingPackageError(
+                "the requested section is not part of the approved outline"
             )
-            if section is None:
+
+        synthesis = context["synthesis"]
+        framework = context["framework"]
+        audit_ref = context["audit_ref"]
+
+        extraction = ExtractionWorkflowRepository(self.store)
+        try:
+            accepted = extraction.require_for_synthesis(audit_ref)
+            batch = extraction.require_batch(accepted["batch_ref"])
+        except ExtractionWorkflowError as exc:
+            raise DraftingPackageError(
+                "the accepted extraction evidence is not consumable"
+            ) from exc
+        acquisition_ref = accepted["acquisition_ref"]
+
+        try:
+            manifest = AcquisitionRepository(self.store).require_acquired(
+                at_ref=acquisition_ref
+            )
+            freeze = manifest["payload"]["freeze"]
+            freeze_ref = validate_ref(freeze["ref"], self.project_id)
+            corpus_ref = validate_ref(freeze["corpus_ref"], self.project_id)
+            snapshot = CandidateRepository(self.store).get(corpus_ref)
+        except (ManifestError, CandidateError, RecordValidationError) as exc:
+            raise DraftingPackageError(
+                "the approved acquisition manifest or frozen corpus metadata is not intact"
+            ) from exc
+        candidates_by_id = {
+            doc["candidate_id"]: doc for doc in snapshot["candidates"]
+        }
+        source_index = self._source_index(manifest["payload"]["entries"])
+
+        cases_by_id = {case["id"]: case for case in batch["cases"]}
+        dispositions = {
+            entry["finding"]: entry["disposition"]
+            for entry in synthesis["dispositions"]
+        }
+
+        # Verified receipt passages per accepted case (existing verified seam).
+        passages_by_case = {
+            case["id"]: self._receipt_passages(extraction, case)
+            for case in batch["cases"]
+        }
+
+        citations = {}
+        evidence = []
+        limitations = []
+        #: Used source ref key -> {ref, candidate_id, citation_key, fallback}
+        used_sources = {}
+        used_cases = set()
+        for record in synthesis["findings"]:
+            finding_key = record["key"]
+            if dispositions.get(finding_key) not in RETAINED_DISPOSITIONS:
+                continue
+            case_id = record["case_id"]
+            case = cases_by_id.get(case_id)
+            if case is None:
                 raise DraftingPackageError(
-                    "the requested section is not part of the approved outline"
+                    "a synthesized finding names a case absent from the accepted batch"
                 )
-
-            synthesis = context["synthesis"]
-            framework = context["framework"]
-            audit_ref = context["audit_ref"]
-
-            extraction = ExtractionWorkflowRepository(self.store)
-            try:
-                accepted = extraction.require_for_synthesis(audit_ref)
-                batch = extraction.require_batch(accepted["batch_ref"])
-            except ExtractionWorkflowError as exc:
-                raise DraftingPackageError(
-                    "the accepted extraction evidence is not consumable"
-                ) from exc
-            acquisition_ref = accepted["acquisition_ref"]
-
-            try:
-                manifest = AcquisitionRepository(self.store).require_acquired(
-                    at_ref=acquisition_ref
+            finding = record["record"]
+            # Bind the finding to its exact verified passage, then to the
+            # passage's own source ref -- never blanket every case source.
+            passage = self._finding_passage(finding, passages_by_case[case_id])
+            source_ref, fallback = self._passage_source_ref(passage, case["source_refs"])
+            candidate_id, candidate = self._candidate_for_source(
+                source_ref, source_index, candidates_by_id
+            )
+            key = citation_key(self.project_id, candidate_id)
+            citations.setdefault(
+                key,
+                _bibliographic_record(
+                    self.project_id, candidate, corpus_ref, freeze_ref, [source_ref]
+                ),
+            )
+            if fallback:
+                limitations.append(
+                    "legacy receipt passages without a per-passage source ref were "
+                    "bound to the case's unique single source"
                 )
-                freeze = manifest["payload"]["freeze"]
-                freeze_ref = validate_ref(freeze["ref"], self.project_id)
-                corpus_ref = validate_ref(freeze["corpus_ref"], self.project_id)
-                snapshot = CandidateRepository(self.store).get(corpus_ref)
-            except (ManifestError, CandidateError, RecordValidationError) as exc:
-                raise DraftingPackageError(
-                    "the approved acquisition manifest or frozen corpus metadata is not intact"
-                ) from exc
-            candidates_by_id = {
-                doc["candidate_id"]: doc for doc in snapshot["candidates"]
-            }
-            source_index = self._source_index(manifest["payload"]["entries"])
-
-            cases_by_id = {case["id"]: case for case in batch["cases"]}
-            dispositions = {
-                entry["finding"]: entry["disposition"]
-                for entry in synthesis["dispositions"]
-            }
-
-            # Verified receipt passages per accepted case (existing verified seam).
-            passages_by_case = {
-                case["id"]: self._receipt_passages(extraction, case)
-                for case in batch["cases"]
-            }
-
-            citations = {}
-            evidence = []
-            limitations = []
-            #: Used source ref key -> {ref, candidate_id, citation_key, fallback}
-            used_sources = {}
-            used_cases = set()
-            for record in synthesis["findings"]:
-                finding_key = record["key"]
-                if dispositions.get(finding_key) not in RETAINED_DISPOSITIONS:
-                    continue
-                case_id = record["case_id"]
-                case = cases_by_id.get(case_id)
-                if case is None:
-                    raise DraftingPackageError(
-                        "a synthesized finding names a case absent from the accepted batch"
-                    )
-                finding = record["record"]
-                # Bind the finding to its exact verified passage, then to the
-                # passage's own source ref -- never blanket every case source.
-                passage = self._finding_passage(finding, passages_by_case[case_id])
-                source_ref, fallback = self._passage_source_ref(passage, case["source_refs"])
-                candidate_id, candidate = self._candidate_for_source(
-                    source_ref, source_index, candidates_by_id
-                )
-                key = citation_key(self.project_id, candidate_id)
-                citations.setdefault(
-                    key,
-                    _bibliographic_record(
-                        self.project_id, candidate, corpus_ref, freeze_ref, [source_ref]
+            evidence.append(
+                {
+                    "finding_key": finding_key,
+                    "finding": finding,
+                    "summary": case["extraction"]["summary"],
+                    "extraction_ref": dict(record["extraction_ref"]),
+                    "source_refs": [dict(source_ref)],
+                    "citation_keys": [key],
+                    "original_passage": self._original_passage(
+                        passage, source_ref, fallback
                     ),
-                )
-                if fallback:
-                    limitations.append(
-                        "legacy receipt passages without a per-passage source ref were "
-                        "bound to the case's unique single source"
-                    )
-                evidence.append(
-                    {
-                        "finding_key": finding_key,
-                        "finding": finding,
-                        "summary": case["extraction"]["summary"],
-                        "extraction_ref": dict(record["extraction_ref"]),
-                        "source_refs": [dict(source_ref)],
-                        "citation_keys": [key],
-                        "original_passage": self._original_passage(
-                            passage, source_ref, fallback
-                        ),
-                    }
-                )
-                used_cases.add(case_id)
-                source_key = canonical_json(source_ref)
-                used_sources.setdefault(
-                    source_key,
-                    {
-                        "ref": source_ref,
-                        "candidate_id": candidate_id,
-                        "citation_key": key,
-                        "fallback": False,
-                    },
-                )
-                used_sources[source_key]["fallback"] = (
-                    used_sources[source_key]["fallback"] or fallback
-                )
-            evidence.sort(key=lambda item: item["finding_key"])
-
-            # Original context: every verified receipt passage of every *used*
-            # source (MVP -- no semantic relevance inference), plus assets.
-            passages_by_used_source = {key: [] for key in used_sources}
-            for case_id in sorted(used_cases):
-                case = cases_by_id[case_id]
-                for passage in passages_by_case[case_id]:
-                    source_ref, fallback = self._passage_source_ref(
-                        passage, case["source_refs"]
-                    )
-                    source_key = canonical_json(source_ref)
-                    if source_key not in passages_by_used_source:
-                        continue
-                    passages_by_used_source[source_key].append(
-                        self._original_passage(passage, source_ref, fallback)
-                    )
-            original_sources = [
-                self._original_source_record(
-                    used_sources[key], passages_by_used_source[key]
-                )
-                for key in sorted(used_sources)
-            ]
-
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "document_type": DOCUMENT_TYPE,
-                "outline_ref": dict(context["outline_ref"]),
-                "framework_ref": dict(context["framework_ref"]),
-                "synthesis_ref": dict(context["synthesis_ref"]),
-                "audit_ref": dict(audit_ref),
-                "acquisition_ref": dict(acquisition_ref),
-                "freeze_ref": dict(freeze_ref),
-                "corpus_ref": dict(corpus_ref),
-                "section_id": section["section_id"],
-                "section": dict(section),
-                "framework": framework,
-                "synthesis": synthesis,
-                "evidence": evidence,
-                "citations": {key: citations[key] for key in sorted(citations)},
-                "methods": {
-                    "framework_criteria": framework["criteria"],
-                    "framework_contribution": framework["contribution"],
-                    "framework_limitations": framework.get("limitations"),
-                    "synthesis_limitations": synthesis.get("limitations"),
-                    "synthesis_independence": synthesis["independence"],
-                    "correlation_groups": synthesis["correlation_groups"],
-                    # Verified original-paper context for every used source:
-                    # passages (text/locator/section), assets, and methods-section
-                    # availability (MVP -- all verified receipt passages).
-                    "original_sources": original_sources,
+                }
+            )
+            used_cases.add(case_id)
+            source_key = canonical_json(source_ref)
+            used_sources.setdefault(
+                source_key,
+                {
+                    "ref": source_ref,
+                    "candidate_id": candidate_id,
+                    "citation_key": key,
+                    "fallback": False,
                 },
-                "limitations": sorted(set(limitations)),
-                "approved": True,
-                "authorizes_execution": False,
-                "authorizes_export": False,
-                "scientific_validation": False,
-                "authority": "named_gate_only",
-                "notice": NOTICE,
-            }
+            )
+            used_sources[source_key]["fallback"] = (
+                used_sources[source_key]["fallback"] or fallback
+            )
+        evidence.sort(key=lambda item: item["finding_key"])
+
+        # Original context: every verified receipt passage of every *used*
+        # source (MVP -- no semantic relevance inference), plus assets.
+        passages_by_used_source = {key: [] for key in used_sources}
+        for case_id in sorted(used_cases):
+            case = cases_by_id[case_id]
+            for passage in passages_by_case[case_id]:
+                source_ref, fallback = self._passage_source_ref(
+                    passage, case["source_refs"]
+                )
+                source_key = canonical_json(source_ref)
+                if source_key not in passages_by_used_source:
+                    continue
+                passages_by_used_source[source_key].append(
+                    self._original_passage(passage, source_ref, fallback)
+                )
+        original_sources = [
+            self._original_source_record(
+                used_sources[key], passages_by_used_source[key]
+            )
+            for key in sorted(used_sources)
+        ]
+
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "document_type": DOCUMENT_TYPE,
+            "outline_ref": dict(context["outline_ref"]),
+            "framework_ref": dict(context["framework_ref"]),
+            "synthesis_ref": dict(context["synthesis_ref"]),
+            "audit_ref": dict(audit_ref),
+            "acquisition_ref": dict(acquisition_ref),
+            "freeze_ref": dict(freeze_ref),
+            "corpus_ref": dict(corpus_ref),
+            "section_id": section["section_id"],
+            "section": dict(section),
+            "framework": framework,
+            "synthesis": synthesis,
+            "evidence": evidence,
+            "citations": {key: citations[key] for key in sorted(citations)},
+            "methods": {
+                "framework_criteria": framework["criteria"],
+                "framework_contribution": framework["contribution"],
+                "framework_limitations": framework.get("limitations"),
+                "synthesis_limitations": synthesis.get("limitations"),
+                "synthesis_independence": synthesis["independence"],
+                "correlation_groups": synthesis["correlation_groups"],
+                # Verified original-paper context for every used source:
+                # passages (text/locator/section), assets, and methods-section
+                # availability (MVP -- all verified receipt passages).
+                "original_sources": original_sources,
+            },
+            "limitations": sorted(set(limitations)),
+            "approved": True,
+            "authorizes_execution": False,
+            "authorizes_export": False,
+            "scientific_validation": False,
+            "authority": "named_gate_only",
+            "notice": NOTICE,
+        }
 
 
 #: Convenience alias used by callers that prefer the shorter name.
