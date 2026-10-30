@@ -170,7 +170,37 @@ def _validate_timestamp(value, field):
 
 
 def _has_surrogate(text):
-    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+    # A UTF-8 encode raises ``UnicodeEncodeError`` for *any* code point in the
+    # surrogate range U+D800-U+DFFF (lone or paired), which is exactly the range
+    # the previous per-character scan rejected.  The ``isascii`` fast path skips
+    # the encode for the overwhelmingly common all-ASCII case.
+    if text.isascii():
+        return False
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def _json_label(root, path):
+    """Reconstruct a ``_check_jsonable`` label from a lazily-built path.
+
+    Labels are only needed when a value is rejected, so the recursive walk
+    carries the root label plus a tuple of path components instead of eagerly
+    formatting an f-string for every child.  This rebuilds the exact same
+    ``root.key[0].key`` strings the eager version produced.
+    """
+    if not path:
+        return root
+    parts = [root]
+    for component in path:
+        if isinstance(component, int):
+            parts.append(f"[{component}]")
+        else:
+            parts.append(".")
+            parts.append(component)
+    return "".join(parts)
 
 
 #: Maximum accepted nesting depth for canonical JSON.  Bounded so a deeply nested
@@ -179,43 +209,58 @@ def _has_surrogate(text):
 _MAX_JSON_DEPTH = 64
 
 
-def _check_jsonable(value, label, _depth=0, _seen=None):
+def _check_jsonable(value, label, _depth=0, _seen=None, _path=()):
     if _depth > _MAX_JSON_DEPTH:
-        _raise(label, "JSON value nests too deeply")
+        _raise(_json_label(label, _path), "JSON value nests too deeply")
     if value is None or isinstance(value, (bool, int)):
         return
     if isinstance(value, str):
         if _has_surrogate(value):
-            _raise(label, "string contains an invalid Unicode surrogate")
+            _raise(
+                _json_label(label, _path),
+                "string contains an invalid Unicode surrogate",
+            )
         return
     if isinstance(value, float):
         if not math.isfinite(value):
-            _raise(label, "NaN and Infinity are not permitted in canonical JSON")
+            _raise(
+                _json_label(label, _path),
+                "NaN and Infinity are not permitted in canonical JSON",
+            )
         return
     if isinstance(value, (list, tuple, dict)):
         if _seen is None:
             _seen = set()
         if id(value) in _seen:
-            _raise(label, "circular reference is not permitted in canonical JSON")
+            _raise(
+                _json_label(label, _path),
+                "circular reference is not permitted in canonical JSON",
+            )
         _seen.add(id(value))
         try:
             if isinstance(value, dict):
                 for key, item in value.items():
                     if not isinstance(key, str):
                         _raise(
-                            label,
+                            _json_label(label, _path),
                             f"object key is not a string (found {type(key).__name__})",
                         )
                     if _has_surrogate(key):
-                        _raise(label, "object key contains an invalid Unicode surrogate")
-                    _check_jsonable(item, f"{label}.{key}", _depth + 1, _seen)
+                        _raise(
+                            _json_label(label, _path),
+                            "object key contains an invalid Unicode surrogate",
+                        )
+                    _check_jsonable(item, label, _depth + 1, _seen, _path + (key,))
             else:
                 for index, item in enumerate(value):
-                    _check_jsonable(item, f"{label}[{index}]", _depth + 1, _seen)
+                    _check_jsonable(item, label, _depth + 1, _seen, _path + (index,))
         finally:
             _seen.discard(id(value))
         return
-    _raise(label, f"value of type {type(value).__name__} is not JSON-serializable")
+    _raise(
+        _json_label(label, _path),
+        f"value of type {type(value).__name__} is not JSON-serializable",
+    )
 
 
 # --------------------------------------------------------------------------- #

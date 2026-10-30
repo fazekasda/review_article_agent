@@ -18,6 +18,7 @@ import unittest
 from review_article_agent.domain.records import (
     ARTIFACT_KINDS,
     RecordValidationError,
+    _has_surrogate,
     canonical_json,
     require_storage_allowed,
     validate_identifier,
@@ -143,6 +144,53 @@ class CanonicalJsonTest(unittest.TestCase):
     def test_rejects_surrogate_in_dict_key(self):
         with self.assertRaises(RecordValidationError):
             canonical_json({"a\ud800": 1})
+
+    def test_has_surrogate_accepts_ascii_and_valid_unicode(self):
+        # The isascii() fast path and the single-encode fallback must accept every
+        # non-surrogate string: ASCII, BMP non-ASCII, and astral code points.
+        for text in ("", "abc", "café", "漢", "😀", "a\u0000b", "x" * 5000):
+            self.assertFalse(_has_surrogate(text), repr(text))
+
+    def test_has_surrogate_rejects_lone_and_paired_surrogates(self):
+        for text in (
+            "\ud800",
+            "\udfff",
+            "\ud800\udc00",  # a paired surrogate in a Python str is still rejected
+            "\udc00\ud800",
+            "a\ud800b",
+            "é\ud800",
+        ):
+            self.assertTrue(_has_surrogate(text), repr(text))
+
+    def test_accepts_bmp_and_astral_values_and_keys(self):
+        self.assertEqual(
+            canonical_json({"k": "é", "漢": "😀"}).decode("utf-8"),
+            '{"k":"é","漢":"😀"}',
+        )
+
+    def test_rejects_lone_high_surrogate_in_value(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"v": "x\ud800"})
+
+    def test_rejects_lone_low_surrogate_in_value(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"v": "x\udfff"})
+
+    def test_rejects_surrogate_in_dict_key_low(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"a\udfff": 1})
+
+    def test_rejects_surrogate_nested_in_value(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"outer": [1, {"inner": "bad\ud800"}]})
+
+    def test_rejects_surrogate_nested_in_dict_key(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json({"outer": {"bad\ud800": 1}})
+
+    def test_rejects_paired_surrogate(self):
+        with self.assertRaises(RecordValidationError):
+            canonical_json("x\ud800\udc00")
 
     def test_rejects_cyclic_dict(self):
         cyclic = {}
