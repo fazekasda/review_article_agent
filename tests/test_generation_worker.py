@@ -45,6 +45,8 @@ for _path in (str(SRC), str(TESTS)):
 import test_generation_runner as gen_runner  # noqa: E402
 import test_generation_synthesis_roles as syn_fx  # noqa: E402
 import test_generation_drafting_roles as draft_fx  # noqa: E402
+import test_generation_delivery_roles as dr_fx  # noqa: E402
+import test_screening_runner as scr_fx  # noqa: E402
 from test_generation_review_roles import _ReviewTransport  # noqa: E402
 
 from review_article_agent.drafting.workflow import DraftingWorkflowRepository  # noqa: E402
@@ -538,6 +540,227 @@ class GenerationRunCliTest(cli_fx.DiscoveryJobsCliBase):
         self.assertIn("--operation", text)
         self.assertIn("--credential-env", text)
         self.assertIn("--params-file", text)
+
+
+# --------------------------------------------------------------------------- #
+# Global review through the worker
+# --------------------------------------------------------------------------- #
+class GenerationWorkerGlobalReviewTest(_EngineBase, dr_fx.DeliveryRolesBase):
+    def _seed_manuscript(self, delivery_id="delivery-1") -> None:
+        text = "Intro [@k1].\n\nBody [@k1]. PROBLEM detail."
+        state = self.repo.read(delivery_id)
+        state["manuscript"] = {"revision_id": "m1", "text": text}
+        state["paragraphs"] = {
+            "p1": {"text": "Intro [@k1].", "checks": "valid"},
+            "p2": {"text": "Body [@k1]. PROBLEM detail.", "checks": "valid"},
+        }
+        self.repo._persist(state)
+
+    def _parameters(self, *, delivery_id="delivery-1") -> dict:
+        return {
+            "operation": "global_review",
+            "delivery_id": delivery_id,
+            "reviewer_hosted_ref": self.reviewer_ref,
+            "writer_hosted_ref": self.writer_ref,
+            "rights": self.rights(delivery_id, "m1"),
+            "source_refs": [self.source_ref],
+            "credential_env": "OPENROUTER_API_KEY",
+        }
+
+    def test_global_review_completes_through_worker(self) -> None:
+        self.start()
+        self._seed_manuscript()
+        transport = dr_fx._RoleTransport(lambda payload: {"findings": []})
+        engine = self.engine(transport=transport)
+        res = self._submit(engine, request_id="gen-gr-1", parameters=self._parameters())
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["job"]["task_kind"], "generation_run")
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        result = job["accepted_result"]["result"]
+        self.assertEqual(result["operation"], "global_review")
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["delivery_id"], "delivery-1")
+        self.assertEqual(result["review_status"], "complete")
+        self.assertEqual(transport.call_count, 1)
+        state = self.repo.read("delivery-1")
+        self.assertEqual(state["global_review"]["status"], "complete")
+        self.assertNotIn(_API_KEY, json.dumps(job))
+
+    def test_global_review_blocks_with_bounded_rounds(self) -> None:
+        self.start()
+        self._seed_manuscript()
+
+        def responder(payload):
+            material = dr_fx._material_of(payload)
+            if "findings" in material:
+                return {"paragraphs": []}
+            return {"findings": [dr_fx._finding("p2")]}
+
+        transport = dr_fx._RoleTransport(responder)
+        engine = self.engine(transport=transport)
+        res = self._submit(engine, request_id="gen-gr-block", parameters=self._parameters())
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        result = job["accepted_result"]["result"]
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["rounds_used"], dr_fx.GLOBAL_ROUND_LIMIT)
+        state = self.repo.read("delivery-1")
+        self.assertEqual(state["global_review"]["status"], "blocked")
+
+
+# --------------------------------------------------------------------------- #
+# Notes plan through the worker (proposal only; never applied)
+# --------------------------------------------------------------------------- #
+class GenerationWorkerNotesPlanTest(_EngineBase, dr_fx.DeliveryRolesBase):
+    def _reviewed_delivery(self) -> None:
+        self.start()
+        transport = dr_fx._RoleTransport(lambda payload: {"findings": []})
+        self.run_review(transport, dr_fx._two_paragraph_manuscript())
+        self.repo.notes(
+            "delivery-1",
+            [
+                {"note_id": "n1", "text": "tighten intro", "category": "wording"},
+                {
+                    "note_id": "n2",
+                    "text": "adjust claim",
+                    "category": "claim",
+                    "target": {"paragraph_id": "p2"},
+                },
+                {"note_id": "n3", "text": "add a section", "category": "scope"},
+            ],
+            rights=self.rights,
+        )
+
+    def _parameters(self) -> dict:
+        return {
+            "operation": "notes_plan",
+            "delivery_id": "delivery-1",
+            "hosted_ref": self.planner_ref,
+            "source_refs": [self.source_ref],
+            "credential_env": "OPENROUTER_API_KEY",
+        }
+
+    def test_notes_plan_proposes_and_never_applies(self) -> None:
+        self._reviewed_delivery()
+
+        def responder(payload):
+            return {
+                "edits": [
+                    {
+                        "note_id": "n1",
+                        "paragraph_id": "p1",
+                        "new_text": "Intro [@k1] tightened.",
+                        "kind": "wording",
+                    },
+                    {"note_id": "nX", "paragraph_id": "p1", "new_text": "x", "kind": "wording"},
+                ]
+            }
+
+        transport = dr_fx._RoleTransport(responder)
+        engine = self.engine(transport=transport)
+        res = self._submit(engine, request_id="gen-np-1", parameters=self._parameters())
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        result = job["accepted_result"]["result"]
+        self.assertEqual(result["operation"], "notes_plan")
+        self.assertEqual(result["status"], "proposed")
+        self.assertEqual(result["edits_count"], 1)
+        self.assertEqual(result["dropped_count"], 1)
+        # Nothing was applied: the delivery still has no applied batch and the
+        # paragraph text is unchanged.
+        state = self.repo.read("delivery-1")
+        self.assertEqual(state["applied_batches"], [])
+        self.assertEqual(state["paragraphs"]["p1"]["text"], "Intro [@k1].")
+
+
+# --------------------------------------------------------------------------- #
+# Screening case through the worker
+# --------------------------------------------------------------------------- #
+class GenerationWorkerScreeningCaseTest(_EngineBase, scr_fx.RunnerTestBase):
+    def _parameters(self) -> dict:
+        return {
+            "operation": "screening_case",
+            "config_ref": self.config_ref,
+            "report_ref": self.report,
+            "hosted_ref": self.hosted_ref,
+            "credential_env": "OPENROUTER_API_KEY",
+        }
+
+    def test_screening_case_commits_decision_result(self) -> None:
+        self.transport.responses.append(scr_fx._jev_response(0.1))
+        engine = self.engine(transport=self.transport, api_key=scr_fx._API_KEY)
+        res = self._submit(engine, request_id="gen-sc-1", parameters=self._parameters())
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["job"]["task_kind"], "generation_run")
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        result = job["accepted_result"]["result"]
+        self.assertEqual(result["operation"], "screening_case")
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["screening_status"], "completed")
+        ref = result["decision_result_ref"]
+        self.assertIsNotNone(ref)
+        self.assertEqual(self.transport.call_count, 1)
+
+        from review_article_agent.runtime.dispatch import RuntimeDispatchRepository
+
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch(ref["dispatch_id"])
+        self.assertEqual(dispatch.state, "completed")
+
+
+# --------------------------------------------------------------------------- #
+# Strict validation for the newly wired operations (before any write)
+# --------------------------------------------------------------------------- #
+class GenerationSubmitValidationNewOpsTest(_EngineBase, dr_fx.DeliveryRolesBase):
+    def test_new_ops_invalid_params_refused_without_writes(self) -> None:
+        engine = self.engine(transport=dr_fx._RoleTransport(lambda payload: {"findings": []}))
+
+        # global_review with an unknown extra field.
+        bad_global = {
+            "operation": "global_review",
+            "delivery_id": "delivery-1",
+            "reviewer_hosted_ref": self.reviewer_ref,
+            "writer_hosted_ref": self.writer_ref,
+            "rights": self.rights("delivery-1", "m1"),
+            "actor": "user",
+            "credential_env": "OPENROUTER_API_KEY",
+        }
+        res = self._submit(engine, request_id="bad-gr", parameters=bad_global)
+        self.assertEqual(res["code"], "bad_value")
+
+        # screening_case missing its required report_ref.
+        bad_screening = {
+            "operation": "screening_case",
+            "config_ref": self.source_ref,
+            "hosted_ref": self.reviewer_ref,
+            "credential_env": "OPENROUTER_API_KEY",
+        }
+        res = self._submit(engine, request_id="bad-sc", parameters=bad_screening)
+        self.assertEqual(res["code"], "bad_value")
+
+        # notes_plan with the wrong credential environment name.
+        bad_notes = {
+            "operation": "notes_plan",
+            "delivery_id": "delivery-1",
+            "hosted_ref": self.planner_ref,
+            "credential_env": "SOME_OTHER_KEY",
+        }
+        res = self._submit(engine, request_id="bad-np", parameters=bad_notes)
+        self.assertEqual(res["code"], "bad_value")
+
+        # No durable job was created for any invalid request.
+        with engine.open_repository(self.project_id) as repo:
+            self.assertEqual(repo.list(), [])
 
 
 if __name__ == "__main__":  # pragma: no cover

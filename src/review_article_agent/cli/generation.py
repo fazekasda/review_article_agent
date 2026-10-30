@@ -19,12 +19,18 @@ reflects a path, id, rights value, credential, or exception text.
 from __future__ import annotations
 
 import argparse
+import json
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..domain.errors import ReviewAgentError, StoreError
 from ..domain.records import RecordValidationError, canonical_json
+from ..generation import hosted_use
+from ..runtime import generation as runtime_generation
 from ..runtime.jobs import JobRepository
 from ..storage import ArtifactConflictError
+from ..storage.artifacts import ArtifactRepository
+from ..storage.human_approvals import HumanApprovalRepository
 from ..worker import discovery as worker_discovery
 from ..worker import generation as worker_generation
 from ..worker.discovery import DiscoveryJobValidationError
@@ -45,6 +51,8 @@ __all__ = [
     "GenerationControlError",
     "build_generation_parser",
     "dispatch_generation",
+    "generation_hosted_use_propose",
+    "generation_hosted_use_show",
     "generation_run_status",
     "generation_run_submit",
 ]
@@ -85,6 +93,28 @@ _RUN_MISSING_KEY_NOTICE = (
     "reconfigures a user's worker). The job is admitted and queued; inspect it with "
     "`job status`."
 )
+_HOSTED_USE_INVALID_MESSAGE = (
+    "the generation hosted-use document failed strict typed validation (a wrong or "
+    "missing envelope/payload field, an unknown role, an invalid configuration, a "
+    "non-positive budget cap, or a malformed evidence record). Nothing was written. "
+    "The supplied values are not shown."
+)
+_HOSTED_USE_CONFLICT_MESSAGE = (
+    "the generation hosted-use artifact already exists with a different kind, or a "
+    "divergent revision already occupies that artifact/revision. Nothing was written."
+)
+_HOSTED_USE_NOT_FOUND_MESSAGE = (
+    "no stored generation hosted-use revision matches that artifact/revision in this "
+    "project; nothing was read."
+)
+_HOSTED_USE_ROLE_MESSAGE = (
+    "invalid --role; the value is not one of the recognized generation roles and is "
+    "not shown. Run --help for the supported roles."
+)
+
+
+def _utc_now_rfc3339() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class GenerationControlError(Exception):
@@ -170,6 +200,74 @@ def build_generation_parser(sub: "argparse._SubParsersAction") -> None:
     )
     p_run_status.add_argument("--project", metavar="ID")
     p_run_status.add_argument("--request-id", required=True, metavar="ID")
+
+    hosted = actions.add_parser(
+        "hosted-use",
+        help=(
+            "per-role generation hosted-use authorization documents: propose one "
+            "(stores an inert revision and prints its gate commands) and show one "
+            "(the validated document and whether its gate is satisfied)"
+        ),
+    )
+    hosted_sub = hosted.add_subparsers(
+        dest="generation_hosted_use_command",
+        required=True,
+        metavar="HOSTED_USE_COMMAND",
+    )
+
+    p_hu_propose = hosted_sub.add_parser(
+        "propose",
+        help=(
+            "validate and store one generation_hosted_use document as an inert "
+            "revision (no approval); prints the exact gate prepare/confirm commands"
+        ),
+    )
+    p_hu_propose.add_argument("--project", metavar="ID")
+    p_hu_propose.add_argument(
+        "--role",
+        required=True,
+        choices=runtime_generation.ROLES,
+        help="the generation role this authorization is for",
+    )
+    p_hu_propose.add_argument(
+        "--config-file",
+        required=True,
+        metavar="PATH",
+        help="strict JSON object: the LeadConfig (concrete model + pricing) for the role",
+    )
+    p_hu_propose.add_argument(
+        "--budget-cap-usd",
+        required=True,
+        metavar="DECIMAL",
+        help="exact decimal string > 0 (the cumulative reserve cap for this role)",
+    )
+    p_hu_propose.add_argument(
+        "--provider-terms-ref", required=True, metavar="REF",
+        help="non-empty reference to the human-reviewed provider-terms evidence",
+    )
+    p_hu_propose.add_argument("--provider-terms-verified-at", metavar="TS")
+    p_hu_propose.add_argument(
+        "--privacy-review-ref", required=True, metavar="REF",
+        help="non-empty reference to the human-reviewed privacy-review evidence",
+    )
+    p_hu_propose.add_argument("--privacy-review-verified-at", metavar="TS")
+    p_hu_propose.add_argument(
+        "--pricing-evidence-ref", required=True, metavar="REF",
+        help="non-empty reference to the human-reviewed pricing evidence",
+    )
+    p_hu_propose.add_argument("--pricing-evidence-verified-at", metavar="TS")
+    p_hu_propose.add_argument("--notes", metavar="TEXT")
+    p_hu_propose.add_argument("--artifact-id", required=True, metavar="ID")
+    p_hu_propose.add_argument("--revision-id", required=True, metavar="ID")
+    p_hu_propose.add_argument("--rights-file", required=True, metavar="PATH")
+
+    p_hu_show = hosted_sub.add_parser(
+        "show",
+        help="print one stored generation hosted-use document and its gate status",
+    )
+    p_hu_show.add_argument("--project", metavar="ID")
+    p_hu_show.add_argument("--artifact-id", required=True, metavar="ID")
+    p_hu_show.add_argument("--revision-id", metavar="ID")
 
 
 def _add_op_flags(parser: argparse.ArgumentParser) -> None:
@@ -400,11 +498,192 @@ def generation_run_status(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# hosted-use handlers
+# --------------------------------------------------------------------------- #
+def _hosted_use_gate_block(
+    store: Any, *, artifact_id: str, revision_id: str, role: str
+) -> dict[str, Any]:
+    """The non-authorizing gate status plus the exact gate CLI commands.
+
+    ``satisfied`` is the real repository's answer **for this exact revision**: it
+    can only be true when this revision is still the artifact's current head. The
+    ``prepare_command``/``confirm_command`` strings are the exact commands an owner
+    runs to record the out-of-band ``batch``/``generation.hosted_use.<role>`` gate.
+    """
+    gate_id = hosted_use.hosted_use_gate_id(role)
+    head = ArtifactRepository(store).current_revision(artifact_id)
+    is_current = head is not None and head.revision_id == revision_id
+    satisfied = is_current and HumanApprovalRepository(store).named_gate_satisfied(
+        artifact_id, gate_kind=hosted_use.HOSTED_USE_GATE_KIND, gate_id=gate_id
+    )
+    base = (
+        f"--artifact-id {artifact_id} --revision-id {revision_id} "
+        f"--gate-kind {hosted_use.HOSTED_USE_GATE_KIND} --gate-id {gate_id} "
+        "--decision approved --rationale <RATIONALE>"
+    )
+    return {
+        "gate_kind": hosted_use.HOSTED_USE_GATE_KIND,
+        "gate_id": gate_id,
+        "artifact_id": artifact_id,
+        "revision_id": revision_id,
+        "satisfied": bool(satisfied),
+        "current": bool(is_current),
+        "stale": not is_current,
+        "prepare_command": "gate prepare " + base,
+        "confirm_command": (
+            "gate confirm " + base + " --snapshot-digest <SHA256 from gate prepare>"
+        ),
+        "authorizes_execution": False,
+    }
+
+
+def generation_hosted_use_propose(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
+    """``generation hosted-use propose`` -- store one hosted-use document.
+
+    Strictly validates the envelope/payload with ``validate_hosted_use_document``
+    (nothing is written on a malformed document), stores it through
+    ``propose_hosted_use`` as one immutable artifact revision with the caller's
+    rights, and prints the exact ``gate prepare``/``gate confirm`` commands for the
+    new revision. It records **no** approval and accepts **no** secret.
+    """
+    project_id = _resolve_project_id(ctx, args.project)
+    role = args.role
+    if role not in runtime_generation.ROLES:
+        raise GenerationControlError(_CATEGORY_VALIDATION, _HOSTED_USE_ROLE_MESSAGE)
+    config = _read_json_file(args.config_file, what="hosted-use configuration")
+    if not isinstance(config, dict):
+        raise GenerationControlError(_CATEGORY_VALIDATION, _HOSTED_USE_INVALID_MESSAGE)
+
+    def _evidence(ref: object, verified_at: object) -> dict[str, Any]:
+        return {
+            "ref": ref,
+            "verified_at": verified_at if verified_at is not None else _utc_now_rfc3339(),
+        }
+
+    document = {
+        "schema_version": hosted_use.SCHEMA_VERSION,
+        "document_type": hosted_use.HOSTED_USE_DOCUMENT_TYPE,
+        "payload": {
+            "role": role,
+            "config": config,
+            "budget_cap_usd": args.budget_cap_usd,
+            "provider_terms": _evidence(
+                args.provider_terms_ref, args.provider_terms_verified_at
+            ),
+            "privacy_review": _evidence(
+                args.privacy_review_ref, args.privacy_review_verified_at
+            ),
+            "pricing_evidence": _evidence(
+                args.pricing_evidence_ref, args.pricing_evidence_verified_at
+            ),
+            "notes": args.notes,
+        },
+    }
+    try:
+        validated = hosted_use.validate_hosted_use_document(document)
+    except hosted_use.GenerationHostedUseError:
+        raise GenerationControlError(_CATEGORY_VALIDATION, _HOSTED_USE_INVALID_MESSAGE) from None
+
+    rights = _read_json_file(args.rights_file, what="rights record")
+    if not isinstance(rights, dict):
+        raise GenerationControlError(_CATEGORY_VALIDATION, _HOSTED_USE_INVALID_MESSAGE)
+
+    with _verified_store(ctx, project_id) as store:
+        try:
+            ref = hosted_use.propose_hosted_use(
+                store,
+                validated,
+                artifact_id=args.artifact_id,
+                revision_id=args.revision_id,
+                rights=rights,
+            )
+        except ArtifactConflictError:
+            raise GenerationControlError(_CATEGORY_CONFLICT, _HOSTED_USE_CONFLICT_MESSAGE) from None
+        except hosted_use.GenerationHostedUseError:
+            raise GenerationControlError(_CATEGORY_VALIDATION, _HOSTED_USE_INVALID_MESSAGE) from None
+        except (RecordValidationError, ReviewAgentError, ValueError, TypeError, OSError):
+            raise GenerationControlError(_CATEGORY_VALIDATION, _HOSTED_USE_INVALID_MESSAGE) from None
+        gate = _hosted_use_gate_block(
+            store,
+            artifact_id=ref["artifact_id"],
+            revision_id=ref["revision_id"],
+            role=role,
+        )
+    return {
+        "revision": ref,
+        "role": role,
+        "document": validated,
+        "gate": gate,
+        "gate_satisfied": gate["satisfied"],
+        "authorizes_execution": False,
+        "scientific_validation": False,
+        "approval_recorded": False,
+    }
+
+
+def generation_hosted_use_show(args: argparse.Namespace, ctx: Any) -> dict[str, Any]:
+    """``generation hosted-use show`` -- print a stored document and its gate status.
+
+    Reads one exact revision (the current head when ``--revision-id`` is omitted),
+    validates its bytes with ``validate_hosted_use_document``, and reports whether
+    the exact ``batch``/``generation.hosted_use.<role>`` gate is satisfied for that
+    revision. No secret is printed and nothing is written.
+    """
+    project_id = _resolve_project_id(ctx, args.project)
+    artifact_id = _parse_identifier(args.artifact_id)
+    with _verified_store(ctx, project_id) as store:
+        repo = ArtifactRepository(store)
+        if args.revision_id is None:
+            head = repo.current_revision(artifact_id)
+            if head is None:
+                raise GenerationControlError(
+                    _CATEGORY_VALIDATION, _HOSTED_USE_NOT_FOUND_MESSAGE
+                )
+            revision_id = head.revision_id
+        else:
+            revision_id = _parse_identifier(args.revision_id)
+        try:
+            content = repo.read_content(artifact_id, revision_id)
+        except (RecordValidationError, ReviewAgentError, ValueError, TypeError, OSError):
+            raise GenerationControlError(
+                _CATEGORY_VALIDATION, _HOSTED_USE_NOT_FOUND_MESSAGE
+            ) from None
+        try:
+            document = hosted_use.validate_hosted_use_document(json.loads(content))
+        except (hosted_use.GenerationHostedUseError, ValueError, UnicodeDecodeError):
+            raise GenerationControlError(
+                _CATEGORY_VALIDATION, _HOSTED_USE_INVALID_MESSAGE
+            ) from None
+        role = document["payload"]["role"]
+        gate = _hosted_use_gate_block(
+            store, artifact_id=artifact_id, revision_id=revision_id, role=role
+        )
+    return {
+        "revision": {
+            "project_id": project_id,
+            "artifact_id": artifact_id,
+            "revision_id": revision_id,
+        },
+        "role": role,
+        "document": document,
+        "gate": gate,
+        "gate_satisfied": gate["satisfied"],
+        "authorizes_execution": False,
+        "scientific_validation": False,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
 GENERATION_RUN_COMMANDS: dict[str, Callable[[argparse.Namespace, Any], Any]] = {
     "submit": generation_run_submit,
     "status": generation_run_status,
+}
+
+GENERATION_HOSTED_USE_COMMANDS: dict[str, Callable[[argparse.Namespace, Any], Any]] = {
+    "propose": generation_hosted_use_propose,
+    "show": generation_hosted_use_show,
 }
 
 
@@ -414,6 +693,11 @@ def dispatch_generation(args: argparse.Namespace, ctx: Any) -> object | None:
     if command == "run":
         handler = GENERATION_RUN_COMMANDS.get(
             getattr(args, "generation_run_command", None)
+        )
+        return None if handler is None else handler(args, ctx)
+    if command == "hosted-use":
+        handler = GENERATION_HOSTED_USE_COMMANDS.get(
+            getattr(args, "generation_hosted_use_command", None)
         )
         return None if handler is None else handler(args, ctx)
     return None
