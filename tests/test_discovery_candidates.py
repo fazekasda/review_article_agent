@@ -50,6 +50,7 @@ from review_article_agent.discovery.candidates import (  # noqa: E402
 from review_article_agent.discovery.records import (  # noqa: E402
     SOURCE_EUROPEPMC,
     SOURCE_PUBMED,
+    MetadataRecord,
 )
 from review_article_agent.domain.records import canonical_json  # noqa: E402
 from review_article_agent.storage import (  # noqa: E402
@@ -902,6 +903,76 @@ class BackupRestoreTests(CandidateTestBase):
         self.addCleanup(restored_store.close)
         restored = CandidateRepository(restored_store)
         self.assertEqual(restored.current(), before)
+
+
+class DecisionIdScaleTests(CandidateTestBase):
+    """One revision minting >= 10,000 dedup decisions must read back intact.
+
+    Regression for the Step 15 scale-test defect: decision ids are *minted* as
+    ``dedup-{n:04d}`` but were *validated* against a strict four-digit pattern, so
+    a single cumulative revision at the ~10,000-candidate target minted the
+    10,000th id ``dedup-10000`` and then failed read-back revalidation with
+    :class:`CandidateCorruptionError` ("membership internally inconsistent").
+    The fix relaxes the read-back pattern to four-or-more digits while keeping the
+    ``:04d`` mint so every previously stored id is byte-identical; the ordering
+    check is likewise made numeric-safe (a lexicographic compare mis-orders
+    ``dedup-10000`` *before* ``dedup-9999``).
+
+    The fixture mirrors ``scripts/scale_test.py``: distinct synthetic metadata
+    records carrying unique pmid/pmcid/doi, so every occurrence is its own
+    consistent component and mints exactly one decision.
+    """
+
+    _N = 10_000  # exactly the upper end of the ~1,000-10,000 target
+
+    @staticmethod
+    def _many_records(n: int) -> tuple[MetadataRecord, ...]:
+        return tuple(
+            MetadataRecord(
+                source=SOURCE_PUBMED,
+                source_id=str(10_000_000 + i),
+                pmid=str(10_000_000 + i),
+                pmcid=f"PMC{20_000_000 + i}",
+                doi=f"10.9999/scale.{i}",
+                title=f"Synthetic scale candidate {i} (not a real study)",
+                publication_year=2000 + (i % 25),
+            )
+            for i in range(n)
+        )
+
+    def test_single_revision_with_10000_decisions_reads_back(self) -> None:
+        records = self._many_records(self._N)
+        page = fx.page(
+            records=records,
+            page_size=len(records),
+            total_count=len(records),
+        )
+        observed = self.observe("req_scale", fx.pubmed_result(pages=(page,)))
+
+        revision = self.ingest([observed.run_id], request_id="corpus_scale")
+        snapshot = self.corpus.current()
+        assert snapshot is not None
+
+        decisions = snapshot["dedup_decisions"]
+        self.assertEqual(len(decisions), self._N)
+        # Boundary ids: the first id keeps the historical byte-identical shape,
+        # and the 10,000th id is the one the strict four-digit pattern rejected.
+        self.assertEqual(decisions[0]["decision_id"], "dedup-0001")
+        self.assertEqual(decisions[-1]["decision_id"], "dedup-10000")
+
+        # Every occurrence minted exactly one distinct resolved candidate, and the
+        # read is the exact revision just written.
+        self.assertEqual(len(snapshot["candidates"]), self._N)
+        self.assertEqual(snapshot["revision_id"], revision.revision_id)
+        self.assertTrue(all(doc["resolved"] for doc in snapshot["candidates"]))
+
+        # The same snapshot is reachable by explicit revision reference.
+        ref = {
+            "project_id": self.project_id,
+            "artifact_id": revision.artifact_id,
+            "revision_id": revision.revision_id,
+        }
+        self.assertEqual(self.corpus.get(ref)["dedup_decisions"], decisions)
 
 
 if __name__ == "__main__":  # pragma: no cover
