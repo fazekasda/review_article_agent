@@ -82,6 +82,7 @@ from ..domain.records import (
 )
 from ..runtime import ipc
 from . import acquisition as acquisition_jobs
+from . import extraction as extraction_jobs
 
 __all__ = [
     "MODE_QUERY",
@@ -90,6 +91,7 @@ __all__ = [
     "MODE_EXPAND",
     "MODE_LEAD",
     "MODE_ACQUIRE",
+    "MODE_EXTRACT",
     "DISCOVERY_MODES",
     "TASK_KIND_QUERY",
     "TASK_KIND_SEED",
@@ -97,13 +99,16 @@ __all__ = [
     "TASK_KIND_EXPAND",
     "TASK_KIND_LEAD",
     "TASK_KIND_ACQUIRE",
+    "TASK_KIND_EXTRACT",
     "DISCOVERY_TASK_KINDS",
     "MODE_PARAMETER_KEYS",
     "LEAD_CREDENTIAL_ENV",
+    "EXTRACT_CREDENTIAL_ENV",
     "RESULT_KIND_OBSERVATION",
     "RESULT_KIND_EXPANSION",
     "RESULT_KIND_LEAD",
     "RESULT_KIND_ACQUISITION",
+    "RESULT_KIND_EXTRACTION",
     "MAX_DISCOVERY_PARAMETERS_BYTES",
     "MAX_EXPAND_ROOTS",
     "PREDISPATCH_PHASE",
@@ -127,8 +132,10 @@ __all__ = [
     "dispatch",
     "dispatch_expand",
     "dispatch_lead",
+    "dispatch_extract",
     "replay_only",
     "persisted_expansion_report",
+    "persisted_extraction_run",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -142,6 +149,9 @@ MODE_EXPAND = "expand"
 MODE_LEAD = "lead"
 #: Official full-text retrieval (Step 06); validated/dispatched by ``worker.acquisition``.
 MODE_ACQUIRE = acquisition_jobs.MODE_ACQUIRE
+#: Bounded direct extraction/quality runs (Step 09); validated/dispatched by
+#: ``worker.extraction``.
+MODE_EXTRACT = extraction_jobs.MODE_EXTRACT
 
 #: Every accepted discovery mode.
 DISCOVERY_MODES = (
@@ -151,6 +161,7 @@ DISCOVERY_MODES = (
     MODE_EXPAND,
     MODE_LEAD,
     MODE_ACQUIRE,
+    MODE_EXTRACT,
 )
 
 #: Durable job task kinds (the existing ``JobRepository`` accepts these strings).
@@ -161,6 +172,8 @@ TASK_KIND_EXPAND = "discovery_expand"
 TASK_KIND_LEAD = "discovery_lead"
 #: A public-network task in the shared serial detached pool (not a discovery search).
 TASK_KIND_ACQUIRE = acquisition_jobs.TASK_KIND_ACQUIRE
+#: A bounded direct extraction/quality run (Step 09) in the shared serial pool.
+TASK_KIND_EXTRACT = extraction_jobs.TASK_KIND_EXTRACT
 
 #: Every discovery job task kind.
 DISCOVERY_TASK_KINDS = frozenset(
@@ -171,6 +184,7 @@ DISCOVERY_TASK_KINDS = frozenset(
         TASK_KIND_EXPAND,
         TASK_KIND_LEAD,
         TASK_KIND_ACQUIRE,
+        TASK_KIND_EXTRACT,
     }
 )
 
@@ -181,6 +195,7 @@ _MODE_BY_TASK_KIND = {
     TASK_KIND_EXPAND: MODE_EXPAND,
     TASK_KIND_LEAD: MODE_LEAD,
     TASK_KIND_ACQUIRE: MODE_ACQUIRE,
+    TASK_KIND_EXTRACT: MODE_EXTRACT,
 }
 _TASK_KIND_BY_MODE = {mode: kind for kind, mode in _MODE_BY_TASK_KIND.items()}
 
@@ -195,16 +210,22 @@ MODE_PARAMETER_KEYS: dict[str, frozenset[str]] = {
     MODE_LEAD: frozenset({"batch_ref", "credential_env"}),
     MODE_ACQUIRE: acquisition_jobs.ACQUIRE_REQUIRED_KEYS
     | acquisition_jobs.ACQUIRE_OPTIONAL_KEYS,
+    MODE_EXTRACT: extraction_jobs.EXTRACT_REQUIRED_KEYS
+    | extraction_jobs.EXTRACT_OPTIONAL_KEYS,
 }
 
 #: The one, fixed environment-variable name a hosted-lead job may name.
 LEAD_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
+
+#: The one, fixed environment-variable name an extraction run may name.
+EXTRACT_CREDENTIAL_ENV = extraction_jobs.EXTRACT_CREDENTIAL_ENV
 
 #: Safe job-accepted-result kinds, one per result family.
 RESULT_KIND_OBSERVATION = "discovery_observation"
 RESULT_KIND_EXPANSION = "discovery_expansion"
 RESULT_KIND_LEAD = "discovery_lead"
 RESULT_KIND_ACQUISITION = acquisition_jobs.RESULT_KIND_ACQUISITION
+RESULT_KIND_EXTRACTION = extraction_jobs.RESULT_KIND_EXTRACTION
 
 #: Technical bound on the number of explicit expansion roots.
 MAX_EXPAND_ROOTS = 10_000
@@ -491,6 +512,10 @@ def validate_submission(
         canonical = acquisition_jobs.validate_acquire(parameters, project_id, request_id)
         _check_parameter_size(canonical)
         return canonical
+    if mode == MODE_EXTRACT:
+        canonical = extraction_jobs.validate_extract(parameters, project_id, request_id)
+        _check_parameter_size(canonical)
+        return canonical
     allowed = MODE_PARAMETER_KEYS[mode]
     params = _require_keys(parameters, allowed)
 
@@ -682,6 +707,8 @@ def result_kind_for_mode(mode: str | None) -> str:
         return RESULT_KIND_LEAD
     if mode == MODE_ACQUIRE:
         return RESULT_KIND_ACQUISITION
+    if mode == MODE_EXTRACT:
+        return RESULT_KIND_EXTRACTION
     return RESULT_KIND_OBSERVATION
 
 
@@ -701,6 +728,8 @@ def accepted_result(job: Any, raw: Any) -> tuple[str, Any]:
         return RESULT_KIND_LEAD, dict(raw)
     if mode == MODE_ACQUIRE:
         return RESULT_KIND_ACQUISITION, acquisition_jobs.accepted_result(raw)
+    if mode == MODE_EXTRACT:
+        return RESULT_KIND_EXTRACTION, extraction_jobs.accepted_result(raw)
     return RESULT_KIND_OBSERVATION, observation_metadata(job, raw)
 
 
@@ -768,6 +797,8 @@ def status_projection(result_kind: str, result: Any) -> Any:
         return _lead_summary(result)
     if result_kind == RESULT_KIND_ACQUISITION:
         return acquisition_jobs.status_projection(result)
+    if result_kind == RESULT_KIND_EXTRACTION:
+        return extraction_jobs.status_projection(result)
     return result
 
 
@@ -989,6 +1020,43 @@ def dispatch_lead(
     )
 
 
+def dispatch_extract(
+    store: Any,
+    registry: Any,
+    token: str,
+    job: Any,
+    *,
+    api_key: str | None,
+    extract_transport: Any = None,
+) -> dict[str, Any]:
+    """Execute one bounded extraction/quality run (at most one POST).
+
+    Delegates to :func:`~review_article_agent.worker.extraction.dispatch_extract`,
+    which calls the revision-scoped runner
+    (:func:`~review_article_agent.extraction.runner.execute_run`). The runner
+    re-derives the config/hosted-use revisions, revalidates the exact named gates,
+    every pinned source's rights, the execution token, and (in bulk mode) the
+    approved pilot and the acquired manifest, reserves on the runtime dispatch
+    ledger before the one POST, and returns a safe readback mapping. A missing
+    credential is refused with **zero** POST.
+    """
+    return extraction_jobs.dispatch_extract(
+        store,
+        registry,
+        token,
+        job,
+        api_key=api_key,
+        transport=extract_transport,
+    )
+
+
+def persisted_extraction_run(store: Any, *, request_id: str | None = None):
+    """Return the saved accepted run mapping for an extraction run job, or None."""
+    if request_id is None:
+        return None
+    return extraction_jobs.persisted_extraction_run(store, request_id=request_id)
+
+
 def persisted_expansion_report(store: Any, *, job_id: str | None = None, request_id: str | None = None):
     """Return the full saved expansion mapping for a completed expand job, or None.
 
@@ -1054,6 +1122,10 @@ def dispatch(
     params = job.parameters if isinstance(job.parameters, dict) else {}
     if mode == MODE_ACQUIRE:
         # Acquisition has its own journaled runner (``acquisition.dispatch_acquire``).
+        raise DiscoveryJobValidationError("bad_value", _M_BAD_MODE)
+    if mode == MODE_EXTRACT:
+        # Extraction has its own bounded runner (``extraction.dispatch_extract``),
+        # dispatched by the engine with the credential read from the environment.
         raise DiscoveryJobValidationError("bad_value", _M_BAD_MODE)
     if mode == MODE_EXPAND:
         return dispatch_expand(store, registry, token, job, transport, job_held=job_held)
@@ -1207,6 +1279,24 @@ def _replay_acquire(store: Any, registry: Any, token: str, job: Any) -> Replayed
     )
 
 
+def _replay_extract(store: Any, job: Any) -> ReplayedOutcome | None:
+    """Read a recorded extraction run back from durable rows (zero POST).
+
+    A terminal resolved outcome is a complete proof; a missing dispatch or an
+    ``unknown``/``submitted`` outcome is **not** (it must be escalated to a human,
+    and is never re-sent).
+    """
+    proven = extraction_jobs.replay_extract(store, None, None, job)
+    if proven is None:
+        return None
+    mapping, complete = proven
+    return ReplayedOutcome(
+        result_kind=RESULT_KIND_EXTRACTION,
+        result=extraction_jobs.accepted_result(mapping),
+        complete=complete,
+    )
+
+
 def replay_only(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutcome | None:
     """Prove an existing durable outcome for ``job`` without any provider I/O.
 
@@ -1223,6 +1313,8 @@ def replay_only(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutc
         return _replay_lead(store, job)
     if mode == MODE_ACQUIRE:
         return _replay_acquire(store, registry, token, job)
+    if mode == MODE_EXTRACT:
+        return _replay_extract(store, job)
     try:
         record = dispatch(store, registry, token, job, _replay_miss_transport)
     except Exception:  # noqa: BLE001 - any failure means "not proven present"

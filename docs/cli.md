@@ -78,7 +78,10 @@ The same `main()` is reached three ways, all standard-library only:
 Data-directory precedence: **`--data-dir` > config file `data_dir` > XDG default**
 (`$XDG_DATA_HOME/review_article_agent`, else `~/.local/share/review_article_agent`).
 The data directory is created and kept **owner-private (`0700`)** by the registry
-on first use.
+on first use. A pre-existing data directory, app-owned project directory, or
+database file that is **not** owner-private is refused (never silently used or
+chmodded) with a specific message naming the path and the `chmod` remedy — see
+§3.
 
 ## 3. Output and exit codes
 
@@ -119,6 +122,23 @@ Both `usage` and `validation` deliberately share exit `2` (matching `argparse`'s
 convention); the JSON `category` distinguishes them. Snapshot failures use
 curated `storage`/`conflict` messages and **never** echo a raw manifest, snapshot,
 or exception detail.
+
+Two `storage` (exit `4`) failures carry a **specific, actionable** message rather
+than the generic storage summary, because the fix is unambiguous and needs the
+offending location named:
+
+* **Not owner-private.** An existing data directory, app-owned project
+  directory, or database file that grants group/other access is refused (never
+  silently used or chmodded). The message names the path, the mode it has, and
+  the exact remedy, e.g. `the data directory '/state' must be private to its
+  owner (mode 0700); it is currently 0755, … Run: chmod 700 /state`.
+* **Forbidden destination.** Writing a snapshot or export inside the application
+  data directory or a project's `.review_article_agent` directory is refused with
+  a message that says so and points to a destination outside `--data-dir`.
+
+Both messages contain only the path the user supplied (via `--data-dir`, a
+project root, or `--output`/`DEST`) and a permission mode — never a secret,
+identifier, payload, or traceback.
 
 ## 4. Configuration file (optional)
 
@@ -296,7 +316,7 @@ online-backup API, so committed WAL content is captured consistently.
 
 | Command | Synopsis |
 | --- | --- |
-| `backup create DEST [--project ID]` | Create a **new** private snapshot directory at `DEST`. Refused if `DEST` already exists, and refused inside the application data directory or any project's app-owned directory. |
+| `backup create DEST [--project ID]` | Create a **new** private snapshot directory at `DEST`. Refused if `DEST` already exists, and refused inside the application data directory or any project's app-owned directory (the error says so and points to a destination outside `--data-dir`; see §3). |
 | `backup verify DIR` | Read-only, fail-closed verification of a snapshot directory. Prints `{"backup": {ok, project_id, counts, …}}`. |
 | `backup restore DIR ROOT` | Verify, then atomically restore `DIR` into a **new** project `ROOT`, preserving the snapshot's exact `project_id`. |
 | `export DEST [--project ID]` | **Alias** of `backup create`: the same private local storage snapshot format. |
@@ -1011,3 +1031,62 @@ assembles one section's reconstructible drafting package:
 `--content` opt-in; the assembly Markdown keeps the approved paragraph structure. No
 default model is selected and no live call is made. Status and disclosures:
 [Step 11 handoff](implementation/handoffs/11-drafting.md).
+
+## 18. Extraction runs — `extraction run` (Step 09 addition)
+
+The `extraction` group's local `propose`/`show`/`accepted` commands (write/read inert
+`config`/`pilot`/`batch`/`audit` revisions; no dispatch, no approval) are unchanged. This
+section adds the detached **run** sub-group over the Step 09 direct-extraction worker
+surface (`discovery_submit` `mode=extraction_run`; see
+[`worker.md`](worker.md) §14). The existing `job status|list|attach|pause|resume|cancel|
+drain|switch|reconcile` lifecycle commands apply to a queued run unchanged.
+
+### 18.1 `extraction run submit`
+
+`extraction run submit` assembles one exact `extraction_run` submission and returns a
+**queued admission only** — never a completion and never a model output:
+
+```
+extraction run submit \
+  --config-artifact-id ID --config-revision-id ID \
+  --report-refs-file PATH \
+  --hosted-artifact-id ID --hosted-revision-id ID \
+  --purpose {extraction,quality} --mode {pilot,bulk} \
+  [--extraction-artifact-id ID --extraction-revision-id ID] \
+  [--pilot-artifact-id ID --pilot-revision-id ID] \
+  --receipt-artifact-id ID --receipt-revision-id ID \
+  --rights-file PATH \
+  --credential-env OPENROUTER_API_KEY \
+  --request-id ID [--project ID] [--timeout SECONDS]
+```
+
+* `--report-refs-file` is a strict JSON list of `{"artifact_id","revision_id"}` report
+  references (the target project is filled in); `--rights-file` is a strict JSON object
+  holding one `RightsRecord` for the **exact receipt revision**.
+* `--extraction-ref` is required for `purpose=quality` and forbidden for
+  `purpose=extraction`; `--pilot-ref` is required for `mode=bulk` and forbidden for
+  `mode=pilot`.
+* Every argument is validated locally, and the assembled parameters are canonicalised by
+  the **real** extraction submission validator, **before** a worker is ensured — so a bad
+  value is a typed `validation` error and no daemon is started and no job is created.
+* `--credential-env` must name the one approved variable (`OPENROUTER_API_KEY`); the
+  credential **value** is never accepted, sent over IPC, persisted, or logged. The worker
+  reads the named variable from its own environment at dispatch, and the CLI warns
+  (`configuration_required`/`notice`) when the key is absent — it never restarts or
+  reconfigures a user's worker.
+* The output carries `queued=true`, `admission_only=true`, `job_completion=false`,
+  `key_value_accepted=false`, and `scientific_validation=false`.
+
+### 18.2 `extraction run status`
+
+`extraction run status --request-id ID [--project ID]` reads one recorded run **locally**
+from the verified project store (no worker, no POST, no approval). The safe run projection
+is returned under `run` (request/status/outcome/dispatch/task/cost/model/usage and the run
+**receipt** reference `run_ref`); the private model output is never included. When the run
+has not completed, `job_state` reports the durable scheduling state. The output carries
+`authorizes_extraction=false`, `authorizes_synthesis=false`, and
+`scientific_validation=false`. An unknown request id is a `validation` error.
+
+Errors use the exit categories of §3 with static, value-free messages. Status and
+disclosures: [`worker.md`](worker.md) §14 and
+[decision 004](decisions/004-step09-direct-extraction.md).
