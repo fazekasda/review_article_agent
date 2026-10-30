@@ -28,13 +28,16 @@ Where a stage's actual output cannot be consumed by the next API, the existing
 synthetic fixture is used and the call site is marked ``# BRIDGE: <why>``; every
 bridge is listed in :data:`BRIDGES` below.
 
-**Fixture disclosure:** the upstream extraction/audit inputs to synthesis, the
-origin-tracing claim/source graph, and the manuscript-text bridge are existing
-*synthetic* fixtures; the critic/writer/reviewer/acquire ports are local fakes
-that count calls.  The export bibliography is now built from the draft package's
-real verified frozen-corpus citation records (``bibliography_from_packages``).
-No live model, network, provider, or OpenCode session call is made, and no source
-is copyrighted.  All content is synthetic.
+**Fixture disclosure:** the upstream extraction/audit inputs to synthesis and the
+manuscript-text bridge are existing *synthetic* fixtures; the critic/writer/
+reviewer ports are local fakes that count calls.  The origin-tracing claim/source
+graph is now derived from the **real** draft and its approved package, and the
+acquisition port is the **real** Step 06/07-backed port
+(``tracing.acquisition_port.make_acquire_port``); no source is fetched.  The
+export bibliography is built from the draft package's real verified frozen-corpus
+citation records (``bibliography_from_packages``).  No live model, network,
+provider, or OpenCode session call is made, and no source is copyrighted.  All
+content is synthetic.
 
 Run::
 
@@ -63,13 +66,7 @@ from test_review_workflow import (  # noqa: E402
     FakeCritic,
     FakeWriter,
 )
-from test_tracing_workflow import (  # noqa: E402
-    POLICY,
-    FakeAcquire,
-    _claim,
-    _primary,
-    _secondary_review,
-)
+from test_tracing_workflow import POLICY  # noqa: E402
 
 from review_article_agent.delivery.export import (  # noqa: E402
     _FORBIDDEN_CLAIM_SUBSTRINGS,
@@ -77,6 +74,10 @@ from review_article_agent.delivery.export import (  # noqa: E402
 )
 from review_article_agent.delivery.workflow import DeliveryRepository  # noqa: E402
 from review_article_agent.review.workflow import SectionReviewRepository  # noqa: E402
+from review_article_agent.tracing.acquisition_port import (  # noqa: E402
+    make_acquire_port,
+)
+from review_article_agent.tracing.inputs import claims_and_sources  # noqa: E402
 from review_article_agent.tracing.workflow import (  # noqa: E402
     OriginTraceRepository,
     origin_coverage,
@@ -91,12 +92,6 @@ BRIDGES = [
         "The accepted Step 09 extraction/audit inputs to synthesis come from the "
         "existing synthetic receipt fixture (test_synthesis_workflow."
         "approved_chain -> accepted_audit); no live extraction run is chained.",
-    ),
-    (
-        "tracing_claims_sources",
-        "Origin tracing's claim/source graph inputs come from the Step 13 "
-        "synthetic fixture (test_tracing_workflow._claim / _secondary_review / "
-        "_primary); only review_checks are chained from the real review state.",
     ),
     (
         "manuscript_text",
@@ -209,32 +204,59 @@ class EndToEndManuscriptTests(DraftBase):
         self.assertTrue(all(c["verdict"] == "supported" for c in checks))
 
         # ---------------------------------------------------------------- #
-        # 5. origin tracing -- chained real review checks
+        # 5. origin tracing -- real claims/sources from the draft + package
         # ---------------------------------------------------------------- #
-        # BRIDGE: tracing_claims_sources -- the claim/source graph is the Step 13
-        # synthetic fixture; the review checks are chained from the real state.
-        acquire = FakeAcquire({"r1": {"status": "acquired", "source": _primary()}})
+        # The claim/source graph is derived from the real draft and its approved
+        # package (one claim per drafted sentence, one source per cited key); the
+        # acquisition port is the real Step 06/07-backed port.  The acquired
+        # primary is the frozen-corpus source itself: at depth 0 its tagged
+        # passage does not attribute the claim (no own/secondary cue), so the
+        # trace ends at depth 0 with the explicit secondary-attribution warning
+        # (the spec-acceptable MVP outcome; never primary_verified).
+        claims, sources, source_digests = claims_and_sources(
+            self.store, draft=draft, package=package, review_state=review_state
+        )
+        self.assertTrue(claims)
+        self.assertEqual(claims[0]["paragraph_id"], "P1")
+        self.assertEqual(claims[0]["intent_id"], "I1")
+        self.assertIn(claims[0]["root_source_key"], sources)
+        self.assertEqual(set(sources), {first_citation})
+        acquire = make_acquire_port(self.store)
         trace = OriginTraceRepository(self.store)
         trace_state = trace.run(
             "trace-e2e",
-            claims=[_claim()],
-            sources={"review": _secondary_review()},
+            claims=claims,
+            sources=sources,
             policy=POLICY,
             review_checks=checks,
             acquire=acquire,
             rights=self.rights,
+            source_digests=source_digests,
         )
-        self.assertEqual(trace_state["claims"][0]["outcome"], "origin_traced")
+        self.assertEqual(trace_state["claims"][0]["outcome"], "secondary_warning")
+        self.assertTrue(trace_state["claims"][0]["requires_final_human_approval"])
+        self.assertTrue(trace_state["claims"][0]["origin_warning"])
         # The chained review check is copied and annotated with origin fields only.
         self.assertEqual(trace_state["section_checks"][0]["verdict"], "supported")
-        self.assertEqual(trace_state["section_checks"][0]["origin_outcome"], "origin_traced")
+        self.assertEqual(
+            trace_state["section_checks"][0]["origin_outcome"], "secondary_warning"
+        )
+        self.assertTrue(
+            trace_state["section_checks"][0]["requires_final_human_approval"]
+        )
         # primary_verified is never emitted.
         self.assertNotIn("primary_verified", str(trace_state))
 
         coverage = origin_coverage(trace_state)
         self.assertTrue(coverage["complete"])
         self.assertFalse(coverage["edits_applied"])
-        self.assertEqual(coverage["requires_human_approval"], [])
+        # The warned secondary account is listed for final human approval and the
+        # export is not yet ready.
+        self.assertFalse(coverage["export_ready"])
+        self.assertEqual(len(coverage["requires_human_approval"]), 1)
+        self.assertEqual(
+            coverage["requires_human_approval"][0]["cite_source_key"], first_citation
+        )
 
         # ---------------------------------------------------------------- #
         # 6. delivery -- global review gate fed by real review + coverage
