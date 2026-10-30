@@ -1090,3 +1090,66 @@ has not completed, `job_state` reports the durable scheduling state. The output 
 Errors use the exit categories of §3 with static, value-free messages. Status and
 disclosures: [`worker.md`](worker.md) §14 and
 [decision 004](decisions/004-step09-direct-extraction.md).
+
+## 19. Pipeline stage status — `pipeline` (kickoff 16 §6, read-only half)
+
+The root `pipeline` group is a **read-only** local surface over
+[`pipeline/status.py`](../src/review_article_agent/pipeline/status.py). It reports,
+for one project, the project's **current pipeline stage** derived from durable state
+and the exact next action a human must take. It is the read-only half of the
+`pipeline run` orchestrator; it holds no authoritative state of its own, reuses the
+stages' existing repositories/`require_*` checks, and writes nothing.
+
+| Command | Synopsis |
+| --- | --- |
+| `pipeline status [--project ID]` | Report the current stage, the completed stages, what the project is blocked on, and the exact next action / CLI command. |
+
+`pipeline status` walks the ordered stage table (discovery plan → coverage → freeze
+→ acquisition → parsing → screening pilot/exclusions → extraction config/pilot/
+batch/outputs → synthesis → framework → outline → drafting blueprint → review →
+tracing → delivery) and stops at the first stage that is not complete. A stage is
+**complete only when its own existing `require_*`/read check passes** (for example
+`discovery.freeze.require_frozen`, `acquisition.manifest.require_acquired`,
+`synthesis.workflow.require_outline`, `drafting.workflow.require_blueprint`), so a
+reported "complete" is exactly the authority the stage itself grants. A stage with
+no proposal revision is treated as *skipped* (not the current stage) when a later
+stage has already begun.
+
+The JSON output is:
+
+```json
+{
+  "stage": "<stage id> | \"complete\"",
+  "completed": ["<stage id>", "..."],
+  "blocked_on": null | {"kind": "human_gate|missing_input|hosted_use|budget|failure|paused",
+                        "detail": "...", "next_command": "<exact CLI line or null>"},
+  "next_action": null | {"kind": "job|human", "role"/"job": "...", "inputs": {...}},
+  "warnings": ["..."],
+  "project_id": "prj_...",
+  "authorizes_execution": false,
+  "authorizes_export": false,
+  "scientific_validation": false
+}
+```
+
+* **Human gate.** When a proposal revision exists but its exact named human gate is
+  not currently active and approved, `blocked_on.kind` is `"human_gate"` and
+  `next_command` is the exact `gate confirm` line
+  (`--artifact-id`/`--revision-id`/`--gate-kind`/`--gate-id`/`--decision approved`
+  plus the required `--rationale`/`--snapshot-digest` placeholders). The `detail`
+  also names the read-only `gate prepare` command needed to obtain the snapshot
+  digest. A stale approval (a new revision after the approval) is reported as
+  awaiting the gate again.
+* **Not started.** When no proposal revision exists and no later stage has begun,
+  `blocked_on` is `null` and `next_action` describes how to produce the proposal,
+  naming the exact CLI command where one exists.
+* **No CLI yet.** Where no CLI exists for the action (review, tracing, delivery;
+  kickoff 16 §9), `next_command` is `null` and the `detail`/`inputs` name the library
+  entry point (`SectionReviewRepository.run`, `OriginTraceRepository.run`,
+  `DeliveryRepository.start_global_review`).
+
+The command never dispatches a model, session, worker job, or network request,
+records no approval, and writes nothing; re-running it over an unchanged store
+returns equal output (idempotent). The project is opened through the registry with
+an expected project id, and failures use the exit categories of §3 with static,
+value-free messages.
