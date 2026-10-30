@@ -106,10 +106,11 @@ _RUN_CHUNK = 500
 #: adds at most ``_RUN_CHUNK * _INGEST_RUNS`` newly-minted candidates to one
 #: snapshot revision, which keeps this harness on the real, documented
 #: incremental accumulation path (``CandidateRepository.ingest`` adds runs to the
-#: prior cumulative snapshot). It also stays clear of an observed limitation:
-#: a *single* revision minting >= 10,000 candidates overflows the 4-digit
-#: ``dedup-NNNN`` decision-id shape and then fails read-back revalidation (see the
-#: report ``notes``; fixing that is out of this task's scope).
+#: prior cumulative snapshot). This test originally surfaced a defect, now fixed
+#: in Task S15-dedup-fix: a single revision minting the 10,000th decision id
+#: ``dedup-10000`` was rejected on read-back (the validator expected exactly four
+#: digits); the pattern now accepts ``\d{4,}`` with numeric id ordering and a
+#: regression test (``tests.test_discovery_candidates.DecisionIdScaleTests``).
 _INGEST_RUNS = 4
 
 #: Default per-stage wall-clock budget in seconds. If a stage exceeds it, the
@@ -277,8 +278,7 @@ def run_discovery_stage(
                 # Ingest recorded runs incrementally: each revision is a
                 # cumulative snapshot adding the next batch of runs. This is the
                 # real documented accumulation path (repeated searches feed one
-                # cumulative ledger), and it keeps each revision's minted-candidate
-                # count within the observed 4-digit decision-id ceiling.
+                # cumulative ledger).
                 for batch_no, (_off, run_batch) in enumerate(
                     _chunks(run_ids, _INGEST_RUNS)
                 ):
@@ -504,14 +504,13 @@ def _environment() -> dict:
         "model_calls": 0,
         "network_calls": 0,
         "notes": [
-            "Observed limitation (not fixed here; out of this task's scope): a "
-            "single candidate-ledger revision that mints >= 10,000 candidates "
-            "fails read-back revalidation. The snapshot's dedup decision ids are "
-            "formatted as dedup-NNNN (exactly four digits), so the 10,000th "
-            "decision id 'dedup-10000' is rejected as corrupt membership. This "
-            "harness therefore ingests incrementally (each revision adds at most "
-            "ingest_batch_runs * run_chunk candidates), which is the real "
-            "documented accumulation path and stays within the ceiling.",
+            "This scale test originally surfaced a defect, now fixed in Task "
+            "S15-dedup-fix: a single candidate-ledger revision minting the 10,000th "
+            "decision id 'dedup-10000' was rejected on read-back because the "
+            "validator expected exactly four digits. The read-back pattern now "
+            "accepts \\d{4,} and orders ids numerically (regression test "
+            "tests.test_discovery_candidates.DecisionIdScaleTests). Ingestion here "
+            "still proceeds incrementally, the real documented accumulation path.",
         ],
         "budget_note": (
             "No numeric scale budget was agreed in Step 01 "

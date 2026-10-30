@@ -78,7 +78,7 @@ Every pointer is an actual test method.
   `tests/test_step15_scale.py` (`ScaleReportShapeTests`; `GatedScaleTests` runs
   1k/10k); report
   `docs/implementation/handoffs/15-scale-report.json`. Measured: 1,000
-  candidates in ~3.9 s; 10,000 in ~84.5 s, max RSS ~223 MB, zero model/network
+  candidates in ~3.9 s; 10,000 in ~85.4 s, max RSS ~223 MB, zero model/network
   calls. **No numeric scale budget was agreed in Step 01** — the report says so
   and claims no universal latency/cost promise.
 - **AC6 (pilot/audit observations are calibration/inspected-sample evidence).**
