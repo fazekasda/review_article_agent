@@ -174,6 +174,7 @@ criterion-by-criterion status is in the
 - [Step 03 handoff (complete, synthetic detached worker)](docs/implementation/handoffs/03-durable-worker.md)
 - [Step 04 handoff (complete, restricted runtime)](docs/implementation/handoffs/04-agent-runtime.md)
 - [Step 05 handoff (complete — scoped discovery workflow)](docs/implementation/handoffs/05-discovery.md)
+- [Step 15 release guide](docs/release.md) and [Step 15 handoff (locally verified MVP; awaiting user review)](docs/implementation/handoffs/15-release.md)
 - [Discovery core, adapters, codec, CLI, and limits (Step 05)](docs/discovery.md)
 - [Step 02 CLI contract](docs/cli.md)
 - [Step 02 storage contract](docs/storage.md)
