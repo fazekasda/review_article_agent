@@ -1292,7 +1292,7 @@ lifecycle commands apply to a queued run unchanged.
 
 ```
 generation run submit \
-  --operation {synthesis,framework,outline,blueprint,draft,section_review} \
+  --operation {synthesis,framework,outline,blueprint,draft,section_review,global_review,notes_plan,screening_case} \
   --credential-env OPENROUTER_API_KEY \
   --request-id ID \
   [--params-file PATH | <op-specific flags>] \
@@ -1303,12 +1303,13 @@ generation run submit \
   (refs as `{"artifact_id","revision_id"}`, the `rights` record, and any optional
   fields); the CLI fills in the project id on every reference. The op-specific flags
   (`--<ref>-artifact-id`/`--<ref>-revision-id`, `--artifact-id`, `--revision-id`,
-  `--review-id`, `--parent-revision-id`, `--source-refs-file`, `--rights-file`) are an
-  alternative to `--params-file`.
-* The wired operations are `synthesis`/`framework`/`outline`, `blueprint`/`draft`, and
-  `section_review`. The recognized-but-unsupported operations `global_review`,
-  `notes_plan`, and `screening_case` are refused with a `validation` error before a
-  worker is ensured (nothing is sent and no job is created).
+  `--delivery-id`, `--review-id`, `--passage-id`, `--parent-revision-id`,
+  `--source-refs-file`, `--rights-file`) are an alternative to `--params-file`.
+* Every documented operation is wired: the single-shot `synthesis`/`framework`/`outline`,
+  `blueprint`/`draft`, and `section_review`; the delivery `global_review` (reads the
+  current manuscript/evidence from the recorded delivery state) and `notes_plan`
+  (proposes an author-note edit batch; never applies it); and `screening_case` (one
+  direct Jev decision committed through the decision ledger). No operation is refused.
 * Every argument is validated locally, and the assembled parameters are canonicalised by
   the **real** generation submission validator, **before** a worker is ensured — so a bad
   value is a typed `validation` error and no daemon is started and no job is created.
@@ -1330,6 +1331,44 @@ safe generation readback); the private model output is never included. When the 
 not completed, `job_state` reports the durable scheduling state. The output carries
 `authorizes_publication=false` and `scientific_validation=false`. An unknown request id is
 a `validation` error.
+
+### 19.3 `generation hosted-use propose`
+
+`generation hosted-use propose` validates and stores one per-role
+`generation_hosted_use` authorization **document** as an inert artifact revision
+(no approval is recorded and no call is made):
+
+```
+generation hosted-use propose \
+  --role {screening,synthesis,framework,outline,blueprint,section_writer,section_critic,section_repair,fact_checker,global_reviewer,global_writer,notes_planner} \
+  --config-file PATH \
+  --budget-cap-usd DECIMAL \
+  --provider-terms-ref REF --privacy-review-ref REF --pricing-evidence-ref REF \
+  --artifact-id ID --revision-id ID --rights-file PATH \
+  [--provider-terms-verified-at TS --privacy-review-verified-at TS --pricing-evidence-verified-at TS] \
+  [--notes TEXT] [--project ID]
+```
+
+* `--config-file` is a strict JSON object: the `LeadConfig` (the concrete model and
+  pricing bound for the role). `--budget-cap-usd` is an exact decimal string `> 0`.
+* Each `--<field>-ref` is a non-empty reference to the human-reviewed evidence; its
+  `verified_at` defaults to the propose instant (RFC 3339 UTC) and may be pinned with
+  `--<field>-verified-at`.
+* The document is validated by `validate_hosted_use_document` (nothing is written on a
+  malformed document) and stored by `propose_hosted_use` with the caller's
+  `--rights-file` record. The output carries `revision`, the validated `document`, and
+  a non-authorizing `gate` block whose `prepare_command`/`confirm_command` are the exact
+  `gate prepare`/`gate confirm` invocations for `--gate-kind batch
+  --gate-id generation.hosted_use.<role>` on the new revision. It records **no**
+  approval, accepts **no** secret, and carries `approval_recorded=false`.
+
+### 19.4 `generation hosted-use show`
+
+`generation hosted-use show --artifact-id ID [--revision-id ID] [--project ID]` reads one
+exact revision (the current head when `--revision-id` is omitted), validates its bytes
+with `validate_hosted_use_document`, and prints the validated `document` plus whether
+the exact `batch`/`generation.hosted_use.<role>` gate is satisfied for that revision
+(`gate_satisfied`; `false` for a superseded/stale revision). Nothing is written.
 
 Errors use the exit categories of §3 with static, value-free messages. Status and
 disclosures: [`worker.md`](worker.md) §15 and [`generation.md`](generation.md).

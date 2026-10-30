@@ -40,16 +40,18 @@ What this module is **not**
   POST. A recorded run is inert provenance.
 * It never accepts, sends, persists, or logs the credential **value**; only the
   one fixed environment-variable **name** is carried in the parameters.
-* It supports a subset of the documented role adapters; an operation that is
-  recognized but not yet wired here is refused with a static validation error
-  (nothing is written and no job is created).
+* It supports every documented role adapter; an operation name outside the closed
+  set is refused with a static validation error (nothing is written and no job is
+  created).
 
 The operations wired here are ``synthesis`` / ``framework`` / ``outline``
 (``generation/synthesis_roles``), ``blueprint`` / ``draft``
-(``generation/drafting_roles``), and ``section_review``
+(``generation/drafting_roles``), ``section_review``
 (``review/workflow.SectionReviewRepository.run`` with ports from
-``generation/review_roles.make_review_ports``). ``global_review``, ``notes_plan``
-and ``screening_case`` are recognized but refused as unsupported.
+``generation/review_roles.make_review_ports``), ``global_review`` / ``notes_plan``
+(``generation/delivery_roles`` over ``delivery/workflow.DeliveryRepository``), and
+``screening_case`` (``screening/runner.execute_screening_case``). Every documented
+operation is now wired; there is no recognized-but-refused operation.
 """
 
 from __future__ import annotations
@@ -95,7 +97,7 @@ RESULT_KIND_GENERATION = "generation_run"
 #: value is never accepted over IPC, persisted, or logged.
 GENERATION_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
 
-#: The operations actually wired to a role adapter on this branch.
+#: The operations actually wired to a role adapter on this branch (all of them).
 SUPPORTED_OPERATIONS = (
     "synthesis",
     "framework",
@@ -103,9 +105,12 @@ SUPPORTED_OPERATIONS = (
     "blueprint",
     "draft",
     "section_review",
+    "global_review",
+    "notes_plan",
+    "screening_case",
 )
-#: The documented operations recognized but not yet wired here (refused).
-UNSUPPORTED_OPERATIONS = ("global_review", "notes_plan", "screening_case")
+#: No recognized operation is refused any more (kept for a stable public name).
+UNSUPPORTED_OPERATIONS: tuple[str, ...] = ()
 #: Every recognized operation name.
 RECOGNIZED_OPERATIONS = SUPPORTED_OPERATIONS + UNSUPPORTED_OPERATIONS
 
@@ -177,6 +182,30 @@ OPERATION_SPECS: dict[str, tuple[tuple[tuple[str, str], ...], tuple[tuple[str, s
             ("rights", "rights"),
         ),
         (("source_refs", "ref_list"),),
+    ),
+    "global_review": (
+        (
+            ("delivery_id", "ident"),
+            ("reviewer_hosted_ref", "ref"),
+            ("writer_hosted_ref", "ref"),
+            ("rights", "rights"),
+        ),
+        (("source_refs", "ref_list"),),
+    ),
+    "notes_plan": (
+        (
+            ("delivery_id", "ident"),
+            ("hosted_ref", "ref"),
+        ),
+        (("source_refs", "ref_list"),),
+    ),
+    "screening_case": (
+        (
+            ("config_ref", "ref"),
+            ("report_ref", "ref"),
+            ("hosted_ref", "ref"),
+        ),
+        (("passage_id", "ident"),),
     ),
 }
 
@@ -329,20 +358,25 @@ def _validate_op(
             continue
         value = parameters[name]
         if kind == "ident":
-            canonical[name] = _ident(value, name)
+            # An optional identifier (e.g. ``passage_id``) may be explicitly null.
+            canonical[name] = None if value is None else _ident(value, name)
         elif kind == "ref_list":
             canonical[name] = _ref_list(value, project_id)
         else:  # pragma: no cover - the spec table is closed
             raise _bad_value(_M_BAD_KEY)
 
-    if operation == "section_review":
-        # The review workflow writes its own artifact (``review_id``) with
-        # generated revision ids, so the base record is validated generically
-        # (project-scoped, storage-allowed, eligible) and its subject is rebound
-        # to each requested revision by the adapter at write time.
-        canonical["rights"] = _rights(parameters["rights"], project_id, None)
-    else:
-        subject = _subject(project_id, artifact_id, revision_id)
+    if "rights" in parameters:
+        if artifact_id is not None and revision_id is not None:
+            # A single-shot operation names the exact artifact/revision it writes,
+            # so its rights record must bind that exact subject.
+            subject = _subject(project_id, artifact_id, revision_id)
+        else:
+            # section_review writes its own artifact (``review_id``) with generated
+            # revision ids, and the delivery/screening operations own their own
+            # writes, so the base record is validated generically (project-scoped,
+            # storage-allowed, eligible) and any per-revision subject is rebound by
+            # the adapter at write time.
+            subject = None
         canonical["rights"] = _rights(parameters["rights"], project_id, subject)
     return canonical
 
@@ -360,10 +394,8 @@ def validate_generation(
     if not isinstance(parameters, dict):
         raise _bad_type(_M_BAD_PARAMETERS)
     operation = parameters.get("operation")
-    if not isinstance(operation, str) or operation not in RECOGNIZED_OPERATIONS:
+    if not isinstance(operation, str) or operation not in SUPPORTED_OPERATIONS:
         raise _bad_value(_M_BAD_OPERATION)
-    if operation in UNSUPPORTED_OPERATIONS:
-        raise _bad_value(_M_UNSUPPORTED_OPERATION)
     if parameters.get("credential_env") != GENERATION_CREDENTIAL_ENV:
         raise _bad_value(_M_BAD_CREDENTIAL_ENV)
     return _validate_op(operation, parameters, project_id)
@@ -580,6 +612,165 @@ def _dispatch_section_review(store, registry, token, job, api_key, transport):
     }
 
 
+def _dispatch_global_review(store, registry, token, job, api_key, transport):
+    """Run one durable bounded global review from the recorded delivery state.
+
+    The current manuscript text/paragraphs and any recorded evidence are read from
+    the delivery state (never passed in by the caller); the real global
+    reviewer/writer ports are built with the caller's reviewer/writer hosted-use
+    revisions (the distinct-concrete-model rule is enforced by
+    ``make_global_review_ports``); and ``DeliveryRepository.run_global_review``
+    runs (or resumes) the bounded, resumable workflow. A model call that does not
+    complete is a **terminal** ``model_not_completed`` result, never a crash. The
+    returned mapping references the delivery id and the final
+    ``complete``/``blocked`` status with the rounds used.
+    """
+    from ..delivery.workflow import DeliveryRepository
+    from ..generation.delivery_roles import DeliveryRoleError, make_global_review_ports
+
+    p = job.parameters
+    delivery_id = p["delivery_id"]
+    repo = DeliveryRepository(store)
+    state = repo.read(delivery_id)
+    if not isinstance(state, dict):
+        return {
+            "operation": "global_review",
+            "status": "model_not_completed",
+            "reason": "delivery_unavailable",
+            "delivery_id": delivery_id,
+        }
+    manuscript = state.get("manuscript") or {}
+    text = manuscript.get("text") if isinstance(manuscript, dict) else None
+    if not isinstance(text, str):
+        text = ""
+    paragraphs = state.get("paragraphs") or {}
+    evidence = state.get("evidence") or []
+
+    reviewer, writer = make_global_review_ports(
+        store,
+        registry=registry,
+        activation_token=token,
+        delivery_id=delivery_id,
+        reviewer_hosted_ref=p["reviewer_hosted_ref"],
+        writer_hosted_ref=p["writer_hosted_ref"],
+        api_key=api_key,
+        transport=transport,
+        source_refs=list(p.get("source_refs") or []),
+    )
+
+    base_rights = p["rights"]
+    project_id = store.project_id
+
+    def rights_factory(artifact_id, revision_id):
+        return _rebind_rights(base_rights, project_id, artifact_id, revision_id)
+
+    try:
+        final = repo.run_global_review(
+            delivery_id,
+            {
+                "revision_id": manuscript.get("revision_id") if isinstance(manuscript, dict) else None,
+                "text": text,
+                "paragraphs": paragraphs,
+            },
+            evidence,
+            reviewer,
+            writer,
+            rights=rights_factory,
+        )
+    except DeliveryRoleError:
+        return {
+            "operation": "global_review",
+            "status": "model_not_completed",
+            "delivery_id": delivery_id,
+        }
+    gr = final.get("global_review") if isinstance(final, dict) else None
+    status = gr.get("status") if isinstance(gr, dict) else None
+    return {
+        "operation": "global_review",
+        "status": status if status in ("complete", "blocked") else "model_not_completed",
+        "delivery_id": delivery_id,
+        "review_status": status,
+        "rounds_used": gr.get("rounds_used") if isinstance(gr, dict) else None,
+    }
+
+
+def _dispatch_notes_plan(store, registry, token, job, api_key, transport):
+    """Propose one author-note edit batch from the recorded delivery state.
+
+    ``generation/delivery_roles.plan_note_edits`` reads the recorded notes and the
+    current manuscript from the delivery state, runs one bounded ``notes_planner``
+    request, and returns a **proposal** batch (never applied): the human approves
+    the batch and only then is ``apply_notes`` called. A non-completed model call
+    or a malformed envelope is a terminal result.
+    """
+    from ..generation.delivery_roles import DeliveryRoleError, plan_note_edits
+
+    p = job.parameters
+    try:
+        result = plan_note_edits(
+            store,
+            registry=registry,
+            activation_token=token,
+            delivery_id=p["delivery_id"],
+            hosted_ref=p["hosted_ref"],
+            api_key=api_key,
+            transport=transport,
+            source_refs=list(p.get("source_refs") or []),
+        )
+    except DeliveryRoleError:
+        return {
+            "operation": "notes_plan",
+            "status": "model_not_completed",
+            "delivery_id": p["delivery_id"],
+        }
+    status = result.get("status")
+    return {
+        "operation": "notes_plan",
+        "status": status
+        if status in ("proposed", "model_not_completed", "invalid_proposal")
+        else "model_not_completed",
+        "delivery_id": p["delivery_id"],
+        "edits": result.get("edits") or [],
+        "dropped": result.get("dropped") or [],
+        "reason": result.get("reason"),
+        "generation": result.get("generation"),
+    }
+
+
+def _dispatch_screening_case(store, registry, token, job, api_key, transport):
+    """Run one screening case through the direct Jev decision path.
+
+    ``screening/runner.execute_screening_case`` re-reads the screening config and
+    parsing report, reuses the hosted-use gate/rights/token authorization, enforces
+    the per-role budget, reserves a ``direct_call`` dispatch before the one POST,
+    and commits the accepted result through the decision ledger. The returned
+    mapping references the committed ``decision_result_ref`` and the dispatch
+    status (a terminal result either way).
+    """
+    from ..screening.runner import execute_screening_case
+
+    p = job.parameters
+    result = execute_screening_case(
+        store,
+        registry=registry,
+        activation_token=token,
+        config_ref=p["config_ref"],
+        report_ref=p["report_ref"],
+        passage_id=p.get("passage_id"),
+        request_id=job.request_id,
+        hosted_ref=p["hosted_ref"],
+        api_key=api_key,
+        transport=transport,
+    )
+    status = result.get("status") if isinstance(result, dict) else None
+    return {
+        "operation": "screening_case",
+        "status": "complete" if status == "completed" else "model_not_completed",
+        "decision_result_ref": result.get("decision_result_ref") if isinstance(result, dict) else None,
+        "screening_status": status,
+    }
+
+
 _DISPATCHERS = {
     "synthesis": _dispatch_synthesis,
     "framework": _dispatch_framework,
@@ -587,6 +778,9 @@ _DISPATCHERS = {
     "blueprint": _dispatch_blueprint,
     "draft": _dispatch_draft,
     "section_review": _dispatch_section_review,
+    "global_review": _dispatch_global_review,
+    "notes_plan": _dispatch_notes_plan,
+    "screening_case": _dispatch_screening_case,
 }
 
 
@@ -658,6 +852,7 @@ def accepted_result(raw: dict[str, Any]) -> dict[str, Any]:
     proposal-ref). Never the credential, the raw model output, the material, or
     any private content.
     """
+    dropped = raw.get("dropped")
     return {
         "kind": RESULT_KIND_GENERATION,
         "mode": MODE_GENERATION,
@@ -669,7 +864,12 @@ def accepted_result(raw: dict[str, Any]) -> dict[str, Any]:
         "ref": raw.get("ref"),
         "review_id": raw.get("review_id"),
         "review_status": raw.get("review_status"),
+        "delivery_id": raw.get("delivery_id"),
+        "rounds_used": raw.get("rounds_used"),
+        "decision_result_ref": raw.get("decision_result_ref"),
+        "screening_status": raw.get("screening_status"),
         "edits_count": len(raw.get("edits") or []) if isinstance(raw.get("edits"), list) else None,
+        "dropped_count": len(dropped) if isinstance(dropped, list) else None,
         "generation": _generation_summary(raw.get("generation")),
         "authorizing": False,
     }
@@ -677,7 +877,9 @@ def accepted_result(raw: dict[str, Any]) -> dict[str, Any]:
 
 _SAFE_KEYS = (
     "kind", "mode", "operation", "request_id", "status", "outcome", "reason",
-    "ref", "review_id", "review_status", "edits_count", "generation", "authorizing",
+    "ref", "review_id", "review_status", "delivery_id", "rounds_used",
+    "decision_result_ref", "screening_status", "edits_count", "dropped_count",
+    "generation", "authorizing",
 )
 
 
@@ -714,6 +916,10 @@ def replay_generation(store: Any, registry: Any, token: str, job: Any):
         if operation == "section_review":
             return _replay_section_review(store, job)
         return None
+    if operation == "global_review":
+        return _replay_global_review(store, job)
+    if operation == "screening_case":
+        return _replay_screening_case(store, job)
 
     try:
         mapping = get_generation_outcome(store, job.request_id)
@@ -753,6 +959,52 @@ def _replay_section_review(store: Any, job: Any):
         "status": status,
         "review_id": review_id,
         "review_status": status,
+    }
+    return accepted_result(raw), True
+
+
+def _replay_global_review(store: Any, job: Any):
+    """Prove a completed global review from the recorded delivery state (no POST)."""
+    from ..delivery.workflow import DeliveryRepository
+
+    params = job.parameters if isinstance(job.parameters, dict) else {}
+    delivery_id = params.get("delivery_id")
+    if not isinstance(delivery_id, str):
+        return None
+    try:
+        state = DeliveryRepository(store).read(delivery_id)
+    except Exception:  # noqa: BLE001 - not a proven present outcome
+        return None
+    gr = state.get("global_review") if isinstance(state, dict) else None
+    status = gr.get("status") if isinstance(gr, dict) else None
+    if status not in ("complete", "blocked"):
+        return None
+    raw = {
+        "operation": "global_review",
+        "status": status,
+        "delivery_id": delivery_id,
+        "review_status": status,
+        "rounds_used": gr.get("rounds_used") if isinstance(gr, dict) else None,
+    }
+    return accepted_result(raw), True
+
+
+def _replay_screening_case(store: Any, job: Any):
+    """Prove a resolved screening case from the dispatch ledger (no POST)."""
+    from ..screening.runner import _readback
+
+    try:
+        mapping = _readback(store, job.request_id, replayed=True)
+    except Exception:  # noqa: BLE001 - not a proven present outcome
+        return None
+    status = mapping.get("status") if isinstance(mapping, dict) else None
+    if status not in ("completed", "unknown"):
+        return None
+    raw = {
+        "operation": "screening_case",
+        "status": "complete" if status == "completed" else "model_not_completed",
+        "decision_result_ref": mapping.get("decision_result_ref"),
+        "screening_status": status,
     }
     return accepted_result(raw), True
 

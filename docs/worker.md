@@ -510,8 +510,8 @@ exception in [decision 004](decisions/004-step09-direct-extraction.md).
 Extends §1–§14. The **only** model-backed generation-role worker surface is
 `discovery_submit` `mode=generation_run` over the already-integrated role adapters in
 [`generation/`](../src/review_article_agent/generation/) (and
-[`screening/runner.py`](../src/review_article_agent/screening/runner.py) for the
-unwired `screening_case`); the adapters own every gate, right, budget, ledger, schema,
+[`screening/runner.py`](../src/review_article_agent/screening/runner.py) for
+`screening_case`); the adapters own every gate, right, budget, ledger, schema,
 and escalation concern. The CLI spellings are in [`cli.md`](cli.md) §23, and the
 role reference is [`generation.md`](generation.md).
 
@@ -520,12 +520,13 @@ role reference is [`generation.md`](generation.md).
   adapter writes, the caller's `rights` record, and the fixed `credential_env` name —
   into one `generation_run` job under the caller's `request_id`; no actor/authority
   flag, no credential value, no model output, and no material. It returns a **queued
-  admission only**. The wired operations are `synthesis`/`framework`/`outline`
-  (`generation/synthesis_roles`), `blueprint`/`draft` (`generation/drafting_roles`), and
+  admission only**. Every documented operation is wired: `synthesis`/`framework`/`outline`
+  (`generation/synthesis_roles`); `blueprint`/`draft` (`generation/drafting_roles`);
   `section_review` (`review/workflow.SectionReviewRepository.run` with ports from
-  `generation/review_roles.make_review_ports`). `global_review`, `notes_plan`, and
-  `screening_case` are **recognized but refused** with a static `validation` error
-  (nothing is written and no job is created).
+  `generation/review_roles.make_review_ports`); `global_review` and `notes_plan`
+  (`generation/delivery_roles` over `delivery/workflow.DeliveryRepository`, reading the
+  current manuscript/evidence from the recorded delivery state); and `screening_case`
+  (`screening/runner.execute_screening_case`). No operation is refused.
 - **Ownership.** [`worker/generation.py`](../src/review_article_agent/worker/generation.py)
   (strict submission validation, the per-operation dispatch, the safe result projection,
   the replay-only read, and the read seam) · [`worker/engine.py`](../src/review_article_agent/worker/engine.py)
@@ -556,7 +557,12 @@ role reference is [`generation.md`](generation.md).
   (`worker.generation.replay_generation`), and an unprovable attempt is escalated for an
   explicit owner `reconcile`.
 - **Tests.** [`tests/test_generation_worker.py`](../tests/test_generation_worker.py) —
-  submission validation (including unsupported operations), a synthesis operation end to
-  end (stored, never approved), a section review through the worker, `invalid_proposal`
-  as a terminal result, missing-credential refusal with zero POST, replay-is-one-run,
-  the persisted read seam, and the `generation run` CLI surface.
+  submission validation, a synthesis operation end to end (stored, never approved), a
+  section review through the worker, a `global_review` that completes (and one that
+  blocks with bounded rounds), a `notes_plan` proposal that is never applied, a
+  `screening_case` that commits a decision result, `invalid_proposal` as a terminal
+  result, missing-credential refusal with zero POST, replay-is-one-run, the persisted
+  read seam, and the `generation run` CLI surface.
+  [`tests/test_cli_generation_hosted_use.py`](../tests/test_cli_generation_hosted_use.py)
+  covers the `generation hosted-use propose|show` surface (propose → show unsatisfied →
+  approve → show satisfied; malformed-document refusal with no write).

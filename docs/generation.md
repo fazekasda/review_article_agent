@@ -79,56 +79,45 @@ Authorization for a role is the per-role `generation_hosted_use` **document** pl
 the out-of-band, owner-authenticated named gate
 `generation.hosted_use.<role>` (gate kind `batch`).
 
-### 1. Store the document (no CLI exists)
+### 1. Store the document (`generation hosted-use propose`)
 
-There is **no CLI command** to propose a `generation_hosted_use` document on this
-branch. (The nearest precedents are `discovery lead configure` for the discovery
-hosted-use batch and `extraction propose` for extraction config/pilot/batch/audit;
-neither writes a generation hosted-use document.) Use the Python API:
+The `generation hosted-use` CLI group proposes and shows a
+`generation_hosted_use` document (see [`cli.md`](cli.md) §23):
 
-```python
-# Placeholder only — never executed by the docs or the tests.
-from review_article_agent.generation.hosted_use import propose_hosted_use
+```console
+# The concrete model + pricing bound for the role (a strict JSON object).
+$ cat config.json
+{"model_id": "…", "upstream_provider": "…", "max_output_tokens": 1024,
+ "context_tokens": 128000, "input_price_per_million": "0.5",
+ "output_price_per_million": "1.5", "pricing_ref": "pricing:…",
+ "instructions_revision": "…", "timeout_seconds": 60.0,
+ "max_response_bytes": 1048576}
 
-document = {
-    "schema_version": 1,
-    "document_type": "generation_hosted_use",
-    "payload": {
-        "role": "section_writer",
-        # LeadConfig: the concrete model and pricing bound for this role.
-        "config": {
-            "model_id": "…",
-            "upstream_provider": "…",
-            "max_output_tokens": 1024,
-            "context_tokens": 128000,
-            "input_price_per_million": "0.5",
-            "output_price_per_million": "1.5",
-            "pricing_ref": "pricing:…",
-            "instructions_revision": "…",
-            "timeout_seconds": 60.0,
-            "max_response_bytes": 1048576,
-        },
-        "budget_cap_usd": "10.00",          # exact decimal string > 0
-        "provider_terms":    {"ref": "…", "verified_at": "…"},  # RFC 3339 UTC
-        "privacy_review":    {"ref": "…", "verified_at": "…"},
-        "pricing_evidence":  {"ref": "…", "verified_at": "…"},
-        "notes": None,
-    },
-}
+# Validate and store one inert revision (no approval, no call). The evidence
+# refs are human-reviewed; verified_at defaults to now (RFC 3339 UTC).
+$ review-article-agent --data-dir "$DD" generation hosted-use propose \
+    --project <PROJECT_ID> --role section_writer \
+    --config-file config.json --budget-cap-usd 10.00 \
+    --provider-terms-ref "terms:…" --privacy-review-ref "privacy:…" \
+    --pricing-evidence-ref "pricing:…" \
+    --artifact-id art-gen-writer --revision-id rev-gen-writer-1 \
+    --rights-file rights.json
 
-ref = propose_hosted_use(
-    store, document,
-    artifact_id="art-gen-writer",
-    revision_id="rev-gen-writer-1",
-    rights=<validated RightsRecord or RightsRecordRef>,  # caller-supplied
-)
-# ref == {"project_id", "artifact_id", "revision_id"} of the stored revision
+# Print the stored document and whether its exact gate is satisfied.
+$ review-article-agent --data-dir "$DD" generation hosted-use show \
+    --project <PROJECT_ID> --artifact-id art-gen-writer
 ```
+
+The `propose` output carries the new `revision`, the validated `document`, and a
+non-authorizing `gate` block whose `prepare_command`/`confirm_command` are the exact
+`gate prepare`/`gate confirm` invocations for the named gate on the new revision.
 
 `validate_hosted_use_document` (pure, no I/O) checks the envelope and payload
 exactly; `propose_hosted_use` validates first (nothing is written on a malformed
 document) then stores one immutable artifact revision with **caller-supplied**
-rights. Rights eligibility is not authority — the named gate below is.
+rights. Rights eligibility is not authority — the named gate below is. The Python
+API (`propose_hosted_use`/`validate_hosted_use_document`) remains available for
+programmatic use.
 
 ### 2. Approve the document (existing `gate` CLI)
 
@@ -252,7 +241,8 @@ response = TransportResponse(
 Tests are in `tests/test_runtime_generation.py`, `tests/test_generation_hosted_use.py`,
 `tests/test_generation_runner.py`, `tests/test_generation_synthesis_roles.py`,
 `tests/test_generation_drafting_roles.py`, `tests/test_generation_review_roles.py`,
-`tests/test_generation_delivery_roles.py`, and `tests/test_screening_runner.py`.
+`tests/test_generation_delivery_roles.py`, `tests/test_screening_runner.py`, and
+`tests/test_cli_generation_hosted_use.py`.
 The runner's `_FakeTransport` (queued responses; raises `RuntimeError` when empty)
 is the canonical pattern.
 
@@ -268,18 +258,20 @@ is the canonical pattern.
   checker.
 - The delivery roles (`global_reviewer`/`global_writer`/`notes_planner`) and
   `screening` **are** wired now (`generation/delivery_roles.py`,
-  `screening/runner.py`), but there is still **no CLI** to propose a
-  `generation_hosted_use` document (Python API only).
+  `screening/runner.py`), and a `generation_hosted_use` document can be proposed
+  and shown from the CLI (`generation hosted-use propose|show`, §1 above); the
+  Python API (`propose_hosted_use`) remains available.
 - There **is** now a worker job kind for the generation roles: the detached
   `generation_run` job (`discovery_submit` `mode=generation_run`) with the
-  `generation run submit|status` CLI. On this branch it wires the single-shot
-  `synthesis`/`framework`/`outline` (`synthesis_roles`) and `blueprint`/`draft`
-  (`drafting_roles`) operations plus `section_review` (`review_roles` ports over
-  `review/workflow.SectionReviewRepository.run`). The delivery
-  (`global_review`, `notes_plan`) and `screening_case` operations are recognized
-  but **refused** by the worker job kind as not yet supported (a validation error;
-  nothing is sent and no job is created). See [`worker.md`](worker.md) §15 and
-  [`cli.md`](cli.md) §23.
+  `generation run submit|status` CLI. It wires **every** documented operation: the
+  single-shot `synthesis`/`framework`/`outline` (`synthesis_roles`) and
+  `blueprint`/`draft` (`drafting_roles`); `section_review` (`review_roles` ports over
+  `review/workflow.SectionReviewRepository.run`); the delivery `global_review` and
+  `notes_plan` (`delivery_roles` over `delivery/workflow.DeliveryRepository`, reading
+  the current manuscript/evidence from the recorded delivery state; `notes_plan`
+  proposes an edit batch and never applies it); and `screening_case`
+  (`screening/runner.execute_screening_case`). No operation is refused. See
+  [`worker.md`](worker.md) §15 and [`cli.md`](cli.md) §23.
 - Live model validation of these roles is **unrun**; the user separately
   authorized one small live OpenRouter smoke test, which is not authorization to
   upload third-party papers or approve a real project.
