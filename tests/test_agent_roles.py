@@ -190,16 +190,24 @@ class ModelRefTests(unittest.TestCase):
         self.assertEqual(ref.ref, "typesafe/jev-1.14")
         self.assertEqual(ref.to_config(), {"providerID": "typesafe", "model": "jev-1.14"})
 
-    def test_rejects_bare_model_name_and_empty_parts(self):
-        for bad in ("claude-sonnet-5-5", "/model", "provider/", "", "provider/model#"):
-            with self.assertRaises(RoleConfigError):
-                ModelRef.from_mapping(bad)
-
-    def test_rejects_whitespace_and_control_characters(self):
-        with self.assertRaises(RoleConfigError):
-            ModelRef.from_mapping("open router/model")
-        with self.assertRaises(RoleConfigError):
-            ModelRef.from_mapping({"provider_id": "openrouter", "model_id": "bad\nmodel"})
+    def test_rejects_malformed_model_refs(self):
+        # One table per validator: every malformed ref spec, same typed error.
+        cases = {
+            "bare_model_name": "claude-sonnet-5-5",
+            "leading_slash": "/model",
+            "trailing_slash": "provider/",
+            "empty": "",
+            "empty_variant": "provider/model#",
+            "whitespace_in_provider": "open router/model",
+            "control_char_in_model": {
+                "provider_id": "openrouter",
+                "model_id": "bad\nmodel",
+            },
+        }
+        for label, bad in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(RoleConfigError):
+                    ModelRef.from_mapping(bad)
 
     def test_same_model_ignores_variant_but_compares_provider_and_id(self):
         base = ModelRef("openrouter", "openai/gpt-6.1-sol", "high")
@@ -212,50 +220,47 @@ class ModelRefTests(unittest.TestCase):
 
 
 class RoleConfigurationTests(unittest.TestCase):
-    def test_requires_explicit_provider_and_model(self):
-        for bad_spec in ({"provider_id": "openrouter"}, {"model_id": "m"}, {}):
-            with self.assertRaises(RoleConfigError):
-                RoleConfiguration.from_mapping(
-                    {"schema_version": 1, "roles": {"writer": bad_spec}}
-                )
-
-    def test_rejects_unknown_role(self):
-        with self.assertRaises(RoleConfigError):
-            RoleConfiguration.from_mapping(
-                {"schema_version": 1, "roles": {"mystery_role": _role_model()}}
-            )
-
-    def test_rejects_unknown_top_level_and_role_fields(self):
-        with self.assertRaises(RoleConfigError):
-            RoleConfiguration.from_mapping(
-                {"schema_version": 1, "roles": _full_roles(), "extra": True}
-            )
-        with self.assertRaises(RoleConfigError):
-            RoleConfiguration.from_mapping(
-                {
-                    "schema_version": 1,
-                    "roles": {
-                        "writer": {
-                            "provider_id": "p",
-                            "model_id": "m",
-                            "temperature": 0.2,
-                        }
-                    },
-                }
-            )
-
-    def test_rejects_bad_schema_version(self):
-        with self.assertRaises(RoleConfigError):
-            RoleConfiguration.from_mapping({"roles": _full_roles()})
-        with self.assertRaises(RoleConfigError):
-            RoleConfiguration.from_mapping({"schema_version": 2, "roles": _full_roles()})
-
-    def test_rejects_unbounded_steps(self):
-        for steps in (0, -1, roles.MAX_ROLE_STEPS + 1, True, "8"):
+    def test_rejects_malformed_configurations(self):
+        # One table per validator: every malformed config mapping, same error.
+        def with_steps(steps):
             roles_raw = _full_roles()
             roles_raw["writer"] = dict(roles_raw["writer"], steps=steps)
-            with self.assertRaises(RoleConfigError):
-                RoleConfiguration.from_mapping({"schema_version": 1, "roles": roles_raw})
+            return {"schema_version": 1, "roles": roles_raw}
+
+        cases = {
+            "missing_provider": {
+                "schema_version": 1,
+                "roles": {"writer": {"provider_id": "openrouter"}},
+            },
+            "missing_model": {"schema_version": 1, "roles": {"writer": {"model_id": "m"}}},
+            "empty_role_spec": {"schema_version": 1, "roles": {"writer": {}}},
+            "unknown_role": {
+                "schema_version": 1,
+                "roles": {"mystery_role": _role_model()},
+            },
+            "unknown_top_level_field": {
+                "schema_version": 1,
+                "roles": _full_roles(),
+                "extra": True,
+            },
+            "unknown_role_field": {
+                "schema_version": 1,
+                "roles": {
+                    "writer": {"provider_id": "p", "model_id": "m", "temperature": 0.2}
+                },
+            },
+            "missing_schema_version": {"roles": _full_roles()},
+            "bad_schema_version": {"schema_version": 2, "roles": _full_roles()},
+            "steps_zero": with_steps(0),
+            "steps_negative": with_steps(-1),
+            "steps_over_max": with_steps(roles.MAX_ROLE_STEPS + 1),
+            "steps_bool": with_steps(True),
+            "steps_str": with_steps("8"),
+        }
+        for label, mapping in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(RoleConfigError):
+                    RoleConfiguration.from_mapping(mapping)
 
     def test_no_fallback_for_unconfigured_role(self):
         partial = _single_role_config("writer", _WRITER_MODEL)
@@ -603,50 +608,65 @@ class RepairHardeningTests(unittest.TestCase):
         self.task = _task(self.config)
 
     # -- typed errors, never raw KeyError ---------------------------------- #
-    def test_missing_digest_is_typed_not_keyerror(self):
-        mapping = _task_mapping()
-        mapping["input_refs"] = [
-            {"project_id": "prj_demo", "artifact_id": "art", "revision_id": "rev"}
-        ]
-        with self.assertRaises(TaskBoundaryError) as ctx:
-            BoundedTask.from_mapping(mapping, configuration=self.config)
-        self.assertEqual(ctx.exception.code, "task_ref_missing")
+    def test_missing_ref_keys_are_typed(self):
+        # One table per validator: a missing ref/target key is a typed boundary
+        # error, never a raw KeyError.
+        def missing_digest():
+            mapping = _task_mapping()
+            mapping["input_refs"] = [
+                {"project_id": "prj_demo", "artifact_id": "art", "revision_id": "rev"}
+            ]
+            return mapping
 
-    def test_missing_target_key_is_typed(self):
-        mapping = _task_mapping()
-        mapping["target"] = {"project_id": "prj_demo", "artifact_id": "art"}
-        with self.assertRaises(TaskBoundaryError) as ctx:
-            BoundedTask.from_mapping(mapping, configuration=self.config)
-        self.assertEqual(ctx.exception.code, "task_ref_missing")
+        def missing_target_key():
+            mapping = _task_mapping()
+            mapping["target"] = {"project_id": "prj_demo", "artifact_id": "art"}
+            return mapping
+
+        cases = {
+            "input_ref_digest": missing_digest,
+            "target_revision_id": missing_target_key,
+        }
+        for label, factory in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(TaskBoundaryError) as ctx:
+                    BoundedTask.from_mapping(factory(), configuration=self.config)
+                self.assertEqual(ctx.exception.code, "task_ref_missing")
 
     # -- cycle / depth rejection, canonical-first -------------------------- #
-    def test_self_referential_content_rejected_cleanly(self):
-        cyclic: dict = {}
-        cyclic["self"] = cyclic
-        start = time.monotonic()
-        with self.assertRaises(ProposalError) as ctx:
-            submit_proposal(self.task, {"content": cyclic}, configuration=self.config)
-        self.assertLess(time.monotonic() - start, 2.0)
-        self.assertEqual(ctx.exception.code, "content_json")
+    def test_non_canonical_content_rejected_cleanly(self):
+        # One table per validator: cyclic/deep content is rejected by canonical
+        # validation before any structural walk, and cheaply.
+        def cyclic_dict():
+            cyclic: dict = {}
+            cyclic["self"] = cyclic
+            return {"content": cyclic}
 
-    def test_self_referential_content_inside_list_rejected(self):
-        cyclic: list = []
-        cyclic.append({"inner": cyclic})
-        with self.assertRaises(ProposalError) as ctx:
-            submit_proposal(self.task, {"content": {"items": cyclic}}, configuration=self.config)
-        self.assertEqual(ctx.exception.code, "content_json")
+        def cyclic_list():
+            cyclic: list = []
+            cyclic.append({"inner": cyclic})
+            return {"content": {"items": cyclic}}
 
-    def test_over_deep_content_rejected_cleanly(self):
-        deep: dict = {}
-        node = deep
-        for _ in range(500):
-            node["n"] = {}
-            node = node["n"]
-        start = time.monotonic()
-        with self.assertRaises(ProposalError) as ctx:
-            submit_proposal(self.task, {"content": deep}, configuration=self.config)
-        self.assertLess(time.monotonic() - start, 2.0)
-        self.assertEqual(ctx.exception.code, "content_json")
+        def over_deep():
+            deep: dict = {}
+            node = deep
+            for _ in range(500):
+                node["n"] = {}
+                node = node["n"]
+            return {"content": deep}
+
+        cases = {
+            "cyclic_dict": cyclic_dict,
+            "cyclic_list": cyclic_list,
+            "over_deep": over_deep,
+        }
+        for label, factory in cases.items():
+            with self.subTest(case=label):
+                start = time.monotonic()
+                with self.assertRaises(ProposalError) as ctx:
+                    submit_proposal(self.task, factory(), configuration=self.config)
+                self.assertLess(time.monotonic() - start, 2.0)
+                self.assertEqual(ctx.exception.code, "content_json")
 
     # -- direct construction cannot bypass validation ---------------------- #
     def test_direct_constructor_validates(self):
@@ -758,23 +778,28 @@ class RepairHardeningTests(unittest.TestCase):
         self.assertEqual(nested.to_mapping()["content"], {"outline": [{"text": "x"}]})
 
     # -- model / config drift --------------------------------------------- #
-    def test_submit_refuses_configuration_drift(self):
-        drifted = _config(
-            writer={"provider_id": "openrouter", "model_id": "some/OTHER", "variant": "low"}
-        )
-        with self.assertRaises(ProposalError) as ctx:
-            submit_proposal(self.task, {"content": {"x": 1}}, configuration=drifted)
-        self.assertEqual(ctx.exception.code, "task_drift")
+    def test_submit_refuses_config_drift(self):
+        # One table per validator: model and step drift, same typed error.
+        def model_drift():
+            return _config(
+                writer={"provider_id": "openrouter", "model_id": "some/OTHER", "variant": "low"}
+            )
 
-    def test_submit_refuses_steps_drift(self):
-        drifted_roles = _full_roles()
-        drifted_roles["writer"] = dict(drifted_roles["writer"], steps=5)
-        drifted = RoleConfiguration.from_mapping(
-            {"schema_version": 1, "roles": drifted_roles}
-        )
-        with self.assertRaises(ProposalError) as ctx:
-            submit_proposal(self.task, {"content": {"x": 1}}, configuration=drifted)
-        self.assertEqual(ctx.exception.code, "task_drift")
+        def steps_drift():
+            drifted_roles = _full_roles()
+            drifted_roles["writer"] = dict(drifted_roles["writer"], steps=5)
+            return RoleConfiguration.from_mapping(
+                {"schema_version": 1, "roles": drifted_roles}
+            )
+
+        cases = {"model": model_drift, "steps": steps_drift}
+        for label, factory in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ProposalError) as ctx:
+                    submit_proposal(
+                        self.task, {"content": {"x": 1}}, configuration=factory()
+                    )
+                self.assertEqual(ctx.exception.code, "task_drift")
 
     def test_submit_refuses_role_relabel(self):
         # A task whose role is not in the supplied configuration cannot be
