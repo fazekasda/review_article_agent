@@ -35,6 +35,7 @@ from ..domain.records import (
     validate_ref,
     validate_rights_record,
 )
+from ..storage import opmemo
 from ..storage.artifacts import (
     ArtifactConflictError,
     ArtifactRepository,
@@ -136,6 +137,10 @@ class _NestedStore:
             yield conn
         except BaseException:
             conn.execute(f"ROLLBACK TO {name}")
+            # A savepoint rollback reverts writes without decreasing
+            # ``total_changes``; drop the memo so reverted state is never
+            # served from a stale entry.
+            opmemo.invalidate(conn)
             conn.execute(f"RELEASE {name}")
             raise
         else:

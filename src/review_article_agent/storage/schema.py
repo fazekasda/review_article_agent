@@ -24,6 +24,7 @@ from typing import Callable, Mapping
 from urllib.parse import quote
 
 from ..domain.errors import MigrationError, StoreError, UnsupportedSchemaVersion
+from . import opmemo
 
 
 def _utc_now() -> str:
@@ -1522,6 +1523,7 @@ def migrate(
             locked = read_user_version(conn)
             if locked > target_version:
                 conn.execute("ROLLBACK")
+                opmemo.invalidate(conn)
                 raise UnsupportedSchemaVersion(
                     label=label, found=locked, supported=target_version
                 )
@@ -1538,6 +1540,7 @@ def migrate(
                 conn.execute("ROLLBACK")
             except sqlite3.Error:  # pragma: no cover - rollback best effort
                 pass
+            opmemo.invalidate(conn)
             raise MigrationError(
                 label=label, target=version, reason=_summarise(exc)
             ) from exc
