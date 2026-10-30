@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "kind": "step15_scale_report",
+  "generated_at_utc": "2026-10-30T07:48:37.655040+00:00",
+  "python_version": "3.14.4",
+  "python_implementation": "CPython",
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "machine": "x86_64",
+  "processor": "unknown",
+  "cpu_count": 4,
+  "model_calls": 0,
+  "network_calls": 0,
+  "notes": [
+    "Observed limitation (not fixed here; out of this task's scope): a single candidate-ledger revision that mints >= 10,000 candidates fails read-back revalidation. The snapshot's dedup decision ids are formatted as dedup-NNNN (exactly four digits), so the 10,000th decision id 'dedup-10000' is rejected as corrupt membership. This harness therefore ingests incrementally (each revision adds at most ingest_batch_runs * run_chunk candidates), which is the real documented accumulation path and stays within the ceiling."
+  ],
+  "budget_note": "No numeric scale budget was agreed in Step 01 (docs/implementation/01-contracts.md); docs/specification.md line 17 sets only a target of ~1,000-10,000 candidates per project. All numbers here are measured once on this machine and are not universal latency, throughput, memory, storage, or cost promises. Model calls and network calls are zero: synthetic inputs only.",
+  "stage_time_budget_seconds": 600.0,
+  "run_chunk": 500,
+  "ingest_batch_runs": 4,
+  "sizes": [
+    {
+      "size": 1000,
+      "discovery_ledger": {
+        "records_requested": 1000,
+        "records_processed": 1000,
+        "runs_recorded": 2,
+        "ingestion_mode": "incremental_cumulative",
+        "ingest_batch_runs": 4,
+        "candidates_ingested": 1000,
+        "corpus_snapshot_present": true,
+        "corpus_revision_count": 1,
+        "corpus_frozen": false,
+        "elapsed_seconds": 3.4619,
+        "peak_python_traced_bytes": 8379243,
+        "max_rss_kib": 56828,
+        "store_bytes": 1754936,
+        "failures": 0,
+        "errors": [],
+        "capped": false,
+        "stage_time_budget_seconds": 600.0
+      },
+      "queue_behaviour": {
+        "jobs_requested": 1000,
+        "jobs_admitted": 1000,
+        "queue_depth_queued": 1000,
+        "duplicates_idempotent": 500,
+        "duplicates_rejected": 100,
+        "elapsed_seconds": 0.3724,
+        "peak_python_traced_bytes": 1294531,
+        "max_rss_kib": 56828,
+        "store_bytes": 4853264,
+        "failures": 0,
+        "errors": [],
+        "capped": false,
+        "stage_time_budget_seconds": 600.0
+      },
+      "total_elapsed_seconds": 3.8688,
+      "failures": 0,
+      "capped": false
+    },
+    {
+      "size": 10000,
+      "discovery_ledger": {
+        "records_requested": 10000,
+        "records_processed": 10000,
+        "runs_recorded": 20,
+        "ingestion_mode": "incremental_cumulative",
+        "ingest_batch_runs": 4,
+        "candidates_ingested": 10000,
+        "corpus_snapshot_present": true,
+        "corpus_revision_count": 5,
+        "corpus_frozen": false,
+        "elapsed_seconds": 80.6529,
+        "peak_python_traced_bytes": 70097104,
+        "max_rss_kib": 223056,
+        "store_bytes": 30169632,
+        "failures": 0,
+        "errors": [],
+        "capped": false,
+        "stage_time_budget_seconds": 600.0
+      },
+      "queue_behaviour": {
+        "jobs_requested": 10000,
+        "jobs_admitted": 10000,
+        "queue_depth_queued": 10000,
+        "duplicates_idempotent": 5000,
+        "duplicates_rejected": 1000,
+        "elapsed_seconds": 3.7071,
+        "peak_python_traced_bytes": 12680811,
+        "max_rss_kib": 223056,
+        "store_bytes": 9047712,
+        "failures": 0,
+        "errors": [],
+        "capped": false,
+        "stage_time_budget_seconds": 600.0
+      },
+      "total_elapsed_seconds": 84.4983,
+      "failures": 0,
+      "capped": false
+    }
+  ]
+}
