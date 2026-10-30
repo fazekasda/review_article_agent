@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from datetime import datetime
 
 #: Canonical artifact kinds (C01 section 4 taxonomy).  Each artifact has exactly one.
@@ -109,6 +110,14 @@ _EVIDENCE_KEYS = ("ref", "provenance")
 
 # Control characters that must never appear in an opaque identifier.
 _FORBIDDEN_ID_CHARS = frozenset("/\\")
+
+#: Fast-path guard for :func:`validate_identifier`: a non-empty run of printable,
+#: non-whitespace ASCII characters (``0x21``-``0x7e``).  Anything matching this
+#: (and free of ``_FORBIDDEN_ID_CHARS``) cannot trip the whitespace,
+#: control-character, or path-separator rejections, so those per-character Python
+#: loops can be skipped.  Everything else falls through to the slow path, which
+#: preserves the exact rejection precedence and messages.
+_SAFE_ID_RE = re.compile(r"[\x21-\x7e]+")
 
 
 class RecordValidationError(ValueError):
@@ -307,6 +316,21 @@ def validate_identifier(value, field="identifier"):
     ``docs/implementation/02-project-foundation.md`` AC3: an id can never select a
     path or escape a project namespace.
     """
+    if (
+        isinstance(value, str)
+        and _SAFE_ID_RE.fullmatch(value)
+        and _FORBIDDEN_ID_CHARS.isdisjoint(value)
+    ):
+        # Fast path: the value is a non-empty run of printable, non-whitespace
+        # ASCII characters with no path separator, so only the dot-traversal and
+        # leading-dot rules can still apply.  ``isdisjoint`` and ``fullmatch`` are
+        # C-level and avoid the per-character Python loops below, which profiling
+        # showed dominated this function.
+        if value in (".", "..") or ".." in value:
+            _raise(field, "must not contain dot-traversal segments")
+        if value.startswith("."):
+            _raise(field, "must not start with '.'")
+        return value
     if not isinstance(value, str):
         _raise(field, "must be a string")
     if value == "":
