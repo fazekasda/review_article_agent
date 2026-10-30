@@ -43,6 +43,7 @@ from review_article_agent.discovery.pubmed import (  # noqa: E402
     PubMedValidationError,
 )
 from review_article_agent.discovery.records import (  # noqa: E402
+    MAX_AUTHORS,
     MAX_TITLE_LEN,
     SOURCE_PUBMED,
     MetadataRecord,
@@ -138,6 +139,20 @@ def esearch_body(
     return json.dumps(payload).encode()
 
 
+def _author_xml(author) -> str:
+    """Render one synthetic ``Author`` element (a dict or a bare collective name)."""
+    if isinstance(author, str):
+        return f"<Author><CollectiveName>{author}</CollectiveName></Author>"
+    parts = []
+    if author.get("last") is not None:
+        parts.append(f"<LastName>{author['last']}</LastName>")
+    if author.get("fore") is not None:
+        parts.append(f"<ForeName>{author['fore']}</ForeName>")
+    if author.get("initials") is not None:
+        parts.append(f"<Initials>{author['initials']}</Initials>")
+    return "<Author>" + "".join(parts) + "</Author>"
+
+
 def efetch_body(articles) -> bytes:
     parts = ["<PubmedArticleSet>"]
     for article in articles:
@@ -146,8 +161,18 @@ def efetch_body(articles) -> bytes:
         year = article.get("year")
         doi = article.get("doi")
         pmcid = article.get("pmcid")
+        authors = article.get("authors")
+        journal = article.get("journal")
         title_xml = f"<ArticleTitle>{title}</ArticleTitle>" if title is not None else ""
         year_xml = f"<PubDate><Year>{year}</Year></PubDate>" if year is not None else ""
+        author_xml = ""
+        if authors is not None:
+            author_xml = (
+                "<AuthorList>" + "".join(_author_xml(a) for a in authors) + "</AuthorList>"
+            )
+        journal_title_xml = (
+            f"<Title>{journal}</Title>" if journal is not None else ""
+        )
         ids = [f'<ArticleId IdType="pubmed">{pmid}</ArticleId>']
         if doi is not None:
             ids.append(f'<ArticleId IdType="doi">{doi}</ArticleId>')
@@ -156,7 +181,8 @@ def efetch_body(articles) -> bytes:
         parts.append(
             "<PubmedArticle><MedlineCitation>"
             f'<PMID Version="1">{pmid}</PMID>'
-            f"<Article>{title_xml}<Journal><JournalIssue>{year_xml}"
+            f"<Article>{title_xml}{author_xml}<Journal>{journal_title_xml}"
+            f"<JournalIssue>{year_xml}"
             "</JournalIssue></Journal></Article>"
             "</MedlineCitation><PubmedData><ArticleIdList>"
             + "".join(ids)
@@ -343,6 +369,45 @@ class SuccessTests(unittest.TestCase):
         self.assertTrue(result.complete)
         self.assertEqual(result.query_translation, "31452104[UID]")
         self.assertIn("term=31452104%5Buid%5D", result.attempts[0].requested_url)
+
+    def test_authors_and_journal_are_parsed_in_order(self):
+        script = [
+            ok(esearch_body(1, [7], retstart=0, retmax=1)),
+            ok(
+                efetch_body(
+                    [
+                        {
+                            "pmid": 7,
+                            "title": "With authors",
+                            "journal": "Journal of Synthetic Studies",
+                            "authors": [
+                                {"fore": "Ada", "last": "Lovelace"},
+                                {"last": "Turing", "initials": "AM"},
+                                {"last": "Solo"},
+                                "The Consortium",
+                            ],
+                        }
+                    ]
+                )
+            ),
+        ]
+        client, _ = make_client(script)
+        record = client.search("q", page_size=1, max_pages=1).records[0]
+        self.assertEqual(
+            record.authors,
+            ("Ada Lovelace", "Turing AM", "Solo", "The Consortium"),
+        )
+        self.assertEqual(record.journal, "Journal of Synthetic Studies")
+
+    def test_absent_authors_and_journal_stay_absent(self):
+        script = [
+            ok(esearch_body(1, [7], retstart=0, retmax=1)),
+            ok(efetch_body([{"pmid": 7, "title": "No authors"}])),
+        ]
+        client, _ = make_client(script)
+        record = client.search("q", page_size=1, max_pages=1).records[0]
+        self.assertEqual(record.authors, ())
+        self.assertIsNone(record.journal)
 
 
 # --------------------------------------------------------------------------- #
@@ -857,6 +922,18 @@ class MalformedInputSafetyTests(unittest.TestCase):
         script = [
             ok(esearch_body(1, [1], retstart=0, retmax=1)),
             ok(efetch_body([{"pmid": 1, "title": long_title}])),
+        ]
+        client, _ = make_client(script)
+        result = client.search("q", page_size=1, max_pages=1)
+
+        self.assertFalse(result.complete)
+        self.assertEqual(result.failure, "malformed_response")
+
+    def test_overlong_author_list_is_malformed_not_truncated(self):
+        authors = [{"last": f"a{i}"} for i in range(MAX_AUTHORS + 1)]
+        script = [
+            ok(esearch_body(1, [1], retstart=0, retmax=1)),
+            ok(efetch_body([{"pmid": 1, "authors": authors}])),
         ]
         client, _ = make_client(script)
         result = client.search("q", page_size=1, max_pages=1)

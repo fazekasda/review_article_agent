@@ -182,6 +182,8 @@ _RECORD_FIELDS = (
     "doi",
     "title",
     "publication_year",
+    "authors",
+    "journal",
 )
 
 
@@ -342,6 +344,8 @@ def _record_material(record: MetadataRecord) -> list:
         record.doi,
         record.title,
         record.publication_year,
+        list(record.authors),
+        record.journal,
     ]
 
 
@@ -722,7 +726,12 @@ class DiscoveryExecutor:
                 if not isinstance(key, str) or key not in _RECORD_FIELDS:
                     raise DiscoveryExecutionError(_M_BAD_IMPORT_RECORDS)
             try:
-                record = MetadataRecord(**item)
+                # A JSON-persisted import carries ``authors`` as a list; the
+                # record contract wants an immutable tuple, so normalise it.
+                normalized = dict(item)
+                if isinstance(normalized.get("authors"), list):
+                    normalized["authors"] = tuple(normalized["authors"])
+                record = MetadataRecord(**normalized)
             except (RecordValidationError, TypeError, ValueError) as exc:
                 raise DiscoveryExecutionError(_M_BAD_IMPORT_RECORDS) from exc
         else:

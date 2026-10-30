@@ -28,11 +28,16 @@ Where a stage's actual output cannot be consumed by the next API, the existing
 synthetic fixture is used and the call site is marked ``# BRIDGE: <why>``; every
 bridge is listed in :data:`BRIDGES` below.
 
-**Fixture disclosure:** the upstream extraction/audit inputs to synthesis, the
-origin-tracing claim/source graph, and the export bibliography/corpus are
-existing *synthetic* fixtures; the critic/writer/reviewer/acquire ports are local
-fakes that count calls.  No live model, network, provider, or OpenCode session
-call is made, and no source is copyrighted.  All content is synthetic.
+**Fixture disclosure:** the upstream extraction/audit inputs to synthesis and the
+manuscript-text bridge are existing *synthetic* fixtures; the critic/writer/
+reviewer ports are local fakes that count calls.  The origin-tracing claim/source
+graph is now derived from the **real** draft and its approved package, and the
+acquisition port is the **real** Step 06/07-backed port
+(``tracing.acquisition_port.make_acquire_port``); no source is fetched.  The
+export bibliography is built from the draft package's real verified frozen-corpus
+citation records (``bibliography_from_packages``).  No live model, network,
+provider, or OpenCode session call is made, and no source is copyrighted.  All
+content is synthetic.
 
 Run::
 
@@ -61,17 +66,18 @@ from test_review_workflow import (  # noqa: E402
     FakeCritic,
     FakeWriter,
 )
-from test_tracing_workflow import (  # noqa: E402
-    POLICY,
-    FakeAcquire,
-    _claim,
-    _primary,
-    _secondary_review,
-)
+from test_tracing_workflow import POLICY  # noqa: E402
 
-from review_article_agent.delivery.export import _FORBIDDEN_CLAIM_SUBSTRINGS  # noqa: E402
+from review_article_agent.delivery.export import (  # noqa: E402
+    _FORBIDDEN_CLAIM_SUBSTRINGS,
+    bibliography_from_packages,
+)
 from review_article_agent.delivery.workflow import DeliveryRepository  # noqa: E402
 from review_article_agent.review.workflow import SectionReviewRepository  # noqa: E402
+from review_article_agent.tracing.acquisition_port import (  # noqa: E402
+    make_acquire_port,
+)
+from review_article_agent.tracing.inputs import claims_and_sources  # noqa: E402
 from review_article_agent.tracing.workflow import (  # noqa: E402
     OriginTraceRepository,
     origin_coverage,
@@ -88,38 +94,15 @@ BRIDGES = [
         "approved_chain -> accepted_audit); no live extraction run is chained.",
     ),
     (
-        "tracing_claims_sources",
-        "Origin tracing's claim/source graph inputs come from the Step 13 "
-        "synthetic fixture (test_tracing_workflow._claim / _secondary_review / "
-        "_primary); only review_checks are chained from the real review state.",
-    ),
-    (
-        "export_bibliography",
-        "Export references/corpus come from the delivery export fixture's "
-        "synthetic approved-corpus records, not from the drafting package's "
-        "opaque cit_* records (which carry no title/author/year).",
-    ),
-    (
         "manuscript_text",
         "The global-review/export manuscript text is a short synthetic bridge "
         "text: the provisional assembly Markdown carries cit_* markers, which the "
-        "export Pandoc-citation reader does not recognise.",
+        "export Pandoc-citation reader does not recognise. The bridge text cites "
+        "the draft package's real verified-corpus citation key so the export "
+        "bibliography (built from the package via bibliography_from_packages) "
+        "passes the consistency check.",
     ),
 ]
-
-#: The synthetic approved-corpus record / corpus used by the export stage.
-_BRIDGE_REF = {
-    "key": "k1",
-    "identity": {"doi": "10.1/x"},
-    "version": "v1",
-    "title": "A synthetic study",
-    "authors": ["A. Author", "B. Author"],
-    "year": 2020,
-    "journal": "Journal of Synthetic Results",
-}
-_BRIDGE_CORPUS = {"k1": {"identity": {"doi": "10.1/x"}, "version": "v1"}}
-#: A short bridge text citing the single synthetic approved-corpus record.
-_BRIDGE_TEXT = "The reported effect is summarised here [@k1]."
 
 
 def _sha256(text: str) -> str:
@@ -172,6 +155,29 @@ class EndToEndManuscriptTests(DraftBase):
         first_citation = draft["paragraphs"][0]["sentences"][0]["citation_keys"][0]
         self.assertIn(first_citation, package["citations"])
 
+        # The export bibliography is built from the real draft package: its
+        # references/corpus come from the package's verified frozen-corpus
+        # citation records (no synthetic _BRIDGE_REF fixture).
+        references, corpus = bibliography_from_packages([package])
+        self.assertEqual([ref["key"] for ref in references], [first_citation])
+        self.assertEqual(set(corpus), {first_citation})
+        # The real frozen-corpus metadata reached the citation record.
+        citation_record = package["citations"][first_citation]
+        self.assertEqual(citation_record["title"], "A study of things")
+        self.assertEqual(citation_record["year"], 2020)
+        self.assertEqual(citation_record["identity"], {"pmid": "111"})
+        # The recorded provider authors/journal also reach the citation record
+        # (the fixture's observation for this candidate carries them).
+        self.assertEqual(citation_record["authors"], ["Ada Lovelace", "Alan Turing"])
+        self.assertEqual(
+            citation_record["journal"], "Journal of Synthetic Studies"
+        )
+
+        # The manuscript-text bridge cites the package's real citation key so the
+        # export consistency check can pass (the assembly Markdown's cit_* markers
+        # are still unrecognised by the Pandoc reader -- a separate bridge).
+        bridge_text = f"The reported effect is summarised here [@{first_citation}]."
+
         # ---------------------------------------------------------------- #
         # 4. section review -- chained real draft + real package
         # ---------------------------------------------------------------- #
@@ -198,32 +204,59 @@ class EndToEndManuscriptTests(DraftBase):
         self.assertTrue(all(c["verdict"] == "supported" for c in checks))
 
         # ---------------------------------------------------------------- #
-        # 5. origin tracing -- chained real review checks
+        # 5. origin tracing -- real claims/sources from the draft + package
         # ---------------------------------------------------------------- #
-        # BRIDGE: tracing_claims_sources -- the claim/source graph is the Step 13
-        # synthetic fixture; the review checks are chained from the real state.
-        acquire = FakeAcquire({"r1": {"status": "acquired", "source": _primary()}})
+        # The claim/source graph is derived from the real draft and its approved
+        # package (one claim per drafted sentence, one source per cited key); the
+        # acquisition port is the real Step 06/07-backed port.  The acquired
+        # primary is the frozen-corpus source itself: at depth 0 its tagged
+        # passage does not attribute the claim (no own/secondary cue), so the
+        # trace ends at depth 0 with the explicit secondary-attribution warning
+        # (the spec-acceptable MVP outcome; never primary_verified).
+        claims, sources, source_digests = claims_and_sources(
+            self.store, draft=draft, package=package, review_state=review_state
+        )
+        self.assertTrue(claims)
+        self.assertEqual(claims[0]["paragraph_id"], "P1")
+        self.assertEqual(claims[0]["intent_id"], "I1")
+        self.assertIn(claims[0]["root_source_key"], sources)
+        self.assertEqual(set(sources), {first_citation})
+        acquire = make_acquire_port(self.store)
         trace = OriginTraceRepository(self.store)
         trace_state = trace.run(
             "trace-e2e",
-            claims=[_claim()],
-            sources={"review": _secondary_review()},
+            claims=claims,
+            sources=sources,
             policy=POLICY,
             review_checks=checks,
             acquire=acquire,
             rights=self.rights,
+            source_digests=source_digests,
         )
-        self.assertEqual(trace_state["claims"][0]["outcome"], "origin_traced")
+        self.assertEqual(trace_state["claims"][0]["outcome"], "secondary_warning")
+        self.assertTrue(trace_state["claims"][0]["requires_final_human_approval"])
+        self.assertTrue(trace_state["claims"][0]["origin_warning"])
         # The chained review check is copied and annotated with origin fields only.
         self.assertEqual(trace_state["section_checks"][0]["verdict"], "supported")
-        self.assertEqual(trace_state["section_checks"][0]["origin_outcome"], "origin_traced")
+        self.assertEqual(
+            trace_state["section_checks"][0]["origin_outcome"], "secondary_warning"
+        )
+        self.assertTrue(
+            trace_state["section_checks"][0]["requires_final_human_approval"]
+        )
         # primary_verified is never emitted.
         self.assertNotIn("primary_verified", str(trace_state))
 
         coverage = origin_coverage(trace_state)
         self.assertTrue(coverage["complete"])
         self.assertFalse(coverage["edits_applied"])
-        self.assertEqual(coverage["requires_human_approval"], [])
+        # The warned secondary account is listed for final human approval and the
+        # export is not yet ready.
+        self.assertFalse(coverage["export_ready"])
+        self.assertEqual(len(coverage["requires_human_approval"]), 1)
+        self.assertEqual(
+            coverage["requires_human_approval"][0]["cite_source_key"], first_citation
+        )
 
         # ---------------------------------------------------------------- #
         # 6. delivery -- global review gate fed by real review + coverage
@@ -248,8 +281,8 @@ class EndToEndManuscriptTests(DraftBase):
             "delivery-e2e",
             {
                 "revision_id": "m1",
-                "text": _BRIDGE_TEXT,
-                "paragraphs": {"P1": {"text": _BRIDGE_TEXT, "checks": "valid"}},
+                "text": bridge_text,
+                "paragraphs": {"P1": {"text": bridge_text, "checks": "valid"}},
             },
             [],
             reviewer,
@@ -283,7 +316,7 @@ class EndToEndManuscriptTests(DraftBase):
                 {
                     "note_id": "n1",
                     "paragraph_id": "P1",
-                    "new_text": "The reported effect is summarised here [@k1].",
+                    "new_text": bridge_text,
                     "kind": "wording",
                 }
             ],
@@ -314,13 +347,14 @@ class EndToEndManuscriptTests(DraftBase):
         # 10. export -- manuscript.md, references.*, companion, disclosures
         # ---------------------------------------------------------------- #
         out_dir = self.tmp / "export-e2e"
-        # BRIDGE: manuscript_text / export_bibliography -- a short synthetic
-        # manuscript text plus the delivery fixture's approved-corpus records.
+        # BRIDGE: manuscript_text -- the synthetic bridge text now cites the
+        # draft package's real verified-corpus key; the bibliography comes from
+        # the package's real citation records (no synthetic _BRIDGE_REF).
         record = delivery.export(
             "delivery-e2e",
-            manuscript={"revision_id": "m1", "text": _BRIDGE_TEXT},
-            references=[dict(_BRIDGE_REF)],
-            corpus=dict(_BRIDGE_CORPUS),
+            manuscript={"revision_id": "m1", "text": bridge_text},
+            references=references,
+            corpus=corpus,
             current_hashes={"art-1": "sha-1"},
             policy={"companion_accepted": True, "journal_policy_verified": False},
             ai_use=[{"role": "writer", "model": "fake", "version": "1"}],
@@ -348,9 +382,21 @@ class EndToEndManuscriptTests(DraftBase):
                 _sha256(content), digest, f"recorded hash mismatch for {name}"
             )
 
-        # The bibliography/RIS agree with the manuscript's cited key.
-        self.assertIn("@article{k1,", (out_dir / "references.bib").read_text())
-        self.assertIn("ID  - k1", (out_dir / "references.ris").read_text())
+        # The bibliography/RIS agree with the manuscript's cited key and carry the
+        # real frozen-corpus metadata (title/year) from the draft package.
+        bib = (out_dir / "references.bib").read_text()
+        ris = (out_dir / "references.ris").read_text()
+        self.assertIn(f"@article{{{first_citation},", bib)
+        self.assertIn("ID  - " + first_citation, ris)
+        self.assertIn("title = {A study of things}", bib)
+        self.assertIn("author = {Ada Lovelace and Alan Turing}", bib)
+        self.assertIn("journal = {Journal of Synthetic Studies}", bib)
+        self.assertIn("year = {2020}", bib)
+        self.assertIn("TI  - A study of things", ris)
+        self.assertIn("AU  - Ada Lovelace", ris)
+        self.assertIn("AU  - Alan Turing", ris)
+        self.assertIn("JO  - Journal of Synthetic Studies", ris)
+        self.assertIn("AN  - 111", ris)
 
         # Disclosures / AI declaration never assert independent validation or
         # submission compliance, and never emit primary_verified.

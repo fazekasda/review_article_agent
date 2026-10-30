@@ -21,8 +21,9 @@ What it is
   window of PMIDs, then one EFetch (``efetch.fcgi``, ``retmode=xml``) to obtain
   bibliographic metadata for exactly those PMIDs.
 * **Bibliographic metadata only.** It parses the PMID, title (including nested
-  markup), publication year, DOI, and PMCID. It never parses abstracts, full
-  text, MeSH, or any other body content.
+  markup), publication year, DOI, PMCID, ordered author display names, and the
+  journal title. It never parses abstracts, full text, MeSH, or any other body
+  content.
 * **Explicit provenance.** Every page keeps the exact ESearch *and* EFetch
   :class:`~review_article_agent.discovery.transport.AttemptRecord` values, the
   exact transmitted query, the ESearch requested URL, and UTC timestamps.
@@ -77,6 +78,9 @@ from typing import Callable
 
 from ..domain.errors import ReviewAgentError
 from .records import (
+    MAX_AUTHORS,
+    MAX_AUTHOR_LEN,
+    MAX_JOURNAL_LEN,
     MAX_PUBLICATION_YEAR,
     MAX_TITLE_LEN,
     MIN_PUBLICATION_YEAR,
@@ -85,6 +89,7 @@ from .records import (
     MetadataRecord,
     SearchPage,
     SearchResult,
+    sanitize_display_text,
 )
 from .transport import (
     AttemptRecord,
@@ -323,6 +328,8 @@ class _FetchedArticle:
     publication_year: int | None
     doi: str | None
     pmcid: str | None
+    authors: tuple[str, ...] = ()
+    journal: str | None = None
 
 
 def _element_text(element: ET.Element | None) -> str | None:
@@ -383,6 +390,41 @@ def _parse_publication_year(citation: ET.Element | None) -> int | None:
     return None
 
 
+def _parse_author_names(citation: ET.Element | None) -> tuple[str, ...]:
+    """Parse ``Article/AuthorList/Author`` into ordered display names.
+
+    A ``ForeName LastName`` name is preferred; otherwise ``LastName Initials``,
+    then a bare ``LastName``, then a collective/consortium ``CollectiveName``.
+    Provider text is untrusted, so each name is sanitised (control characters
+    removed, whitespace normalized). A name that sanitises to empty is skipped.
+    """
+    if citation is None:
+        return ()
+    author_list = citation.find("Article/AuthorList")
+    if author_list is None:
+        return ()
+    names: list[str] = []
+    for author in author_list.findall("Author"):
+        last = _element_text(author.find("LastName"))
+        fore = _element_text(author.find("ForeName"))
+        initials = _element_text(author.find("Initials"))
+        collective = _element_text(author.find("CollectiveName"))
+        if fore and last:
+            raw = f"{fore} {last}"
+        elif last and initials:
+            raw = f"{last} {initials}"
+        elif last:
+            raw = last
+        elif collective:
+            raw = collective
+        else:
+            continue
+        name = sanitize_display_text(raw)
+        if name:
+            names.append(name)
+    return tuple(names)
+
+
 def _parse_efetch(text: str) -> tuple[_FetchedArticle, ...]:
     """Parse a ``PubmedArticleSet`` into bibliographic articles only.
 
@@ -419,6 +461,17 @@ def _parse_efetch(text: str) -> tuple[_FetchedArticle, ...]:
         if doi is None:
             doi = _find_elocation_doi(citation)
         pmcid = _find_article_id(article_id_list, "pmc")
+        authors = _parse_author_names(citation)
+        if len(authors) > MAX_AUTHORS:
+            # Never silently truncate a provider author list.
+            raise _MalformedResponse("author list too long")
+        for name in authors:
+            if len(name) > MAX_AUTHOR_LEN:
+                raise _MalformedResponse("author name too long")
+        journal_raw = _find_text(citation, "Article/Journal/Title")
+        journal = sanitize_display_text(journal_raw) if journal_raw else None
+        if journal is not None and len(journal) > MAX_JOURNAL_LEN:
+            raise _MalformedResponse("journal too long")
         articles.append(
             _FetchedArticle(
                 pmid=pmid,
@@ -426,6 +479,8 @@ def _parse_efetch(text: str) -> tuple[_FetchedArticle, ...]:
                 publication_year=_parse_publication_year(citation),
                 doi=doi,
                 pmcid=pmcid,
+                authors=authors,
+                journal=journal,
             )
         )
     return tuple(articles)
@@ -798,6 +853,8 @@ class PubMedClient:
                     doi=article.doi,
                     title=article.title,
                     publication_year=article.publication_year,
+                    authors=article.authors,
+                    journal=article.journal,
                 )
                 for article in fetched
                 if article.pmid in requested_set

@@ -258,6 +258,53 @@ def render_ris(references) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# bibliography_from_packages
+# --------------------------------------------------------------------------- #
+#: Bibliographic fields carried from a drafting-package citation record into an
+#: export reference (only when the frozen corpus actually carried them).
+_REFERENCE_FIELDS = ("title", "authors", "year", "journal")
+
+
+def bibliography_from_packages(packages) -> tuple:
+    """Turn approved drafting-package citation records into ``(references, corpus)``.
+
+    Pure: it reads only the ``citations`` maps of the supplied packages and
+    returns the ``references`` list and ``corpus`` mapping that
+    :func:`check_consistency` / :func:`render_bibtex` / :func:`render_ris` expect.
+
+    Every citation record carries its verified frozen-corpus metadata: the
+    ``identity`` identifiers (``doi``/``pmid``/``pmcid``), the frozen-corpus
+    ``version``, and any ``title``/``authors``/``year``/``journal`` the corpus
+    actually carried.  A field absent from a record is omitted -- it is never
+    invented.  Keys are de-duplicated (first package wins) and the references are
+    ordered by key for determinism.
+    """
+    references: list = []
+    corpus: dict = {}
+    seen: set = set()
+    for package in packages or []:
+        citations = (package or {}).get("citations") or {}
+        for key in sorted(citations):
+            if key in seen:
+                continue
+            seen.add(key)
+            record = citations[key]
+            if not isinstance(record, dict):
+                _require(False, "a citation record must be a JSON object")
+            identity = record.get("identity")
+            identity = dict(identity) if isinstance(identity, dict) else {}
+            version = record.get("version")
+            ref = {"key": key, "identity": identity, "version": version}
+            for field in _REFERENCE_FIELDS:
+                if field in record and record[field] is not None:
+                    ref[field] = record[field]
+            references.append(ref)
+            corpus[key] = {"identity": dict(identity), "version": version}
+    references.sort(key=lambda ref: ref["key"])
+    return references, corpus
+
+
+# --------------------------------------------------------------------------- #
 # build_disclosures
 # --------------------------------------------------------------------------- #
 def _ai_declaration(ai_use) -> str:
@@ -442,6 +489,7 @@ def build_export_package(manuscript, references, corpus, approval, current_hashe
 
 __all__ = [
     "ExportError",
+    "bibliography_from_packages",
     "build_disclosures",
     "build_export_package",
     "check_consistency",

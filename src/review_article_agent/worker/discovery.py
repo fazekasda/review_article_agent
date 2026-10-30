@@ -246,6 +246,8 @@ _RECORD_FIELDS = (
     "doi",
     "title",
     "publication_year",
+    "authors",
+    "journal",
 )
 
 _UTC_TIMESTAMP_RE = re.compile(

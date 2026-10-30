@@ -318,7 +318,19 @@ class FreezeTestBase(unittest.TestCase):
 
     # -- corpus + coverage --------------------------------------------------- #
     def build_corpus(self, *, request_id="corpus-1", artifact_id=DEFAULT_CORPUS_ARTIFACT_ID):
-        a = self.observe("req-a", self.pubmed_run((self.rec(pmid="111", source_id="a"),)))
+        a = self.observe(
+            "req-a",
+            self.pubmed_run(
+                (
+                    self.rec(
+                        pmid="111",
+                        source_id="a",
+                        authors=("Ada Lovelace", "Alan Turing"),
+                        journal="Journal of Synthetic Studies",
+                    ),
+                )
+            ),
+        )
         b = self.observe(
             "req-b",
             self.pubmed_run((

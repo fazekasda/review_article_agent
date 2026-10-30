@@ -13,6 +13,7 @@ import unittest
 
 from review_article_agent.delivery.export import (
     ExportError,
+    bibliography_from_packages,
     build_disclosures,
     build_export_package,
     check_consistency,
@@ -191,6 +192,83 @@ class ExportPackageTests(unittest.TestCase):
         manuscript = {"revision_id": "rev-1", "text": "A [@smith2020; @ghost]."}
         with self.assertRaises(ExportError):
             build_export_package(manuscript, refs, CORPUS, approval, current_hashes, disclosures)
+
+
+def _package(*citations):
+    return {"citations": {key: record for key, record in citations}}
+
+
+class BibliographyFromPackagesTests(unittest.TestCase):
+    """The helper turns real package citation records into export references."""
+
+    def test_real_fields_flow_to_references_and_corpus(self):
+        record = {
+            "citation_key": "cit_abc",
+            "candidate_id": "cand_1",
+            "identity": {"doi": "10.1/x", "pmid": "999"},
+            "version": "rev-c",
+            "title": "A real study",
+            "authors": ["A. Author", "B. Writer"],
+            "year": 2020,
+            "journal": "Journal of Real Results",
+        }
+        references, corpus = bibliography_from_packages([_package(("cit_abc", record))])
+        self.assertEqual(
+            references,
+            [
+                {
+                    "key": "cit_abc",
+                    "identity": {"doi": "10.1/x", "pmid": "999"},
+                    "version": "rev-c",
+                    "title": "A real study",
+                    "authors": ["A. Author", "B. Writer"],
+                    "year": 2020,
+                    "journal": "Journal of Real Results",
+                }
+            ],
+        )
+        self.assertEqual(corpus, {"cit_abc": {"identity": {"doi": "10.1/x", "pmid": "999"}, "version": "rev-c"}})
+
+        # The rendered BibTeX/RIS carry the real title/authors/year/DOI.
+        bib = render_bibtex(references)
+        self.assertIn("@article{cit_abc,", bib)
+        self.assertIn("author = {A. Author and B. Writer}", bib)
+        self.assertIn("title = {A real study}", bib)
+        self.assertIn("journal = {Journal of Real Results}", bib)
+        self.assertIn("year = {2020}", bib)
+        self.assertIn("doi = {10.1/x}", bib)
+        ris = render_ris(references)
+        self.assertIn("TI  - A real study", ris)
+        self.assertIn("AU  - A. Author", ris)
+        self.assertIn("DO  - 10.1/x", ris)
+        self.assertIn("AN  - 999", ris)
+
+        # And the consistency check passes for a manuscript citing the real key.
+        check = check_consistency("See [@cit_abc].", references, corpus)
+        self.assertTrue(check["ok"])
+
+    def test_absent_fields_are_omitted(self):
+        record = {"identity": {"pmid": "111"}, "version": "rev-c"}
+        references, corpus = bibliography_from_packages([_package(("cit_x", record))])
+        ref = references[0]
+        self.assertEqual(ref["key"], "cit_x")
+        self.assertEqual(ref["identity"], {"pmid": "111"})
+        self.assertNotIn("title", ref)
+        self.assertNotIn("authors", ref)
+        self.assertNotIn("year", ref)
+        self.assertNotIn("journal", ref)
+        self.assertNotIn("doi", ref["identity"])
+
+    def test_multiple_packages_merge_and_dedupe_by_key(self):
+        a = {"identity": {"doi": "10.1/a"}, "version": "v1", "title": "A"}
+        b = {"identity": {"doi": "10.1/b"}, "version": "v1", "title": "B"}
+        references, corpus = bibliography_from_packages(
+            [_package(("k2", b), ("k1", a)), _package(("k1", {"title": "dup"}))]
+        )
+        self.assertEqual([ref["key"] for ref in references], ["k1", "k2"])
+        self.assertEqual(set(corpus), {"k1", "k2"})
+        # The first package wins for a duplicated key.
+        self.assertEqual(references[0]["title"], "A")
 
 
 if __name__ == "__main__":
