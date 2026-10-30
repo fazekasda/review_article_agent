@@ -83,6 +83,7 @@ from ..domain.records import (
 from ..runtime import ipc
 from . import acquisition as acquisition_jobs
 from . import extraction as extraction_jobs
+from . import generation as generation_jobs
 
 __all__ = [
     "MODE_QUERY",
@@ -92,6 +93,7 @@ __all__ = [
     "MODE_LEAD",
     "MODE_ACQUIRE",
     "MODE_EXTRACT",
+    "MODE_GENERATION",
     "DISCOVERY_MODES",
     "TASK_KIND_QUERY",
     "TASK_KIND_SEED",
@@ -100,15 +102,18 @@ __all__ = [
     "TASK_KIND_LEAD",
     "TASK_KIND_ACQUIRE",
     "TASK_KIND_EXTRACT",
+    "TASK_KIND_GENERATION",
     "DISCOVERY_TASK_KINDS",
     "MODE_PARAMETER_KEYS",
     "LEAD_CREDENTIAL_ENV",
     "EXTRACT_CREDENTIAL_ENV",
+    "GENERATION_CREDENTIAL_ENV",
     "RESULT_KIND_OBSERVATION",
     "RESULT_KIND_EXPANSION",
     "RESULT_KIND_LEAD",
     "RESULT_KIND_ACQUISITION",
     "RESULT_KIND_EXTRACTION",
+    "RESULT_KIND_GENERATION",
     "MAX_DISCOVERY_PARAMETERS_BYTES",
     "MAX_EXPAND_ROOTS",
     "PREDISPATCH_PHASE",
@@ -133,9 +138,11 @@ __all__ = [
     "dispatch_expand",
     "dispatch_lead",
     "dispatch_extract",
+    "dispatch_generation",
     "replay_only",
     "persisted_expansion_report",
     "persisted_extraction_run",
+    "persisted_generation_run",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +159,9 @@ MODE_ACQUIRE = acquisition_jobs.MODE_ACQUIRE
 #: Bounded direct extraction/quality runs (Step 09); validated/dispatched by
 #: ``worker.extraction``.
 MODE_EXTRACT = extraction_jobs.MODE_EXTRACT
+#: One model-backed generation role operation (kickoff 16 §5); validated/dispatched
+#: by ``worker.generation``.
+MODE_GENERATION = generation_jobs.MODE_GENERATION
 
 #: Every accepted discovery mode.
 DISCOVERY_MODES = (
@@ -162,6 +172,7 @@ DISCOVERY_MODES = (
     MODE_LEAD,
     MODE_ACQUIRE,
     MODE_EXTRACT,
+    MODE_GENERATION,
 )
 
 #: Durable job task kinds (the existing ``JobRepository`` accepts these strings).
@@ -174,6 +185,8 @@ TASK_KIND_LEAD = "discovery_lead"
 TASK_KIND_ACQUIRE = acquisition_jobs.TASK_KIND_ACQUIRE
 #: A bounded direct extraction/quality run (Step 09) in the shared serial pool.
 TASK_KIND_EXTRACT = extraction_jobs.TASK_KIND_EXTRACT
+#: One model-backed generation role operation (kickoff 16 §5) in the shared pool.
+TASK_KIND_GENERATION = generation_jobs.TASK_KIND_GENERATION
 
 #: Every discovery job task kind.
 DISCOVERY_TASK_KINDS = frozenset(
@@ -185,6 +198,7 @@ DISCOVERY_TASK_KINDS = frozenset(
         TASK_KIND_LEAD,
         TASK_KIND_ACQUIRE,
         TASK_KIND_EXTRACT,
+        TASK_KIND_GENERATION,
     }
 )
 
@@ -196,6 +210,7 @@ _MODE_BY_TASK_KIND = {
     TASK_KIND_LEAD: MODE_LEAD,
     TASK_KIND_ACQUIRE: MODE_ACQUIRE,
     TASK_KIND_EXTRACT: MODE_EXTRACT,
+    TASK_KIND_GENERATION: MODE_GENERATION,
 }
 _TASK_KIND_BY_MODE = {mode: kind for kind, mode in _MODE_BY_TASK_KIND.items()}
 
@@ -212,6 +227,8 @@ MODE_PARAMETER_KEYS: dict[str, frozenset[str]] = {
     | acquisition_jobs.ACQUIRE_OPTIONAL_KEYS,
     MODE_EXTRACT: extraction_jobs.EXTRACT_REQUIRED_KEYS
     | extraction_jobs.EXTRACT_OPTIONAL_KEYS,
+    MODE_GENERATION: generation_jobs.GENERATION_REQUIRED_KEYS
+    | generation_jobs.GENERATION_OPTIONAL_KEYS,
 }
 
 #: The one, fixed environment-variable name a hosted-lead job may name.
@@ -220,12 +237,16 @@ LEAD_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
 #: The one, fixed environment-variable name an extraction run may name.
 EXTRACT_CREDENTIAL_ENV = extraction_jobs.EXTRACT_CREDENTIAL_ENV
 
+#: The one, fixed environment-variable name a generation run may name.
+GENERATION_CREDENTIAL_ENV = generation_jobs.GENERATION_CREDENTIAL_ENV
+
 #: Safe job-accepted-result kinds, one per result family.
 RESULT_KIND_OBSERVATION = "discovery_observation"
 RESULT_KIND_EXPANSION = "discovery_expansion"
 RESULT_KIND_LEAD = "discovery_lead"
 RESULT_KIND_ACQUISITION = acquisition_jobs.RESULT_KIND_ACQUISITION
 RESULT_KIND_EXTRACTION = extraction_jobs.RESULT_KIND_EXTRACTION
+RESULT_KIND_GENERATION = generation_jobs.RESULT_KIND_GENERATION
 
 #: Technical bound on the number of explicit expansion roots.
 MAX_EXPAND_ROOTS = 10_000
@@ -518,6 +539,10 @@ def validate_submission(
         canonical = extraction_jobs.validate_extract(parameters, project_id, request_id)
         _check_parameter_size(canonical)
         return canonical
+    if mode == MODE_GENERATION:
+        canonical = generation_jobs.validate_generation(parameters, project_id, request_id)
+        _check_parameter_size(canonical)
+        return canonical
     allowed = MODE_PARAMETER_KEYS[mode]
     params = _require_keys(parameters, allowed)
 
@@ -711,6 +736,8 @@ def result_kind_for_mode(mode: str | None) -> str:
         return RESULT_KIND_ACQUISITION
     if mode == MODE_EXTRACT:
         return RESULT_KIND_EXTRACTION
+    if mode == MODE_GENERATION:
+        return RESULT_KIND_GENERATION
     return RESULT_KIND_OBSERVATION
 
 
@@ -732,6 +759,8 @@ def accepted_result(job: Any, raw: Any) -> tuple[str, Any]:
         return RESULT_KIND_ACQUISITION, acquisition_jobs.accepted_result(raw)
     if mode == MODE_EXTRACT:
         return RESULT_KIND_EXTRACTION, extraction_jobs.accepted_result(raw)
+    if mode == MODE_GENERATION:
+        return RESULT_KIND_GENERATION, generation_jobs.accepted_result(raw)
     return RESULT_KIND_OBSERVATION, observation_metadata(job, raw)
 
 
@@ -801,6 +830,8 @@ def status_projection(result_kind: str, result: Any) -> Any:
         return acquisition_jobs.status_projection(result)
     if result_kind == RESULT_KIND_EXTRACTION:
         return extraction_jobs.status_projection(result)
+    if result_kind == RESULT_KIND_GENERATION:
+        return generation_jobs.status_projection(result)
     return result
 
 
@@ -1052,11 +1083,46 @@ def dispatch_extract(
     )
 
 
+def dispatch_generation(
+    store: Any,
+    registry: Any,
+    token: str,
+    job: Any,
+    *,
+    api_key: str | None,
+    generation_transport: Any = None,
+) -> dict[str, Any]:
+    """Execute one model-backed generation role operation (at most one POST).
+
+    Delegates to :func:`~review_article_agent.worker.generation.dispatch_generation`,
+    which calls the exact role adapter for the job's ``operation``. The adapter
+    revalidates the exact named gates, every pinned source's rights, the execution
+    token, and the per-role budget before its one POST, and returns a safe mapping
+    carrying the adapter ``status`` and what it wrote. A missing credential is
+    refused with **zero** POST.
+    """
+    return generation_jobs.dispatch_generation(
+        store,
+        registry,
+        token,
+        job,
+        api_key=api_key,
+        transport=generation_transport,
+    )
+
+
 def persisted_extraction_run(store: Any, *, request_id: str | None = None):
     """Return the saved accepted run mapping for an extraction run job, or None."""
     if request_id is None:
         return None
     return extraction_jobs.persisted_extraction_run(store, request_id=request_id)
+
+
+def persisted_generation_run(store: Any, *, request_id: str | None = None):
+    """Return the saved accepted run mapping for a generation run job, or None."""
+    if request_id is None:
+        return None
+    return generation_jobs.persisted_generation_run(store, request_id=request_id)
 
 
 def persisted_expansion_report(store: Any, *, job_id: str | None = None, request_id: str | None = None):
@@ -1127,6 +1193,10 @@ def dispatch(
         raise DiscoveryJobValidationError("bad_value", _M_BAD_MODE)
     if mode == MODE_EXTRACT:
         # Extraction has its own bounded runner (``extraction.dispatch_extract``),
+        # dispatched by the engine with the credential read from the environment.
+        raise DiscoveryJobValidationError("bad_value", _M_BAD_MODE)
+    if mode == MODE_GENERATION:
+        # Generation has its own bounded runner (``generation.dispatch_generation``),
         # dispatched by the engine with the credential read from the environment.
         raise DiscoveryJobValidationError("bad_value", _M_BAD_MODE)
     if mode == MODE_EXPAND:
@@ -1299,6 +1369,24 @@ def _replay_extract(store: Any, job: Any) -> ReplayedOutcome | None:
     )
 
 
+def _replay_generation(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutcome | None:
+    """Read a recorded generation run back from durable rows (zero POST).
+
+    A terminal resolved outcome is a complete proof; a missing dispatch or an
+    ``unknown``/``submitted`` outcome is **not** (it must be escalated to a human,
+    and is never re-sent).
+    """
+    proven = generation_jobs.replay_generation(store, registry, token, job)
+    if proven is None:
+        return None
+    result, complete = proven
+    return ReplayedOutcome(
+        result_kind=RESULT_KIND_GENERATION,
+        result=result,
+        complete=complete,
+    )
+
+
 def replay_only(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutcome | None:
     """Prove an existing durable outcome for ``job`` without any provider I/O.
 
@@ -1317,6 +1405,8 @@ def replay_only(store: Any, registry: Any, token: str, job: Any) -> ReplayedOutc
         return _replay_acquire(store, registry, token, job)
     if mode == MODE_EXTRACT:
         return _replay_extract(store, job)
+    if mode == MODE_GENERATION:
+        return _replay_generation(store, registry, token, job)
     try:
         record = dispatch(store, registry, token, job, _replay_miss_transport)
     except Exception:  # noqa: BLE001 - any failure means "not proven present"

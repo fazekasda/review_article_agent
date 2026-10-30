@@ -158,6 +158,11 @@ from .drafting import (
     build_drafting_parser,
     dispatch_drafting,
 )
+from .generation import (
+    GenerationControlError,
+    build_generation_parser,
+    dispatch_generation,
+)
 
 PROG = "review-article-agent"
 
@@ -317,6 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_extraction_parser(sub)
     build_synthesis_parser(sub)
     build_drafting_parser(sub)
+    build_generation_parser(sub)
 
     return parser
 
@@ -1078,6 +1084,13 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> object:
                 f"unknown drafting command {args.drafting_command!r}"
             )
         return result
+    if args.command == "generation":
+        result = dispatch_generation(args, ctx)
+        if result is None:  # pragma: no cover - argparse enforces choices
+            raise CliUsageError(
+                f"unknown generation command {args.generation_command!r}"
+            )
+        return result
     try:
         handler = _COMMANDS[args.command]
     except KeyError as exc:  # pragma: no cover - argparse enforces choices
@@ -1196,6 +1209,16 @@ _DRAFTING_CATEGORY_EXITS = {
 }
 
 
+#: Generation worker run error categories mapped to the CLI's stable exit codes.
+#: ``generation`` raises :class:`GenerationControlError` with a curated,
+#: value-free message; a failure records no revision and authorizes nothing.
+_GENERATION_CATEGORY_EXITS = {
+    "validation": EXIT_VALIDATION,
+    "conflict": EXIT_CONFLICT,
+    "storage": EXIT_STORAGE,
+}
+
+
 def _redirect_broken_stdout(out: TextIO) -> None:
     """Point a broken stdout stream's file descriptor at the null device.
 
@@ -1285,6 +1308,8 @@ def classify_error(exc: BaseException) -> tuple[str, int]:
         return exc.category, _SYNTHESIS_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, DraftingControlError):
         return exc.category, _DRAFTING_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
+    if isinstance(exc, GenerationControlError):
+        return exc.category, _GENERATION_CATEGORY_EXITS.get(exc.category, EXIT_STORAGE)
     if isinstance(exc, (ProjectConflict, ArtifactConflictError, BackupConflictError)):
         return "conflict", EXIT_CONFLICT
     if isinstance(exc, (StoreError, ProjectPathError, UnsupportedSchemaVersion)):
@@ -1338,6 +1363,9 @@ def _error_message(exc: BaseException, category: str) -> str:
         return str(exc)
     if isinstance(exc, DraftingControlError):
         # Authored in ``cli.drafting``; a static, curated, value-free message.
+        return str(exc)
+    if isinstance(exc, GenerationControlError):
+        # Authored in ``cli.generation``; a static, curated, value-free message.
         return str(exc)
     if category == "usage":
         if isinstance(exc, (CliUsageError, ConfigError)):

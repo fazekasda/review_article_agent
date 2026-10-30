@@ -504,3 +504,59 @@ exception in [decision 004](decisions/004-step09-direct-extraction.md).
   submission validation, queued admission + asynchronous completion, receipt readback via
   `require_run`, missing credential/gate refusals, replay-is-one-run, ambiguous-outcome
   recovery, and the `extraction run` CLI surface.
+
+## 15. Owner-controlled generation role runs (kickoff 16 §5 addition)
+
+Extends §1–§14. The **only** model-backed generation-role worker surface is
+`discovery_submit` `mode=generation_run` over the already-integrated role adapters in
+[`generation/`](../src/review_article_agent/generation/) (and
+[`screening/runner.py`](../src/review_article_agent/screening/runner.py) for the
+unwired `screening_case`); the adapters own every gate, right, budget, ledger, schema,
+and escalation concern. The Step 09 CLI spellings are in [`cli.md`](cli.md) §19, and the
+role reference is [`generation.md`](generation.md).
+
+- **Exact operation, strict parameters.** `mode=generation_run` carries one closed
+  `operation` plus its exact per-operation parameters — refs, the artifact/revision the
+  adapter writes, the caller's `rights` record, and the fixed `credential_env` name —
+  into one `generation_run` job under the caller's `request_id`; no actor/authority
+  flag, no credential value, no model output, and no material. It returns a **queued
+  admission only**. The wired operations are `synthesis`/`framework`/`outline`
+  (`generation/synthesis_roles`), `blueprint`/`draft` (`generation/drafting_roles`), and
+  `section_review` (`review/workflow.SectionReviewRepository.run` with ports from
+  `generation/review_roles.make_review_ports`). `global_review`, `notes_plan`, and
+  `screening_case` are **recognized but refused** with a static `validation` error
+  (nothing is written and no job is created).
+- **Ownership.** [`worker/generation.py`](../src/review_article_agent/worker/generation.py)
+  (strict submission validation, the per-operation dispatch, the safe result projection,
+  the replay-only read, and the read seam) · [`worker/engine.py`](../src/review_article_agent/worker/engine.py)
+  (`_run_generate_dispatch`) · [`worker/discovery.py`](../src/review_article_agent/worker/discovery.py)
+  (the `MODE_GENERATION`/`TASK_KIND_GENERATION` delegation alongside `MODE_EXTRACT`).
+- **One guarded POST per durable job.** Each adapter runs through
+  `generation.runner.execute_generation_task`, which re-reads the exact hosted-use
+  document and its named `batch`/`generation.hosted_use.<role>` gate, verifies every
+  input revision's bytes and every original source's hosted-transfer rights, enforces
+  the per-role budget cap, reserves a `direct_call` dispatch (stage `generation`) before
+  the one POST, and commits the non-authoritative proposal together with the accepted
+  dispatch result and settled cost. A missing credential, an unapproved/stale hosted-use
+  document, a denied rights record, or a gate/budget/activation refusal performs
+  **zero** POST.
+- **Explicit worker env name; value never persisted.** The one permitted credential name
+  is **`OPENROUTER_API_KEY`** (`worker/generation.py` `GENERATION_CREDENTIAL_ENV`, the
+  same variable the lead/extraction jobs use). The worker reads the variable from its
+  **own** environment at dispatch; the credential **value** is never accepted over IPC,
+  never written to the DB, and never logged.
+- **Honest outcome; never a blind retry.** A terminal adapter status — `proposed`,
+  `invalid_proposal`, `model_not_completed`, or `complete`/`blocked` (section review) —
+  is persisted as the job's safe accepted result, which references what was written (a
+  workflow ref / a review state id) and carries no credential or raw output.
+  `invalid_proposal` and `model_not_completed` are **terminal** results needing human
+  attention, not crashes. Anything that may have been sent and has no terminal outcome
+  moves the job to `waiting_human` and is **never** re-POSTed: on restart the engine
+  proves an existing outcome by replay from durable rows with **zero** POST
+  (`worker.generation.replay_generation`), and an unprovable attempt is escalated for an
+  explicit owner `reconcile`.
+- **Tests.** [`tests/test_generation_worker.py`](../tests/test_generation_worker.py) —
+  submission validation (including unsupported operations), a synthesis operation end to
+  end (stored, never approved), a section review through the worker, `invalid_proposal`
+  as a terminal result, missing-credential refusal with zero POST, replay-is-one-run,
+  the persisted read seam, and the `generation run` CLI surface.
