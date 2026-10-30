@@ -33,8 +33,9 @@ What this is
   ``source_id`` encodes the native source and id (for example ``MED:31452104``,
   ``PMC:PMC123``, ``PPR:PPR123``), so a Europe PMC ``MED`` record and a
   ``PMC``/preprint record can never alias a bare numeric id. ``pmid``/``pmcid``/
-  ``doi``/``title``/``publication_year`` stay nullable; a missing identifier is
-  explicit and no candidate id is ever invented.
+  ``doi``/``title``/``publication_year``/``journal`` stay nullable and
+  ``authors`` is an ordered display-name list; a missing identifier is explicit
+  and no candidate id is ever invented.
 
 What this is **not**
 --------------------
@@ -100,6 +101,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .records import (
+    MAX_AUTHORS,
+    MAX_AUTHOR_LEN,
+    MAX_JOURNAL_LEN,
     MAX_PUBLICATION_YEAR,
     MAX_TITLE_LEN,
     MIN_PUBLICATION_YEAR,
@@ -108,6 +112,7 @@ from .records import (
     MetadataRecord,
     SearchPage,
     SearchResult,
+    sanitize_display_text,
 )
 from .transport import (
     AttemptRecord,
@@ -245,6 +250,101 @@ def _optional_title(item: dict[str, Any], key: str) -> str | None:
     return value
 
 
+def _author_display_name(entry: dict[str, Any]) -> str | None:
+    """Best-effort display name from one Europe PMC author object.
+
+    Prefers the provider's own ``fullName``; otherwise composes ``firstName
+    lastName`` (or ``lastName initials``), then a collective/consortium name.
+    Optional subfields with a non-string type are ignored (treated absent); the
+    container types are validated by the caller.
+    """
+    full = entry.get("fullName")
+    if isinstance(full, str) and full.strip():
+        return full
+    first = entry.get("firstName")
+    last = entry.get("lastName")
+    initials = entry.get("initials")
+    if isinstance(first, str) and isinstance(last, str) and first.strip() and last.strip():
+        return f"{first} {last}"
+    if isinstance(last, str) and last.strip():
+        if isinstance(initials, str) and initials.strip():
+            return f"{last} {initials}"
+        return last
+    collective = entry.get("collectiveName")
+    if isinstance(collective, str) and collective.strip():
+        return collective
+    return None
+
+
+def _optional_authors(item: dict[str, Any]) -> tuple[str, ...]:
+    """Read the ordered author display-name list; absent/empty stays ``()``.
+
+    Prefers the structured ``authorList.author[].*`` names; falls back to the
+    provider's ``authorString`` (split on commas) only when no structured names
+    are present. Untrusted text is sanitised; an over-long list or name is
+    malformed rather than silently truncated.
+    """
+    names: list[str] = []
+    author_list = item.get("authorList")
+    if author_list is not None:
+        if not isinstance(author_list, dict):
+            raise _MalformedResponse("authorList: not an object")
+        authors = author_list.get("author")
+        if authors is not None:
+            if not isinstance(authors, list):
+                raise _MalformedResponse("authorList.author: not a list")
+            for entry in authors:
+                if not isinstance(entry, dict):
+                    raise _MalformedResponse("authorList.author: not an object")
+                raw = _author_display_name(entry)
+                if raw is None:
+                    continue
+                name = sanitize_display_text(raw)
+                if name:
+                    names.append(name)
+    if not names:
+        raw_string = item.get("authorString")
+        if raw_string is not None:
+            if not isinstance(raw_string, str):
+                raise _MalformedResponse("authorString: not a string")
+            for part in raw_string.split(","):
+                name = sanitize_display_text(part)
+                if name:
+                    names.append(name)
+    if len(names) > MAX_AUTHORS:
+        raise _MalformedResponse("author list too long")
+    for name in names:
+        if len(name) > MAX_AUTHOR_LEN:
+            raise _MalformedResponse("author name too long")
+    return tuple(names)
+
+
+def _optional_journal(item: dict[str, Any]) -> str | None:
+    """Read a nullable journal title; absent/empty stays ``None``.
+
+    Prefers ``journalTitle``; falls back to ``journalInfo.journal.title``.
+    """
+    raw = item.get("journalTitle")
+    if raw is None:
+        journal_info = item.get("journalInfo")
+        if isinstance(journal_info, dict):
+            journal = journal_info.get("journal")
+            if isinstance(journal, dict):
+                candidate = journal.get("title")
+                if isinstance(candidate, str) and candidate:
+                    raw = candidate
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise _MalformedResponse("journalTitle: not a string")
+    journal = sanitize_display_text(raw)
+    if not journal:
+        return None
+    if len(journal) > MAX_JOURNAL_LEN:
+        raise _MalformedResponse("journalTitle: too long")
+    return journal
+
+
 def _optional_year(item: dict[str, Any], key: str) -> int | None:
     """Read a nullable publication year; absent/empty stays ``None``."""
     value = item.get(key)
@@ -355,6 +455,8 @@ def _parse_page(body: bytes) -> tuple[int, tuple[MetadataRecord, ...], str | Non
                     doi=_optional_identifier(item, "doi"),
                     title=_optional_title(item, "title"),
                     publication_year=_optional_year(item, "pubYear"),
+                    authors=_optional_authors(item),
+                    journal=_optional_journal(item),
                 )
             )
         except DiscoveryRecordError as exc:

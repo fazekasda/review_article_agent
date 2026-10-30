@@ -304,11 +304,11 @@ EuropePMCClient.search(query: str, page_size: int = 100,
 
 ## Durable search observations (schema 11)
 
-### `discovery.serialization` — codec version 1
+### `discovery.serialization` — codec versions 1 and 2
 
 ```python
 SEARCH_RESULT_FORMAT = "review_article_agent.discovery.search_result"
-SEARCH_RESULT_FORMAT_VERSION = 1
+SEARCH_RESULT_FORMAT_VERSION = 2             # newest; version 1 still decodes
 MAX_SEARCH_RESULT_BYTES = 536_870_912        # 512 MiB
 
 encode_search_result(result: SearchResult) -> bytes
@@ -318,13 +318,24 @@ decode_search_result(data: bytes) -> SearchResult
 - Emits **canonical** (sorted-key, compact, UTF-8) JSON with envelope keys
   exactly `format`, `format_version`, `result_type`, `result`; `result_type` is
   `search_result` or `pubmed_search_result`.
+- **Version 2** adds the optional per-record fields `authors` (a JSON array of
+  display-name strings, provider order preserved) and `journal` (a string or
+  `null`). **Version 1** is the earlier seven-key record with neither field.
+  The codec decodes both versions.
+- **Backward-compatible encoding:** a result whose records carry neither field
+  is still emitted as **version 1** with the exact bytes it had before, so a
+  previously stored observation's canonical bytes (and therefore its stored
+  digest) never change; a result with at least one non-empty `authors` or
+  non-null `journal` is emitted as version 2. `encode(decode(bytes)) == bytes`
+  therefore holds for old version-1 rows too.
 - Decodes only the exact base `SearchResult` or `PubMedSearchResult` and rebuilds
   it through the real dataclass constructors, so page/source/query agreement,
   flattened aggregates, identifier shapes, `complete` semantics, and
   failure/stop consistency are enforced rather than trusted.
 - **Lossless:** exact query/source strings, UTC timestamps, URLs, counts, page
   order, overlapping and duplicate records, missing (`None`) identifiers,
-  explicit failures/stop reasons, every attempt, PubMed `query_translation`, and
+  explicit failures/stop reasons, every attempt, PubMed `query_translation`,
+  author lists, journal titles, and
   the `int`/`float` distinction of `retry_after_seconds` survive.
 - **Strict:** invalid UTF-8, malformed or over-deep JSON, duplicate object keys,
   non-finite/overflowing numbers (including `1e999`), unknown or missing fields
@@ -383,11 +394,11 @@ payloads — this is **not** scientific deduplication. A fresh `search()` is **n
 replay: it re-issues provider requests; only `record_search` with the same key
 replays stored bytes.
 
-**Preserved source observations.** PubMed title/year/DOI/PMCID and
-`query_translation`, Europe PMC native `source:id` identity, requested URLs and
-timestamps, missing IDs, overlaps/duplicates in page order, and partial failures
-with earlier successful pages are all retained exactly. No merge, map, score, or
-drop occurs.
+**Preserved source observations.** PubMed title/year/DOI/PMCID, authors, journal,
+and `query_translation`, Europe PMC native `source:id` identity, authors/journal,
+requested URLs and timestamps, missing IDs, overlaps/duplicates in page order,
+and partial failures with earlier successful pages are all retained exactly. No
+merge, map, score, or drop occurs.
 
 `verify_backup`/`restore_backup` share the same schema-11 read-only integrity
 sweep; a schema-10 legacy snapshot is still supported and is upgraded by the

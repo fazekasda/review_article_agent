@@ -23,7 +23,10 @@ Contract (``build(outline_ref, section_id)``)::
          "original_passage": {<verified receipt passage: text, locator,
                                source_ref, report_ref, section_path, assets>}}, ...
       ],
-      "citations": {<stable key>: <verified corpus bibliographic record>},
+      "citations": {<stable key>: <verified corpus bibliographic record:
+                                   candidate_id, version, identity {doi/pmid/pmcid},
+                                   and the observed title/authors/year/journal
+                                   where present>},
       "methods": {..., "original_sources": [<verified passages/assets per used source>]},
       ... exact global refs, methods/context, and inert authority flags ...
     }
@@ -39,13 +42,18 @@ remain available for interpretation.
 
 A citation is **only** a verified corpus record: the finding's exact source
 document is traced through the current approved acquisition manifest entries to
-the frozen candidate metadata of the accepted freeze.  A missing, foreign,
-unresolved, or ambiguous linkage is rejected rather than invented; no
-model/caller bibliography is accepted.  The stable citation key derives
-deterministically from the project + candidate identity (never a title/author
-guess).  A legacy synthetic receipt whose passages lack a per-passage source ref
-is bound to the case's unique single source only, and the fallback is disclosed
-in ``limitations`` and ``source_ref_fallback``.
+the frozen candidate metadata of the accepted freeze.  Each citation record
+carries the verified frozen-corpus metadata available for that candidate -- its
+identity identifiers, its frozen-corpus revision ``version``, and the observed
+``title``/``authors``/``year``/``journal`` where the corpus recorded them -- so
+the delivery export emits a real bibliography.  A missing, foreign, unresolved,
+or ambiguous linkage is
+rejected rather than invented; no model/caller bibliography is accepted, and a
+field the corpus does not carry is omitted, never invented.  The stable citation
+key derives deterministically from the project + candidate identity (never a
+title/author guess).  A legacy synthetic receipt whose passages lack a
+per-passage source ref is bound to the case's unique single source only, and the
+fallback is disclosed in ``limitations`` and ``source_ref_fallback``.
 
 Authority is only the existing named owner gates consumed by
 :meth:`~review_article_agent.synthesis.workflow.SynthesisWorkflowRepository.require_for_blueprints`
@@ -65,10 +73,17 @@ from ..domain.errors import ReviewAgentError
 from ..domain.records import RecordValidationError, canonical_json, validate_ref
 from ..extraction.workflow import ExtractionWorkflowError, ExtractionWorkflowRepository
 from ..storage import opmemo
+from ..storage.discovery import DiscoveryRepository
 from ..synthesis.workflow import SynthesisWorkflowError, SynthesisWorkflowRepository
 
 #: Package envelope schema version.
-SCHEMA_VERSION = 1
+#:
+#: Version 2 carries the verified frozen-corpus bibliographic metadata (``title``/
+#: ``year`` from the recorded observations, plus ``identity`` and ``version``) on
+#: each citation record so export emits a real bibliography. The optional
+#: ``authors``/``journal`` observations are carried the same additive way when
+#: the recorded provider metadata has them (absent fields are simply omitted).
+SCHEMA_VERSION = 2
 
 #: Generic-document ``document_type`` of one drafting package.
 DOCUMENT_TYPE = "drafting_package"
@@ -157,8 +172,69 @@ def _ambiguity(tokens):
     return False
 
 
-def _bibliographic_record(project_id, candidate, corpus_ref, freeze_ref, source_refs):
-    """Build one verified bibliographic record from a frozen candidate doc."""
+def _observed_bibliographic_fields(candidate, discovery):
+    """Return the verified bibliographic fields recorded for one frozen candidate.
+
+    The title, publication year, authors, and journal are read from the
+    candidate's *own* recorded provider observations (the frozen corpus
+    re-derives the candidate from exactly these observations).  A field is
+    returned only when every occurrence that carries it agrees on a single
+    value; a field that is absent or whose occurrences disagree is omitted -- it
+    is never invented or guessed.  Authors are emitted as a JSON-portable list
+    (the provider's own order), never re-ordered or synthesised.
+    """
+    titles: set = set()
+    years: set = set()
+    authors: set = set()
+    journals: set = set()
+    for pin in candidate.get("occurrences") or []:
+        if not isinstance(pin, list) or len(pin) != 2:
+            continue
+        run_id, index = pin[0], pin[1]
+        if not isinstance(run_id, str) or isinstance(index, bool) or not isinstance(index, int):
+            continue
+        record = discovery.get_search(run_id)
+        if record is None:
+            continue
+        records = record.result.records
+        if index < 0 or index >= len(records):
+            continue
+        observed = records[index]
+        title = observed.title
+        if isinstance(title, str) and title.strip():
+            titles.add(title)
+        year = observed.publication_year
+        if isinstance(year, int) and not isinstance(year, bool):
+            years.add(year)
+        observed_authors = observed.authors
+        if isinstance(observed_authors, tuple) and observed_authors:
+            authors.add(observed_authors)
+        journal = observed.journal
+        if isinstance(journal, str) and journal.strip():
+            journals.add(journal)
+    fields: dict = {}
+    if len(titles) == 1:
+        fields["title"] = next(iter(titles))
+    if len(years) == 1:
+        fields["year"] = next(iter(years))
+    if len(authors) == 1:
+        fields["authors"] = list(next(iter(authors)))
+    if len(journals) == 1:
+        fields["journal"] = next(iter(journals))
+    return fields
+
+
+def _bibliographic_record(
+    project_id, candidate, corpus_ref, freeze_ref, source_refs, observed=None
+):
+    """Build one verified bibliographic record from a frozen candidate doc.
+
+    The record carries the verified corpus metadata available for the candidate:
+    the identity identifiers from its exact tokens, its frozen-corpus revision
+    ``version``, and any observed ``title``/``authors``/``year``/``journal``
+    (``observed``).  A field that the frozen corpus does not carry is omitted,
+    never invented.  The stable citation key derivation is unchanged.
+    """
     tokens = candidate.get("tokens")
     if not isinstance(tokens, list):
         raise DraftingPackageError("a frozen candidate has no readable identifier tokens")
@@ -174,11 +250,19 @@ def _bibliographic_record(project_id, candidate, corpus_ref, freeze_ref, source_
         # A resolved candidate always carries at least its provider-native token;
         # an empty token set means the metadata cannot be verified.
         raise DraftingPackageError("a frozen candidate carries no bibliographic metadata")
-    return {
+    identity = {
+        namespace: identifiers[namespace]
+        for namespace in sorted(identifiers)
+    }
+    record = {
         "citation_key": citation_key(project_id, candidate["candidate_id"]),
         "candidate_id": candidate["candidate_id"],
         "project_id": project_id,
         "resolved": bool(candidate.get("resolved")),
+        # The exact frozen-corpus revision the metadata was verified against; it
+        # is the bibliography version the export consistency check compares.
+        "version": corpus_ref.get("revision_id"),
+        "identity": identity,
         "bibliographic_identifiers": dict(sorted(identifiers.items())),
         "provider_identifiers": dict(sorted(providers.items())),
         "tokens": [list(token) for token in tokens],
@@ -186,6 +270,9 @@ def _bibliographic_record(project_id, candidate, corpus_ref, freeze_ref, source_
         "corpus_ref": dict(corpus_ref),
         "freeze_ref": dict(freeze_ref),
     }
+    for field, value in (observed or {}).items():
+        record[field] = value
+    return record
 
 
 class DraftingPackageRepository:
@@ -416,6 +503,7 @@ class DraftingPackageRepository:
         audit_ref = context["audit_ref"]
 
         extraction = ExtractionWorkflowRepository(self.store)
+        discovery = DiscoveryRepository(self.store)
         try:
             accepted = extraction.require_for_synthesis(audit_ref)
             batch = extraction.require_batch(accepted["batch_ref"])
@@ -479,12 +567,16 @@ class DraftingPackageRepository:
                 source_ref, source_index, candidates_by_id
             )
             key = citation_key(self.project_id, candidate_id)
-            citations.setdefault(
-                key,
-                _bibliographic_record(
-                    self.project_id, candidate, corpus_ref, freeze_ref, [source_ref]
-                ),
-            )
+            if key not in citations:
+                observed = _observed_bibliographic_fields(candidate, discovery)
+                citations[key] = _bibliographic_record(
+                    self.project_id,
+                    candidate,
+                    corpus_ref,
+                    freeze_ref,
+                    [source_ref],
+                    observed,
+                )
             if fallback:
                 limitations.append(
                     "legacy receipt passages without a per-passage source ref were "

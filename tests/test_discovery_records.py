@@ -108,6 +108,38 @@ class MetadataRecordTests(unittest.TestCase):
         with self.assertRaises(DiscoveryRecordError):
             record(title="x" * (records.MAX_TITLE_LEN + 1))
 
+    def test_authors_default_empty_and_order_preserved(self):
+        rec = MetadataRecord(source=records.SOURCE_PUBMED)
+        self.assertEqual(rec.authors, ())
+        self.assertIsNone(rec.journal)
+        rec2 = record(authors=("Ada Lovelace", "Alan Turing"), journal="J Synth")
+        self.assertEqual(rec2.authors, ("Ada Lovelace", "Alan Turing"))
+        self.assertEqual(rec2.journal, "J Synth")
+
+    def test_hostile_authors_are_refused(self):
+        for authors in (
+            ["Ada Lovelace"],  # list, not tuple
+            ("",),
+            ("Ada\u0000Lovelace",),
+            (" leading",),
+            ("trailing ",),
+            (7,),
+            tuple("x" * (records.MAX_AUTHOR_LEN + 1) for _ in range(1)),
+        ):
+            with self.subTest(authors=authors):
+                with self.assertRaises(DiscoveryRecordError):
+                    record(authors=authors)
+        with self.assertRaises(DiscoveryRecordError):
+            record(authors=tuple(f"a{i}" for i in range(records.MAX_AUTHORS + 1)))
+
+    def test_hostile_journal_is_refused(self):
+        for journal in ("", " leading", "trailing ", "x" * (records.MAX_JOURNAL_LEN + 1), 42):
+            with self.subTest(journal=journal):
+                with self.assertRaises(DiscoveryRecordError):
+                    record(journal=journal)
+        with self.assertRaises(DiscoveryRecordError):
+            record(journal="with\u0000control")
+
 
 # --------------------------------------------------------------------------- #
 # SearchPage

@@ -16,9 +16,10 @@ What these values are
 
 * :class:`MetadataRecord` — a frozen, normalized bibliographic record. It carries
   the **provider provenance** (``source`` + ``source_id``) and the nullable
-  identifiers ``pmid``/``pmcid``/``doi``, ``title``, and ``publication_year``.
-  A missing identifier stays **explicit** (``has_identifier()`` is ``False``); it
-  is never fabricated.
+  identifiers ``pmid``/``pmcid``/``doi``, ``title``, ``publication_year``,
+  ``journal``, and the (possibly empty) ordered ``authors`` display-name list.
+  A missing identifier stays **explicit** (``has_identifier()`` is ``False``); an
+  absent author/journal stays absent. Neither is ever fabricated.
 * :class:`SearchPage` — one immutable page of a provider response with the exact
   query, source, requested URL, UTC retrieval timestamp, page index/size, total
   count, records, an optional next cursor, an explicit ``complete`` flag, and a
@@ -53,8 +54,12 @@ __all__ = [
     "STOP_REASONS",
     "FAILURE_REASONS",
     "MAX_TITLE_LEN",
+    "MAX_AUTHORS",
+    "MAX_AUTHOR_LEN",
+    "MAX_JOURNAL_LEN",
     "MIN_PUBLICATION_YEAR",
     "MAX_PUBLICATION_YEAR",
+    "sanitize_display_text",
     "DiscoveryRecordError",
     "MetadataRecord",
     "SearchPage",
@@ -80,6 +85,15 @@ FAILURE_REASONS = (
 
 #: Bounds on untrusted bibliographic text.
 MAX_TITLE_LEN = 4096
+#: Bounds on an untrusted author list: a bounded number of bounded display names.
+#: 200 covers even large-consortium papers while refusing an unbounded list; 512
+#: characters per display name is generous for "ForeName LastName" (or a
+#: collective/consortium name). A provider value outside either bound is an
+#: explicit refusal at the adapter, never a silent truncation.
+MAX_AUTHORS = 200
+MAX_AUTHOR_LEN = 512
+#: Bound on an untrusted journal title.
+MAX_JOURNAL_LEN = 1024
 MIN_PUBLICATION_YEAR = 1000
 MAX_PUBLICATION_YEAR = 9999
 
@@ -123,6 +137,73 @@ def _require_optional_title(value: object, field_name: str) -> str | None:
     return value
 
 
+def sanitize_display_text(value: str) -> str:
+    """Sanitise untrusted provider display text (author name / journal title).
+
+    Replaces C0/DEL control characters with a space and normalizes internal
+    whitespace (all runs to a single space), then trims. It never truncates a
+    value; an over-long value is refused by the caller's bound check, never
+    silently cut.
+    """
+    cleaned = "".join(
+        " " if (ord(ch) < 0x20 or ord(ch) == 0x7F) else ch for ch in value
+    )
+    return " ".join(cleaned.split())
+
+
+def _require_authors(value: object, field_name: str) -> tuple[str, ...]:
+    """Validate an author display-name list: a bounded tuple of bounded names.
+
+    Order is preserved (it is the provider's order) and each name is a non-empty,
+    already-trimmed string with no control characters. A wrong container, an
+    over-long list/name, or a hostile entry is refused rather than sanitised here
+    (the adapters sanitise provider text before constructing the record).
+    """
+    if not isinstance(value, tuple):
+        raise DiscoveryRecordError(f"{field_name}: must be a tuple")
+    if len(value) > MAX_AUTHORS:
+        raise DiscoveryRecordError(f"{field_name}: has too many entries")
+    for name in value:
+        if not isinstance(name, str) or not name:
+            raise DiscoveryRecordError(
+                f"{field_name}: must contain non-empty strings"
+            )
+        if name != name.strip():
+            raise DiscoveryRecordError(
+                f"{field_name}: an entry has surrounding whitespace"
+            )
+        if len(name) > MAX_AUTHOR_LEN:
+            raise DiscoveryRecordError(f"{field_name}: an entry is too long")
+        for ch in name:
+            if ord(ch) < 0x20 or ord(ch) == 0x7F:
+                raise DiscoveryRecordError(
+                    f"{field_name}: an entry contains control characters"
+                )
+    return value
+
+
+def _require_optional_journal(value: object, field_name: str) -> str | None:
+    """Validate a nullable journal title (non-empty, trimmed, bounded, no controls)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise DiscoveryRecordError(
+            f"{field_name}: must be a non-empty string or None"
+        )
+    if value != value.strip():
+        raise DiscoveryRecordError(
+            f"{field_name}: must not have surrounding whitespace"
+        )
+    if len(value) > MAX_JOURNAL_LEN:
+        raise DiscoveryRecordError(f"{field_name}: is too long")
+    for ch in value:
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise DiscoveryRecordError(
+                f"{field_name}: must not contain control characters"
+            )
+    return value
+
+
 def _require_optional_year(value: object, field_name: str) -> int | None:
     if value is None:
         return None
@@ -162,9 +243,11 @@ class MetadataRecord:
 
     ``source`` is the provider id (e.g. :data:`SOURCE_PUBMED`); ``source_id`` is
     the provider's own record identifier. ``pmid``/``pmcid``/``doi``/``title``/
-    ``publication_year`` are nullable. A record with no identifier is valid but
-    explicit: :meth:`has_identifier` is ``False``. Publication identity is never
-    treated as study identity and no identifier is ever fabricated.
+    ``publication_year``/``journal`` are nullable and ``authors`` is a (possibly
+    empty) tuple of provider display names in the provider's own order. A record
+    with no identifier is valid but explicit: :meth:`has_identifier` is ``False``.
+    Publication identity is never treated as study identity and no identifier,
+    author, or journal is ever fabricated: an absent field stays absent.
     """
 
     source: str
@@ -174,6 +257,8 @@ class MetadataRecord:
     doi: str | None = None
     title: str | None = None
     publication_year: int | None = None
+    authors: tuple[str, ...] = ()
+    journal: str | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.source, "source")
@@ -185,6 +270,8 @@ class MetadataRecord:
         _require_optional_id(self.doi, "doi")
         _require_optional_title(self.title, "title")
         _require_optional_year(self.publication_year, "publication_year")
+        _require_authors(self.authors, "authors")
+        _require_optional_journal(self.journal, "journal")
 
     def has_identifier(self) -> bool:
         """True when at least one provider identifier is present."""

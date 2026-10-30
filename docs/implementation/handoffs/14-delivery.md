@@ -16,7 +16,7 @@ storage migration, no new dependency. `schema.py`/`export.py` behavior is
   `render_bibtex`, `render_ris`, `build_disclosures`, `build_export_package`.
 - `delivery/workflow.py` (new): `DeliveryRepository(store)` with
   `start_global_review`, `run_global_review`, `freshness`, `notes`, `apply_notes`,
-  `revalidated`, `final_approval`, `export`, each persisting the **full state as a
+  `revalidate`, `final_approval`, `export`, each persisting the **full state as a
   new immutable artifact revision** and `read(delivery_id)` returning the latest.
   `reviewer`/`writer` are injected ports; `rights(artifact_id, revision_id)`
   authorises each revision.
@@ -85,7 +85,8 @@ storage migration, no new dependency. `schema.py`/`export.py` behavior is
   `DeliveryRepository.read(delivery_id)` **equals** the original persisted state.
 - **Failure examples:** incomplete section/ origin start refusal; 2-round
   exhaustion → `blocked`; second top-up refused; scope note refused as an edit;
-  citation edit → stale blocks approval until `revalidated`; unsupported major
+  citation edit → stale blocks approval until `revalidate` recomputes the
+  Step 12/13 checks; unsupported major
   claim refused; hash change after approval → export refused (no files written).
 
 ## Disclosures
@@ -98,9 +99,24 @@ storage migration, no new dependency. `schema.py`/`export.py` behavior is
   omission is a real blocking major finding rather than a note.
 - **MVP limits:** the persisted state is the latest full revision (there is no
   separate per-call event log); the freshness gate is simplified to requiring
-  `cutoff_accepted` before final approval; `revalidated` trusts the caller's fresh
-  Step 12/13 results (it does not re-run them); resume is idempotent at the
+  `cutoff_accepted` before final approval; resume is idempotent at the
   operation granularity (a completed/blocked global review is returned unchanged).
+- **Revalidation recomputes, never trusts (S17-B4):** `revalidate(delivery_id,
+  paragraph_ids, *, package, origin_state=None)` re-runs the checks instead of
+  accepting caller-supplied results.  For each named paragraph it (a) requires
+  every key cited in the paragraph text to exist in the approved `package`
+  `citations` (no invented citation); (b) re-runs the deterministic Step 12 fact
+  check (`review.schema.fact_check`) over a sentence built from the paragraph
+  text, requiring a `supported` verdict -- a paragraph that cites nothing cannot
+  be mapped to package evidence and stays required; and (c) when `origin_state`
+  is supplied, requires Step 13 `origin_coverage` to be complete.  Only a
+  paragraph passing every check becomes `checks="valid"` and leaves
+  `revalidation_required`; any other stays required with recorded reasons.  The
+  recomputed per-paragraph checks and digests are persisted in
+  `revalidation_records`, and any recorded approval is invalidated as before.
+  Limitation: origin coverage is audited at whole-state granularity (the current
+  origin/package shapes carry no per-citation-key link), so when an incomplete
+  `origin_state` is supplied every named paragraph stays required.
 
 ## Verification
 - `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'` — **3639
