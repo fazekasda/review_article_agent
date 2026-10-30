@@ -511,7 +511,7 @@ shards, the 2 py3.11 `full` shards, and `full-durations` are all `SUCCESS`).
   (`generation/delivery_roles.py`); the Jev screening runner
   (`screening/runner.py`) with `verified_dispatch` provenance.
 
-### `feat/pipeline-run` (steps 6 and 9; PR #<pending>)
+### `feat/pipeline-run` (steps 6 and 9; PR #29)
 
 Branch `feat/pipeline-run`, head `0300299`. The coordinator opens the PR.
 
@@ -683,4 +683,4 @@ Task worktrees under `review_article_agent-worktrees/s16-*` and
 | `f670aee` | housekeeping: README, release matrix, plan ticks (kickoff 16 §10) |
 | `6e81e03` | `pipeline run` end-to-end test (kickoff 16 §6/§8) |
 | `0300299` | repair: record the reviewed manuscript at `delivery start` (S17-O4) |
-| `<this handoff commit>` | extend this handoff to steps 5–10, fix README §08, tick step 10 |
+| `ae6cc7b` | extend this handoff to steps 5–10, fix README §08, tick step 10 |
