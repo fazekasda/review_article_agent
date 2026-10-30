@@ -141,47 +141,43 @@ class TestLoopbackAndAuth(unittest.TestCase):
             client = OpenCodeV2Client(url, token="t")
             self.assertEqual(client.auth, "bearer")
 
-    def test_non_loopback_or_bad_scheme_or_embedded_credentials_rejected(self) -> None:
-        for url in (
-            "http://example.com:443",
-            "https://10.1.2.3:1234",
-            "http://0.0.0.0:1",
-            "ftp://127.0.0.1:1",
-            "http://user:pass@127.0.0.1:1",
-            "not a url",
-        ):
-            with self.assertRaises(ValueError, msg=url):
-                OpenCodeV2Client(url, token="t")
-
-    def test_missing_or_empty_token_fails_closed(self) -> None:
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1")
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1", token="   ")
-
-    def test_bad_numeric_and_page_bounds_rejected(self) -> None:
-        for kwargs in (
-            {"timeout": 0},
-            {"timeout": -1.0},
-            {"max_message_pages": 0},
-            {"max_response_bytes": 0},
-        ):
-            with self.assertRaises(ValueError, msg=repr(kwargs)):
-                OpenCodeV2Client("http://127.0.0.1:1", token="t", **kwargs)
-
-    def test_unknown_auth_scheme_and_mutually_exclusive_fields(self) -> None:
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1", auth="digest", password="x")
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1", token="t", auth="basic", password="p")
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1", token="t", password="p")
-
-    def test_basic_requires_explicit_password(self) -> None:
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1", auth="basic")
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1", auth="basic", username="opencode")
+    def test_invalid_client_construction_rejected(self) -> None:
+        # One table per validator: every rejected constructor input.
+        cases = {
+            "non_loopback": lambda: OpenCodeV2Client("http://example.com:443", token="t"),
+            "https_private": lambda: OpenCodeV2Client("https://10.1.2.3:1234", token="t"),
+            "wildcard_host": lambda: OpenCodeV2Client("http://0.0.0.0:1", token="t"),
+            "bad_scheme": lambda: OpenCodeV2Client("ftp://127.0.0.1:1", token="t"),
+            "embedded_credentials": lambda: OpenCodeV2Client("http://user:pass@127.0.0.1:1", token="t"),
+            "not_a_url": lambda: OpenCodeV2Client("not a url", token="t"),
+            "missing_token": lambda: OpenCodeV2Client("http://127.0.0.1:1"),
+            "blank_token": lambda: OpenCodeV2Client("http://127.0.0.1:1", token="   "),
+            "timeout_zero": lambda: OpenCodeV2Client("http://127.0.0.1:1", token="t", timeout=0),
+            "timeout_negative": lambda: OpenCodeV2Client("http://127.0.0.1:1", token="t", timeout=-1.0),
+            "max_message_pages_zero": lambda: OpenCodeV2Client(
+                "http://127.0.0.1:1", token="t", max_message_pages=0
+            ),
+            "max_response_bytes_zero": lambda: OpenCodeV2Client(
+                "http://127.0.0.1:1", token="t", max_response_bytes=0
+            ),
+            "unknown_auth_scheme": lambda: OpenCodeV2Client(
+                "http://127.0.0.1:1", auth="digest", password="x"
+            ),
+            "basic_with_token": lambda: OpenCodeV2Client(
+                "http://127.0.0.1:1", token="t", auth="basic", password="p"
+            ),
+            "token_and_password": lambda: OpenCodeV2Client(
+                "http://127.0.0.1:1", token="t", password="p"
+            ),
+            "basic_without_password": lambda: OpenCodeV2Client("http://127.0.0.1:1", auth="basic"),
+            "basic_username_without_password": lambda: OpenCodeV2Client(
+                "http://127.0.0.1:1", auth="basic", username="opencode"
+            ),
+        }
+        for label, build in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    build()
 
     def test_info_exposes_server_version(self) -> None:
         with MockServer(token="t") as server:
@@ -743,36 +739,38 @@ class TestFiniteBounds(unittest.TestCase):
         with self.assertRaises(ValueError, msg=repr(kwargs)):
             OpenCodeV2Client("http://127.0.0.1:1", token="t", **kwargs)
 
-    def test_timeout_must_be_finite_positive_and_capped(self) -> None:
-        for bad in (
-            float("nan"),
-            float("inf"),
-            float("-inf"),
-            True,
-            False,
-            0,
-            -1.0,
-            MAX_TIMEOUT + 1,
-        ):
-            self._reject(timeout=bad)
-
-    def test_page_and_byte_bounds_must_be_positive_capped_ints(self) -> None:
-        for bad in (
-            float("inf"),
-            float("nan"),
-            True,
-            3.0,
-            "3",
-            0,
-            -1,
-            MAX_MESSAGE_PAGES_CAP + 1,
-            10**9,
-        ):
-            self._reject(max_message_pages=bad)
-        for bad in (float("inf"), True, 0, MAX_RESPONSE_BYTES_CAP + 1):
-            self._reject(max_response_bytes=bad)
-        for bad in (float("inf"), True, 0, MAX_REQUEST_BYTES_CAP + 1):
-            self._reject(max_request_bytes=bad)
+    def test_invalid_bounds_rejected(self) -> None:
+        # One table per validator: every rejected per-call/constructor bound.
+        cases = {
+            "timeout_nan": {"timeout": float("nan")},
+            "timeout_inf": {"timeout": float("inf")},
+            "timeout_negative_inf": {"timeout": float("-inf")},
+            "timeout_bool_true": {"timeout": True},
+            "timeout_bool_false": {"timeout": False},
+            "timeout_zero": {"timeout": 0},
+            "timeout_negative": {"timeout": -1.0},
+            "timeout_over_cap": {"timeout": MAX_TIMEOUT + 1},
+            "max_message_pages_inf": {"max_message_pages": float("inf")},
+            "max_message_pages_nan": {"max_message_pages": float("nan")},
+            "max_message_pages_bool": {"max_message_pages": True},
+            "max_message_pages_float": {"max_message_pages": 3.0},
+            "max_message_pages_str": {"max_message_pages": "3"},
+            "max_message_pages_zero": {"max_message_pages": 0},
+            "max_message_pages_negative": {"max_message_pages": -1},
+            "max_message_pages_over_cap": {"max_message_pages": MAX_MESSAGE_PAGES_CAP + 1},
+            "max_message_pages_huge": {"max_message_pages": 10**9},
+            "max_response_bytes_inf": {"max_response_bytes": float("inf")},
+            "max_response_bytes_bool": {"max_response_bytes": True},
+            "max_response_bytes_zero": {"max_response_bytes": 0},
+            "max_response_bytes_over_cap": {"max_response_bytes": MAX_RESPONSE_BYTES_CAP + 1},
+            "max_request_bytes_inf": {"max_request_bytes": float("inf")},
+            "max_request_bytes_bool": {"max_request_bytes": True},
+            "max_request_bytes_zero": {"max_request_bytes": 0},
+            "max_request_bytes_over_cap": {"max_request_bytes": MAX_REQUEST_BYTES_CAP + 1},
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(case=label):
+                self._reject(**kwargs)
 
     def test_valid_bounds_are_accepted(self) -> None:
         client = OpenCodeV2Client(
@@ -901,33 +899,28 @@ class TestCuratedErrors(unittest.TestCase):
 class TestStrictJson(unittest.TestCase):
     """``json.loads`` leniency (duplicate keys, NaN/Infinity, deep nesting) is off."""
 
-    def test_duplicate_keys_rejected(self) -> None:
-        with self.assertRaises(OpenCodeProtocolError):
-            OpenCodeV2Client._decode(b'{"data":1,"data":2}')
+    def test_malformed_json_rejected(self) -> None:
+        # One table per validator: every malformed body _decode must refuse.
+        cases = {
+            "duplicate_keys": b'{"data":1,"data":2}',
+            "non_finite_nan": b'{"data":NaN}',
+            "non_finite_infinity": b'{"data":Infinity}',
+            "non_finite_negative_infinity": b'{"data":-Infinity}',
+            "over_deep_json": b"[" * 100000 + b"]" * 100000,
+            "numeric_overflow_1e999": b'{"cost":1e999}',
+            "numeric_overflow_negative_1e999": b'{"cost":-1e999}',
+            "numeric_overflow_1e309": b'{"cost":1e309}',
+            "nesting_depth_over_cap": b"[" * (MAX_JSON_DEPTH + 1) + b"]" * (MAX_JSON_DEPTH + 1),
+            "non_json": b"not json",
+        }
+        for label, body in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(OpenCodeProtocolError):
+                    OpenCodeV2Client._decode(body)
 
-    def test_non_finite_numbers_rejected(self) -> None:
-        for body in (b'{"data":NaN}', b'{"data":Infinity}', b'{"data":-Infinity}'):
-            with self.assertRaises(OpenCodeProtocolError, msg=body):
-                OpenCodeV2Client._decode(body)
-
-    def test_over_deep_json_rejected(self) -> None:
-        deep = b"[" * 100000 + b"]" * 100000
-        with self.assertRaises(OpenCodeProtocolError):
-            OpenCodeV2Client._decode(deep)
-
-    def test_numeric_overflow_to_infinity_rejected(self) -> None:
-        # ``parse_constant`` alone misses a numeric literal that overflows to inf.
-        for body in (b'{"cost":1e999}', b'{"cost":-1e999}', b'{"cost":1e309}'):
-            with self.assertRaises(OpenCodeProtocolError, msg=body):
-                OpenCodeV2Client._decode(body)
+    def test_valid_exponents_and_depth_at_cap_are_accepted(self) -> None:
+        # a non-overflowing exponent and the exact depth cap are still valid JSON
         self.assertEqual(OpenCodeV2Client._decode(b'{"cost":1e308}'), {"cost": 1e308})
-
-    def test_nesting_depth_is_capped(self) -> None:
-        with self.assertRaises(OpenCodeProtocolError):
-            OpenCodeV2Client._decode(
-                b"[" * (MAX_JSON_DEPTH + 1) + b"]" * (MAX_JSON_DEPTH + 1)
-            )
-        # exactly at the cap is still valid JSON
         value = OpenCodeV2Client._decode(b"[" * MAX_JSON_DEPTH + b"]" * MAX_JSON_DEPTH)
         self.assertIsInstance(value, list)
 
@@ -939,10 +932,6 @@ class TestStrictJson(unittest.TestCase):
     def test_valid_json_round_trips_and_empty_is_none(self) -> None:
         self.assertIsNone(OpenCodeV2Client._decode(b""))
         self.assertEqual(OpenCodeV2Client._decode(b'{"data":1}'), {"data": 1})
-
-    def test_non_json_rejected(self) -> None:
-        with self.assertRaises(OpenCodeProtocolError):
-            OpenCodeV2Client._decode(b"not json")
 
     def test_non_json_response_over_http_is_protocol_error(self) -> None:
         with _RecorderServer(body=b'{"data":1,"data":2}') as origin:
@@ -999,27 +988,30 @@ class TestPagingCursorValidation(unittest.TestCase):
         self.assertFalse(truncated)
         self.assertEqual([m["id"] for m in messages], ["msg_cur000002"])
 
-    def test_collect_messages_max_pages_override_validated(self) -> None:
-        for bad in (
-            0,
-            -1,
-            True,
-            3.5,
-            "3",
-            float("nan"),
-            float("inf"),
-            MAX_MESSAGE_PAGES_CAP + 1,
-        ):
-            with self.assertRaises(ValueError, msg=repr(bad)):
-                self.client.collect_messages(self.sid, max_pages=bad)
-
-    def test_list_messages_limit_and_cursor_validated(self) -> None:
-        for bad_limit in (0, -1, True, MAX_MESSAGE_LIMIT + 1):
-            with self.assertRaises(ValueError, msg=repr(bad_limit)):
-                self.client.list_messages(self.sid, limit=bad_limit)
-        for bad_cursor in (123, ""):
-            with self.assertRaises(ValueError, msg=repr(bad_cursor)):
-                self.client.list_messages(self.sid, cursor=bad_cursor)
+    def test_paging_arguments_validated(self) -> None:
+        # One table per validator: every rejected collect_messages/list_messages arg.
+        cases = {
+            "max_pages_zero": lambda: self.client.collect_messages(self.sid, max_pages=0),
+            "max_pages_negative": lambda: self.client.collect_messages(self.sid, max_pages=-1),
+            "max_pages_bool": lambda: self.client.collect_messages(self.sid, max_pages=True),
+            "max_pages_float": lambda: self.client.collect_messages(self.sid, max_pages=3.5),
+            "max_pages_str": lambda: self.client.collect_messages(self.sid, max_pages="3"),
+            "max_pages_nan": lambda: self.client.collect_messages(self.sid, max_pages=float("nan")),
+            "max_pages_inf": lambda: self.client.collect_messages(self.sid, max_pages=float("inf")),
+            "max_pages_over_cap": lambda: self.client.collect_messages(
+                self.sid, max_pages=MAX_MESSAGE_PAGES_CAP + 1
+            ),
+            "limit_zero": lambda: self.client.list_messages(self.sid, limit=0),
+            "limit_negative": lambda: self.client.list_messages(self.sid, limit=-1),
+            "limit_bool": lambda: self.client.list_messages(self.sid, limit=True),
+            "limit_over_max": lambda: self.client.list_messages(self.sid, limit=MAX_MESSAGE_LIMIT + 1),
+            "cursor_int": lambda: self.client.list_messages(self.sid, cursor=123),
+            "cursor_empty": lambda: self.client.list_messages(self.sid, cursor=""),
+        }
+        for label, call in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    call()
 
 
 class TestWaitBounds(unittest.TestCase):
@@ -1032,15 +1024,28 @@ class TestWaitBounds(unittest.TestCase):
         self.client = OpenCodeV2Client(self.server.base_url, token="t")
         self.sid = self.client.create_session(agent="writer", model=WRITER_MODEL)["id"]
 
-    def test_retry_interval_validated(self) -> None:
-        for bad in (0, -1.0, float("nan"), float("inf"), True, MAX_RETRY_INTERVAL + 1):
-            with self.assertRaises(ValueError, msg=repr(bad)):
-                self.client.wait(self.sid, retry_interval=bad)
-
-    def test_timeout_validated(self) -> None:
-        for bad in (0, -1.0, float("nan"), float("inf"), True, MAX_TIMEOUT + 1):
-            with self.assertRaises(ValueError, msg=repr(bad)):
-                self.client.wait(self.sid, timeout=bad)
+    def test_wait_bounds_validated(self) -> None:
+        # One table per validator: every rejected wait timeout/interval.
+        cases = {
+            "retry_interval_zero": lambda: self.client.wait(self.sid, retry_interval=0),
+            "retry_interval_negative": lambda: self.client.wait(self.sid, retry_interval=-1.0),
+            "retry_interval_nan": lambda: self.client.wait(self.sid, retry_interval=float("nan")),
+            "retry_interval_inf": lambda: self.client.wait(self.sid, retry_interval=float("inf")),
+            "retry_interval_bool": lambda: self.client.wait(self.sid, retry_interval=True),
+            "retry_interval_over_max": lambda: self.client.wait(
+                self.sid, retry_interval=MAX_RETRY_INTERVAL + 1
+            ),
+            "timeout_zero": lambda: self.client.wait(self.sid, timeout=0),
+            "timeout_negative": lambda: self.client.wait(self.sid, timeout=-1.0),
+            "timeout_nan": lambda: self.client.wait(self.sid, timeout=float("nan")),
+            "timeout_inf": lambda: self.client.wait(self.sid, timeout=float("inf")),
+            "timeout_bool": lambda: self.client.wait(self.sid, timeout=True),
+            "timeout_over_max": lambda: self.client.wait(self.sid, timeout=MAX_TIMEOUT + 1),
+        }
+        for label, call in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    call()
 
 
 class TestPinVerification(unittest.TestCase):
@@ -1172,25 +1177,34 @@ class TestMalformedIdleOutcome(unittest.TestCase):
 class TestIntegerBoundsNoOverflow(unittest.TestCase):
     """A huge int is a clean ValueError, never a raw OverflowError."""
 
-    def test_huge_int_constructor_bounds(self) -> None:
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1", token="t", timeout=10**1000)
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1", token="t", max_message_pages=10**1000)
-        with self.assertRaises(ValueError):
-            OpenCodeV2Client("http://127.0.0.1:1", token="t", max_response_bytes=10**1000)
+    def test_huge_int_bounds_are_clean_value_errors(self) -> None:
+        # One table per validator: a huge int is a ValueError, never OverflowError.
+        huge = 10**1000
+        constructor_cases = {
+            "constructor_timeout": {"timeout": huge},
+            "constructor_max_message_pages": {"max_message_pages": huge},
+            "constructor_max_response_bytes": {"max_response_bytes": huge},
+        }
+        for label, kwargs in constructor_cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    OpenCodeV2Client("http://127.0.0.1:1", token="t", **kwargs)
 
-    def test_huge_int_wait_bounds(self) -> None:
         server = MockServer(token="t")
         server.__enter__()
         self.addCleanup(server.__exit__, None, None, None)
         client = OpenCodeV2Client(server.base_url, token="t")
         sid = client.create_session(agent="writer", model=WRITER_MODEL)["id"]
-        for bad in (10**1000, -(10**1000)):
-            with self.assertRaises(ValueError, msg=repr(type(bad))):
-                client.wait(sid, timeout=bad)
-            with self.assertRaises(ValueError, msg=repr(type(bad))):
-                client.wait(sid, retry_interval=bad)
+        wait_cases = {
+            "wait_timeout_positive": lambda: client.wait(sid, timeout=huge),
+            "wait_timeout_negative": lambda: client.wait(sid, timeout=-huge),
+            "wait_retry_interval_positive": lambda: client.wait(sid, retry_interval=huge),
+            "wait_retry_interval_negative": lambda: client.wait(sid, retry_interval=-huge),
+        }
+        for label, call in wait_cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    call()
 
 
 class TestWaitMinimumInterval(unittest.TestCase):

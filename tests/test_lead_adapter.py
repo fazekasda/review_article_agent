@@ -150,61 +150,15 @@ class ConfigTests(unittest.TestCase):
         self.assertIsInstance(config.input_price_per_million, Decimal)
         self.assertEqual(config.input_price_per_million, Decimal("0.10"))
 
-    def test_missing_field_refused(self):
-        mapping = config_mapping()
-        del mapping["pricing_ref"]
-        with self.assertRaises(lead.LeadValidationError):
-            lead.LeadConfig.from_mapping(mapping)
+    def test_invalid_configs_refused(self):
+        # One table per validator: every rejected LeadConfig construction.
+        def missing_field():
+            mapping = config_mapping()
+            del mapping["pricing_ref"]
+            return lead.LeadConfig.from_mapping(mapping)
 
-    def test_unknown_field_refused(self):
-        with self.assertRaises(lead.LeadValidationError):
-            lead.LeadConfig.from_mapping(config_mapping(tools=[]))
-
-    def test_non_mapping_refused(self):
-        for bad in (None, [], "x", 3):
-            with self.assertRaises(lead.LeadValidationError):
-                lead.LeadConfig.from_mapping(bad)
-
-    def test_missing_or_none_values_refused(self):
-        with self.assertRaises(lead.LeadValidationError):
-            lead.LeadConfig.from_mapping(config_mapping(model_id=None))
-        with self.assertRaises(lead.LeadValidationError):
-            lead.LeadConfig.from_mapping(config_mapping(model_id=""))
-
-    def test_context_below_max_output_refused(self):
-        with self.assertRaises(lead.LeadValidationError):
-            cfg(context_tokens=1024, max_output_tokens=4096)
-
-    def test_unbounded_prices_refused(self):
-        for bad in ("1e999999", "0e-999999", "1e25", 0, "-1", "0", float("inf"), True):
-            with self.assertRaises(lead.LeadValidationError):
-                cfg(input_price_per_million=bad)
-        for bad in ("1e999999", 0.4, 0, "-2", True):
-            with self.assertRaises(lead.LeadValidationError):
-                cfg(output_price_per_million=bad)
-
-    def test_bool_and_nonfinite_numeric_fields_refused(self):
-        with self.assertRaises(lead.LeadValidationError):
-            cfg(max_output_tokens=True)
-        with self.assertRaises(lead.LeadValidationError):
-            cfg(max_output_tokens=10 ** 30)
-        with self.assertRaises(lead.LeadValidationError):
-            cfg(context_tokens=10 ** 30)
-        with self.assertRaises(lead.LeadValidationError):
-            cfg(max_response_bytes=10 ** 30)
-        for bad in (float("nan"), float("inf"), float("-inf"), 0, -1, 1e9, True):
-            with self.assertRaises(lead.LeadValidationError):
-                cfg(timeout_seconds=bad)
-
-    def test_whitespace_in_identifiers_refused(self):
-        with self.assertRaises(lead.LeadValidationError):
-            cfg(upstream_provider="deep seek")
-        with self.assertRaises(lead.LeadValidationError):
-            cfg(model_id=" deepseek/model")
-
-    def test_direct_construction_is_validated(self):
-        with self.assertRaises(lead.LeadValidationError):
-            lead.LeadConfig(
+        def direct_construction():
+            return lead.LeadConfig(
                 model_id="",
                 upstream_provider="deepseek",
                 max_output_tokens=1,
@@ -216,6 +170,49 @@ class ConfigTests(unittest.TestCase):
                 timeout_seconds=1.0,
                 max_response_bytes=1,
             )
+
+        cases = {
+            "missing_field": missing_field,
+            "unknown_field": lambda: lead.LeadConfig.from_mapping(config_mapping(tools=[])),
+            "non_mapping_none": lambda: lead.LeadConfig.from_mapping(None),
+            "non_mapping_list": lambda: lead.LeadConfig.from_mapping([]),
+            "non_mapping_str": lambda: lead.LeadConfig.from_mapping("x"),
+            "non_mapping_int": lambda: lead.LeadConfig.from_mapping(3),
+            "missing_value_none": lambda: cfg(model_id=None),
+            "missing_value_empty": lambda: cfg(model_id=""),
+            "context_below_max_output": lambda: cfg(context_tokens=1024, max_output_tokens=4096),
+            "input_price_1e999999": lambda: cfg(input_price_per_million="1e999999"),
+            "input_price_0e-999999": lambda: cfg(input_price_per_million="0e-999999"),
+            "input_price_1e25": lambda: cfg(input_price_per_million="1e25"),
+            "input_price_zero_int": lambda: cfg(input_price_per_million=0),
+            "input_price_negative": lambda: cfg(input_price_per_million="-1"),
+            "input_price_zero_str": lambda: cfg(input_price_per_million="0"),
+            "input_price_inf": lambda: cfg(input_price_per_million=float("inf")),
+            "input_price_bool": lambda: cfg(input_price_per_million=True),
+            "output_price_1e999999": lambda: cfg(output_price_per_million="1e999999"),
+            "output_price_float": lambda: cfg(output_price_per_million=0.4),
+            "output_price_zero": lambda: cfg(output_price_per_million=0),
+            "output_price_negative": lambda: cfg(output_price_per_million="-2"),
+            "output_price_bool": lambda: cfg(output_price_per_million=True),
+            "max_output_tokens_bool": lambda: cfg(max_output_tokens=True),
+            "max_output_tokens_huge": lambda: cfg(max_output_tokens=10 ** 30),
+            "context_tokens_huge": lambda: cfg(context_tokens=10 ** 30),
+            "max_response_bytes_huge": lambda: cfg(max_response_bytes=10 ** 30),
+            "timeout_nan": lambda: cfg(timeout_seconds=float("nan")),
+            "timeout_inf": lambda: cfg(timeout_seconds=float("inf")),
+            "timeout_negative_inf": lambda: cfg(timeout_seconds=float("-inf")),
+            "timeout_zero": lambda: cfg(timeout_seconds=0),
+            "timeout_negative": lambda: cfg(timeout_seconds=-1),
+            "timeout_over_cap": lambda: cfg(timeout_seconds=1e9),
+            "timeout_bool": lambda: cfg(timeout_seconds=True),
+            "provider_whitespace": lambda: cfg(upstream_provider="deep seek"),
+            "model_id_whitespace": lambda: cfg(model_id=" deepseek/model"),
+            "direct_construction": direct_construction,
+        }
+        for label, build in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(lead.LeadValidationError):
+                    build()
 
 
 # --------------------------------------------------------------------------- #
@@ -388,72 +385,83 @@ class SuccessTests(unittest.TestCase):
 # Never a silent success
 # --------------------------------------------------------------------------- #
 class NeverSuccessTests(unittest.TestCase):
-    def _run_body(self, **overrides):
-        return run(FakeTransport(resp(200, valid_body(**overrides))))
+    def test_never_a_silent_success(self):
+        # One table per validator: each malformed/refused 200 becomes a subTest.
+        def wrong_model():
+            return valid_body(model="openai/other-model")
 
-    def test_wrong_model_is_protocol_error(self):
-        body = valid_body(model="openai/other-model")
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertIsNone(result.proposal_text)
-        self.assertEqual(result.cost.state, "known")
-        self.assertEqual(result.cost.amount_usd, "0.00002037")
+        def length_finish():
+            return valid_body(choices=[valid_choices(finish_reason="length")])
 
-    def test_length_finish_is_never_success(self):
-        result = self._run_body(choices=[valid_choices(finish_reason="length")])
-        self.assertEqual(result.outcome, "protocol_error")
+        def tool_calls():
+            choice = valid_choices()
+            choice["message"]["tool_calls"] = [{"id": "t1", "type": "function"}]
+            return valid_body(choices=[choice])
 
-    def test_tool_calls_are_never_success(self):
-        choice = valid_choices()
-        choice["message"]["tool_calls"] = [{"id": "t1", "type": "function"}]
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
+        def refusal():
+            choice = valid_choices()
+            choice["message"]["refusal"] = "I cannot help with that."
+            choice["message"]["content"] = ""
+            return valid_body(choices=[choice])
 
-    def test_refusal_is_refused(self):
-        choice = valid_choices()
-        choice["message"]["refusal"] = "I cannot help with that."
-        choice["message"]["content"] = ""
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "refused")
-        self.assertIsNone(result.proposal_text)
+        def content_filter():
+            return valid_body(choices=[valid_choices(finish_reason="content_filter")])
 
-    def test_content_filter_is_refused(self):
-        result = self._run_body(choices=[valid_choices(finish_reason="content_filter")])
-        self.assertEqual(result.outcome, "refused")
+        def top_level_error():
+            body = valid_body()
+            body["error"] = {"code": 500, "message": CANARY}
+            return body
 
-    def test_top_level_error_is_protocol_error(self):
-        body = valid_body()
-        body["error"] = {"code": 500, "message": CANARY}
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
+        def missing_choices():
+            body = valid_body()
+            del body["choices"]
+            return body
 
-    def test_missing_choices_is_protocol_error(self):
-        body = valid_body()
-        del body["choices"]
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
+        def multiple_choices():
+            return valid_body(choices=[valid_choices(), valid_choices()])
 
-    def test_multiple_choices_is_protocol_error(self):
-        result = self._run_body(choices=[valid_choices(), valid_choices()])
-        self.assertEqual(result.outcome, "protocol_error")
+        def non_text_content():
+            choice = valid_choices()
+            choice["message"]["content"] = [{"type": "text", "text": "hi"}]
+            return valid_body(choices=[choice])
 
-    def test_non_text_content_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = [{"type": "text", "text": "hi"}]
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
+        def empty_content():
+            choice = valid_choices()
+            choice["message"]["content"] = "   "
+            return valid_body(choices=[choice])
 
-    def test_empty_content_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = "   "
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
+        def invalid_usage_tokens():
+            body = valid_body()
+            body["usage"]["prompt_tokens"] = -1
+            return body
 
-    def test_invalid_usage_tokens_is_protocol_error(self):
-        body = valid_body()
-        body["usage"]["prompt_tokens"] = -1
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
+        def wrong_model_extra(result):
+            self.assertIsNone(result.proposal_text)
+            self.assertEqual(result.cost.state, "known")
+            self.assertEqual(result.cost.amount_usd, "0.00002037")
+
+        def refusal_extra(result):
+            self.assertIsNone(result.proposal_text)
+
+        cases = [
+            ("wrong_model", wrong_model, "protocol_error", wrong_model_extra),
+            ("length_finish", length_finish, "protocol_error", None),
+            ("tool_calls", tool_calls, "protocol_error", None),
+            ("refusal", refusal, "refused", refusal_extra),
+            ("content_filter", content_filter, "refused", None),
+            ("top_level_error", top_level_error, "protocol_error", None),
+            ("missing_choices", missing_choices, "protocol_error", None),
+            ("multiple_choices", multiple_choices, "protocol_error", None),
+            ("non_text_content", non_text_content, "protocol_error", None),
+            ("empty_content", empty_content, "protocol_error", None),
+            ("invalid_usage_tokens", invalid_usage_tokens, "protocol_error", None),
+        ]
+        for label, build, expected, extra in cases:
+            with self.subTest(case=label):
+                result = run(FakeTransport(resp(200, build())))
+                self.assertEqual(result.outcome, expected)
+                if extra is not None:
+                    extra(result)
 
 
 # --------------------------------------------------------------------------- #
@@ -561,49 +569,55 @@ class GuardTests(unittest.TestCase):
                 lead.execute_lead(self._valid_plan(), api_key=bad, transport=transport)
         self.assertEqual(transport.calls, [])
 
-    def test_forged_model_refused(self):
-        forged = dataclasses.replace(self._valid_plan(), config=cfg(model_id="openai/other"))
-        transport = FakeTransport(resp(200, valid_body()))
-        with self.assertRaises(lead.LeadError):
-            lead.execute_lead(forged, api_key=API_KEY, transport=transport)
-        self.assertEqual(transport.calls, [])
+    def test_forged_plans_refused(self):
+        # One table per validator: each forged/foreign plan is refused with zero I/O.
+        def forged_model():
+            return dataclasses.replace(self._valid_plan(), config=cfg(model_id="openai/other"))
 
-    def test_forged_text_refused(self):
-        forged = dataclasses.replace(self._valid_plan(), text="MUTATED")
-        transport = FakeTransport(resp(200, valid_body()))
-        with self.assertRaises(lead.LeadValidationError):
-            lead.execute_lead(forged, api_key=API_KEY, transport=transport)
-        self.assertEqual(transport.calls, [])
+        def forged_text():
+            return dataclasses.replace(self._valid_plan(), text="MUTATED")
 
-    def test_forged_body_refused(self):
-        forged = dataclasses.replace(self._valid_plan(), request_body=b"{}")
-        with self.assertRaises(lead.LeadValidationError):
-            lead.execute_lead(forged, api_key=API_KEY, transport=FakeTransport())
-        self.assertEqual(forged.request_body, b"{}")
+        def forged_body():
+            return dataclasses.replace(self._valid_plan(), request_body=b"{}")
 
-    def test_forged_reserve_refused(self):
-        forged = dataclasses.replace(self._valid_plan(), reserve_usd="0")
-        with self.assertRaises(lead.LeadValidationError):
-            lead.execute_lead(forged, api_key=API_KEY, transport=FakeTransport())
+        def forged_reserve():
+            return dataclasses.replace(self._valid_plan(), reserve_usd="0")
 
-    def test_forged_bound_evidence_refused(self):
-        forged = dataclasses.replace(self._valid_plan(), bound_evidence={"a": 1})
-        with self.assertRaises(lead.LeadValidationError):
-            lead.execute_lead(forged, api_key=API_KEY, transport=FakeTransport())
+        def forged_bound_evidence():
+            return dataclasses.replace(self._valid_plan(), bound_evidence={"a": 1})
 
-    def test_forged_endpoint_refused(self):
-        forged = dataclasses.replace(self._valid_plan(), endpoint="https://evil.example/x")
-        with self.assertRaises(lead.LeadError):
-            lead.execute_lead(forged, api_key=API_KEY, transport=FakeTransport())
+        def forged_endpoint():
+            return dataclasses.replace(self._valid_plan(), endpoint="https://evil.example/x")
 
-    def test_forged_payload_refused(self):
-        forged = dataclasses.replace(self._valid_plan(), payload={"model": MODEL})
-        with self.assertRaises(lead.LeadValidationError):
-            lead.execute_lead(forged, api_key=API_KEY, transport=FakeTransport())
+        def forged_payload():
+            return dataclasses.replace(self._valid_plan(), payload={"model": MODEL})
 
-    def test_non_plan_refused(self):
-        with self.assertRaises(lead.LeadValidationError):
-            lead.execute_lead({"nope": 1}, api_key=API_KEY, transport=FakeTransport())
+        cases = [
+            ("forged_model", forged_model, lead.LeadError),
+            ("forged_text", forged_text, lead.LeadValidationError),
+            ("forged_body", forged_body, lead.LeadValidationError),
+            ("forged_reserve", forged_reserve, lead.LeadValidationError),
+            ("forged_bound_evidence", forged_bound_evidence, lead.LeadValidationError),
+            ("forged_endpoint", forged_endpoint, lead.LeadError),
+            ("forged_payload", forged_payload, lead.LeadValidationError),
+        ]
+        for label, build, expected in cases:
+            with self.subTest(case=label):
+                transport = FakeTransport(resp(200, valid_body()))
+                forged = build()
+                with self.assertRaises(expected):
+                    lead.execute_lead(forged, api_key=API_KEY, transport=transport)
+                self.assertEqual(transport.calls, [])
+
+        with self.subTest(case="forged_body_is_not_rewritten"):
+            forged = dataclasses.replace(self._valid_plan(), request_body=b"{}")
+            with self.assertRaises(lead.LeadValidationError):
+                lead.execute_lead(forged, api_key=API_KEY, transport=FakeTransport())
+            self.assertEqual(forged.request_body, b"{}")
+
+        with self.subTest(case="non_plan"):
+            with self.assertRaises(lead.LeadValidationError):
+                lead.execute_lead({"nope": 1}, api_key=API_KEY, transport=FakeTransport())
 
     def test_no_retry_single_call(self):
         transport = FakeTransport(resp(200, valid_body()))
@@ -691,26 +705,27 @@ class CostRecordTests(unittest.TestCase):
         self.assertIsNone(record.amount_usd)
         self.assertEqual(record.route, "direct_call")
 
-    def test_known_requires_amount(self):
-        with self.assertRaises(lead.LeadValidationError):
-            lead.CostRecord(state="known")
-
-    def test_not_incurred_rejects_amount(self):
-        with self.assertRaises(lead.LeadValidationError):
-            lead.CostRecord(state="not_incurred", amount_usd="0.1")
-
-    def test_unknown_rejects_zero_amount(self):
-        with self.assertRaises(lead.LeadValidationError):
-            lead.CostRecord(state="unknown", amount_usd="0")
-
-    def test_bucket_mismatch_rejected(self):
-        with self.assertRaises(lead.LeadValidationError):
-            lead.CostRecord(state="unknown", reserve_usd="1", reserve_retained=True,
-                            accounting_bucket="session_statistics")
-
-    def test_reserve_retained_must_match_state(self):
-        with self.assertRaises(lead.LeadValidationError):
-            lead.CostRecord(state="unknown", reserve_usd="1", reserve_retained=False)
+    def test_invalid_cost_records_refused(self):
+        cases = {
+            "known_requires_amount": {"state": "known"},
+            "not_incurred_rejects_amount": {"state": "not_incurred", "amount_usd": "0.1"},
+            "unknown_rejects_zero_amount": {"state": "unknown", "amount_usd": "0"},
+            "bucket_mismatch_rejected": {
+                "state": "unknown",
+                "reserve_usd": "1",
+                "reserve_retained": True,
+                "accounting_bucket": "session_statistics",
+            },
+            "reserve_retained_must_match_state": {
+                "state": "unknown",
+                "reserve_usd": "1",
+                "reserve_retained": False,
+            },
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(lead.LeadValidationError):
+                    lead.CostRecord(**kwargs)
 
 
 # --------------------------------------------------------------------------- #
