@@ -42,7 +42,7 @@ from ..domain.errors import (
     StoreError,
     UnsupportedSchemaVersion,
 )
-from . import paths, schema
+from . import opmemo, paths, schema
 
 
 def _utc_now() -> str:
@@ -56,11 +56,16 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     Commits on clean exit and rolls back on any exception. Nested use is not
     supported (SQLite has no nested transactions); the caller owns the unit of
     work.
+
+    This is the outermost transaction, so the operation-scoped validation memo
+    is cleared on entry and again on exit (commit *or* rollback): no memo entry
+    may outlive the operation that produced it.
     """
     try:
         conn.execute("BEGIN IMMEDIATE")
     except sqlite3.Error as exc:  # pragma: no cover - environment dependent
         raise StoreError("could not begin a database transaction.") from exc
+    opmemo.invalidate(conn)
     try:
         yield conn
         conn.execute("COMMIT")
@@ -70,6 +75,8 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         except sqlite3.Error:  # pragma: no cover - best effort
             pass
         raise
+    finally:
+        opmemo.invalidate(conn)
 
 
 class _ReadonlyIdentity:
