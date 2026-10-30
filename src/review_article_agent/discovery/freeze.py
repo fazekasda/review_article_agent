@@ -205,6 +205,7 @@ from ..domain.records import (
     validate_identifier,
     validate_ref,
 )
+from ..storage import opmemo
 from ..storage.artifacts import (
     ArtifactConflictError,
     ArtifactRepository,
@@ -523,6 +524,19 @@ def _ref_dict(value: dict) -> dict:
         "artifact_id": value["artifact_id"],
         "revision_id": value["revision_id"],
     }
+
+
+def _memo_canonical_key(value: object) -> str | None:
+    """A stable string key for ``value``, or ``None`` when it is not keyable.
+
+    Used only to key the operation-scoped validation memo.  An unkeyable
+    argument simply skips memoization, so the original call runs unchanged and
+    no exception type or message is altered by the key construction.
+    """
+    try:
+        return canonical_json(value).decode("utf-8")
+    except Exception:  # noqa: BLE001 - any non-canonical value just skips the memo
+        return None
 
 
 def _require_rationale(value: object, message: str = _M_BAD_RATIONALE, error=FreezeValidationError) -> str:
@@ -1326,7 +1340,29 @@ class FreezeRepository:
         corpus/coverage/plan revisions must exist and their digests must match). A
         stale, forged, wrong-gate, missing-coverage, or raw (unapproved) state
         raises :class:`FreezeNotAuthorizedError`.
+
+        The result is a pure function of the transaction snapshot and the exact
+        ``(artifact_id, at_ref)`` inputs, so within one operation it is memoized
+        on those inputs plus the connection's ``total_changes``.  A new freeze /
+        search-again revision, a revoking or superseding approval, or any other
+        write the operation makes changes ``total_changes`` and the gate is
+        re-derived exactly as before (fail-closed); the raised
+        :class:`FreezeNotAuthorizedError` is never cached.
         """
+        at_key = "<current>" if at_ref is None else _memo_canonical_key(at_ref)
+        if at_key is None:
+            return self._require_frozen(artifact_id, at_ref=at_ref)
+        key = ("freeze.require_frozen", self.project_id, str(artifact_id), at_key)
+        return opmemo.memoize(
+            self._store.connection,
+            key,
+            lambda: self._require_frozen(artifact_id, at_ref=at_ref),
+        )
+
+    def _require_frozen(
+        self, artifact_id: str = DEFAULT_FREEZE_ARTIFACT_ID, *, at_ref=None
+    ) -> dict:
+        """Uncached body of :meth:`require_frozen` (see it for the memo contract)."""
         artifact_id = _artifact_identifier(artifact_id)
         if at_ref is None:
             revision = self._artifacts.current_revision(artifact_id)
@@ -1500,6 +1536,28 @@ class FreezeRepository:
         return None
 
     def _read(self, revision: Revision) -> dict:
+        """Decode and fully re-derive one freeze revision, memoized per operation.
+
+        A revision is immutable and the re-derivation reads only durable state,
+        so the assembled document is a pure function of the transaction snapshot
+        and the exact ``(artifact_id, revision_id)``.  It is memoized on those
+        plus the connection's ``total_changes``; any write the operation makes
+        (a superseding revision, a savepoint rollback) misses the entry and the
+        payload is re-derived exactly as before.  A raised
+        :class:`FreezeCorruptionError` is never cached.
+        """
+        key = (
+            "freeze._read",
+            self.project_id,
+            revision.artifact_id,
+            revision.revision_id,
+        )
+        return opmemo.memoize(
+            self._store.connection, key, lambda: self._read_uncached(revision)
+        )
+
+    def _read_uncached(self, revision: Revision) -> dict:
+        """Uncached body of :meth:`_read` (see it for the memo contract)."""
         document = _read_document(self._artifacts, revision)
         try:
             payload = _validate_payload(document["payload"], self.project_id, self._store)

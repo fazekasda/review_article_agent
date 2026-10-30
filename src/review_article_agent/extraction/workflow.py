@@ -38,6 +38,7 @@ from ..parsing.core import NORMALIZATION_VERSION, PARSER_VERSION
 from ..parsing.repository import _NestedStore
 from ..runtime.gates import MAX_GATE_SNAPSHOT_ENTRIES
 from ..runtime.lead import LeadConfig, LeadError
+from ..storage import opmemo
 from ..storage.artifacts import ArtifactRepository, DependencyRef, sha256_digest
 from ..storage.human_approvals import HumanApprovalRepository
 from .schema import validate_extraction
@@ -172,6 +173,19 @@ def require(condition, message=None):
 def _text(value, label):
     require(isinstance(value, str) and value.strip() != "", label)
     return value
+
+
+def _memo_canonical_key(value):
+    """A stable string key for ``value``, or ``None`` when it is not keyable.
+
+    Used only to key the operation-scoped validation memo.  An unkeyable
+    argument simply skips memoization, so the original call runs unchanged and
+    no exception type or message is altered by the key construction.
+    """
+    try:
+        return canonical_json(value).decode("utf-8")
+    except Exception:  # noqa: BLE001 - any non-canonical value just skips the memo
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -339,6 +353,33 @@ class ExtractionWorkflowRepository:
         require(sha256_digest(data) == rev.content_sha256 and len(data) == rev.byte_size)
 
     def _read(self, ref, kind, *, current=True):
+        """Decode and fully re-derive one extraction document, memoized per operation.
+
+        The payload is a pure function of the transaction snapshot and the exact
+        ``(ref, kind, current)`` inputs, so within one operation it is memoized
+        on those plus the connection's ``total_changes``.  A write the operation
+        makes (a new revision, a savepoint rollback) misses the entry and the
+        document is re-derived exactly as before; a raised
+        :class:`ExtractionWorkflowError` is never cached.
+        """
+        ref_key = _memo_canonical_key(ref)
+        if ref_key is None:
+            return self._read_uncached(ref, kind, current=current)
+        key = (
+            "extraction._read",
+            self.store.project_id,
+            ref_key,
+            str(kind),
+            "current" if current else "explicit",
+        )
+        return opmemo.memoize(
+            self.store.connection,
+            key,
+            lambda: self._read_uncached(ref, kind, current=current),
+        )
+
+    def _read_uncached(self, ref, kind, *, current=True):
+        """Uncached body of :meth:`_read` (see it for the memo contract)."""
         ref = self._ref(ref)
         rev = self.artifacts.get_revision(ref["artifact_id"], ref["revision_id"])
         require(rev is not None)
@@ -419,6 +460,24 @@ class ExtractionWorkflowRepository:
         }
 
     def require_config(self, ref):
+        """Read and gate one extraction config, memoized per operation.
+
+        The result is a pure function of the transaction snapshot and the exact
+        ``ref``, so within one operation it is memoized on ``(project_id, ref)``
+        plus the connection's ``total_changes``; any write the operation makes
+        (a superseding config revision, a new/revoked gate) misses the entry and
+        the config is re-derived and re-gated exactly as before.  A raised
+        :class:`ExtractionWorkflowError` is never cached.
+        """
+        ref_key = _memo_canonical_key(ref)
+        if ref_key is None:
+            return self._require_config_uncached(ref)
+        key = ("extraction.require_config", self.store.project_id, ref_key)
+        return opmemo.memoize(
+            self.store.connection, key, lambda: self._require_config_uncached(ref)
+        )
+
+    def _require_config_uncached(self, ref):
         config = self._validate_config(self._read(ref, "config"))
         self._approved(ref, GATE_CONFIG)
         return config
@@ -530,6 +589,22 @@ class ExtractionWorkflowRepository:
         }
 
     def require_pilot(self, ref):
+        """Read and gate one extraction pilot, memoized per operation.
+
+        Pure in the transaction snapshot and ``ref``; memoized on
+        ``(project_id, ref)`` plus the connection's ``total_changes`` so any
+        operation write re-derives and re-gates it exactly as before.  A raised
+        :class:`ExtractionWorkflowError` is never cached.
+        """
+        ref_key = _memo_canonical_key(ref)
+        if ref_key is None:
+            return self._require_pilot_uncached(ref)
+        key = ("extraction.require_pilot", self.store.project_id, ref_key)
+        return opmemo.memoize(
+            self.store.connection, key, lambda: self._require_pilot_uncached(ref)
+        )
+
+    def _require_pilot_uncached(self, ref):
         pilot = self._read(ref, "pilot")
         require(self._pilot(pilot["input"]) == pilot)
         require(not pilot["blocking_failures"])
@@ -586,6 +661,23 @@ class ExtractionWorkflowRepository:
         }
 
     def require_batch(self, ref):
+        """Read and gate one extraction batch, memoized per operation.
+
+        Pure in the transaction snapshot and ``ref``; memoized on
+        ``(project_id, ref)`` plus the connection's ``total_changes`` so any
+        operation write (a new acquisition/freeze revision, a superseding gate)
+        re-derives and re-gates it exactly as before.  A raised
+        :class:`ExtractionWorkflowError` is never cached.
+        """
+        ref_key = _memo_canonical_key(ref)
+        if ref_key is None:
+            return self._require_batch_uncached(ref)
+        key = ("extraction.require_batch", self.store.project_id, ref_key)
+        return opmemo.memoize(
+            self.store.connection, key, lambda: self._require_batch_uncached(ref)
+        )
+
+    def _require_batch_uncached(self, ref):
         batch = self._read(ref, "batch")
         require(self._batch(batch["input"]) == batch)
         self._approved(ref, GATE_BATCH)
@@ -618,6 +710,22 @@ class ExtractionWorkflowRepository:
         }
 
     def require_audit(self, ref):
+        """Read and gate one extraction audit, memoized per operation.
+
+        Pure in the transaction snapshot and ``ref``; memoized on
+        ``(project_id, ref)`` plus the connection's ``total_changes`` so any
+        operation write re-derives and re-gates it exactly as before.  A raised
+        :class:`ExtractionWorkflowError` is never cached.
+        """
+        ref_key = _memo_canonical_key(ref)
+        if ref_key is None:
+            return self._require_audit_uncached(ref)
+        key = ("extraction.require_audit", self.store.project_id, ref_key)
+        return opmemo.memoize(
+            self.store.connection, key, lambda: self._require_audit_uncached(ref)
+        )
+
+    def _require_audit_uncached(self, ref):
         audit = self._read(ref, "audit")
         require(self._audit(audit["input"]) == audit)
         require(not audit["paused"])
@@ -634,7 +742,26 @@ class ExtractionWorkflowRepository:
         audit revision** of the same batch so an earlier important error
         permanently pauses that exact batch -- a later clean audit can never erase
         it; correction means a new batch and a fresh re-audit.
+
+        The accepted evidence is a pure function of the transaction snapshot and
+        the exact ``audit_ref``, so within one operation it is memoized on
+        ``(project_id, audit_ref)`` plus the connection's ``total_changes``; any
+        write the operation makes (a new revision, a superseding gate) misses the
+        entry and every gate is re-derived exactly as before.  A raised
+        :class:`ExtractionWorkflowError` is never cached.
         """
+        ref_key = _memo_canonical_key(audit_ref)
+        if ref_key is None:
+            return self._require_for_synthesis_uncached(audit_ref)
+        key = ("extraction.require_for_synthesis", self.store.project_id, ref_key)
+        return opmemo.memoize(
+            self.store.connection,
+            key,
+            lambda: self._require_for_synthesis_uncached(audit_ref),
+        )
+
+    def _require_for_synthesis_uncached(self, audit_ref):
+        """Uncached body of :meth:`require_for_synthesis`."""
         ref = self._ref(audit_ref)
         with _NestedStore(self.store).transaction():
             audit = self._read(ref, "audit")
