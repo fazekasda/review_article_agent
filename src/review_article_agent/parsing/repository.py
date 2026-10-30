@@ -500,8 +500,15 @@ class ParsingRepository:
             raise _err("report_payload_invalid")
         for passage in passages:
             self._validate_passage(passage)
-        if fmt == "pdf" and (status != "needs_review" or passages or payload["human_action_required"] is not True):
-            raise _err("report_payload_invalid")
+        if fmt == "pdf":
+            # A PDF report carries either usable extracted text (``parsed`` with
+            # page-locatored passages) or an explicit human-review state
+            # (``needs_review``). It is never ``rejected`` and always requires a
+            # human action (PDF text is not reliable column-ordered full text);
+            # the global ``excludes_candidate``/``authorizes_scientific_processing``
+            # checks above still apply, and every passage digest is validated.
+            if status not in ("parsed", "needs_review") or payload["human_action_required"] is not True:
+                raise _err("report_payload_invalid")
         return payload
 
     @staticmethod

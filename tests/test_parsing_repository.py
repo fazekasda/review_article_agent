@@ -500,5 +500,40 @@ class FailedParseTests(ParsingRepositoryTestBase):
             self.assertFalse(record["excludes_candidate"])
 
 
+_REAL_PYPDF = __import__("importlib.util").util.find_spec("pypdf") is not None
+
+
+@unittest.skipUnless(_REAL_PYPDF, "optional dependency pypdf not installed ([pdf] extra)")
+class PdfReportRepositoryTests(ParsingRepositoryTestBase):
+    """A PDF report with usable extracted text is durable and readable (S17-P7)."""
+
+    def test_pdf_text_report_reads_back_with_passages(self):
+        from test_acquisition_pdf_inspection import build_pdf, text_stream
+        from review_article_agent.parsing.pdf_adapter import PDF_PARSER_VERSION
+
+        long_text = "The quick brown fox jumps over the lazy dog. " * 8
+        data = build_pdf([text_stream(long_text), text_stream(long_text)])
+        with self.new_store() as store:
+            pid = store.project_id
+            src_ref, _ = self.add_document(
+                store, "art-pdf", data, "rev-pdf", media_type="application/pdf"
+            )
+            pr = ParsingRepository(store)
+            out = pr.parse_stored_document(
+                src_ref, report_artifact_id="art-pr", report_revision_id="rev-pr",
+                rights=_rights(pid, "art-pr", "rev-pr"),
+            )
+            self.assertEqual(out["status"], "parsed")
+            self.assertEqual(out["parser_version"], PDF_PARSER_VERSION)
+            self.assertTrue(out["human_action_required"])
+            self.assertFalse(out["excludes_candidate"])
+            record = pr.read_report(out["report_ref"])
+            self.assertEqual(record["format"], "pdf")
+            self.assertEqual(record["status"], "parsed")
+            self.assertEqual({p["page"] for p in record["payload"]["passages"]}, {1, 2})
+            self.assertTrue(record["payload"]["non_text_assets_require_review"])
+            self.assertFalse(record["excludes_candidate"])
+
+
 if __name__ == "__main__":
     unittest.main()

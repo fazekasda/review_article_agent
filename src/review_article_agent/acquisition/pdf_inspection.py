@@ -129,7 +129,13 @@ def _is_int(value: object) -> bool:
 
 
 def _run_child(
-    data: bytes, max_pages: int, max_text_chars: int, timeout_seconds: float
+    data: bytes,
+    max_pages: int,
+    max_text_chars: int,
+    timeout_seconds: float,
+    *,
+    script: Path | None = None,
+    max_output_bytes: int = MAX_CHILD_OUTPUT_BYTES,
 ) -> tuple[str, bytes]:
     """Run the child; return ``(outcome, stdout)``.
 
@@ -137,12 +143,16 @@ def _run_child(
     or ``spawn_failed``. Everything is bounded: wall time, stdout size and the
     child's own POSIX resource limits. The whole process group is killed on any
     abnormal end.
+
+    ``script`` defaults to the Step 06 integrity child; the Step 07 full-text
+    extractor passes its own self-contained child and a larger output bound.
     """
+    script = _CHILD_SCRIPT if script is None else script
     cpu_seconds = int(timeout_seconds) + 2
     argv = [
         sys.executable,
         "-I",
-        str(_CHILD_SCRIPT),
+        str(script),
         str(max_pages),
         str(max_text_chars),
         str(cpu_seconds),
@@ -197,7 +207,7 @@ def _run_child(
             if not chunk:
                 return
             out.extend(chunk)
-            if len(out) > MAX_CHILD_OUTPUT_BYTES:
+            if len(out) > max_output_bytes:
                 overflow.set()
                 kill()
                 return

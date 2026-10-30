@@ -65,16 +65,19 @@ in CI.
 `tests/test_cli.py::WheelPackagingTest` builds a wheel offline through the
 project's declared build backend, which `pyproject.toml` names as
 `requires = ["setuptools>=68"]`. The Python 3.14 runner does not ship
-`setuptools`, so both the `fast` and `full` jobs install it explicitly
-(`python -m pip install "setuptools>=68"`) right after `setup-python`. This is
-intentional: if `setuptools` is absent the test **fails** with an actionable
-message rather than skipping, so the packaging coverage can never silently
-disappear. To reproduce locally, install the backend in the interpreter that
-runs the tests:
+`setuptools`, so both the `fast` and `full` jobs install it explicitly right
+after `setup-python`, together with the optional `pypdf==6.21.4` extra
+(`python -m pip install "setuptools>=68" "pypdf==6.21.4"`) so the PDF
+extraction/inspection tests that need the optional dependency actually run
+instead of skipping. Installing `setuptools` is intentional: if it is absent the
+packaging test **fails** with an actionable message rather than skipping, so the
+packaging coverage can never silently disappear. To reproduce locally, install
+the backend (and the optional PDF extra) in the interpreter that runs the tests:
 
 ```bash
-python3 -m pip install "setuptools>=68"
+python3 -m pip install "setuptools>=68" "pypdf==6.21.4"
 PYTHONPATH=src:tests python3 -m unittest tests.test_cli.WheelPackagingTest
+PYTHONPATH=src:tests python3 -m unittest tests.test_parsing_pdf_adapter
 ```
 
 ## Test tiers

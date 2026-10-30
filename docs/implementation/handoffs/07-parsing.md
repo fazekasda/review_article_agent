@@ -12,7 +12,8 @@
 - Focused: `tests/test_parsing_core.py` + `tests/test_parsing_repository.py` = 36, `tests/test_cli_parsing.py` = 6 → **42 passed**. Full final: **3121 tests OK, no skips**, 399.765s at `35c4f04` via `PYTHONPATH=src /tmp/opencode/step06-pdf-venv/bin/python -m unittest discover -s tests -p 'test_*.py'`. No CI configured.
 
 ## Partial MVP / not ticked
-- PDF extraction/OCR/visual/table-cell interpretation **unsupported → human review**; synthetic self-authored XML/TEI fixtures only, no representative human-adjudicated benchmark. XML structural text is supported; PDF full-text extraction is unsupported.
+- PDF extraction/OCR/visual/table-cell interpretation **unsupported → human review**; synthetic self-authored XML/TEI fixtures only, no representative human-adjudicated benchmark. XML structural text is supported.
+- **Update (S17-P7, kickoff §7):** `parsing/pdf_adapter.py` now extracts bounded per-page text via the optional `pypdf` extra in an isolated child process, emitting normalized paragraph passages with 1-based page locators. Usable text yields `parsed`; blank/short/garbled/limited/malformed/unavailable inputs stay `needs_review`. OCR, column order, and figure/table interpretation remain unverified → human review; no automatic exclusion.
 - Stdlib Python (PSF); optional `pypdf` (BSD-3) PDF diagnostic, no weights; ≤32 MiB local input; no live trials/network/model/approval; no migration, no new deps, no hosted calls.
 
 ## Copyable usage

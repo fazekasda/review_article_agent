@@ -54,7 +54,7 @@ jobs:
       # 3.14 runner ships no setuptools, so install it explicitly rather than
       # silently skipping the coverage.
       - name: Install build backend for the wheel packaging test
-        run: python -m pip install "setuptools>=68"
+        run: python -m pip install "setuptools>=68" "pypdf==6.21.4"
 
       - name: Byte-compile src and scripts
         run: python -m compileall -q src scripts
@@ -147,7 +147,7 @@ jobs:
       # 3.14 runner ships no setuptools, so install it explicitly rather than
       # silently skipping the coverage.
       - name: Install build backend for the wheel packaging test
-        run: python -m pip install "setuptools>=68"
+        run: python -m pip install "setuptools>=68" "pypdf==6.21.4"
 
       - name: Run full test tier (shard ${{ matrix.shard }}/${{ matrix.shards }})
         shell: bash
