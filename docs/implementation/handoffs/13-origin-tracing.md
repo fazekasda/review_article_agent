@@ -93,19 +93,58 @@ Full suite: see PR.
   overlap) over synthetic fixtures — deterministic and fixturable, not semantics
   of arbitrary prose; only Step 07 tagged citation links are read; cycle
   detection is by `source_key`/`sha` **after** acquisition (so a cycle still
-  consumes an acquisition attempt); the `acquire` port is **injected** — no real
-  Step 06 call is wired; **upstream cache invalidation depends on the caller
-  supplying current `source_digests`** (the engine cannot observe upstream
-  changes on its own).
+  consumes an acquisition attempt); the `acquire` port is **injected** (a real
+  Step 06/07-backed port now exists — see below — but the engine still accepts
+  any callable); **upstream cache invalidation depends on the caller supplying
+  current `source_digests`** (the engine cannot observe upstream changes on its
+  own).
 - **Step 14:** `origin_coverage(state)` is the read-only final coverage
   operation — `edits_applied: False`, `export_ready` (plus `complete`), and
   `blockers` each carrying a `route_to` step. No exactly-correct or exhaustive
   historical-origin claim is made.
 
+## Wired acquisition port and real inputs (MVP, kickoff 16 §8)
+- `tracing/acquisition_port.py` (`make_acquire_port(store)`) supplies the real
+  `acquire(request)` port, backed by **already acquired** sources only:
+  - `{"status": "acquired", "source": <source dict>}` when the request's
+    `identifiers` (`doi`/`pmid`) match the `expected_identifiers` of an acquired
+    candidate (the currently-complete acquisition manifest via
+    `AcquisitionRepository.require_acquired`) whose source document has a
+    **fully revalidated** parsed report (`ParsingRepository.read_report`). The
+    `source` dict is the exact shape `tracing.schema` reads
+    (`source_key`, `source.sha256` = the acquired asset digest, `passages`,
+    `references`, `citation_links`); reference identifiers are empty (the Step 07
+    parser does not extract them), so a further hop stops at `missing_identifier`.
+  - `{"status": "pending_disposition"}` when the reference is **known** to the
+    project (a current-manifest entry exists) but is not acquired and parsed yet
+    — the user must acquire/import it through the existing Step 06 gate.
+  - `{"status": "unavailable"}` when the reference is unknown to the project.
+  - The port **reads only**: no fetch, no network, no corpus admission, no
+    authority; `primary_verified` is never emitted. Reports are found through the
+    exact `derived_from` document dependency and only count once `read_report`
+    revalidates them (the acquisition manifest also depends on the same source
+    and is rejected by that revalidation).
+- `tracing/inputs.py` (`claims_and_sources(store, *, draft, package,
+  review_state)`) derives the real tracing inputs from the Step 11 draft and its
+  approved package: one claim per drafted sentence that cites evidence (atoms
+  from the sentence's cited evidence), one tracing source per cited citation key
+  (passages = the package's verified original passages; `source.sha256` = the
+  acquired asset digest), and a `source_digests` map from those digests.
+  Read-only.
+- The Step 15 manuscript e2e now uses these real builders + port instead of the
+  synthetic `tracing_claims_sources` bridge. With the synthetic frozen-corpus
+  source the depth-0 tagged passage does not attribute the claim, so the trace
+  ends at **depth 0** with the explicit **secondary-attribution warning**
+  (`secondary_warning`, `requires_final_human_approval=True`, listed by
+  `origin_coverage` for final human approval) — the spec-acceptable MVP outcome.
+
 ## Disclosures
-- The `acquire` port and depth-0 sources are **injected fixtures** that count
-  calls; no live model, network, provider, or OpenCode session call. No CLI is
-  added and no upstream source is admitted to the corpus.
+- The `acquire` port and depth-0 sources were **injected fixtures** that count
+  calls; the real Step 06/07-backed port (`make_acquire_port`) now also exists
+  and reads durable state only. No live model, network, provider, or OpenCode
+  session call. No CLI is added and no upstream source is admitted to the corpus.
+- The MVP traces each drafted sentence against its first (sorted) cited source;
+  a sentence citing several sources is traced against one of them only.
 - Cached reuse is **not** a fresh read of the upstream source; a fingerprint
   match only proves the recorded inputs are unchanged.
 
