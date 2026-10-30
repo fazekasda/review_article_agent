@@ -171,9 +171,12 @@ class EndToEndManuscriptTests(DraftBase):
         self.assertEqual(citation_record["title"], "A study of things")
         self.assertEqual(citation_record["year"], 2020)
         self.assertEqual(citation_record["identity"], {"pmid": "111"})
-        # A field the frozen corpus does not carry is omitted, never invented.
-        self.assertNotIn("authors", citation_record)
-        self.assertNotIn("journal", citation_record)
+        # The recorded provider authors/journal also reach the citation record
+        # (the fixture's observation for this candidate carries them).
+        self.assertEqual(citation_record["authors"], ["Ada Lovelace", "Alan Turing"])
+        self.assertEqual(
+            citation_record["journal"], "Journal of Synthetic Studies"
+        )
 
         # The manuscript-text bridge cites the package's real citation key so the
         # export consistency check can pass (the assembly Markdown's cit_* markers
@@ -364,8 +367,13 @@ class EndToEndManuscriptTests(DraftBase):
         self.assertIn(f"@article{{{first_citation},", bib)
         self.assertIn("ID  - " + first_citation, ris)
         self.assertIn("title = {A study of things}", bib)
+        self.assertIn("author = {Ada Lovelace and Alan Turing}", bib)
+        self.assertIn("journal = {Journal of Synthetic Studies}", bib)
         self.assertIn("year = {2020}", bib)
         self.assertIn("TI  - A study of things", ris)
+        self.assertIn("AU  - Ada Lovelace", ris)
+        self.assertIn("AU  - Alan Turing", ris)
+        self.assertIn("JO  - Journal of Synthetic Studies", ris)
         self.assertIn("AN  - 111", ris)
 
         # Disclosures / AI declaration never assert independent validation or

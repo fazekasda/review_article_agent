@@ -344,8 +344,11 @@ class RoundTripTests(unittest.TestCase):
         envelope = envelope_bytes(first)
         self.assertEqual(set(envelope), {"format", "format_version", "result_type", "result"})
         self.assertEqual(envelope["format"], SEARCH_RESULT_FORMAT)
-        self.assertEqual(envelope["format_version"], SEARCH_RESULT_FORMAT_VERSION)
+        # A result that carries no authors/journal stays on the oldest supported
+        # format version, so a previously stored observation is byte-identical.
+        self.assertEqual(envelope["format_version"], 1)
         self.assertEqual(envelope["result_type"], "search_result")
+        self.assertGreaterEqual(SEARCH_RESULT_FORMAT_VERSION, 2)
 
     def test_bound_is_at_least_one_transport_response(self):
         from review_article_agent.discovery.transport import MAX_RESPONSE_BYTES
@@ -433,7 +436,6 @@ class FieldSetTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class StrictJsonTests(unittest.TestCase):
     def test_duplicate_key_refused(self):
-        self.assertEqual(SEARCH_RESULT_FORMAT_VERSION, 1)
         raw = (
             '{"format":"%s","format":"%s","format_version":1,'
             '"result_type":"search_result","result":{}}'
@@ -693,6 +695,119 @@ class EncoderValidationTests(unittest.TestCase):
         )
         with self.assertRaises(DiscoverySerializationError):
             encode_search_result(bad_result)
+
+
+# --------------------------------------------------------------------------- #
+# Extended bibliographic fields (authors/journal) and version 2
+# --------------------------------------------------------------------------- #
+class ExtendedBibliographicTests(unittest.TestCase):
+    def _extended_result(self):
+        return result(
+            pages=(
+                page(
+                    records=(
+                        record(
+                            authors=("Ada Lovelace", "Alan Turing"),
+                            journal="Journal of Synthetic Studies",
+                        ),
+                    )
+                ),
+            )
+        )
+
+    def test_roundtrip_preserves_authors_and_journal(self):
+        original = self._extended_result()
+        encoded = encode_search_result(original)
+        decoded = decode_search_result(encoded)
+        self.assertEqual(decoded, original)
+        self.assertEqual(
+            decoded.records[0].authors, ("Ada Lovelace", "Alan Turing")
+        )
+        self.assertEqual(decoded.records[0].journal, "Journal of Synthetic Studies")
+        self.assertEqual(encode_search_result(decoded), encoded)
+
+    def test_extended_result_uses_version_two(self):
+        encoded = encode_search_result(self._extended_result())
+        env = envelope_bytes(encoded)
+        self.assertEqual(env["format_version"], 2)
+        self.assertEqual(SEARCH_RESULT_FORMAT_VERSION, 2)
+        record_obj = env["result"]["pages"][0]["records"][0]
+        self.assertEqual(
+            set(record_obj),
+            {
+                "source",
+                "source_id",
+                "pmid",
+                "pmcid",
+                "doi",
+                "title",
+                "publication_year",
+                "authors",
+                "journal",
+            },
+        )
+        self.assertEqual(record_obj["authors"], ["Ada Lovelace", "Alan Turing"])
+        self.assertEqual(record_obj["journal"], "Journal of Synthetic Studies")
+
+    def test_empty_authors_and_null_journal_stay_version_one(self):
+        # Explicit absent values do not force version 2.
+        plain = result(pages=(page(records=(record(authors=(), journal=None),)),))
+        env = envelope_bytes(encode_search_result(plain))
+        self.assertEqual(env["format_version"], 1)
+        self.assertNotIn("authors", env["result"]["pages"][0]["records"][0])
+        self.assertNotIn("journal", env["result"]["pages"][0]["records"][0])
+
+    def test_old_version_one_bytes_decode_and_reencode_identically(self):
+        # A version-1 observation (no authors/journal) predates the new fields;
+        # its stored digest must not change.
+        old = encode_search_result(result())
+        self.assertEqual(envelope_bytes(old)["format_version"], 1)
+        decoded = decode_search_result(old)
+        self.assertEqual(decoded.records[0].authors, ())
+        self.assertIsNone(decoded.records[0].journal)
+        self.assertEqual(encode_search_result(decoded), old)
+
+    def test_version_one_record_with_authors_key_is_refused(self):
+        env = envelope_bytes(encode_search_result(result()))
+        env["result"]["pages"][0]["records"][0]["authors"] = ["Ada"]
+        with self.assertRaises(DiscoverySerializationError):
+            decode_search_result(encode_mapping(env))
+
+    def test_version_two_record_missing_authors_key_is_refused(self):
+        env = envelope_bytes(encode_search_result(self._extended_result()))
+        env["result"]["pages"][0]["records"][0].pop("authors")
+        with self.assertRaises(DiscoverySerializationError):
+            decode_search_result(encode_mapping(env))
+
+    def test_authors_wrong_type_refused(self):
+        env = envelope_bytes(encode_search_result(self._extended_result()))
+        env["result"]["pages"][0]["records"][0]["authors"] = "Ada Lovelace"
+        with self.assertRaises(DiscoverySerializationError):
+            decode_search_result(encode_mapping(env))
+
+    def test_hostile_authors_and_journal_refused(self):
+        env = envelope_bytes(encode_search_result(self._extended_result()))
+        record_obj = env["result"]["pages"][0]["records"][0]
+        # A non-string entry, a control character, and an over-long name are all
+        # refused rather than returned.
+        record_obj["authors"] = ["Ada", 7]
+        with self.assertRaises(DiscoverySerializationError):
+            decode_search_result(encode_mapping(env))
+        env = envelope_bytes(encode_search_result(self._extended_result()))
+        env["result"]["pages"][0]["records"][0]["authors"] = ["Ada\u0000Lovelace"]
+        with self.assertRaises(DiscoverySerializationError):
+            decode_search_result(encode_mapping(env))
+        env = envelope_bytes(encode_search_result(self._extended_result()))
+        env["result"]["pages"][0]["records"][0]["journal"] = 42
+        with self.assertRaises(DiscoverySerializationError):
+            decode_search_result(encode_mapping(env))
+
+    def test_non_tuple_authors_refused_on_encode(self):
+        original = self._extended_result()
+        bad_record = original.records[0]
+        object.__setattr__(bad_record, "authors", ["Ada Lovelace"])
+        with self.assertRaises(DiscoverySerializationError):
+            encode_search_result(original)
 
 
 # --------------------------------------------------------------------------- #

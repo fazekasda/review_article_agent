@@ -25,7 +25,8 @@ Contract (``build(outline_ref, section_id)``)::
       ],
       "citations": {<stable key>: <verified corpus bibliographic record:
                                    candidate_id, version, identity {doi/pmid/pmcid},
-                                   and the observed title/year where present>},
+                                   and the observed title/authors/year/journal
+                                   where present>},
       "methods": {..., "original_sources": [<verified passages/assets per used source>]},
       ... exact global refs, methods/context, and inert authority flags ...
     }
@@ -44,8 +45,9 @@ document is traced through the current approved acquisition manifest entries to
 the frozen candidate metadata of the accepted freeze.  Each citation record
 carries the verified frozen-corpus metadata available for that candidate -- its
 identity identifiers, its frozen-corpus revision ``version``, and the observed
-``title``/``year`` where the corpus recorded them -- so the delivery export emits
-a real bibliography.  A missing, foreign, unresolved, or ambiguous linkage is
+``title``/``authors``/``year``/``journal`` where the corpus recorded them -- so
+the delivery export emits a real bibliography.  A missing, foreign, unresolved,
+or ambiguous linkage is
 rejected rather than invented; no model/caller bibliography is accepted, and a
 field the corpus does not carry is omitted, never invented.  The stable citation
 key derives deterministically from the project + candidate identity (never a
@@ -78,7 +80,9 @@ from ..synthesis.workflow import SynthesisWorkflowError, SynthesisWorkflowReposi
 #:
 #: Version 2 carries the verified frozen-corpus bibliographic metadata (``title``/
 #: ``year`` from the recorded observations, plus ``identity`` and ``version``) on
-#: each citation record so export emits a real bibliography.
+#: each citation record so export emits a real bibliography. The optional
+#: ``authors``/``journal`` observations are carried the same additive way when
+#: the recorded provider metadata has them (absent fields are simply omitted).
 SCHEMA_VERSION = 2
 
 #: Generic-document ``document_type`` of one drafting package.
@@ -169,18 +173,20 @@ def _ambiguity(tokens):
 
 
 def _observed_bibliographic_fields(candidate, discovery):
-    """Return the verified ``title``/``year`` recorded for one frozen candidate.
+    """Return the verified bibliographic fields recorded for one frozen candidate.
 
-    The title and publication year are read from the candidate's *own* recorded
-    provider observations (the frozen corpus re-derives the candidate from exactly
-    these observations).  A field is returned only when every occurrence that
-    carries it agrees on a single value; a field that is absent or whose
-    occurrences disagree is omitted -- it is never invented or guessed.  Authors
-    and journal are not part of the frozen-corpus metadata model, so they are
-    never produced here.
+    The title, publication year, authors, and journal are read from the
+    candidate's *own* recorded provider observations (the frozen corpus
+    re-derives the candidate from exactly these observations).  A field is
+    returned only when every occurrence that carries it agrees on a single
+    value; a field that is absent or whose occurrences disagree is omitted -- it
+    is never invented or guessed.  Authors are emitted as a JSON-portable list
+    (the provider's own order), never re-ordered or synthesised.
     """
     titles: set = set()
     years: set = set()
+    authors: set = set()
+    journals: set = set()
     for pin in candidate.get("occurrences") or []:
         if not isinstance(pin, list) or len(pin) != 2:
             continue
@@ -200,11 +206,21 @@ def _observed_bibliographic_fields(candidate, discovery):
         year = observed.publication_year
         if isinstance(year, int) and not isinstance(year, bool):
             years.add(year)
+        observed_authors = observed.authors
+        if isinstance(observed_authors, tuple) and observed_authors:
+            authors.add(observed_authors)
+        journal = observed.journal
+        if isinstance(journal, str) and journal.strip():
+            journals.add(journal)
     fields: dict = {}
     if len(titles) == 1:
         fields["title"] = next(iter(titles))
     if len(years) == 1:
         fields["year"] = next(iter(years))
+    if len(authors) == 1:
+        fields["authors"] = list(next(iter(authors)))
+    if len(journals) == 1:
+        fields["journal"] = next(iter(journals))
     return fields
 
 
@@ -215,9 +231,9 @@ def _bibliographic_record(
 
     The record carries the verified corpus metadata available for the candidate:
     the identity identifiers from its exact tokens, its frozen-corpus revision
-    ``version``, and any observed ``title``/``year`` (``observed``).  A field that
-    the frozen corpus does not carry is omitted, never invented.  The stable
-    citation key derivation is unchanged.
+    ``version``, and any observed ``title``/``authors``/``year``/``journal``
+    (``observed``).  A field that the frozen corpus does not carry is omitted,
+    never invented.  The stable citation key derivation is unchanged.
     """
     tokens = candidate.get("tokens")
     if not isinstance(tokens, list):

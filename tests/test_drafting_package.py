@@ -492,9 +492,11 @@ class DraftingOverRealRunnerTest(extraction_runner.FullFlowIntegrationTest):
 # Bibliographic metadata carry-over (pure; no store)
 # --------------------------------------------------------------------------- #
 class _Rec:
-    def __init__(self, title=None, year=None):
+    def __init__(self, title=None, year=None, authors=(), journal=None):
         self.title = title
         self.publication_year = year
+        self.authors = authors
+        self.journal = journal
 
 
 class _Result:
@@ -547,6 +549,51 @@ class BibliographicMetadataTests(unittest.TestCase):
         # The frozen corpus carries no authors/journal; they are omitted.
         self.assertNotIn("authors", record)
         self.assertNotIn("journal", record)
+
+    def test_authors_and_journal_are_carried_from_the_observation(self):
+        discovery = _FakeDiscovery(
+            {
+                "run1": _Observation(
+                    [
+                        _Rec(
+                            "Real title",
+                            2020,
+                            authors=("Ada Lovelace", "Alan Turing"),
+                            journal="Journal of Synthetic Studies",
+                        )
+                    ]
+                )
+            }
+        )
+        observed = _observed_bibliographic_fields(self._candidate(), discovery)
+        self.assertEqual(
+            observed,
+            {
+                "title": "Real title",
+                "year": 2020,
+                "authors": ["Ada Lovelace", "Alan Turing"],
+                "journal": "Journal of Synthetic Studies",
+            },
+        )
+        record = _bibliographic_record(
+            "P", self._candidate(), self._CORPUS_REF, self._FREEZE_REF, [], observed
+        )
+        self.assertEqual(record["authors"], ["Ada Lovelace", "Alan Turing"])
+        self.assertEqual(record["journal"], "Journal of Synthetic Studies")
+
+    def test_disagreeing_authors_or_journal_omit_the_field(self):
+        discovery = _FakeDiscovery(
+            {
+                "run1": _Observation([_Rec("T", 2020, authors=("A",), journal="J1")]),
+                "run2": _Observation([_Rec("T", 2020, authors=("B",), journal="J2")]),
+            }
+        )
+        candidate = self._candidate(occurrences=[["run1", 0], ["run2", 0]])
+        observed = _observed_bibliographic_fields(candidate, discovery)
+        self.assertNotIn("authors", observed)
+        self.assertNotIn("journal", observed)
+        # The title agrees, so it is still carried.
+        self.assertEqual(observed["title"], "T")
 
     def test_absent_fields_are_omitted_never_invented(self):
         discovery = _FakeDiscovery({"run1": _Observation([_Rec(None, None)])})
