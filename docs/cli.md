@@ -1372,3 +1372,79 @@ the exact `batch`/`generation.hosted_use.<role>` gate is satisfied for that revi
 
 Errors use the exit categories of §3 with static, value-free messages. Status and
 disclosures: [`worker.md`](worker.md) §15 and [`generation.md`](generation.md).
+
+## 24. Pipeline run — `pipeline run` (kickoff 16 §6, write half)
+
+`pipeline run` is the **write half** of the `pipeline` group (its read-only half is §19).
+For the active (or named) project it determines the current stage from durable state
+alone (reusing [`pipeline/status.py`](../src/review_article_agent/pipeline/status.py)),
+derives the **next machine job(s)** the stage needs
+([`pipeline/run.py`](../src/review_article_agent/pipeline/run.py)), submits them to the
+detached worker, and stops at the next human gate, budget limit, pause, or failure,
+reporting the exact next command.
+
+| Command | Synopsis |
+| --- | --- |
+| `pipeline run --config PATH [--project ID] [--wait] [--timeout SECONDS] [--max-steps N]` | Submit the current stage's next machine job(s) and stop at the next gate/budget/pause/failure. |
+
+* It holds **no authoritative state of its own**: every decision is re-derived from the
+  stages' existing repositories and the worker's durable jobs. Re-running it is
+  **idempotent**: each `generation_run` job carries a deterministic request id derived
+  from the stage, the section, and the exact input revisions, and an id already present
+  in the durable `JobRepository` is never re-submitted (the worker would replay it
+  anyway).
+* A stage with no configured automatic job (discovery, acquisition, parsing, screening,
+  extraction, review, tracing, delivery, and — until configured — the synthesis stages)
+  submits nothing and reports the manual `next_command` from `pipeline status`.
+* `--wait` polls the submitted jobs to a terminal state through the existing `job status`
+  control call, bounded by `--timeout` (default 60s), before re-resolving.
+* `--max-steps` bounds the orchestration steps in one call (1..1000, default 10).
+* The configured credential **environment-variable name** must be present in the process
+  environment before any job is submitted; only the name is ever read (never a value), and
+  a missing credential is a `validation` refusal with **zero** jobs and no local write.
+* No secret is ever printed; the JSON output carries `submitted`, `already_done`,
+  `stopped_at` (the `pipeline status` blocker), `next_command`, `stage`,
+  `authorizes_execution=false`, and `scientific_validation=false`.
+
+### 24.1 `--config` format
+
+`--config` names a **strict** JSON object (stdlib only). It supplies the information the
+stages do not record anywhere else; the pipeline never invents a model, a rights value,
+or a credential.
+
+```json
+{
+  "credential_env": "OPENROUTER_API_KEY",
+  "sections": ["sec1"],
+  "roles": {
+    "blueprint": {
+      "hosted_artifact_id": "hu-blueprint",
+      "hosted_revision_id": "hu-blueprint-r1",
+      "target_artifact_id": "bp-{section_id}",
+      "target_revision_id": "bp-{section_id}-r1"
+    },
+    "section_writer": {"hosted_artifact_id": "hu-writer"}
+  },
+  "workspace_artifact_id": "ws-{section_id}",
+  "workspace_revision_id": "ws-{section_id}-r1",
+  "rights": { "<a full RightsRecord template>" }
+}
+```
+
+* `credential_env` — optional; only the one approved value `OPENROUTER_API_KEY` is
+  accepted (the value is never read).
+* `sections` — the section ids the drafting stage drives.
+* `roles.<role>` — per generation role (`blueprint`, `section_writer`, ...): the
+  `hosted_artifact_id` whose **current** revision is the role's hosted-use document
+  (`hosted_revision_id` pins an exact revision instead), and the target
+  `artifact_id`/`revision_id` templates for the proposal the role writes. The string
+  `{section_id}` is substituted per section. A role absent from `roles` means "no
+  automatic job".
+* `workspace_artifact_id` / `workspace_revision_id` — templates for the per-section
+  drafting workspace the drafting stage writes before the blueprint job.
+* `rights` — a full RightsRecord **template**; its project id and subject are rebound to
+  each written revision (workspace or proposal) exactly as the worker rebinds a section
+  review. Rights eligibility is not authority.
+
+Malformed or extra keys are a `validation` error before anything is submitted; the path
+and contents are never echoed.

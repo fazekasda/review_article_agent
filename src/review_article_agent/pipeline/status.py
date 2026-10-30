@@ -53,8 +53,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Callable
 
+from ..generation import hosted_use as _hosted_use
+from ..generation import runner as _generation_runner
 from ..acquisition.manifest import (
     ACQUISITION_GATE_ID,
     ACQUISITION_GATE_KIND,
@@ -729,6 +732,102 @@ def _failure_detail(stage: Stage) -> str:
     )
 
 
+#: The generation roles each model-backed stage needs before it can produce a
+#: proposal. A stage absent from this table is not gated by a hosted-use document.
+_GENERATIVE_ROLES: dict[str, tuple[str, ...]] = {
+    "synthesis.memo": ("synthesis",),
+    "synthesis.framework": ("framework",),
+    "synthesis.outline": ("outline",),
+    "drafting.blueprint": ("blueprint", "section_writer"),
+    "review.sections": ("section_critic", "section_repair"),
+}
+
+
+def _hosted_use_candidates(heads: list[dict], role: str) -> list[dict]:
+    return [
+        head
+        for head in heads
+        if head["document_type"] == _hosted_use.HOSTED_USE_DOCUMENT_TYPE
+        and isinstance(head["document"].get("payload"), dict)
+        and head["document"]["payload"].get("role") == role
+    ]
+
+
+def _generative_blocker(store: Any, heads: list[dict], stage: Stage) -> dict | None:
+    """A ``hosted_use`` or ``budget`` blocker for a model-backed stage, or ``None``.
+
+    Read-only: for each generation role the stage needs, the exact current
+    hosted-use document and its named ``batch``/``generation.hosted_use.<role>``
+    gate are checked with the runner's own :func:`require_hosted_use`; the role's
+    recorded dispatch exposure is summed with the runner's ledger query and
+    compared to the document's ``budget_cap_usd``. Nothing is written, no model or
+    worker is called, and no secret is read.
+    """
+    roles = _GENERATIVE_ROLES.get(stage.id)
+    if not roles:
+        return None
+    for role in roles:
+        candidates = _hosted_use_candidates(heads, role)
+        approved = None
+        for entry in candidates:
+            try:
+                _hosted_use.require_hosted_use(store, _ref(entry), role=role)
+            except Exception:  # noqa: BLE001 - any failure is "not approved"
+                continue
+            approved = entry
+            break
+        if approved is None:
+            if not candidates:
+                return {
+                    "kind": "hosted_use",
+                    "detail": (
+                        f"the current stage {stage.id} runs a model-backed "
+                        f"{role!r} role, but no generation hosted-use document "
+                        f"exists for that role; the next machine job cannot be "
+                        f"submitted. Create the document and approve it through "
+                        f"`gate prepare`/`gate confirm`."
+                    ),
+                    "next_command": None,
+                }
+            entry = candidates[0]
+            gate = (_hosted_use.HOSTED_USE_GATE_KIND, _hosted_use.hosted_use_gate_id(role))
+            return {
+                "kind": "hosted_use",
+                "detail": (
+                    f"the current stage {stage.id} runs a model-backed {role!r} "
+                    f"role, but its exact named hosted-use gate "
+                    f"{gate[0]}/{gate[1]} is not currently active and approved for "
+                    f"the current document revision; the next machine job cannot be "
+                    f"submitted. Run the prepare command first to obtain the "
+                    f"snapshot digest: "
+                    f"`{_prepare_command(store.project_id, _ref(entry), gate)}`"
+                ),
+                "next_command": _gate_command(store.project_id, _ref(entry), gate),
+            }
+        payload = approved["document"].get("payload") or {}
+        cap = payload.get("budget_cap_usd")
+        if isinstance(cap, str):
+            try:
+                exposure = _generation_runner._role_exposure(
+                    store, role=role, hosted_ref=_ref(approved)
+                )
+            except Exception:  # noqa: BLE001 - a ledger read failure is not a blocker
+                continue
+            if exposure >= Decimal(cap):
+                return {
+                    "kind": "budget",
+                    "detail": (
+                        f"the {role!r} generation role's budget cap under the "
+                        f"approved hosted-use revision is already fully consumed by "
+                        f"recorded dispatches; no further job will be submitted. "
+                        f"Raise the cap in a new hosted-use revision and re-approve "
+                        f"it, or reconcile the outstanding reserve."
+                    ),
+                    "next_command": None,
+                }
+    return None
+
+
 def resolve(store: Any, registry: Any = None) -> dict:
     """Determine the current pipeline stage from durable state (read-only).
 
@@ -828,6 +927,20 @@ def resolve(store: Any, registry: Any = None) -> dict:
             break
 
         completed.append(stage.id)
+
+    # A model-backed stage that is otherwise ready to produce its proposal is
+    # additionally gated by its per-role hosted-use document (and its budget).
+    # This is checked only when nothing else already blocks the stage, so an
+    # outstanding proposal gate / failure keeps precedence.
+    if current is not None and blocked_on is None:
+        generative = _generative_blocker(store, heads, current)
+        if generative is not None:
+            blocked_on = generative
+            next_action = {
+                "kind": "human",
+                "role": "hosted_use",
+                "inputs": {"kind": generative["kind"]},
+            }
 
     return {
         "stage": current.id if current is not None else "complete",
