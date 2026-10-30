@@ -26,3 +26,13 @@
 ## Handoff
 
 Provide a complete example delivery and failure examples, actual loop counters, final approval manifest, export checks, and backup/restore evidence.
+
+Revalidation after a post-review factual/citation edit **recomputes** the Step 12
+support check and the Step 13 origin coverage rather than trusting caller-supplied
+results: `DeliveryRepository.revalidate(delivery_id, paragraph_ids, *,
+package, origin_state=None)` requires (a) every cited key to exist in the approved
+package citations, (b) the deterministic Step 12 fact check to return `supported`
+for the paragraph text, and (c) origin coverage to be complete when an origin
+state is supplied.  A paragraph passes only when all checks pass; otherwise it
+stays `revalidation_required` with recorded reasons, and final approval remains
+refused.
