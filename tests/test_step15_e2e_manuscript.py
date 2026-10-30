@@ -86,6 +86,12 @@ from review_article_agent.tracing.workflow import (  # noqa: E402
 #: Every place a real stage output could not be consumed by the next API and the
 #: existing synthetic fixture is used instead.  Each is marked ``# BRIDGE:`` at
 #: its call site.
+#:
+#: **The MVP path is now covered without these bridges.**  This hand-glued chain
+#: is retained as a focused back-half demonstration, but the end-to-end MVP path
+#: (real Step 09 receipts -> ``pipeline run`` -> scripted gates -> delivery) lives
+#: in :mod:`tests.test_mvp_pipeline_e2e`; the ``synthesis_inputs`` bridge below is
+#: exactly the Step 08 "extraction -> synthesis" seam that test closes.
 BRIDGES = [
     (
         "synthesis_inputs",
