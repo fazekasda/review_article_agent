@@ -11,15 +11,19 @@ import hashlib
 import json
 from collections import deque
 from decimal import Decimal, InvalidOperation
+from typing import Mapping
 
 from ..acquisition.manifest import AcquisitionRepository
 from ..domain.errors import ReviewAgentError
-from ..domain.records import canonical_json, validate_ref
+from ..domain.records import canonical_json, validate_identifier, validate_ref
 from ..parsing.core import NORMALIZATION_VERSION, PARSER_VERSION
 from ..parsing.repository import ParsingRepository, _NestedStore
+from ..runtime.dispatch import RuntimeDispatchRepository
 from ..runtime.gates import MAX_GATE_SNAPSHOT_ENTRIES
 from ..runtime.jev import MODEL, SAFE_MAX_REQUEST_BYTES, JevError, QuestionDef, build_request, validate_response
 from ..storage.artifacts import ArtifactRepository, DependencyRef, sha256_digest
+from ..storage.decision_intents import DecisionIntentRepository
+from ..storage.decision_results import RESULT_KIND, DecisionResultRepository
 from ..storage.human_approvals import HumanApprovalRepository
 
 
@@ -120,6 +124,80 @@ def _classify_and_observe(config, response, *, context_ready=True):
 def classify(config, response, *, context_ready=True):
     """Preserve raw typed probabilities; errors/uncertainty always retain."""
     return _classify_and_observe(config, response, context_ready=context_ready)[0]
+
+
+#: The only key of a case ``response`` that references a committed decision
+#: result instead of an imported response envelope.
+DECISION_RESULT_REF_KEY = "decision_result_ref"
+
+
+def is_decision_result_response(value):
+    """True iff a case ``response`` is a committed-result reference."""
+    return isinstance(value, Mapping) and set(value) == {DECISION_RESULT_REF_KEY}
+
+
+def case_context(parsing, report_ref, passage_id):
+    """Assemble the exact screening context text for one case (shared).
+
+    Returns ``{report, text, locator, ready}``. Context is the whole parsed
+    article, never an isolated sentence or a summary; oversize inputs are
+    retained, never silently truncated. The current source/report/rights are
+    always verified, even for whole-paper cases.
+    """
+    report = parsing.read_report(report_ref)
+    passages = report["payload"]["passages"]
+    require(report["verifiable"])
+    locator = None
+    text = "\n\n".join(p["text"] for p in passages)
+    if passage_id is not None:
+        locator = parsing.make_passage_locator(report_ref, passage_id)
+        text = ("Target passage: "
+                + next(p["text"] for p in passages if p["passage_id"] == passage_id)
+                + "\n\nOriginal article context:\n" + text)
+    ready = not report["human_action_required"] and bool(text.strip())
+    if passages:
+        check = parsing.resolve_passage(
+            parsing.make_passage_locator(report_ref, passages[0]["passage_id"]))
+        require(not check["current"]["reasons"])
+    parsing._assert_source_allows_derivative(report["source_ref"])
+    return {"report": report, "text": text, "locator": locator, "ready": ready}
+
+
+def _response_from_observation(repository, observation):
+    """Rebuild a Jev response envelope from a committed observation's records.
+
+    Only genuinely ``answered`` predicate/choice/score answers are reconstructed
+    (a predicate probability is the raw stored value). Every other outcome is
+    omitted, so ``validate_response`` re-derives the same retained
+    uncertainty/refusal/malformed outcome it did at dispatch time — never an
+    exclusion and never a fabricated answer.
+    """
+    answers = {}
+    for question in observation.questions:
+        record = repository.get_question_record(observation.dispatch_id, question.question_id)
+        require(record is not None)
+        mapping = record.record
+        answer = mapping.get("answer")
+        if mapping.get("outcome") != "answered" or not isinstance(answer, Mapping):
+            continue
+        kind = answer.get("answer_kind")
+        # The stored probability/score are exact canonical decimal *strings*; the
+        # wire validator wants a JSON number, so hand back the exact ``Decimal``.
+        if kind == "predicate":
+            answers[question.question_id] = {"type": "noul", "noul": Decimal(answer["probability"])}
+        elif kind == "choice":
+            answers[question.question_id] = {"type": "choice", "choice": answer["choice"]}
+        elif kind == "score":
+            answers[question.question_id] = {"type": "score", "score": Decimal(answer["score"])}
+    usage = observation.usage or {}
+    return {
+        "model": observation.actual_model,
+        "usage": {
+            "input_tokens": usage.get("input_tokens") or 0,
+            "output_tokens": usage.get("output_tokens") or 0,
+        },
+        "answers": answers,
+    }
 
 
 class ScreeningRepository:
@@ -224,25 +302,46 @@ class ScreeningRepository:
         questions(config)
         return config
 
+    def _verified_response(self, config, ref, request_sha256, ready):
+        """Load and verify a committed decision result for a case response.
+
+        The referenced result must be the **accepted** result of a completed
+        direct-Jev dispatch in this project whose recorded pre-dispatch intent
+        used the pinned model and whose exact request digest equals the request
+        this case builds (binding config questions, report context, and model).
+        A missing/foreign/unaccepted/ambiguous result, a divergent request, or a
+        model mismatch is refused. Returns ``(machine, observed_model, provenance)``.
+        """
+        require(isinstance(ref, Mapping) and set(ref) == {"project_id", "dispatch_id"})
+        require(ref["project_id"] == self.store.project_id)
+        dispatch_id = validate_identifier(ref["dispatch_id"], "dispatch_id")
+        results = DecisionResultRepository(self.store)
+        observation = results.get_result(dispatch_id)
+        require(observation is not None)
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch(dispatch_id)
+        # Only an accepted, completed result is a verified response; an inert or
+        # ambiguous observation (unknown dispatch, no accepted triple) is refused.
+        require(dispatch is not None and dispatch.state == "completed"
+                and dispatch.result_kind == RESULT_KIND
+                and dispatch.result_ref == observation.result_id
+                and dispatch.result_digest == observation.digest)
+        intent = DecisionIntentRepository(self.store).get_intent(dispatch_id)
+        require(intent is not None and intent.model == config["model"])
+        # ``request_sha256`` is the canonical ``sha256:<hex>`` digest the workflow
+        # records; the ledger stores the bare hex, so compare the bare form.
+        bare = request_sha256.split(":", 1)[-1] if isinstance(request_sha256, str) else request_sha256
+        require(observation.request_sha256 == bare)
+        response = _response_from_observation(results, observation)
+        machine, observed_model = _classify_and_observe(config, response, context_ready=ready)
+        return machine, observed_model, "verified_dispatch"
+
     def _case(self, config, item):
         require(set(item) == {"id", "report_ref", "passage_id", "response"})
         require(isinstance(item["id"], str) and 0 < len(item["id"]) <= 128)
-        report = self.parsing.read_report(self._ref(item["report_ref"]))
-        passages = report["payload"]["passages"]
-        require(report["verifiable"])
-        locator = None
-        # Context is the whole parsed article, never an isolated sentence or a
-        # summary. Oversize inputs are retained, never silently truncated.
-        text = "\n\n".join(p["text"] for p in passages)
-        if item["passage_id"] is not None:
-            locator = self.parsing.make_passage_locator(item["report_ref"], item["passage_id"])
-            text = "Target passage: " + next(p["text"] for p in passages if p["passage_id"] == item["passage_id"]) + "\n\nOriginal article context:\n" + text
-        ready = not report["human_action_required"] and bool(text.strip())
-        # Always verify current source/report/rights, even for whole-paper cases.
-        if passages:
-            check = self.parsing.resolve_passage(self.parsing.make_passage_locator(item["report_ref"], passages[0]["passage_id"]))
-            require(not check["current"]["reasons"])
-        self.parsing._assert_source_allows_derivative(report["source_ref"])
+        context = case_context(self.parsing, item["report_ref"], item["passage_id"])
+        report = context["report"]
+        text = context["text"]
+        ready = context["ready"]
         try:
             request = build_request(questions(config), text)
             require(len(canonical_json(request)) <= SAFE_MAX_REQUEST_BYTES)
@@ -252,17 +351,26 @@ class ScreeningRepository:
         except ScreeningError:
             request = None
             ready = False
-        machine, observed_model = _classify_and_observe(config, item["response"], context_ready=ready)
+        request_sha256 = sha256_digest(canonical_json(request)) if request else None
+        if is_decision_result_response(item["response"]):
+            # A verified dispatch can only be bound when this case builds a valid
+            # request; otherwise there is nothing to bind the result to.
+            require(request is not None)
+            machine, observed_model, provenance = self._verified_response(
+                config, item["response"][DECISION_RESULT_REF_KEY], request_sha256, ready)
+        else:
+            machine, observed_model = _classify_and_observe(config, item["response"], context_ready=ready)
+            provenance = "imported_unverified_dispatch"
         # ``model`` is the requested/pinned config model; ``observed_model`` is
         # the identity the validated response actually reported. They are kept
         # separate so a dated snapshot never silently stands in for the base
         # alias (or vice versa).
         return {"id": item["id"], "report_ref": item["report_ref"], "source_ref": report["source_ref"],
-                "locator": locator, "input_sha256": sha256_digest(text.encode()),
-                "request_sha256": sha256_digest(canonical_json(request)) if request else None,
+                "locator": context["locator"], "input_sha256": sha256_digest(text.encode()),
+                "request_sha256": request_sha256,
                 "model": config["model"], "observed_model": observed_model,
                 "parser": report["parser_version"],
-                "response_provenance": "imported_unverified_dispatch",
+                "response_provenance": provenance,
                 "machine": machine}
 
     def _cases(self, config, cases):
