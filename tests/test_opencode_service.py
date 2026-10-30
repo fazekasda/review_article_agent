@@ -1075,6 +1075,10 @@ class Repair2ContainmentTests(_ServiceCase):
         fake_proc = mock.Mock()
         fake_proc.pid = 999_999
         fake_proc.poll.return_value = None
+        # This test never runs a real binary: pin binary resolution to a
+        # harmless path so the test does not depend on `opencode` being on the
+        # developer's/CI runner's PATH.
+        manager._resolve_binary = mock.Mock(return_value="/bin/true")
         manager._spawn = mock.Mock(return_value=fake_proc)
         manager._verify_binary_version = mock.Mock(return_value="2.2.0")
         manager._await_ready = mock.Mock(side_effect=ServiceStartError("x", "x"))
@@ -1090,6 +1094,10 @@ class Repair2ContainmentTests(_ServiceCase):
         fake_proc = mock.Mock()
         fake_proc.pid = 999_999
         fake_proc.poll.return_value = None
+        # This test never runs a real binary: pin binary resolution to a
+        # harmless path so the test does not depend on `opencode` being on the
+        # developer's/CI runner's PATH.
+        manager._resolve_binary = mock.Mock(return_value="/bin/true")
         manager._spawn = mock.Mock(return_value=fake_proc)
         manager._verify_binary_version = mock.Mock(return_value="2.2.0")
         manager._await_ready = mock.Mock(side_effect=ServiceStartError("x", "x"))
