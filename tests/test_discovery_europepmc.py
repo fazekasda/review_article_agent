@@ -321,6 +321,64 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(record.doi, "10.1/x")
         self.assertEqual(record.title, "A title")
         self.assertEqual(record.publication_year, 2019)
+        self.assertEqual(record.authors, ())
+        self.assertIsNone(record.journal)
+
+    def test_structured_authors_and_journal_are_parsed_in_order(self):
+        results = [
+            item(
+                "9",
+                source="MED",
+                title="With authors",
+                journalTitle="Journal of Synthetic Studies",
+                authorList={
+                    "author": [
+                        {"fullName": "Ada Lovelace"},
+                        {"firstName": "Alan", "lastName": "Turing"},
+                        {"lastName": "Solo", "initials": "A"},
+                        {"collectiveName": "The Consortium"},
+                    ]
+                },
+            )
+        ]
+        script = [json_response(epmc_payload(hit_count=1, results=results))]
+        client, _, _, _ = make_client(script)
+        record = client.search("q").records[0]
+        self.assertEqual(
+            record.authors,
+            ("Ada Lovelace", "Alan Turing", "Solo A", "The Consortium"),
+        )
+        self.assertEqual(record.journal, "Journal of Synthetic Studies")
+
+    def test_author_string_fallback_and_journal_info_fallback(self):
+        results = [
+            item(
+                "9",
+                source="MED",
+                authorString="Ada Lovelace, Alan Turing",
+                journalInfo={"journal": {"title": "Fallback Journal"}},
+            )
+        ]
+        script = [json_response(epmc_payload(hit_count=1, results=results))]
+        client, _, _, _ = make_client(script)
+        record = client.search("q").records[0]
+        self.assertEqual(record.authors, ("Ada Lovelace", "Alan Turing"))
+        self.assertEqual(record.journal, "Fallback Journal")
+
+    def test_control_characters_are_stripped_from_author_and_journal(self):
+        results = [
+            item(
+                "9",
+                source="MED",
+                authorString="Ada\u0000 Lovelace",
+                journalTitle="Journal\u0007 of\nSynthetic  Studies",
+            )
+        ]
+        script = [json_response(epmc_payload(hit_count=1, results=results))]
+        client, _, _, _ = make_client(script)
+        record = client.search("q").records[0]
+        self.assertEqual(record.authors, ("Ada Lovelace",))
+        self.assertEqual(record.journal, "Journal of Synthetic Studies")
 
 
 # --------------------------------------------------------------------------- #
@@ -659,6 +717,28 @@ class MalformedTests(unittest.TestCase):
                     )
                 ],
             )
+        )
+
+    def test_author_list_not_a_list(self):
+        self._assert_malformed(
+            epmc_payload(
+                hit_count=1,
+                results=[item("1", source="MED", authorList={"author": "Ada"})],
+            )
+        )
+
+    def test_over_long_author_list(self):
+        authors = [{"fullName": f"a{i}"} for i in range(records.MAX_AUTHORS + 1)]
+        self._assert_malformed(
+            epmc_payload(
+                hit_count=1,
+                results=[item("1", source="MED", authorList={"author": authors})],
+            )
+        )
+
+    def test_non_string_journal_title(self):
+        self._assert_malformed(
+            epmc_payload(hit_count=1, results=[item("1", source="MED", journalTitle=7)])
         )
 
     def test_malformed_page_retains_attempt_provenance(self):

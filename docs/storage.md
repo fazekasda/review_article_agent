@@ -206,9 +206,9 @@ observations are not duplicated into the manifest; they are inner-validated
 read-only from the snapshot database, exactly like the schema-4/5/6 rows. The
 manifest therefore never carries a schema-8 intent's request state text, a
 schema-9 per-question answer/legend/option text, a schema-10 session-turn
-intent's canonical plan/message text, a schema-11 query/source/title/attempt
-payload, or any artifact/request BLOB content — only ids, counts, and aggregate
-digests.
+intent's canonical plan/message text, a schema-11 query/source/title/authors/
+journal/attempt payload, or any artifact/request BLOB content — only ids, counts,
+and aggregate digests.
 
 ## 4. Public API
 

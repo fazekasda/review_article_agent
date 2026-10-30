@@ -42,6 +42,7 @@ import json
 import os
 
 from ..domain.records import validate_identifier
+from ..review.schema import fact_check
 from ..storage.artifacts import ArtifactRepository
 from ..tracing.workflow import origin_coverage
 from .export import build_disclosures, build_export_package, cited_keys
@@ -104,6 +105,7 @@ def _new_state(delivery_id) -> dict:
         "paragraphs": {},
         "applied_batches": [],
         "revalidation_required": [],
+        "revalidation_records": {},
         "approval": None,
         "invalidated_approvals": [],
         "export": None,
@@ -320,22 +322,119 @@ class DeliveryRepository:
         self._persist(state)
         return state
 
-    def revalidated(self, delivery_id, paragraph_ids, rights=None):
-        """Mark rechecked paragraphs valid again (fresh Step 12/13 results)."""
+    def revalidate(
+        self,
+        delivery_id,
+        paragraph_ids,
+        *,
+        package,
+        origin_state=None,
+        rights=None,
+    ):
+        """Re-run the Step 12/13 checks for the named paragraphs; never trust the caller.
+
+        For every named paragraph this recomputes, from the persisted paragraph
+        text and the supplied approved drafting *package*:
+
+        * **(a) citations** -- every key cited in the paragraph text must exist in
+          the package's approved ``citations`` (no invented citation);
+        * **(b) support** -- the deterministic Step 12 fact check
+          (:func:`review_article_agent.review.schema.fact_check`) must return a
+          ``supported`` verdict for the paragraph; a paragraph that cites nothing
+          cannot be mapped to package evidence and stays required;
+        * **(c) origin** -- when *origin_state* is supplied, Step 13
+          ``origin_coverage`` must be complete.
+
+        Only a paragraph that passes every check becomes ``checks="valid"`` and
+        leaves ``revalidation_required``; any other paragraph stays required with
+        the recorded reasons.  The recomputed evidence (per-paragraph checks and
+        digests) is persisted, and any recorded approval is invalidated.
+        """
         self._set_rights(rights)
         state = self._load(delivery_id)
         ids = list(paragraph_ids or [])
-        _require(ids, "revalidated requires at least one paragraph_id")
+        _require(ids, "revalidate requires at least one paragraph_id")
+
+        citations = (package or {}).get("citations")
+        _require(
+            isinstance(citations, dict),
+            "package.citations must be a JSON object",
+        )
+        approved_keys = set(citations)
+        coverage = origin_coverage(origin_state) if origin_state is not None else None
+
+        still_required = list(state.get("revalidation_required") or [])
+        records = dict(state.get("revalidation_records") or {})
+
         for paragraph_id in ids:
             paragraph = (state.get("paragraphs") or {}).get(paragraph_id)
             _require(
                 isinstance(paragraph, dict),
-                f"revalidated names unknown paragraph {paragraph_id!r}",
+                f"revalidate names unknown paragraph {paragraph_id!r}",
             )
-            paragraph["checks"] = "valid"
-        state["revalidation_required"] = [
-            pid for pid in state.get("revalidation_required") or [] if pid not in ids
-        ]
+            text = paragraph.get("text", "")
+            keys = cited_keys(text)
+            reasons: list = []
+            checks: list = []
+
+            # (a) no invented citation: every cited key is in the approved package.
+            unknown = [key for key in keys if key not in approved_keys]
+            if unknown:
+                reasons.append("unknown_citation:" + ",".join(unknown))
+
+            # (b) re-run the deterministic Step 12 fact check from the paragraph text.
+            if not keys:
+                reasons.append("no_citable_evidence")
+            else:
+                draft = {
+                    "paragraphs": [
+                        {
+                            "paragraph_id": paragraph_id,
+                            "sentences": [
+                                {
+                                    "intent_id": paragraph.get("intent_id")
+                                    or f"revalidate:{paragraph_id}",
+                                    "text": text,
+                                    "citation_keys": keys,
+                                }
+                            ],
+                        }
+                    ]
+                }
+                checks = fact_check(draft, package)
+                for check in checks:
+                    if check.get("verdict") not in (None, "not_applicable", "supported"):
+                        reasons.append("fact_check:" + str(check.get("verdict")))
+
+            # (c) Step 13 origin coverage, when an origin state is supplied.
+            if coverage is not None and not coverage.get("complete"):
+                reasons.append("origin_incomplete")
+
+            records[paragraph_id] = {
+                "paragraph_id": paragraph_id,
+                "text_digest": _sha256(text),
+                "citation_keys": keys,
+                "fact_checks": checks,
+                "checks_digest": _sha256(json.dumps(checks, sort_keys=True)),
+                "coverage_complete": (
+                    None if coverage is None else coverage.get("complete")
+                ),
+                "reasons": reasons,
+                "valid": not reasons,
+            }
+
+            if reasons:
+                paragraph["checks"] = "stale"
+                if paragraph_id not in still_required:
+                    still_required.append(paragraph_id)
+            else:
+                paragraph["checks"] = "valid"
+                still_required = [
+                    pid for pid in still_required if pid != paragraph_id
+                ]
+
+        state["revalidation_records"] = records
+        state["revalidation_required"] = still_required
         self._invalidate_approval(state)
         self._persist(state)
         return state

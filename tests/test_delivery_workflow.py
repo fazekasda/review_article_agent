@@ -94,6 +94,46 @@ def _ref(key="k1", doi="10.1/x", version="v1"):
 
 CORPUS = {"k1": {"identity": {"doi": "10.1/x"}, "version": "v1"}}
 
+#: An approved drafting package whose citations/evidence support ``[@k1]``/``[@k2]``.
+PACKAGE = {
+    "citations": {
+        "k1": {"identity": {"doi": "10.1/x"}, "version": "v1", "verified": True},
+        "k2": {"identity": {"doi": "10.2/y"}, "version": "v1", "verified": True},
+    },
+    "evidence": [
+        {
+            "finding_key": "f1",
+            "citation_keys": ["k1"],
+            "original_passage": {"text": "The effect was observed in study 1."},
+            "summary": "A supporting finding.",
+        },
+        {
+            "finding_key": "f2",
+            "citation_keys": ["k2"],
+            "original_passage": {"text": "The effect was observed in study 2."},
+            "summary": "A supporting finding.",
+        },
+    ],
+}
+
+#: A package that approves ``k1`` but carries no evidence supporting it.
+UNSUPPORTED_PACKAGE = {
+    "citations": {"k1": {"identity": {"doi": "10.1/x"}, "version": "v1", "verified": True}},
+    "evidence": [
+        {
+            "finding_key": "f2",
+            "citation_keys": ["k2"],
+            "original_passage": {"text": "An unrelated finding."},
+        }
+    ],
+}
+
+#: An origin state with an unresolved blocker (coverage incomplete).
+ORIGIN_INCOMPLETE = {
+    "trace_id": "trace-1",
+    "claims": [{"claim_id": "c1", "outcome": "unsupported"}],
+}
+
 
 def _reviewer(find_if_missing=True):
     """A recording fake reviewer: an open major finding while ``MISSING`` is present."""
@@ -490,7 +530,9 @@ class NotesTests(DeliveryBase):
                 rights=self.rights,
             )
 
-        self.repo.revalidated(did, ["p1"], rights=self.rights)
+        self.repo.revalidate(
+            did, ["p1"], package=PACKAGE, origin_state=ORIGIN_OK, rights=self.rights
+        )
         state = self.repo.final_approval(
             did,
             artifact_hashes={"art-1": "sha-1"},
@@ -501,6 +543,93 @@ class NotesTests(DeliveryBase):
             rights=self.rights,
         )
         self.assertTrue(state["approval"]["approved"])
+
+
+class RevalidationTests(DeliveryBase):
+    """``revalidate`` recomputes the Step 12/13 checks; it never trusts the caller."""
+
+    def _stale(self, did, text):
+        self.start(did)
+        self.review_once(
+            did, text=text, paragraphs={"p1": {"text": text, "checks": "stale"}}
+        )
+        self.accept_cutoff(did)
+        return did
+
+    def test_supported_paragraph_becomes_valid(self):
+        did = "delivery-reval-ok"
+        self._stale(did, "Body [@k1].")
+        state = self.repo.revalidate(
+            did, ["p1"], package=PACKAGE, origin_state=ORIGIN_OK, rights=self.rights
+        )
+        self.assertNotIn("p1", state["revalidation_required"])
+        self.assertEqual(state["paragraphs"]["p1"]["checks"], "valid")
+        record = state["revalidation_records"]["p1"]
+        self.assertTrue(record["valid"])
+        self.assertEqual(record["reasons"], [])
+        self.assertEqual(record["citation_keys"], ["k1"])
+        self.assertTrue(record["coverage_complete"])
+        self.assertEqual(record["fact_checks"][0]["verdict"], "supported")
+
+    def test_unknown_citation_key_stays_required(self):
+        did = "delivery-reval-unknown"
+        self._stale(did, "Body [@k9].")
+        state = self.repo.revalidate(
+            did, ["p1"], package=PACKAGE, origin_state=ORIGIN_OK, rights=self.rights
+        )
+        self.assertIn("p1", state["revalidation_required"])
+        self.assertEqual(state["paragraphs"]["p1"]["checks"], "stale")
+        record = state["revalidation_records"]["p1"]
+        self.assertFalse(record["valid"])
+        self.assertIn("unknown_citation:k9", record["reasons"])
+
+    def test_unsupported_claim_stays_required(self):
+        did = "delivery-reval-unsupported"
+        self._stale(did, "Body [@k1].")
+        state = self.repo.revalidate(
+            did,
+            ["p1"],
+            package=UNSUPPORTED_PACKAGE,
+            origin_state=ORIGIN_OK,
+            rights=self.rights,
+        )
+        self.assertIn("p1", state["revalidation_required"])
+        record = state["revalidation_records"]["p1"]
+        self.assertFalse(record["valid"])
+        self.assertIn("fact_check:unsupported", record["reasons"])
+
+    def test_missing_origin_coverage_stays_required(self):
+        did = "delivery-reval-origin"
+        self._stale(did, "Body [@k1].")
+        state = self.repo.revalidate(
+            did,
+            ["p1"],
+            package=PACKAGE,
+            origin_state=ORIGIN_INCOMPLETE,
+            rights=self.rights,
+        )
+        self.assertIn("p1", state["revalidation_required"])
+        record = state["revalidation_records"]["p1"]
+        self.assertFalse(record["valid"])
+        self.assertIn("origin_incomplete", record["reasons"])
+        self.assertFalse(record["coverage_complete"])
+
+    def test_final_approval_refused_while_any_paragraph_required(self):
+        did = "delivery-reval-refuse"
+        self._stale(did, "Body [@k9].")
+        self.repo.revalidate(
+            did, ["p1"], package=PACKAGE, origin_state=ORIGIN_OK, rights=self.rights
+        )
+        with self.assertRaises(DeliveryError):
+            self.repo.final_approval(
+                did,
+                artifact_hashes={"art-1": "sha-1"},
+                warnings=[],
+                accepted_warning_ids=[],
+                unsupported_major_claims=[],
+                approver="alice",
+                rights=self.rights,
+            )
 
 
 class ApprovalAndExportTests(DeliveryBase):

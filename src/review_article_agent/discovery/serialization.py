@@ -49,8 +49,8 @@ What this module is **not**
   bound, chosen from the adapters' documented retrieval envelopes; crossing it
   is an explicit refusal, never a silent truncation.
 
-Format (version 1)
-------------------
+Format (versions 1 and 2)
+-------------------------
 
 An envelope object with exactly ``format``, ``format_version``, ``result_type``
 and ``result``. ``result_type`` is ``search_result`` or
@@ -62,6 +62,19 @@ the codec rebuilds them as tuples. ``result.records``/``result.attempts`` are
 retained even though they are derivable from the pages, so the codec can reject
 a record whose aggregate disagrees with its pages rather than silently
 re-deriving (or dropping) a stored observation.
+
+**Version 2** adds the two optional bibliographic fields ``authors`` (a JSON
+array of display-name strings, order preserved) and ``journal`` (a string or
+``null``) to each record object; a version-2 record object has exactly the nine
+record keys. **Version 1** is the earlier seven-key record (no ``authors``/
+``journal``). The codec decodes **both**. Encoding is *backward-compatible*: a
+result whose records carry neither field is still emitted as version 1 with the
+exact bytes it had before, so a previously stored observation's canonical bytes
+(and therefore its stored digest) never change; a result that carries at least
+one non-empty ``authors`` or non-null ``journal`` is emitted as version 2. This
+keeps :func:`encode_search_result` a lossless inverse of
+:func:`decode_search_result` for every supported version (the storage layer's
+``encode(decode(bytes)) == bytes`` integrity invariant holds for old rows too).
 
 Bounds
 ------
@@ -104,8 +117,16 @@ __all__ = [
 #: Stable envelope tag; a different family is never decoded as this record.
 SEARCH_RESULT_FORMAT = "review_article_agent.discovery.search_result"
 
-#: Version of the record representation below (independent of any store schema).
-SEARCH_RESULT_FORMAT_VERSION = 1
+#: Newest version of the record representation below (independent of any store
+#: schema). Version 2 adds the optional ``authors``/``journal`` fields to each
+#: ``MetadataRecord``.
+SEARCH_RESULT_FORMAT_VERSION = 2
+
+#: Every format version this codec still decodes. Version 1 (no ``authors``/
+#: ``journal`` on a record) stays fully supported so a previously stored
+#: observation keeps decoding, and re-encoding it reproduces its exact original
+#: bytes (its stored digest never changes).
+_SUPPORTED_FORMAT_VERSIONS = (1, 2)
 
 #: Technical upper bound on one encoded/decode payload. See the module docstring
 #: for the documented-adapter rationale; this is not a scientific threshold.
@@ -153,7 +174,7 @@ _PAGE_KEYS = frozenset(
         "attempts",
     }
 )
-_RECORD_KEYS = frozenset(
+_RECORD_KEYS_V1 = frozenset(
     {
         "source",
         "source_id",
@@ -164,6 +185,8 @@ _RECORD_KEYS = frozenset(
         "publication_year",
     }
 )
+#: Version 2 adds the two optional bibliographic fields to each record object.
+_RECORD_KEYS_V2 = _RECORD_KEYS_V1 | {"authors", "journal"}
 _ATTEMPT_KEYS = frozenset(
     {
         "attempt_no",
@@ -383,12 +406,20 @@ def _opt_number(value: object) -> int | float | None:
 # --------------------------------------------------------------------------- #
 # Encode
 # --------------------------------------------------------------------------- #
-def _encode_record(record: object) -> dict[str, Any]:
+def _encode_authors(authors: object) -> list[str]:
+    if type(authors) is not tuple:
+        raise DiscoverySerializationError(
+            "search result metadata record authors must be an immutable tuple"
+        )
+    return [_str(name) for name in authors]
+
+
+def _encode_record(record: object, version: int) -> dict[str, Any]:
     if type(record) is not MetadataRecord:
         raise DiscoverySerializationError(
             "search result contains an unsupported metadata record type"
         )
-    return {
+    data: dict[str, Any] = {
         "source": _str(record.source),
         "source_id": _opt_str(record.source_id),
         "pmid": _opt_str(record.pmid),
@@ -397,6 +428,10 @@ def _encode_record(record: object) -> dict[str, Any]:
         "title": _opt_str(record.title),
         "publication_year": _opt_int(record.publication_year),
     }
+    if version >= 2:
+        data["authors"] = _encode_authors(record.authors)
+        data["journal"] = _opt_str(record.journal)
+    return data
 
 
 def _encode_attempt(attempt: object) -> dict[str, Any]:
@@ -417,12 +452,12 @@ def _encode_attempt(attempt: object) -> dict[str, Any]:
     }
 
 
-def _encode_record_tuple(records: object) -> list[dict[str, Any]]:
+def _encode_record_tuple(records: object, version: int) -> list[dict[str, Any]]:
     if type(records) is not tuple:
         raise DiscoverySerializationError(
             "search result records must be an immutable tuple"
         )
-    return [_encode_record(record) for record in records]
+    return [_encode_record(record, version) for record in records]
 
 
 def _encode_attempt_tuple(attempts: object) -> list[dict[str, Any]]:
@@ -433,7 +468,7 @@ def _encode_attempt_tuple(attempts: object) -> list[dict[str, Any]]:
     return [_encode_attempt(attempt) for attempt in attempts]
 
 
-def _encode_page(page: object) -> dict[str, Any]:
+def _encode_page(page: object, version: int) -> dict[str, Any]:
     if type(page) is not SearchPage:
         raise DiscoverySerializationError(
             "search result contains an unsupported page type"
@@ -444,7 +479,7 @@ def _encode_page(page: object) -> dict[str, Any]:
         "requested_url": _str(page.requested_url),
         "retrieved_at": _str(page.retrieved_at),
         "page_index": _int(page.page_index),
-        "records": _encode_record_tuple(page.records),
+        "records": _encode_record_tuple(page.records, version),
         "page_size": _opt_int(page.page_size),
         "total_count": _opt_int(page.total_count),
         "next_cursor": _opt_str(page.next_cursor),
@@ -455,7 +490,9 @@ def _encode_page(page: object) -> dict[str, Any]:
     }
 
 
-def _encode_result_body(result: SearchResult, *, pubmed: bool) -> dict[str, Any]:
+def _encode_result_body(
+    result: SearchResult, *, pubmed: bool, version: int
+) -> dict[str, Any]:
     if type(result.pages) is not tuple:
         raise DiscoverySerializationError(
             "search result pages must be an immutable tuple"
@@ -463,8 +500,8 @@ def _encode_result_body(result: SearchResult, *, pubmed: bool) -> dict[str, Any]
     body: dict[str, Any] = {
         "source": _str(result.source),
         "query": _str(result.query),
-        "pages": [_encode_page(page) for page in result.pages],
-        "records": _encode_record_tuple(result.records),
+        "pages": [_encode_page(page, version) for page in result.pages],
+        "records": _encode_record_tuple(result.records, version),
         "started_at": _str(result.started_at),
         "completed_at": _str(result.completed_at),
         "stop_reason": _str(result.stop_reason),
@@ -480,6 +517,21 @@ def _encode_result_body(result: SearchResult, *, pubmed: bool) -> dict[str, Any]
     return body
 
 
+def _result_format_version(result: SearchResult) -> int:
+    """Pick the newest format version the result actually needs.
+
+    Version 2 is emitted only when at least one record carries a non-empty
+    ``authors`` list or a non-null ``journal``; otherwise version 1 is emitted so
+    a result that predates the new fields re-encodes to its exact original bytes.
+    """
+    for record in result.records:
+        if isinstance(record, MetadataRecord) and (
+            record.authors or record.journal is not None
+        ):
+            return 2
+    return 1
+
+
 def encode_search_result(result: SearchResult) -> bytes:
     """Encode one exact ``SearchResult``/``PubMedSearchResult`` as canonical bytes.
 
@@ -488,6 +540,11 @@ def encode_search_result(result: SearchResult) -> bytes:
     The returned bytes are deterministic, versioned, and at most
     :data:`MAX_SEARCH_RESULT_BYTES`. Encoding is inert: it never validates
     anything scientific, never re-fetches, and never mutates ``result``.
+
+    The emitted ``format_version`` is the newest version the result needs: a
+    result with no ``authors``/``journal`` observation stays version 1 (so a
+    previously stored observation re-encodes byte-for-byte), and one that carries
+    them is version 2.
     """
     if type(result) is PubMedSearchResult:
         pubmed = True
@@ -500,12 +557,13 @@ def encode_search_result(result: SearchResult) -> bytes:
             "search result is not a supported concrete result type"
         )
 
+    version = _result_format_version(result)
     try:
         envelope = {
             "format": SEARCH_RESULT_FORMAT,
-            "format_version": SEARCH_RESULT_FORMAT_VERSION,
+            "format_version": version,
             "result_type": result_type,
-            "result": _encode_result_body(result, pubmed=pubmed),
+            "result": _encode_result_body(result, pubmed=pubmed, version=version),
         }
         payload = canonical_json(envelope)
     except DiscoverySerializationError:
@@ -531,24 +589,34 @@ def encode_search_result(result: SearchResult) -> bytes:
 # --------------------------------------------------------------------------- #
 # Decode
 # --------------------------------------------------------------------------- #
-def _decode_record(value: object) -> MetadataRecord:
-    obj = _mapping(value, _RECORD_KEYS)
+def _decode_record(value: object, version: int) -> MetadataRecord:
+    obj = _mapping(value, _RECORD_KEYS_V2 if version >= 2 else _RECORD_KEYS_V1)
     try:
-        return MetadataRecord(
-            source=_str(obj["source"]),
-            source_id=_opt_str(obj["source_id"]),
-            pmid=_opt_str(obj["pmid"]),
-            pmcid=_opt_str(obj["pmcid"]),
-            doi=_opt_str(obj["doi"]),
-            title=_opt_str(obj["title"]),
-            publication_year=_opt_int(obj["publication_year"]),
-        )
+        kwargs: dict[str, Any] = {
+            "source": _str(obj["source"]),
+            "source_id": _opt_str(obj["source_id"]),
+            "pmid": _opt_str(obj["pmid"]),
+            "pmcid": _opt_str(obj["pmcid"]),
+            "doi": _opt_str(obj["doi"]),
+            "title": _opt_str(obj["title"]),
+            "publication_year": _opt_int(obj["publication_year"]),
+        }
+        if version >= 2:
+            kwargs["authors"] = _decode_authors(obj["authors"])
+            kwargs["journal"] = _opt_str(obj["journal"])
+        # A version-1 record carries neither key; the dataclass defaults then
+        # give the explicit absent values (``()`` / ``None``).
+        return MetadataRecord(**kwargs)
     except DiscoverySerializationError:
         raise
     except (ReviewAgentError, TypeError, ValueError, OverflowError) as exc:
         raise DiscoverySerializationError(
             "search result metadata record violates its value contract"
         ) from exc
+
+
+def _decode_authors(value: object) -> tuple[str, ...]:
+    return tuple(_str(name) for name in _list(value))
 
 
 def _decode_attempt(value: object) -> AttemptRecord:
@@ -573,15 +641,15 @@ def _decode_attempt(value: object) -> AttemptRecord:
         ) from exc
 
 
-def _decode_record_array(value: object) -> tuple[MetadataRecord, ...]:
-    return tuple(_decode_record(item) for item in _list(value))
+def _decode_record_array(value: object, version: int) -> tuple[MetadataRecord, ...]:
+    return tuple(_decode_record(item, version) for item in _list(value))
 
 
 def _decode_attempt_array(value: object) -> tuple[AttemptRecord, ...]:
     return tuple(_decode_attempt(item) for item in _list(value))
 
 
-def _decode_page(value: object) -> SearchPage:
+def _decode_page(value: object, version: int) -> SearchPage:
     obj = _mapping(value, _PAGE_KEYS)
     try:
         return SearchPage(
@@ -590,7 +658,7 @@ def _decode_page(value: object) -> SearchPage:
             requested_url=_str(obj["requested_url"]),
             retrieved_at=_str(obj["retrieved_at"]),
             page_index=_int(obj["page_index"]),
-            records=_decode_record_array(obj["records"]),
+            records=_decode_record_array(obj["records"], version),
             page_size=_opt_int(obj["page_size"]),
             total_count=_opt_int(obj["total_count"]),
             next_cursor=_opt_str(obj["next_cursor"]),
@@ -607,13 +675,17 @@ def _decode_page(value: object) -> SearchPage:
         ) from exc
 
 
-def _decode_result_body(obj: dict[str, Any], *, pubmed: bool) -> SearchResult:
+def _decode_result_body(
+    obj: dict[str, Any], *, pubmed: bool, version: int
+) -> SearchResult:
     try:
         common = {
             "source": _str(obj["source"]),
             "query": _str(obj["query"]),
-            "pages": tuple(_decode_page(page) for page in _list(obj["pages"])),
-            "records": _decode_record_array(obj["records"]),
+            "pages": tuple(
+                _decode_page(page, version) for page in _list(obj["pages"])
+            ),
+            "records": _decode_record_array(obj["records"], version),
             "started_at": _str(obj["started_at"]),
             "completed_at": _str(obj["completed_at"]),
             "stop_reason": _str(obj["stop_reason"]),
@@ -656,7 +728,7 @@ def decode_search_result(data: bytes) -> SearchResult:
             "search result record has an unsupported format tag"
         )
     version = _int(envelope["format_version"])
-    if version != SEARCH_RESULT_FORMAT_VERSION:
+    if version not in _SUPPORTED_FORMAT_VERSIONS:
         raise DiscoverySerializationError(
             "search result record has an unsupported format version"
         )
@@ -670,4 +742,4 @@ def decode_search_result(data: bytes) -> SearchResult:
     body = _mapping(
         envelope["result"], _PUBMED_RESULT_KEYS if pubmed else _RESULT_KEYS
     )
-    return _decode_result_body(body, pubmed=pubmed)
+    return _decode_result_body(body, pubmed=pubmed, version=version)

@@ -303,6 +303,41 @@ def _readable_summary(value: object, *, label: str):
     return _mapping(value, label=label)
 
 
+def _citation_record(record: object, *, label: str) -> dict:
+    """Validate one approved citation record's optional bibliographic fields.
+
+    The citation record is verified frozen-corpus metadata (not model output), so
+    its stable ``candidate_id``/``identity``/``version`` and any
+    ``title``/``authors``/``year``/``journal`` the corpus carried are accepted
+    when present and well-formed.  A field the corpus did not carry is simply
+    absent (it is omitted, never invented), so no field is required.
+    """
+    record = _mapping(record, label=label)
+    if "candidate_id" in record:
+        _string(record["candidate_id"], label=f"{label}.candidate_id")
+    if "version" in record:
+        _string(record["version"], label=f"{label}.version")
+    identity = record.get("identity")
+    if identity is not None:
+        identity = _mapping(identity, label=f"{label}.identity")
+        for namespace in ("doi", "pmid", "pmcid"):
+            if namespace in identity:
+                _string(identity[namespace], label=f"{label}.identity.{namespace}")
+    if "title" in record:
+        _string(record["title"], label=f"{label}.title")
+    if "journal" in record:
+        _string(record["journal"], label=f"{label}.journal")
+    if "year" in record:
+        year = record["year"]
+        _require(
+            isinstance(year, int) and not isinstance(year, bool),
+            f"{label}.year must be an integer",
+        )
+    if "authors" in record:
+        _str_list(record["authors"], label=f"{label}.authors", allow_empty=False)
+    return record
+
+
 def _index_package(package: object) -> dict:
     """Validate and index the approved drafting package (the authorized context).
 
@@ -387,7 +422,9 @@ def _index_package(package: object) -> dict:
     citation_by_key: dict = {}
     for key, record in citations_raw.items():
         _string(key, label="drafting package.citations key")
-        citation_by_key[key] = _mapping(record, label=f"drafting package.citations[{key}]")
+        citation_by_key[key] = _citation_record(
+            record, label=f"drafting package.citations[{key}]"
+        )
     for key, evidence in evidence_by_key.items():
         for citation_key in evidence["citation_keys"]:
             _require(
