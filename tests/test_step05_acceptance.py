@@ -52,6 +52,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -531,6 +532,7 @@ class StaleApprovalTest(LibraryAcceptanceBase):
 # 5. search-again: authentic gate required; history retained
 # --------------------------------------------------------------------------- #
 class SearchAgainTest(LibraryAcceptanceBase):
+    @slow
     def test_search_again_requires_authentic_gate_and_keeps_history(self):
         _ctx, _plan, corpus_ref, coverage_ref, snapshot, _expansion = self._run_pipeline()
         freeze_rev = self.propose_freeze(
@@ -690,6 +692,7 @@ class NoForcedCompletenessTest(LibraryAcceptanceBase):
 # 8. Restore backup / reopen reproduce exact snapshots + statuses + invariants
 # --------------------------------------------------------------------------- #
 class BackupRestoreTest(LibraryAcceptanceBase):
+    @slow
     def test_restore_and_reopen_reproduce_exact_snapshots_and_status(self):
         _ctx, _plan, corpus_ref, coverage_ref, snapshot, _expansion = self._run_pipeline(
             known_relevant=[{"namespace": "pmid", "value": _DEFAULT_PMID}]
@@ -780,6 +783,7 @@ class InjectionCannotExpandAuthorityTest(LibraryAcceptanceBase):
 # 10. REAL detached worker process (real IPC/kernel/SQLite/job state/thread
 #     executor; the ONLY external transport is an in-process stub)
 # --------------------------------------------------------------------------- #
+@slow
 class RealProcessAcceptanceTest(DiscoveryWorkerBase):
     """Drive a real detached worker process built by ``step05_process_fixture``.
 

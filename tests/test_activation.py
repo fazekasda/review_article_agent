@@ -27,6 +27,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -240,6 +241,7 @@ class ActivationTest(unittest.TestCase):
             with reg.execution_write_guard(token, a, allow_draining=True):
                 pass
 
+    @slow
     def test_release_cannot_race_accepted_write(self) -> None:
         """A release waits for the guarded local commit; it cannot interleave."""
         reg, a, _ = self._two_projects()
@@ -281,6 +283,7 @@ class ActivationTest(unittest.TestCase):
         finally:
             proc.wait(timeout=10)
 
+    @slow
     def test_release_cannot_race_draining_reconciliation(self) -> None:
         """A release waits for a draining reconciliation commit too."""
         reg, a, _ = self._two_projects()

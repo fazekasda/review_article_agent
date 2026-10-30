@@ -106,6 +106,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -774,6 +775,7 @@ def _stop_owned_or_report(manager, state: dict | None = None) -> None:
 
 
 @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+@slow
 class RealServiceAcceptanceTests(unittest.TestCase):
     """One shared, real, app-owned service for the non-restart criteria."""
 
@@ -1439,6 +1441,7 @@ class RealServiceAcceptanceTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+@slow
 class RestartMidTurnTests(unittest.TestCase):
     """Restart only the owned service mid-turn; never a false completion."""
 

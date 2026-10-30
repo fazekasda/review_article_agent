@@ -20,6 +20,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 REPO = Path(__file__).resolve().parents[1]
@@ -167,6 +168,7 @@ class EntryPointTest(CliTestCase):
         self.assertEqual(err["error"]["category"], "usage")
 
 
+@slow
 class ProjectFlowTest(CliTestCase):
     def test_two_projects_recover_across_restart_and_stay_independent(self) -> None:
         pid_a = self.create_project("proj-a")
@@ -198,6 +200,7 @@ class ProjectFlowTest(CliTestCase):
         self.assertFalse(global_status["scientific_validation"])
 
 
+@slow
 class ArtifactFlowTest(CliTestCase):
     def test_artifacts_are_isolated_per_project(self) -> None:
         pid_a = self.create_project("proj-a")
@@ -281,6 +284,7 @@ class DenialTest(CliTestCase):
                        "--project", "prj_" + "0" * 32, expect=2)
         self.assertEqual(err["error"]["category"], "not_found")
 
+    @slow
     def test_registry_store_mismatch_is_denied(self) -> None:
         pid_a = self.create_project("proj-a")
         pid_b = self.create_project("proj-b")
@@ -295,6 +299,7 @@ class DenialTest(CliTestCase):
         self.assertNotIn("Traceback", json.dumps(err))
 
 
+@slow
 class ConfigCliTest(CliTestCase):
     def test_invalid_config_is_nonzero_without_echoing_secret(self) -> None:
         secret = "SUPER_SECRET_VALUE_DO_NOT_ECHO"
@@ -337,6 +342,7 @@ class ConfigCliTest(CliTestCase):
 class WheelPackagingTest(unittest.TestCase):
     """Build a wheel offline and inspect its metadata (no install, no network)."""
 
+    @slow
     def test_wheel_metadata_has_console_script_and_no_invented_license(self) -> None:
         tmp = tempfile.TemporaryDirectory(prefix="raa-wheel-")
         self.addCleanup(tmp.cleanup)
@@ -394,6 +400,7 @@ class LeakBoundaryTest(CliTestCase):
 
     SECRET = "SYNTHETIC-SECRET-NO-REAL-CREDENTIAL"
 
+    @slow
     def test_rights_record_secret_is_not_echoed(self) -> None:
         pid = self.create_project("proj-a")
         self.cli("--data-dir", str(self.state), "artifact", "create",
@@ -447,6 +454,7 @@ class LeakBoundaryTest(CliTestCase):
         self.assertNotIn("Traceback", combined)
 
 
+@slow
 class StrictJsonCliTest(CliTestCase):
     """Duplicate keys / non-finite / over-deep input fail cleanly (no payload)."""
 
@@ -509,6 +517,7 @@ class StrictJsonCliTest(CliTestCase):
             self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation", name)
 
 
+@slow
 class OutputProtectionTest(CliTestCase):
     """``artifact content --output`` creates exclusively and never clobbers state."""
 

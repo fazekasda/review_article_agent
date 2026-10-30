@@ -42,6 +42,7 @@ from review_article_agent.synthesis.workflow import (  # noqa: E402
     GATE_SYNTHESIS,
     GATE_SYNTHESIS_KIND,
 )
+from _tiers import slow
 
 _PLANNER_MODEL = "openrouter/deepseek/v4.1-flash#high"
 _WRITER_MODEL = "openrouter/anthropic/claude-sonnet-5-5#high"
@@ -115,6 +116,7 @@ class WorkspaceBase(SynthesisBase):
         )
 
 
+@slow
 class ProposeAndReadTests(WorkspaceBase):
     def test_propose_and_reopen_reconstructs_mapping(self):
         _s, _f, outline_ref = self.approved_chain()
@@ -166,6 +168,7 @@ class ProposeAndReadTests(WorkspaceBase):
         self.assertEqual(live[0].as_ref(), outline_ref)
 
 
+@slow
 class FailClosedTests(WorkspaceBase):
     def test_foreign_role_mapping_refused(self):
         _s, _f, outline_ref = self.approved_chain()
@@ -237,6 +240,7 @@ class FailClosedTests(WorkspaceBase):
             self.propose_ws(payload)
 
 
+@slow
 class HistoryAndDivergenceTests(WorkspaceBase):
     def test_old_revision_inspectable_after_global_change(self):
         synthesis_ref, _framework_ref, outline_ref = self.approved_chain()
@@ -326,6 +330,7 @@ class HistoryAndDivergenceTests(WorkspaceBase):
             self.workspace.read(forged_ref)
 
 
+@slow
 class PerSectionAndOutlineAdvanceTests(WorkspaceBase):
     def test_cross_section_mapping_reuse_refused(self):
         _s, _f, outline_ref = self.approved_chain()

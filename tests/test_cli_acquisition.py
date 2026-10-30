@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -167,6 +168,7 @@ class AcquisitionCliTestCase(unittest.TestCase):
             store.close()
 
     # -- tests ---------------------------------------------------------------- #
+    @slow
     def test_import_replay_duplicate_and_readbacks(self) -> None:
         src = self.write_bytes("src.bin", _BYTES)
         first = self.cli(*self.import_args(file=src))

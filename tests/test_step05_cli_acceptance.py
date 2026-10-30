@@ -60,6 +60,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 TESTS = Path(__file__).resolve().parent
@@ -662,6 +663,7 @@ class CliAcceptanceBase(unittest.TestCase):
 class FullChainTest(CliAcceptanceBase):
     """The whole chain, driven only through the real CLI."""
 
+    @slow
     def test_end_to_end_cli_chain_freezes_exact_roster(self):
         self.pid = self.create_project()
         c = self.drive_to_frozen()
@@ -774,6 +776,7 @@ class FullChainTest(CliAcceptanceBase):
         self.assertIn("entry_reviews", entry_content["document"]["payload"])
 
 
+@slow
 class LaterWorkTest(CliAcceptanceBase):
     """Later work with different artifact ids never mutates the frozen roster."""
 
@@ -821,6 +824,7 @@ class LaterWorkTest(CliAcceptanceBase):
         self.assertEqual(old["revision_id"], "corpus-1")
 
 
+@slow
 class SearchAgainTest(CliAcceptanceBase):
     """An approved search_again keeps history; a proposal alone never reopens."""
 
@@ -861,6 +865,7 @@ class SearchAgainTest(CliAcceptanceBase):
         )
 
 
+@slow
 class NegativeGateTest(CliAcceptanceBase):
     """Stale / rejected / wrong-gate approvals never authorize a freeze."""
 
@@ -896,6 +901,7 @@ class NegativeGateTest(CliAcceptanceBase):
         self.assertIsNone(status["current_decision"])
 
 
+@slow
 class FakeInstructionAndPrivacyTest(CliAcceptanceBase):
     """A fake instruction payload cannot approve; replay makes no new external call."""
 
@@ -983,6 +989,7 @@ class FakeInstructionAndPrivacyTest(CliAcceptanceBase):
 class NoForcedCompletenessTest(CliAcceptanceBase):
     """All known-relevant tokens present still never forces a complete claim."""
 
+    @slow
     def test_all_known_present_still_never_claims_completeness(self):
         self.pid = self.create_project()
         c = self.drive_to_frozen(

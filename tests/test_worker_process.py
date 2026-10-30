@@ -29,6 +29,7 @@ import unittest
 import warnings
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -308,6 +309,7 @@ print(json.dumps(result))
 '''
 
 
+@slow
 class WorkerProcessTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="raa-wp-")

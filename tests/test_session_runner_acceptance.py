@@ -56,6 +56,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -349,6 +350,7 @@ print(json.dumps({
 
 
 @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+@slow
 class RunnerE2ETests(unittest.TestCase):
     """Child submit + separate-process reconcile, and the fresh critic."""
 
@@ -616,6 +618,7 @@ class RunnerE2ETests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+@slow
 class TwoProjectIsolationTests(unittest.TestCase):
     """Two registered projects; no cross session/model/mapping/token; switch blocked."""
 
@@ -730,6 +733,7 @@ class TwoProjectIsolationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_REAL, "opencode v2.2.0 is not installed")
+@slow
 class RestartMidTurnRunnerTests(unittest.TestCase):
     """Restart the owned service mid-turn; the runner reconciles unknown, never completed."""
 

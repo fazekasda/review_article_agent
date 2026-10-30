@@ -43,6 +43,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 TESTS = Path(__file__).resolve().parent
@@ -534,6 +535,7 @@ class ReportCreateTest(ReportsCliBase):
 # --------------------------------------------------------------------------- #
 # freeze propose / status / show / history / require
 # --------------------------------------------------------------------------- #
+@slow
 class FreezeCliTest(ReportsCliBase):
     def _setup(self, *, propose_accept="accepted: expansion not performed",
                decision="freeze", rev="frz-cli-1", request_id="frz-req-1",

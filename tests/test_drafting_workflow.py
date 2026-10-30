@@ -56,6 +56,7 @@ from review_article_agent.drafting.workspace import (  # noqa: E402
     PLANNER_ROLE,
     WRITER_ROLE,
 )
+from _tiers import slow
 
 _FINDING = "c1:F1"
 
@@ -144,6 +145,7 @@ class BlueprintBase(WorkspaceBase):
         return self.approve_ref(ref, GATE_KIND, GATE_ID)
 
 
+@slow
 class ProposeReadAndGateTests(BlueprintBase):
     def test_propose_read_reopen_and_own_gate(self):
         _s, _f, outline_ref = self.approved_chain()
@@ -194,6 +196,7 @@ class ProposeReadAndGateTests(BlueprintBase):
         self.assertIn(json.dumps(outline_ref, sort_keys=True), refs)
 
 
+@slow
 class OwnerGateIsolationTests(BlueprintBase):
     def test_unapproved_other_section_does_not_block(self):
         _s, _f, outline_ref = self.approved_chain()
@@ -232,6 +235,7 @@ class OwnerGateIsolationTests(BlueprintBase):
             self.propose_bp(payload)
 
 
+@slow
 class StalenessAndHistoryTests(BlueprintBase):
     def test_changing_shared_framework_flags_stale_and_refuses_require(self):
         synthesis_ref, _f, outline_ref = self.approved_chain()
@@ -296,6 +300,7 @@ class StalenessAndHistoryTests(BlueprintBase):
                             artifact_id="bp-sec1", revision="bp-sec1-r2", parent="bp-sec1-r1")
 
 
+@slow
 class FailClosedTests(BlueprintBase):
     def _import_blueprint(self, payload, *, artifact_id="forged-bp", revision="forged-bp-r1",
                           dependencies=()):

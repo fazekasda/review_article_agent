@@ -34,6 +34,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -401,6 +402,7 @@ class IntentTestBase(unittest.TestCase):
         )
 
 
+@slow
 class RecordIntentTest(IntentTestBase):
     def test_records_exact_intent(self) -> None:
         record = self._record()
@@ -522,6 +524,7 @@ class RecordIntentTest(IntentTestBase):
         self.assertEqual(self.intents.list_intents(), [])
 
 
+@slow
 class ForgedPlanTest(IntentTestBase):
     def test_forged_request_body_refused(self) -> None:
         forged = dataclasses.replace(self.plan, request_body=b"forged-body")
@@ -547,6 +550,7 @@ class ForgedPlanTest(IntentTestBase):
         self.assertEqual(self.intents.list_intents(), [])
 
 
+@slow
 class RefsTest(IntentTestBase):
     def test_foreign_ref_refused(self) -> None:
         refs = dict(self.qdef_refs)
@@ -637,6 +641,7 @@ class RefsTest(IntentTestBase):
             self.intents.get_intent(record.dispatch_id)
 
 
+@slow
 class VersionsTest(IntentTestBase):
     def test_input_digest_mismatch_refused(self) -> None:
         versions = dict(self.versions)
@@ -690,6 +695,7 @@ class VersionsTest(IntentTestBase):
         self.assertEqual(self.intents.list_intents(), [])
 
 
+@slow
 class TimestampAndRouteTest(IntentTestBase):
     def test_bad_created_at_refused(self) -> None:
         with self.assertRaises(DecisionIntentValidationError):
@@ -732,6 +738,7 @@ class TimestampAndRouteTest(IntentTestBase):
         )
 
 
+@slow
 class IntegrityTest(IntentTestBase):
     def test_integrity_of_valid_store_is_empty(self) -> None:
         self._record()
@@ -814,6 +821,7 @@ class IntegrityTest(IntentTestBase):
         self.assertTrue(any("foreign" in problem for problem in problems))
 
 
+@slow
 class IntegrityRepairTest(IntentTestBase):
     """Regression coverage for the T5f-R1 independent-pin / bound / immutability repairs."""
 
@@ -943,6 +951,7 @@ class IntegrityRepairTest(IntentTestBase):
         self.assertEqual(self.intents.verify_all_integrity(), [])
 
 
+@slow
 class MigrationTest(IntentTestBase):
     def test_schema7_to_8_preserves_old_rows(self) -> None:
         root = str(self.tmp / "p7")

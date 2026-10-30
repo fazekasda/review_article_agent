@@ -65,6 +65,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -371,6 +372,7 @@ class _AcceptanceBase(unittest.TestCase):
         return str(path)
 
 
+@slow
 class SigkillRestartMatrixTest(_AcceptanceBase):
     """AC2: SIGKILL/restart at every dispatch seam recovers one local result."""
 
@@ -478,6 +480,7 @@ class DetachedSubmitterTest(_AcceptanceBase):
     concern.)
     """
 
+    @slow
     def test_job_completes_after_submitter_process_exits(self) -> None:
         data_dir, _registry, info = self._fixture()
         worker = self._start_worker(data_dir, pause_at="before_dispatch")
@@ -543,6 +546,7 @@ class DetachedSubmitterTest(_AcceptanceBase):
 class ConcurrentActivationTest(_AcceptanceBase):
     """AC4: two concurrent project submitters cannot admit two projects."""
 
+    @slow
     def test_two_concurrent_project_submits_only_one_admits(self) -> None:
         data_dir = self.tmp / "state"
         registry = Registry(data_dir)
@@ -593,6 +597,7 @@ class ConcurrentActivationTest(_AcceptanceBase):
         worker.stop()
 
 
+@slow
 class SwitchWhileInflightTest(_AcceptanceBase):
     """AC4: a switch drains the old project; its result stays in the old store."""
 
@@ -652,6 +657,7 @@ class SwitchWhileInflightTest(_AcceptanceBase):
         worker.stop()
 
 
+@slow
 class AmbiguityPinsActivationTest(_AcceptanceBase):
     """AC3/AC5: ambiguity pins activation, admits nothing new, never busy-loops."""
 
@@ -763,6 +769,7 @@ class StaleFenceTest(_AcceptanceBase):
 class BudgetCapTest(_AcceptanceBase):
     """AC6: a cap stops new admission; an unknown reserve is retained."""
 
+    @slow
     def test_unknown_reserve_retained_and_cap_blocks_new_admission(self) -> None:
         # -- direct repository: a retained unknown reserve counts and blocks. --
         app_dir = paths.app_dir_for(str(self.tmp / "budgetproj"))
@@ -836,6 +843,7 @@ class BudgetCapTest(_AcceptanceBase):
         worker.stop()
 
 
+@slow
 class BackupRestoreInteropTest(_AcceptanceBase):
     """T6: engine-job backup/roundtrip and restored ambiguity blocks execution."""
 

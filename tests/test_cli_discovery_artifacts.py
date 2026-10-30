@@ -44,6 +44,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 TESTS = Path(__file__).resolve().parent
@@ -450,6 +451,7 @@ class DiscoveryCliTestCase(unittest.TestCase):
 # context import / show / validate over every type
 # --------------------------------------------------------------------------- #
 class ContextReadAllTypesTest(DiscoveryCliTestCase):
+    @slow
     def test_import_and_read_every_context_type(self) -> None:
         pid = self.create_project()
         refs, _interview = self.build_plan_fixture(pid)
@@ -701,6 +703,7 @@ class ContextRejectionTest(DiscoveryCliTestCase):
 # --------------------------------------------------------------------------- #
 # plan amendments + historical reads
 # --------------------------------------------------------------------------- #
+@slow
 class PlanAmendmentTest(DiscoveryCliTestCase):
     def test_amended_plan_requires_real_parent_and_nonempty_impact(self) -> None:
         pid = self.create_project()

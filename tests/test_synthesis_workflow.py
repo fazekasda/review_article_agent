@@ -38,6 +38,7 @@ from review_article_agent.synthesis.workflow import (  # noqa: E402
     SynthesisWorkflowRepository,
 )
 from unittest import mock  # noqa: E402
+from _tiers import slow
 
 _CASE = "c1"
 _FINDING = _CASE + ":F1"
@@ -210,6 +211,7 @@ class SynthesisBase(WorkflowBase):
         return synthesis_ref, framework_ref, outline_ref
 
 
+@slow
 class ChainAndGateTests(SynthesisBase):
     def test_approved_chain_and_blueprints_after_reopen(self):
         synthesis_ref, framework_ref, outline_ref = self.approved_chain()
@@ -336,6 +338,7 @@ class BlockingAndClassificationTests(SynthesisBase):
             )
 
 
+@slow
 class ImpactTests(SynthesisBase):
     def _impact_of(self, ref, kind):
         return self.synth.read_impact(ref, kind)
@@ -483,6 +486,7 @@ class ImpactTests(SynthesisBase):
             self.assertEqual(impact["affected_sections"][section_id], ["global_change"])
 
 
+@slow
 class RefEqualityAndFailClosedTests(SynthesisBase):
     def _two_syntheses_one_framework(self):
         audit_ref, _batch = self.accepted_audit()
@@ -600,6 +604,7 @@ class SynthesisOverRealRunnerTest(extraction_runner.FullFlowIntegrationTest):
         super().setUp()
         self.synth = SynthesisWorkflowRepository(self.store)
 
+    @slow
     def test_step09_outputs_gate_consumed(self):
         src, acquisition_ref = self._acquire()
         self._config_and_report(src)

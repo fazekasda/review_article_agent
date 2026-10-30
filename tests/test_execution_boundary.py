@@ -35,6 +35,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
+from _tiers import slow
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -140,6 +141,7 @@ def _writer_config(*, provider=FIXTURE_PROVIDER, model_id=WRITER_MODEL_ID, varia
     return RoleConfiguration.from_mapping({"schema_version": 1, "roles": {"writer": role}})
 
 
+@slow
 class ExecutionBoundaryTest(scenario_helpers.SessionTurnPlanTestBase):
     # -- scenario ---------------------------------------------------------
     def _fixture_scenario(

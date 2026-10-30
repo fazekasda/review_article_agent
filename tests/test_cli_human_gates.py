@@ -54,6 +54,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -383,6 +384,7 @@ class _Base(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Happy path + read-back
 # --------------------------------------------------------------------------- #
+@slow
 class GateConfirmRecordsApprovalTest(_Base):
     def test_exact_digest_records_durable_human_approval(self) -> None:
         pid = self.project_with_revision()
@@ -464,6 +466,7 @@ class GateConfirmRecordsApprovalTest(_Base):
 # --------------------------------------------------------------------------- #
 # Refusals that must write zero rows
 # --------------------------------------------------------------------------- #
+@slow
 class GateConfirmRefusalTest(_Base):
     def test_wrong_expected_digest_is_refused_before_the_terminal(self) -> None:
         pid = self.project_with_revision()
@@ -557,6 +560,7 @@ class GateConfirmRefusalTest(_Base):
 # --------------------------------------------------------------------------- #
 # Real controlling-terminal boundary (no seams): piped stdin / missing tty
 # --------------------------------------------------------------------------- #
+@slow
 class GateConfirmRealTerminalBoundaryTest(_Base):
     def test_piped_stdin_and_missing_tty_cannot_confirm(self) -> None:
         pid = self.project_with_revision()
@@ -579,6 +583,7 @@ class GateConfirmRealTerminalBoundaryTest(_Base):
 # --------------------------------------------------------------------------- #
 # Output safety and redaction
 # --------------------------------------------------------------------------- #
+@slow
 class GateConfirmSafetyTest(_Base):
     def test_no_source_bytes_or_rationale_text_is_reflected(self) -> None:
         pid = self.create_project("proj")
@@ -618,6 +623,7 @@ class GateConfirmSafetyTest(_Base):
 # --------------------------------------------------------------------------- #
 # Named-gate claim is bounded; historical rows are retained
 # --------------------------------------------------------------------------- #
+@slow
 class GateNamedGateBoundaryTest(_Base):
     def test_final_release_never_bypasses_scientific_validation(self) -> None:
         pid = self.project_with_revision()
@@ -714,6 +720,7 @@ def _drive_pty(master_fd: int, *, deadline: float) -> str:
 
 class GateConfirmRealPtyTest(_Base):
     @unittest.skipUnless(hasattr(os, "forkpty"), "requires os.forkpty")
+    @slow
     def test_real_pty_confirmation_records_a_row(self) -> None:
         pid = self.project_with_revision()
         digest = self.preview_digest(pid=pid)

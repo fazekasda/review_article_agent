@@ -39,6 +39,7 @@ import sys
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from _tiers import slow
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -218,6 +219,7 @@ class CommittedStateBackupTest(CommitTestBase):
         self.assertEqual(self.fingerprint(restored), before)
 
 
+@slow
 class CompletedKnownCostRoundTripTest(CommittedStateBackupTest):
     def test_completed_accepted_triple_state_cost_and_budget_survive(self) -> None:
         self.submit()
@@ -262,6 +264,7 @@ class CompletedKnownCostRoundTripTest(CommittedStateBackupTest):
         )
 
 
+@slow
 class CompletedUnknownCostRoundTripTest(CommittedStateBackupTest):
     def test_completed_with_unknown_cost_survives_and_keeps_reserve(self) -> None:
         self.submit()
@@ -306,6 +309,7 @@ class CompletedUnknownCostRoundTripTest(CommittedStateBackupTest):
         )
 
 
+@slow
 class DefinitiveFailureRoundTripTest(CommittedStateBackupTest):
     def test_failed_not_incurred_survives_and_is_never_an_accepted_result(self) -> None:
         self.submit()
@@ -352,6 +356,7 @@ class DefinitiveFailureRoundTripTest(CommittedStateBackupTest):
         self.assertEqual(self.fingerprint(restored), before)
 
 
+@slow
 class AmbiguousOutcomeRoundTripTest(CommittedStateBackupTest):
     def test_ambiguous_known_amount_survives_unknown_and_is_never_resubmitted(
         self,
@@ -434,6 +439,7 @@ class AmbiguousOutcomeRoundTripTest(CommittedStateBackupTest):
         self.assertEqual(self.fingerprint(restored), before)
 
 
+@slow
 class CompletedReplayAfterRestoreTest(CommittedStateBackupTest):
     def test_replay_is_a_byte_exact_noop_and_refusals_write_nothing(self) -> None:
         self.submit()
@@ -478,6 +484,7 @@ class CompletedReplayAfterRestoreTest(CommittedStateBackupTest):
         self.assertFalse(restored.connection.in_transaction)
 
 
+@slow
 class InertObservationRestoreTest(CommittedStateBackupTest):
     def test_inert_observation_restores_submitted_and_is_never_promoted(self) -> None:
         self.submit()
@@ -527,6 +534,7 @@ class InertObservationRestoreTest(CommittedStateBackupTest):
         self.assertEqual(applied.result_kind, RESULT_KIND)
 
 
+@slow
 class ReadonlyVerifyTest(CommittedStateBackupTest):
     def test_verify_backup_never_changes_snapshot_manifest_or_live_store(self) -> None:
         self.submit()
