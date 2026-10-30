@@ -224,9 +224,13 @@ _INTEGRITY_INITIAL = {
     "provenance": "missing",
 }
 
-#: The conflict/decision id shapes used in a snapshot payload.
-_CONFLICT_ID_RE = re.compile(r"^conflict-\d{4}$")
-_DECISION_ID_RE = re.compile(r"^dedup-\d{4}$")
+#: The conflict/decision id shapes used in a snapshot payload. Ids are minted
+#: with a zero-padded ``:04d`` suffix (so all historical ids stay byte-identical)
+#: but the *read-back* validator accepts four **or more** digits: a single
+#: cumulative revision at the ~10,000-candidate target mints ``dedup-10000``,
+#: which a strict four-digit pattern wrongly rejected as internal inconsistency.
+_CONFLICT_ID_RE = re.compile(r"^conflict-\d{4,}$")
+_DECISION_ID_RE = re.compile(r"^dedup-\d{4,}$")
 
 _RUN_META_KEYS = frozenset(
     {
@@ -434,6 +438,26 @@ def _tokens_of(
 
 def _doc_pins(doc: dict) -> list[tuple[str, int]]:
     return [(pin[0], pin[1]) for pin in doc["occurrences"]]
+
+
+def _numeric_ids_are_ordered(ids: list[str], prefix: str) -> bool:
+    """True iff ``ids`` are unique and non-decreasing by numeric suffix.
+
+    Conflict/decision ids are minted as ``<prefix><zero-padded int>`` but the
+    suffix may exceed four digits at scale (a single revision at the ~10,000
+    target mints ``dedup-10000``, ``dedup-10001``, ...). A plain lexicographic
+    compare would wrongly order ``dedup-10000`` *before* ``dedup-9999``, so
+    ordering is checked on the parsed integers instead. For every historical
+    snapshot (fewer than 10,000 ids, all exactly four digits) this is identical
+    to the previous lexicographic check.
+    """
+    numbers: list[int] = []
+    for value in ids:
+        try:
+            numbers.append(int(value[len(prefix):]))
+        except (TypeError, ValueError):
+            return False
+    return numbers == sorted(numbers) and len(set(ids)) == len(ids)
 
 
 def _candidate_doc(
@@ -955,9 +979,7 @@ def _validate_payload(
             if len(set(refs)) != len(refs):
                 raise _corruption(_M_CORRUPT_MEMBERSHIP)
         conflict_ids.append(conflict_id)
-    if conflict_ids != sorted(conflict_ids) or len(set(conflict_ids)) != len(
-        conflict_ids
-    ):
+    if not _numeric_ids_are_ordered(conflict_ids, "conflict-"):
         raise _corruption(_M_CORRUPT_MEMBERSHIP)
     for candidate_id in candidate_ids:
         for ref in candidate_conflict_map[candidate_id]:
@@ -997,9 +1019,7 @@ def _validate_payload(
         if not isinstance(reason, str) or not reason:
             raise _corruption(_M_CORRUPT_MEMBERSHIP)
         decision_ids.append(decision_id)
-    if decision_ids != sorted(decision_ids) or len(set(decision_ids)) != len(
-        decision_ids
-    ):
+    if not _numeric_ids_are_ordered(decision_ids, "dedup-"):
         raise _corruption(_M_CORRUPT_MEMBERSHIP)
 
     # -- re-derive the exact T1 component structure over the observations ----- #
