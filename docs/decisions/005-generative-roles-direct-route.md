@@ -8,8 +8,8 @@ to implement kickoff 16 steps 5–10 (`docs/implementation/kickoffs/16-mvp-harde
 §5), which directed that "for the MVP the direct OpenRouter path is enough (step
 00 accepted it as fallback)", to "Reuse those gates; do not invent a parallel
 authorization path", and to "Open the OpenCode production route only if the user
-decides to". The exact user session id is **not recorded in this document**; the
-coordinator holds the session record.
+decides to". The user's 2026-10-30 instruction session is recorded as
+**`ses_e73abb6baffeVk8BLNhLn10U3p`** (the OpenChamber coordinator session).
 
 **What this approval is and is not.** It approves the **architecture/scope
 direction** for the generative model roles on the direct route, grounded in code
@@ -57,6 +57,10 @@ a new route.
   gate), `7f3913e` (application-boundary generation runner, S17-G4), `06f6109`
   (section critic + repair ports, S17-G7), `443a9df` (synthesis/framework/outline
   proposers, S17-G5), `df55fa5` (blueprint/section-writer drafting roles, S17-G6).
+  The delivery-role and screening ports this record now also describes landed
+  **after** the approval baseline (see below): `647c34b` (global reviewer/writer +
+  notes planner ports, S17-G8) and `e6e8719` (Jev screening runner bound to the
+  decision ledger, S17-G9).
 - **Architecture actually present (verified against this branch):**
   - [`runtime/generation.py`](../../src/review_article_agent/runtime/generation.py)
     — a **pure single-shot adapter** over `lead.post_chat`: `ROLES` (the closed
@@ -89,17 +93,28 @@ a new route.
     (critic sees only draft + package; repair edits only targeted sentences,
     never citation keys; deterministic request ids `<id>.<role>.<sha16>` so
     resumes replay).
-  - **Not present on this branch:** a `generation/delivery_roles.py` for
-    `global_reviewer`/`global_writer`/`notes_planner` (these roles are declared in
-    `ROLES` with directives but have **no** production port module here;
-    [`delivery/workflow.py`](../../src/review_article_agent/delivery/workflow.py)
-    still takes injected `reviewer`/`writer` fixtures). Screening is likewise
-    **not** a chat-fallback generation port on this branch:
-    [`screening/workflow.py`](../../src/review_article_agent/screening/workflow.py)
-    is the Jev decision-ledger workflow that accepts only imported responses; the
-    `screening` role has a directive but no production port module. These are
-    described below as "Jev decision ledger (in progress)" / "declared, not yet
-    wired".
+  - **Delivery roles (added after the baseline, merged on this branch as
+    `647c34b`, S17-G8):** [`generation/delivery_roles.py`](../../src/review_article_agent/generation/delivery_roles.py)
+    — `make_global_review_ports` builds the `global_reviewer`/`global_writer`
+    ports for [`delivery/workflow.DeliveryRepository.run_global_review`](../../src/review_article_agent/delivery/workflow.py)
+    (the writer edits only targeted paragraphs, and a paragraph edit that would
+    add a citation key not already present is rejected; the distinct-concrete-model
+    rule is enforced via `role_models_distinct`); `plan_note_edits` runs one
+    bounded `notes_planner` request that proposes an edit batch, drops invalid
+    edits with static reasons, and **never** calls `apply_notes` (the human
+    approves the batch first). Both derive deterministic request ids
+    `<delivery_id>.<role>.<sha16>`.
+  - **Screening (added after the baseline, merged on this branch as `e6e8719`,
+    S17-G9):** [`screening/runner.py`](../../src/review_article_agent/screening/runner.py)
+    — `execute_screening_case` runs the **Jev** direct path (not a chat fallback):
+    it reuses the `generation.hosted_use.screening` gate, reserves a `direct_call`
+    dispatch via `runtime/dispatch`, records the immutable pre-dispatch intent
+    (including runner-stored per-question `QuestionDef`/criteria artifacts),
+    dispatches once, and commits via `DecisionResultRepository.commit_result`.
+    Screening cases may reference a committed result
+    (`{"decision_result_ref": {...}}`) and are then recorded with provenance
+    `verified_dispatch`; imported responses keep `imported_unverified_dispatch`.
+    A Jev answer never auto-excludes.
 
 ## Options and evidence
 
@@ -139,10 +154,14 @@ discussed against the code already merged on the branch).**
   `global_reviewer`, `global_writer`, `notes_planner`. `fact_checker` **remains**
   the deterministic [`review/schema.fact_check`](../../src/review_article_agent/review/schema.py)
   (line 492); the adapter declares a directive for it but no production port
-  replaces the deterministic checker. `screening` remains the Jev decision ledger
-  (in progress) unless a chat-fallback port is added; `global_reviewer`,
-  `global_writer`, and `notes_planner` are declared in `ROLES` but **not yet
-  wired** to a production port on this branch.
+  replaces the deterministic checker. `screening` is wired to the Jev direct path
+  ([`screening/runner.py`](../../src/review_article_agent/screening/runner.py)
+  `execute_screening_case`), which commits to the same decision ledger. The
+  delivery roles `global_reviewer`, `global_writer`, and `notes_planner` are
+  wired to production ports
+  ([`generation/delivery_roles.py`](../../src/review_article_agent/generation/delivery_roles.py)
+  `make_global_review_ports` / `plan_note_edits`); the notes planner only
+  *proposes* a batch and never applies it without a human `approval_id`.
 - **One adapter.** Every model-backed generative call runs through
   [`runtime/generation.py`](../../src/review_article_agent/runtime/generation.py)
   and the application-boundary
@@ -215,11 +234,13 @@ discussed against the code already merged on the branch).**
   [`generation/synthesis_roles.py`](../../src/review_article_agent/generation/synthesis_roles.py),
   [`generation/drafting_roles.py`](../../src/review_article_agent/generation/drafting_roles.py),
   [`generation/review_roles.py`](../../src/review_article_agent/generation/review_roles.py),
+  [`generation/delivery_roles.py`](../../src/review_article_agent/generation/delivery_roles.py),
+  [`screening/runner.py`](../../src/review_article_agent/screening/runner.py),
   [`runtime/roles.py`](../../src/review_article_agent/runtime/roles.py).
 - Decision format: [`docs/implementation/decision-template.md`](../implementation/decision-template.md).
-- **Unresolved follow-up (not blockers):** a production port module for
-  `global_reviewer`/`global_writer`/`notes_planner`; a screening chat-fallback
-  decision (the Jev ledger is in progress); a CLI for proposing the
-  `generation_hosted_use` document (none exists today — see `docs/generation.md`);
-  and live model validation (unrun). No secrets and no licensed full text are
+- **Unresolved follow-up (not blockers):** a CLI for proposing the
+  `generation_hosted_use` document (none exists today — the Python API is the
+  only route; see `docs/generation.md`); a worker job kind for the generation
+  roles (none exists yet — a pipeline/orchestrator change will add them); and
+  live model validation (unrun). No secrets and no licensed full text are
   included here.

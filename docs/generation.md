@@ -25,17 +25,25 @@ remain required before anything is authoritative.
   reserve, single POST, atomic commit) and `get_generation_outcome` (readback).
 - Role modules: [`generation/synthesis_roles.py`](../src/review_article_agent/generation/synthesis_roles.py),
   [`generation/drafting_roles.py`](../src/review_article_agent/generation/drafting_roles.py),
-  [`generation/review_roles.py`](../src/review_article_agent/generation/review_roles.py).
+  [`generation/review_roles.py`](../src/review_article_agent/generation/review_roles.py),
+  [`generation/delivery_roles.py`](../src/review_article_agent/generation/delivery_roles.py)
+  (`make_global_review_ports`, `plan_note_edits`).
+- [`screening/runner.py`](../src/review_article_agent/screening/runner.py) —
+  `execute_screening_case`, the application boundary that runs the **Jev** direct
+  path (not the chat fallback) through the same hosted-use gate/rights/budget
+  machinery and commits via the decision ledger.
 
 ## Roles
 
 The closed role set is `runtime.generation.ROLES`. The direct-call dispatch stage
-is `generation` (`generation.runner.GENERATION_STAGE`). "Wired" means a production
-port module exists on this branch and calls `execute_generation_task`.
+for the generative roles is `generation` (`generation.runner.GENERATION_STAGE`).
+"Wired" means a production port module exists on this branch and drives the role
+through its runner — for the `generation` stage, `execute_generation_task`; for
+`screening`, the Jev direct path in `screening/runner.py` (stage `screening`).
 
 | Role | Stage | Prompt version constant | Output contract owner / validator | Consumed by | Wired? |
 | --- | --- | --- | --- | --- | --- |
-| `screening` | `generation` | — | — | Jev decision ledger ([`screening/workflow.py`](../src/review_article_agent/screening/workflow.py)) | **No** — Jev decision ledger (in progress); a directive exists in `ROLES` but no chat-fallback port |
+| `screening` | `screening` | `screening/runner.PROMPT_VERSION = "screening.jev.v1"` | Jev rubric (`runtime/jev.py`, deterministic) | Jev decision ledger ([`screening/workflow.py`](../src/review_article_agent/screening/workflow.py)) via [`screening/runner.py`](../src/review_article_agent/screening/runner.py) `execute_screening_case` | Yes |
 | `synthesis` | `generation` | `PROMPT_VERSION_SYNTHESIS = "synthesis/1"` | `synthesis/schema.validate_synthesis` | `synthesis/workflow.SynthesisWorkflowRepository.propose`; gate `artifact_revision` / `synthesis.memo` | Yes |
 | `framework` | `generation` | `PROMPT_VERSION_FRAMEWORK = "framework/1"` | `synthesis/schema.validate_framework` | `synthesis.workflow…propose`; gate `framework` / `synthesis.framework` | Yes |
 | `outline` | `generation` | `PROMPT_VERSION_OUTLINE = "outline/1"` | `synthesis/schema.validate_outline` | `synthesis.workflow…propose`; gate `outline` / `synthesis.outline` | Yes |
@@ -44,13 +52,12 @@ port module exists on this branch and calls `execute_generation_task`.
 | `section_critic` | `generation` | `SECTION_CRITIC_PROMPT_VERSION = "section_critic.generation.v1"` | `review/schema.normalize_finding` | `review/workflow.SectionReviewRepository.run` via `review_roles.make_review_ports` | Yes |
 | `section_repair` | `generation` | `SECTION_REPAIR_PROMPT_VERSION = "section_repair.generation.v1"` | `review/schema.check_repair` | `review/workflow.SectionReviewRepository.run` via `make_review_ports` | Yes |
 | `fact_checker` | `generation` | — | `review/schema.fact_check` (deterministic) | `review/workflow` | **No** — the deterministic `review/schema.fact_check` (line 492) remains the mechanism; `ROLES` declares a directive only |
-| `global_reviewer` | `generation` | — | — | `delivery/workflow.py` (injected `reviewer` port) | **No** — declared in `ROLES`; no production port on this branch |
-| `global_writer` | `generation` | — | — | `delivery/workflow.py` (injected `writer` port) | **No** — declared in `ROLES`; no production port on this branch |
-| `notes_planner` | `generation` | — | — | `delivery/workflow.py` (`plan_notes`) | **No** — declared in `ROLES`; no production port on this branch |
+| `global_reviewer` | `generation` | `GLOBAL_REVIEWER_PROMPT_VERSION = "global_reviewer.generation.v1"` | delivery findings (`delivery/schema.evaluate_global`) | `delivery/workflow.DeliveryRepository.run_global_review` via [`generation/delivery_roles.py`](../src/review_article_agent/generation/delivery_roles.py) `make_global_review_ports` | Yes |
+| `global_writer` | `generation` | `GLOBAL_WRITER_PROMPT_VERSION = "global_writer.generation.v1"` | delivery schema (`delivery/schema.py`; targeted-paragraph, no new citation key) | `delivery/workflow.DeliveryRepository.run_global_review` via [`generation/delivery_roles.py`](../src/review_article_agent/generation/delivery_roles.py) `make_global_review_ports` | Yes |
+| `notes_planner` | `generation` | `NOTES_PLANNER_PROMPT_VERSION = "notes_planner.generation.v1"` | delivery schema (`EDIT_KINDS`) | `delivery/workflow.DeliveryRepository.apply_notes` (only after a human `approval_id`) via [`generation/delivery_roles.py`](../src/review_article_agent/generation/delivery_roles.py) `plan_note_edits` (proposal only; human approves the batch) | Yes |
 
-Unverified/absent on this branch: `generation/delivery_roles.py` does not exist;
-`delivery/workflow.py` still takes injected `reviewer`/`writer` fixtures. The
-prompt-version constants above are the ones actually defined in the role modules.
+The prompt-version constants above are the ones actually defined in the role
+modules.
 
 `role` and `prompt_version` are pinned into the request digest and the synthetic
 system message by the adapter, so a stored output is bound to the exact prompt
@@ -244,7 +251,8 @@ response = TransportResponse(
 
 Tests are in `tests/test_runtime_generation.py`, `tests/test_generation_hosted_use.py`,
 `tests/test_generation_runner.py`, `tests/test_generation_synthesis_roles.py`,
-`tests/test_generation_drafting_roles.py`, and `tests/test_generation_review_roles.py`.
+`tests/test_generation_drafting_roles.py`, `tests/test_generation_review_roles.py`,
+`tests/test_generation_delivery_roles.py`, and `tests/test_screening_runner.py`.
 The runner's `_FakeTransport` (queued responses; raises `RuntimeError` when empty)
 is the canonical pattern.
 
@@ -255,9 +263,14 @@ is the canonical pattern.
   validation, and any human escalation.
 - The OpenCode production route is **unchanged** and still fail-closed
   (`runtime/execution_boundary.py`); this route does not relax it.
-- `screening` (Jev decision ledger, in progress), `fact_checker` (deterministic),
-  and `global_reviewer`/`global_writer`/`notes_planner` are **not** wired to a
-  production generation port on this branch.
+- `fact_checker` remains the deterministic `review/schema.fact_check`; `ROLES`
+  declares a directive for it but no production port replaces the deterministic
+  checker.
+- The delivery roles (`global_reviewer`/`global_writer`/`notes_planner`) and
+  `screening` **are** wired now (`generation/delivery_roles.py`,
+  `screening/runner.py`), but there is still **no CLI** to propose a
+  `generation_hosted_use` document (Python API only) and **no worker job kind**
+  for the generation roles yet (a pipeline/orchestrator change will add them).
 - Live model validation of these roles is **unrun**; the user separately
   authorized one small live OpenRouter smoke test, which is not authorization to
   upload third-party papers or approve a real project.
