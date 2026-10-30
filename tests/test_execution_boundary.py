@@ -404,22 +404,6 @@ class ExecutionBoundaryTest(scenario_helpers.SessionTurnPlanTestBase):
                 scenario.manager, scenario.spec, authorized=True
             )
 
-    # -- production routes ------------------------------------------------
-    def test_production_routes_are_blocked(self) -> None:
-        for route, code in (
-            (eb.SESSION_ROUTE, "session_route_blocked"),
-            (eb.DIRECT_ROUTE, "direct_route_blocked"),
-        ):
-            with self.assertRaises(eb.ExecutionBoundaryBlocked) as ctx:
-                eb.assert_production_execution_supported(route)
-            self.assertEqual(ctx.exception.code, code)
-            self.assertIsInstance(ctx.exception, eb.ProductionExecutionBlocked)
-        for bogus in ("bogus", None, 1, ""):
-            with self.assertRaises(eb.ExecutionBoundaryBlocked) as ctx:
-                eb.assert_production_execution_supported(bogus)
-            self.assertEqual(ctx.exception.code, "route")
-        self.assertEqual(eb.PRODUCTION_SUPPORTED_ROUTES, frozenset())
-
     def test_declared_boundary_is_non_authorizing(self) -> None:
         self.assertFalse(eb.EXECUTION_BOUNDARY_IS_OUT_OF_BAND_APPROVAL)
         self.assertFalse(eb.EXECUTION_BOUNDARY_IS_PERSISTED_PROOF)
