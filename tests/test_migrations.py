@@ -7,6 +7,7 @@ rows across an upgrade (the property future artifact migrations rely on).
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 import tempfile
@@ -251,6 +252,87 @@ class MigrationTest(unittest.TestCase):
             conn.close()
         with self.assertRaises(UnsupportedSchemaVersion):
             Registry(data_dir).list_projects()
+
+
+class SynchronousPragmaTest(unittest.TestCase):
+    """The test-only SQLite durability hook (``schema.resolve_synchronous``).
+
+    Production durability stays ``FULL``; only the environment variable
+    ``RAA_TEST_SQLITE_SYNCHRONOUS`` may lower it, and only for the exact values
+    ``OFF``/``NORMAL``.
+    """
+
+    def test_unset_and_unknown_resolve_to_full(self) -> None:
+        for value in (
+            None,
+            "",
+            "FULL",
+            "off",
+            "normal",
+            "Off",
+            "garbage",
+            "1",
+            " ON",
+        ):
+            env = {} if value is None else {schema.TEST_SYNCHRONOUS_ENV: value}
+            with self.subTest(value=value):
+                self.assertEqual(schema.resolve_synchronous(env), "FULL")
+
+    def test_off_and_normal_honoured(self) -> None:
+        self.assertEqual(
+            schema.resolve_synchronous({schema.TEST_SYNCHRONOUS_ENV: "OFF"}),
+            "OFF",
+        )
+        self.assertEqual(
+            schema.resolve_synchronous({schema.TEST_SYNCHRONOUS_ENV: "NORMAL"}),
+            "NORMAL",
+        )
+
+    def test_never_raises_on_broken_mapping(self) -> None:
+        class Boom(dict):
+            def get(self, *args, **kwargs):  # noqa: D401 - test double
+                raise RuntimeError("boom")
+
+        self.assertEqual(schema.resolve_synchronous(Boom()), "FULL")
+
+    def test_production_default_is_full(self) -> None:
+        self.assertIn("PRAGMA synchronous = FULL", schema.COMMON_PRAGMAS)
+        self.assertIn("PRAGMA synchronous = FULL", schema.common_pragmas())
+        self.assertEqual(schema.PRODUCTION_SYNCHRONOUS, "FULL")
+
+    def test_open_connection_honours_env(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="raa-sync-") as tmp:
+            db_path = os.path.join(tmp, "store.db")
+            old = os.environ.get(schema.TEST_SYNCHRONOUS_ENV)
+            try:
+                os.environ[schema.TEST_SYNCHRONOUS_ENV] = "OFF"
+                conn = schema.open_connection(db_path)
+                try:
+                    # 0 == OFF, 1 == NORMAL, 2 == FULL, 3 == EXTRA.
+                    value = int(conn.execute("PRAGMA synchronous").fetchone()[0])
+                finally:
+                    conn.close()
+                self.assertEqual(value, 0)
+            finally:
+                if old is None:
+                    os.environ.pop(schema.TEST_SYNCHRONOUS_ENV, None)
+                else:
+                    os.environ[schema.TEST_SYNCHRONOUS_ENV] = old
+
+    def test_open_connection_defaults_to_full(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="raa-sync-") as tmp:
+            db_path = os.path.join(tmp, "store.db")
+            old = os.environ.pop(schema.TEST_SYNCHRONOUS_ENV, None)
+            try:
+                conn = schema.open_connection(db_path)
+                try:
+                    value = int(conn.execute("PRAGMA synchronous").fetchone()[0])
+                finally:
+                    conn.close()
+                self.assertEqual(value, 2)  # FULL
+            finally:
+                if old is not None:
+                    os.environ[schema.TEST_SYNCHRONOUS_ENV] = old
 
 
 if __name__ == "__main__":  # pragma: no cover
