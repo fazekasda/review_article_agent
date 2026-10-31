@@ -454,19 +454,21 @@ class ApprovalRepository:
         with the historical :data:`VERSION_LINEAGE_ROLE`; if the same revision is
         also reachable through any non-ancestry (live-input) edge, the live role
         wins conservatively. The full exact closure is always preserved.
+
+        Liveness is a **path** property: a node is live iff it is reachable from
+        the target through a path made exclusively of non-ancestry edges. A node
+        reached only through a ``version_of`` edge -- or through the historical
+        inputs of an ancestor, which are reachable only via that ancestry edge --
+        is lineage, so a revised ancestor's superseded sources are not head-
+        compared (and do not spuriously invalidate an amendment).
         """
         target_key = (target_ref["artifact_id"], target_ref["revision_id"])
-        order: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        edges: list[tuple[str, str]] = []  # roles of every reached edge
+        order: list[tuple[str, str]] = [target_key]
+        seen: set[tuple[str, str]] = {target_key}
         live_keys: set[tuple[str, str]] = {target_key}
         queue: list[tuple[str, str]] = [target_key]
         while queue:
             key = queue.pop(0)
-            if key in seen:
-                continue
-            seen.add(key)
-            order.append(key)
             artifact_id, revision_id = key
             if self._artifacts.get_revision(artifact_id, revision_id) is None:
                 raise RecordValidationError(
@@ -477,13 +479,25 @@ class ApprovalRepository:
                 self._artifacts.list_dependencies(artifact_id, revision_id),
                 key=lambda d: (d.artifact_id, d.revision_id, d.role),
             )
+            # Liveness propagates only along live edges from the target: a child
+            # reached through an ancestry edge, or from a node that is itself only
+            # historical lineage, is not a live input. "Live wins": a node also
+            # reachable by an all-live path is live. A node discovered first as
+            # lineage and later reached live is re-walked so liveness propagates
+            # through it (``live_keys`` makes this monotone and terminating).
+            parent_is_live = key in live_keys
             for dep in dependencies:
                 child = (dep.artifact_id, dep.revision_id)
-                if dep.role != _ANCESTRY_ROLE:
-                    # Any live (non-ancestry) edge marks the child as a live input,
-                    # even if it is also named as an ancestor ("live wins").
+                child_is_live = parent_is_live and dep.role != _ANCESTRY_ROLE
+                newly_discovered = child not in seen
+                if newly_discovered:
+                    seen.add(child)
+                    order.append(child)
+                if child_is_live and child not in live_keys:
                     live_keys.add(child)
-                if child not in seen:
+                    if not newly_discovered:
+                        queue.append(child)
+                if newly_discovered:
                     queue.append(child)
         entries: list[FixtureSnapshotEntry] = []
         for key in order:

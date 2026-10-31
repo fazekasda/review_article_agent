@@ -711,7 +711,11 @@ class LineageSnapshotTest(ApprovalTestBase):
         entries = {e.revision_id: e.role for e in approvals.snapshot_entries(appr.approval_id)}
         self.assertEqual(entries["rev-2"], "target")
         self.assertEqual(entries["rev-1"], "version_lineage")
-        self.assertEqual(entries["rev-doc"], "source_document")
+        # The document is reachable only through the version_of ancestry edge to
+        # rev-1, so it too is historical lineage: still pinned and verified, but
+        # never head-compared (a revised ancestor's superseded source must not
+        # spuriously invalidate an amendment).
+        self.assertEqual(entries["rev-doc"], "version_lineage")
         self.assertEqual(approvals.evaluate(appr.approval_id).status, "active")
         self.assertTrue(approvals.verify_snapshot(appr.approval_id).ok)
 
@@ -723,13 +727,17 @@ class LineageSnapshotTest(ApprovalTestBase):
         )
         self.assertEqual(approvals.evaluate(appr.approval_id).status, "stale")
 
-    def test_live_input_edit_after_lineage_stales(self) -> None:
+    def test_historical_source_edit_after_lineage_does_not_stale(self) -> None:
+        # The document is reachable only through the version_of ancestry edge to
+        # rev-1, so it is historical lineage: a later edit of that historical
+        # source does not reopen the amendment's approval. A genuinely *live*
+        # input edit still stales (see the transitive-dependency staleness test).
         store, repo, doc, doc_rev, rep, r1, approvals, appr = self._lineage_setup()
         self.import_revision(
             repo, doc.artifact_id, b"doc-v2", revision_id="rev-doc-2",
             parent_revision_id=doc_rev.revision_id,
         )
-        self.assertEqual(approvals.evaluate(appr.approval_id).status, "stale")
+        self.assertEqual(approvals.evaluate(appr.approval_id).status, "active")
 
     def test_live_edge_overrides_ancestry_role(self) -> None:
         # Same revision reachable through a live edge and a version_of edge: the
