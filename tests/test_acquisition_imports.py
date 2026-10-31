@@ -421,28 +421,41 @@ class RightsGateTest(Base):
         for table in ("artifact", "revision", "rights_record"):
             self.assertEqual(self.count(table), 0, table)
 
-    def test_unknown_storage_retains_no_bytes(self) -> None:
-        bad = rights(self.pid, "doc-a", "src-1", ops={"storage": "unknown"})
-        with self.assertRaises(AssetImportError) as caught:
-            self.do_import("req-1", src_rights=bad)
-        self.assertEqual(caught.exception.code, "storage_not_allowed")
-        self.assert_nothing_retained()
+    def test_rights_gate_blocks_and_retains_nothing(self) -> None:
+        # One parameterized test: each denied/unknown rights operation fails
+        # closed with its code and retains no bytes.  Each former method is kept
+        # as a subTest case label.
+        def unknown_storage_retains_no_bytes():
+            bad = rights(self.pid, "doc-a", "src-1", ops={"storage": "unknown"})
+            with self.assertRaises(AssetImportError) as caught:
+                self.do_import("req-storage", src_rights=bad)
+            self.assertEqual(caught.exception.code, "storage_not_allowed")
+            self.assert_nothing_retained()
 
-    def test_acquisition_and_storage_are_separate_gates(self) -> None:
-        bad = rights(self.pid, "doc-a", "src-1", ops={"acquisition": "not_allowed"})
-        with self.assertRaises(AssetImportError) as caught:
-            self.do_import("req-1", src_rights=bad)
-        self.assertEqual(caught.exception.code, "acquisition_not_allowed")
-        self.assert_nothing_retained()
+        def acquisition_and_storage_are_separate_gates():
+            bad = rights(self.pid, "doc-a", "src-1", ops={"acquisition": "not_allowed"})
+            with self.assertRaises(AssetImportError) as caught:
+                self.do_import("req-acq", src_rights=bad)
+            self.assertEqual(caught.exception.code, "acquisition_not_allowed")
+            self.assert_nothing_retained()
 
-    def test_privacy_denial_blocks(self) -> None:
-        bad = rights(self.pid, "doc-a", "src-1",
-                     privacy={"personal_data": True, "confidentiality": "confidential",
-                              "denial": True})
-        with self.assertRaises(AssetImportError) as caught:
-            self.do_import("req-1", src_rights=bad)
-        self.assertEqual(caught.exception.code, "privacy_denied")
-        self.assert_nothing_retained()
+        def privacy_denial_blocks():
+            bad = rights(self.pid, "doc-a", "src-1",
+                         privacy={"personal_data": True, "confidentiality": "confidential",
+                                  "denial": True})
+            with self.assertRaises(AssetImportError) as caught:
+                self.do_import("req-privacy", src_rights=bad)
+            self.assertEqual(caught.exception.code, "privacy_denied")
+            self.assert_nothing_retained()
+
+        cases = {
+            "test_unknown_storage_retains_no_bytes": unknown_storage_retains_no_bytes,
+            "test_acquisition_and_storage_are_separate_gates": acquisition_and_storage_are_separate_gates,
+            "test_privacy_denial_blocks": privacy_denial_blocks,
+        }
+        for label, check in cases.items():
+            with self.subTest(case=label):
+                check()
 
     def test_superseded_source_rights_rejected(self) -> None:
         self.artifacts.create_artifact("doc-a", kind="document")
