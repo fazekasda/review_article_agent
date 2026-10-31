@@ -374,7 +374,27 @@ class ImpactTests(SynthesisBase):
             "Compound Z tumor-volume effect.",
         )
 
-    def test_concept_change_flags_relationship_only_section(self):
+    def test_framework_edit_impact_matrix(self):
+        """One parameterized method preserving every original case verbatim.
+
+        Each ``subTest`` case label is the original standalone method name. The
+        gate-staling case ``test_definition_edit_flags_dependent_section_and_stales_gate``
+        stays standalone (stale-approval).
+        """
+        cases = (
+            ("test_concept_change_flags_relationship_only_section", self._concept_change),
+            ("test_relationship_edit_flags_indirect_concept_endpoints", self._relationship_edit),
+            ("test_global_criteria_change_flags_all_sections", self._global_criteria),
+            ("test_global_limitations_change_flags_all_sections", self._global_limitations),
+        )
+        for name, case in cases:
+            with self.subTest(case=name):
+                # Each original case ran with its own fresh store (a manifest
+                # request key is single-use), so re-establish the fixture here.
+                self.setUp()
+                case()
+
+    def _concept_change(self):
         # A section with relationship_dependencies ['R1'] and NO concept deps
         # must be flagged when a concept C1 named by R1's endpoint changes.
         synthesis_ref, framework_ref, outline_ref = self.approved_chain()
@@ -386,7 +406,7 @@ class ImpactTests(SynthesisBase):
         self.assertEqual(entry["outline_ref"], outline_ref)
         self.assertEqual(entry["affected_sections"]["sec2"], ["relationship:R1"])
 
-    def test_relationship_edit_flags_indirect_concept_endpoints(self):
+    def _relationship_edit(self):
         synthesis_ref, framework_ref, outline_ref = self.approved_chain()
         edited = self.put_framework(
             synthesis_ref, revision="fw-r2", parent="fw-r1",
@@ -401,7 +421,7 @@ class ImpactTests(SynthesisBase):
         self.assertIn("concept:C1", entry["affected_sections"]["sec1"])
         self.assertIn("concept:C2", entry["affected_sections"]["sec3"])
 
-    def test_global_criteria_change_flags_all_sections(self):
+    def _global_criteria(self):
         # Only criteria change (same concepts/relationships): conservatively flag
         # every dependent section with a global reason; claim none unaffected.
         synthesis_ref, framework_ref, outline_ref = self.approved_chain()
@@ -419,7 +439,7 @@ class ImpactTests(SynthesisBase):
         for section_id in ("sec1", "sec2", "sec3"):
             self.assertEqual(entry["affected_sections"][section_id], ["global_change"])
 
-    def test_global_limitations_change_flags_all_sections(self):
+    def _global_limitations(self):
         synthesis_ref, framework_ref, outline_ref = self.approved_chain()
         edited = self.put_framework(
             synthesis_ref, revision="fw-r2", parent="fw-r1",

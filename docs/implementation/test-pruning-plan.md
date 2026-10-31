@@ -623,6 +623,103 @@ Verification: `python3 scripts/run_tests.py --slow -j 4 <batch modules>` and the
 full fast tier `python3 scripts/run_tests.py -j 4` pass;
 `python3 scripts/check_contract_docs.py` OK; `git diff --check` clean.
 
+### 4.3 Batch H execution results (task S19-PRUNE-H)
+
+Executed on branch `task/s19-prune-H` from
+`91380c7f6ac5601f8a7c862b2e46c0c14bca1646`. Batch H is **test-only** (no `src/`).
+Case-preserving `subTest` merges (P1) in three of the twenty modules; every
+original method name is kept as the `subTest` case label
+(`with self.subTest(case="test_<name>")`), so `grep test_<name>` still finds the
+behaviour text.
+
+| module | before | after | Δ | action |
+|---|---:|---:|---:|---|
+| `test_drafting_package` | 21 | 16 | −5 | P1 merge |
+| `test_synthesis_workflow` | 23 | 20 | −3 | P1 merge |
+| `test_delivery_export` | 17 | 14 | −3 | P1 merge |
+| other 17 Batch H modules | 253 | 253 | 0 | none (see below) |
+| **Batch H total** | **314** | **303** | **−11** | |
+
+P1 merges applied (cases preserved verbatim as `subTest` labels):
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---:|---:|
+| `test_drafting_package` | 6 `BibliographicMetadataTests` cases (`test_present_fields_are_carried_from_the_observation`, `test_authors_and_journal_are_carried_from_the_observation`, `test_disagreeing_authors_or_journal_omit_the_field`, `test_absent_fields_are_omitted_never_invented`, `test_disagreeing_occurrences_omit_the_field`, `test_identity_only_carries_present_namespaces`) → `test_bibliographic_metadata_rules` | 6 | 5 |
+| `test_synthesis_workflow` | 4 framework-edit impact cases (`test_concept_change_flags_relationship_only_section`, `test_relationship_edit_flags_indirect_concept_endpoints`, `test_global_criteria_change_flags_all_sections`, `test_global_limitations_change_flags_all_sections`) → `test_framework_edit_impact_matrix` | 4 | 3 |
+| `test_delivery_export` | 2 `CitedKeysTests` cases (`test_ordered_unique_keys`, `test_no_citations`) → `test_cited_keys` | 2 | 1 |
+| `test_delivery_export` | 3 `CheckConsistencyTests` cases (`test_clean`, `test_invented_and_missing`, `test_duplicate_doi_and_version_mismatch`) → `test_consistency_checks` | 3 | 2 |
+
+Notes:
+
+- The `test_framework_edit_impact_matrix` cases each need a **fresh store** (a
+  manifest request key is single-use, so re-running `approved_chain()` in one
+  store raises `ManifestConflictError`); the merged method calls `self.setUp()`
+  before each `subTest` case to re-establish the identical fixture. The
+  gate-staling case `test_definition_edit_flags_dependent_section_and_stales_gate`
+  stays standalone (stale-approval).
+- **Deletion list: empty.** No P2/P3 deletion was safe in this batch.
+
+**Plan §4.1 row not materialisable (reported, not skipped silently).**
+`test_parsing_core` "malformed-input tests → `test_malformed_inputs` ~8": the
+candidate set is `XmlThreatTests` (`test_entity_declaration_rejected`,
+`test_internal_subset_rejected`, `test_undefined_entity_rejected`,
+`test_unsupported_root_is_human_review_not_exclusion`,
+`test_empty_input_is_human_review_not_exclusion`,
+`test_empty_body_is_human_review_not_exclusion`,
+`test_source_digest_must_match_bytes`). Every one is a fail-closed / XML-threat
+(XXE / entity-expansion / never-exclusion) test, so per the binding keep rule
+("keep every fail-closed test standalone") none was merged.
+
+**Plan §4.2 rows not materialisable (reported).**
+`test_screening_runner::test_*` (covering `test_screening::test_*`) and
+`test_extraction_workflow::test_*` (covering `test_extraction_runner::test_*`)
+are **different layers**, not duplicates: `test_screening` exercises
+`ScreeningRepository` gates/staleness/historical reads and never calls
+`execute_screening_case`; `test_screening_runner` exercises the runner's
+dispatch-commit / reserve-retention / replay / `verified_dispatch` provenance
+(none of which `test_screening` asserts). Likewise `test_extraction_workflow`
+exercises the `ExtractionWorkflowRepository` comparison/gating/selection logic
+over the `_require_run` seam, which `test_extraction_runner` (real runner) does
+not cover. Deleting either would lose coverage, so both rows were left
+untouched.
+
+The remaining Batch H modules are workflow/gate/fail-closed heavy (screening,
+extraction, drafting workspace/drafts/workflow, review, delivery, parsing
+repository, tracing): their methods are already one-behaviour-per-method gate or
+fail-closed tests, which the binding rule keeps standalone, so no safe merge
+group was available.
+
+**§6 grep cross-check** on the exact 11 merged-away standalone names (excluding
+`test-pruning-plan.md` itself):
+
+```bash
+comm -12 <(LC_ALL=C sort -u /tmp/del_H.txt) /tmp/docs_cited_noplan.txt   # empty
+comm -12 <(LC_ALL=C sort -u /tmp/del_H.txt) /tmp/sec_named.txt           # empty
+```
+
+The docs-cited baseline is 438 names (matching §1). Note: the
+`test_tracing_workflow::CacheTests` retrace family was **excluded** from merging
+precisely because all five names are docs-cited
+(`docs/implementation/handoffs/13-origin-tracing.md`), i.e. K1.
+
+**Mutation spot-check (scratch, uncommitted):** forcing `delivery/export.py
+cited_keys` to `return []` made the merged `test_cited_keys` report the exact
+failing case `case='test_ordered_unique_keys'` (and the dependent
+`test_consistency_checks` cases). Source restored (`git diff -- src/` empty).
+
+Verification (all on `task/s19-prune-H`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 <all 20 Batch H modules>
+# -> 20 modules, 303 tests, 0 failures, 0 errors, 5 skipped
+
+python3 scripts/run_tests.py -j 4
+# -> 145 modules, 3691 tests, 0 failures, 0 errors, 703 skipped (fast tier)
+
+python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
+git diff --check                        # -> clean
+```
+
 ## 5. Projected total and reachability
 
 | Group | before | after |
