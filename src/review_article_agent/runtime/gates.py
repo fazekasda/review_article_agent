@@ -29,10 +29,12 @@ What this module **is**
   :class:`PreparedGate`: the named target (entry 0) plus every transitively
   reachable revision, each pinned by ``{project_id, artifact_id, revision_id}``,
   its canonical content digest, its byte size, and its pinned rights key and
-  rights-record digest. All entries share one project. A same-artifact
-  ``version_of`` ancestor is captured as a historical ``version_lineage`` pin:
-  it is verified exactly but is **never** compared against its artifact's
-  current head (so honest history is not spuriously stale). Any live input that
+  rights-record digest. All entries share one project. Any revision reachable
+  from the target only through a ``version_of`` ancestry edge — a same-artifact
+  ancestor *and, transitively, that ancestor's own historical inputs* — is
+  captured as a historical ``version_lineage`` pin: it is verified exactly but is
+  **never** compared against its artifact's current head (so honest history, and
+  an amendment built on it, is not spuriously stale). Any live input that
   is not the artifact's current revision — or a pinned rights record a newer
   ``record_revision`` has superseded — blocks preparation. Every dependency pin
   is validated **before** its revision is looked up: its ``project_id`` must be
@@ -857,17 +859,27 @@ def _exact_closure(store, artifacts: ArtifactRepository, target_ref: dict[str, s
     (target entry 0, live-wins over ancestry, transitive ``version_of`` lineage,
     one shared project) without calling its unbounded builder.
 
+    Liveness is a **path** property: a node is a live input iff it is reachable
+    from the target through a path consisting exclusively of non-ancestry
+    (live-input) edges. Every node reachable only through at least one
+    ``version_of`` ancestry edge — including the historical inputs of an ancestor,
+    which are reachable only via that ancestry edge — is classified as historical
+    ``version_lineage``. Lineage entries keep their exact digest/rights pins
+    (integrity is unchanged) but are never head-compared, so an honest history is
+    not spuriously stale. If a node is reachable both ways, the live role wins.
+
     The :data:`MAX_GATE_SNAPSHOT_ENTRIES` bound is enforced **while discovering
-    unique nodes** (at enqueue time), so a wide or dense graph is refused before
+    unique nodes** (at discovery time), so a wide or dense graph is refused before
     the overflowing node is ever looked up — never after a full unbounded walk.
-    ``seen`` tracks every *discovered* node, so the pending queue never holds a
-    duplicate of a node reached through many edges (a dense graph cannot blow up
-    the queue). The traversal is cycle-safe, and every dependency pin is validated
-    (same project, approved role, ``version_of`` = older same-artifact revision)
-    **before** its revision is looked up.
+    ``seen`` tracks every *discovered* node, so a node reached through many edges
+    is walked at most once for discovery; a node that is later reached by a live
+    path is re-walked once more so liveness propagates through it (``live_keys``
+    makes this monotone and terminating). The traversal is cycle-safe, and every
+    dependency pin is validated (same project, approved role, ``version_of`` =
+    older same-artifact revision) **before** its revision is looked up.
     """
     target_key = (target_ref["artifact_id"], target_ref["revision_id"])
-    order: list[tuple[str, str]] = []
+    order: list[tuple[str, str]] = [target_key]
     seen: set[tuple[str, str]] = {target_key}
     live_keys: set[tuple[str, str]] = {target_key}
     queue: deque[tuple[str, str]] = deque([target_key])
@@ -880,7 +892,6 @@ def _exact_closure(store, artifacts: ArtifactRepository, target_ref: dict[str, s
     try:
         while queue:
             key = queue.popleft()
-            order.append(key)
             artifact_id, revision_id = key
             if artifacts.get_revision(artifact_id, revision_id) is None:
                 raise GateDependencyError(
@@ -895,13 +906,24 @@ def _exact_closure(store, artifacts: ArtifactRepository, target_ref: dict[str, s
             for dep in dependencies:
                 _validate_dependency_edge(store, key, dep)
             dependencies.sort(key=lambda d: (d.artifact_id, d.revision_id, d.role))
+            # Liveness is *path* semantics, not "any edge" semantics: a node is a
+            # live input iff it is reachable from the target through a path made
+            # exclusively of non-ancestry (live-input) edges. A node reached only
+            # through a ``version_of`` ancestry edge -- or through the historical
+            # inputs of an ancestor, which are themselves reachable only via that
+            # ancestry edge -- is historical lineage: its exact bytes are still
+            # pinned for integrity, but it is never head-compared. "Live wins": a
+            # node also reachable by an all-live path is live. A node discovered
+            # first as lineage and later reached live is re-walked so liveness can
+            # propagate through it (the ``live_keys`` set makes this monotone and
+            # terminating: each node is enqueued at most once for discovery and
+            # once for a liveness upgrade).
+            parent_is_live = key in live_keys
             for dep in dependencies:
                 child = (dep.artifact_id, dep.revision_id)
-                if dep.role != _ANCESTRY_ROLE:
-                    # Any live (non-ancestry) edge marks the child as a live
-                    # input, even if it is also named as an ancestor ("live wins").
-                    live_keys.add(child)
-                if child not in seen:
+                child_is_live = parent_is_live and dep.role != _ANCESTRY_ROLE
+                newly_discovered = child not in seen
+                if newly_discovered:
                     seen.add(child)
                     if len(seen) > MAX_GATE_SNAPSHOT_ENTRIES:
                         raise GateDependencyError(
@@ -909,6 +931,14 @@ def _exact_closure(store, artifacts: ArtifactRepository, target_ref: dict[str, s
                             f"{MAX_GATE_SNAPSHOT_ENTRIES}-entry bound; the gate "
                             "snapshot cannot be prepared."
                         )
+                    order.append(child)
+                if child_is_live and child not in live_keys:
+                    live_keys.add(child)
+                    if not newly_discovered:
+                        # Liveness upgrade: re-walk the node so liveness can
+                        # propagate through it to its own live children.
+                        queue.append(child)
+                if newly_discovered:
                     queue.append(child)
 
         entries: list[FixtureSnapshotEntry] = []

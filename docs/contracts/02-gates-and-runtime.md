@@ -2,7 +2,7 @@
 
 ## Status and authority
 
-- **Contract version:** `v3.2` (representation, dated 2026-10-27).
+- **Contract version:** `v3.3` (representation dated 2026-10-27; minor clarification 2026-10-31).
 - **Approval state: behavioral direction APPROVED (2026-10-27); representation
   pending field-level review.** On 2026-10-27 the user approved the **behavior**
   described by the coordinated Step 01 contracts and selected the Step 01
@@ -200,11 +200,26 @@ snapshot/approval). A dependency whose current revision/digest differs from an
 entry makes the bound approval `stale` (revision changed) or `invalidated`
 (digest mismatch).
 
+**What "dependency" means for staleness (clarified 2026-10-31).** For approval
+staleness, a target's **dependencies** are exactly the revisions reachable from
+the target through a path made **only of live (non-`version_of`) edges**. A
+revision reachable **only** through a `version_of` ancestry edge — the ancestor
+itself and, transitively, that ancestor's own historical inputs — is **historical
+lineage**: it MUST still be enumerated in the snapshot and its exact `digest`
+MUST verify (integrity is unchanged), but a change to it MUST NOT make the
+target's approval `stale`. A source the target itself depends on through a live
+path MUST still make the approval `stale` when its revision changes. When a
+revision is reachable both through a live path and through a `version_of`
+ancestry edge, the **live** role wins. This is the user decision of 2026-10-31
+(OpenChamber session `ses_e73abb6baffeVk8BLNhLn10U3p`); the runtime realization
+is `runtime/gates._exact_closure` and
+`storage/approvals.ApprovalRepository._build_snapshot`.
+
 ## 3. Stale and invalidated approvals
 
 | Trigger | Resulting `status` | Effect |
 | --- | --- | --- |
-| Any dependency `revision_id` changes (new evidence/revision, spec line 33) | `stale` | Dependent stage `blocked` until re-approval; unaffected work preserved. |
+| Any **live-path** dependency `revision_id` changes (new evidence/revision, spec line 33) | `stale` | Dependent stage `blocked` until re-approval; unaffected work preserved. |
 | Stored `digest` ≠ recomputed digest | `invalidated` | Approval not honored. |
 | Declared-material change to rubric / framework / parser / model / policy | `stale` | "Material rubric/model/parser changes reopen relevant pilot approval" (spec line 30). |
 | New artifact revision replaces the approved one | `stale` | The prior approval does not carry forward to the new revision. |
@@ -216,6 +231,15 @@ Invariants:
 
 - A `stale`/`invalidated`/`superseded` approval MUST NOT authorize execution or
   export.
+- **A dependency is a live-path input.** The dependencies whose change can make an
+  approval `stale` are exactly the revisions reachable from the target through a
+  path made **only of live (non-`version_of`) edges** (§2.2). A revision reachable
+  **only** through a `version_of` ancestry edge — the ancestor and, transitively,
+  its own historical inputs — is historical lineage: it MUST remain pinned and
+  integrity-verified, but a change to it MUST NOT make the target's approval
+  `stale`. A source the target itself depends on through a live path MUST still
+  make the approval `stale` when its revision changes. (User decision, 2026-10-31;
+  OpenChamber session `ses_e73abb6baffeVk8BLNhLn10U3p`.)
 - A historical exact-revision approval (bound to a now-superseded ancestor tuple)
   is preserved for **audit history**; it MUST NOT authorize current use. This
   document does not create a new historical-export policy — the existing safe
@@ -1121,4 +1145,5 @@ per-project** value is unset, dependent behavior is `blocked` (fail closed, §9)
 | `v2` | 2026-10-27 | Review repairs: gate identity and project-scoped snapshot; out-of-band authority; `VersionSlot` states; typed answers; exact-decimal costs; section-scoped budgets and readiness; superseded/deferred; `configuration_required`; `DispatchAttempt`; cancellation and nullable activation; complete examples; step-01 storage wording. | Historical (superseded). |
 | `v3` | 2026-10-27 | Adapter-faithful decisions: predicate probability mandatory (no boolean/threshold), choice options/confidence/probabilities and score levels/legend per `live_jev.py`, `box` unsupported and excluded, singular typed `answer` with immutable `QuestionDef`/`question_def_ref`, `wire_type` persisted, per-question `missing_answer`/`provider_error`; human disposition cannot waive a confirmed blocker (`counter_evidence` required); `ValidationRecord` separated from `Round`, readiness before validation, reservation-before-dispatch with exactly-once finalize; `CostRecord` amount iff known/estimated with retained reserves; nullable `id|null` activation; waiting-external/pause retain project arbitration; direct retry needs authorization and a non-ambiguous prior outcome; ancestor-tuple stale clause; sibling references as the coordinated contract set; valid synthetic 64-hex digests with explicit out-of-band precondition; example validation against types, ranges, and digests. | Historical (superseded). |
 | `v3.1` | 2026-10-27 | Coordinator's bounded consistency correction after two worker repairs: predicate probability is conditionally mandatory, not mandatory for choice/score answers; read-only validation forbids repairs, not separately authorized model checks, and consumes no repair round. | Historical (superseded). |
-| `v3.2` | 2026-10-27 | Behavioral-direction alignment (2026-10-27 approval): status reframed — behavior approved, representation still proposed. Severity §4.4 becomes the four selected categories with `blocking`/`major`/unclassified-consequential preventing completion. Predicate mapping §6.2 becomes rubric-specific pilot-calibrated rules + uncertainty region (no universal cutoff; raw probability retained; human exclusion approval). Tracing §7.2 becomes required per-project limits (not a Step 01 unresolved item); `configuration_required` is a runtime project gate. New §5.6 records the selected USD 25 / USD 10 / 2 caps and reserve-before-dispatch. §7 adds the review-warning+companion secondary handling (no raw warning tag required; exact manuscript/dependency/warning-set approval; material edits reopen). §12 rewritten to selected policies vs mandatory per-project values. No numeric scientific threshold invented; the 3/2/2 repair maxima are unchanged. Prior "proposed/unapproved" wording retained only in the historical rows above. | **Behaviorally approved (user, 2026-10-27); representation pending review.** |
+| `v3.2` | 2026-10-27 | Behavioral-direction alignment (2026-10-27 approval): status reframed — behavior approved, representation still proposed. Severity §4.4 becomes the four selected categories with `blocking`/`major`/unclassified-consequential preventing completion. Predicate mapping §6.2 becomes rubric-specific pilot-calibrated rules + uncertainty region (no universal cutoff; raw probability retained; human exclusion approval). Tracing §7.2 becomes required per-project limits (not a Step 01 unresolved item); `configuration_required` is a runtime project gate. New §5.6 records the selected USD 25 / USD 10 / 2 caps and reserve-before-dispatch. §7 adds the review-warning+companion secondary handling (no raw warning tag required; exact manuscript/dependency/warning-set approval; material edits reopen). §12 rewritten to selected policies vs mandatory per-project values. No numeric scientific threshold invented; the 3/2/2 repair maxima are unchanged. Prior "proposed/unapproved" wording retained only in the historical rows above. | Historical (superseded). |
+| `v3.3` | 2026-10-31 | Owner-approved clarification of **"dependency" for approval staleness**: a target's dependencies are the revisions reachable from the target through a path made **only of live (non-`version_of`) edges**; a revision reachable **only** through a `version_of` ancestry edge (the ancestor itself and, transitively, its own historical inputs) is historical lineage — pinned in the snapshot and integrity-verified (digest, size, rights), but a change to it does **not** make the target's approval `stale`. A source the target itself depends on through a live path still makes it `stale`. Added to the §2.2 snapshot invariant and the §3 stale table + invariants; the "any dependency `revision_id` changes" row is qualified as a **live-path** dependency. User decision 2026-10-31 (OpenChamber session `ses_e73abb6baffeVk8BLNhLn10U3p`); realized in `runtime/gates._exact_closure` and `storage/approvals.ApprovalRepository._build_snapshot`. | **Current (minor clarification; behavior approved 2026-10-27).** |
