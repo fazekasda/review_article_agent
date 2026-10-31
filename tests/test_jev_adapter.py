@@ -411,35 +411,50 @@ class PerQuestionFailureTests(unittest.TestCase):
         _, outcomes = self._outcomes(payload)
         self.assertEqual(outcomes["confidence_level"].outcome, "malformed")
 
-    def test_type_mismatch_is_malformed(self):
-        payload = valid_payload()
-        payload["answers"]["study_design"] = {"type": "noul", "noul": 0.4}
-        _, outcomes = self._outcomes(payload)
-        self.assertEqual(outcomes["study_design"].outcome, "malformed")
+    def test_malformed_answers(self):
+        # Each former standalone malformed-answer test is preserved verbatim as
+        # a labelled subTest case. (The docs-cited choice/score siblings
+        # test_choice_outside_options_is_malformed_not_protocol and
+        # test_score_outside_levels_is_malformed stay standalone under K1.)
+        def case_test_type_mismatch_is_malformed():
+            payload = valid_payload()
+            payload["answers"]["study_design"] = {"type": "noul", "noul": 0.4}
+            _, outcomes = self._outcomes(payload)
+            self.assertEqual(outcomes["study_design"].outcome, "malformed")
 
-    def test_non_object_answer_is_malformed(self):
-        payload = valid_payload()
-        payload["answers"]["study_design"] = "randomised"
-        _, outcomes = self._outcomes(payload)
-        self.assertEqual(outcomes["study_design"].outcome, "malformed")
+        def case_test_non_object_answer_is_malformed():
+            payload = valid_payload()
+            payload["answers"]["study_design"] = "randomised"
+            _, outcomes = self._outcomes(payload)
+            self.assertEqual(outcomes["study_design"].outcome, "malformed")
 
-    def test_out_of_range_probability_is_malformed(self):
-        payload = valid_payload()
-        payload["answers"]["is_original_report"] = {"type": "noul", "noul": 1.4}
-        _, outcomes = self._outcomes(payload)
-        self.assertEqual(outcomes["is_original_report"].outcome, "malformed")
+        def case_test_out_of_range_probability_is_malformed():
+            payload = valid_payload()
+            payload["answers"]["is_original_report"] = {"type": "noul", "noul": 1.4}
+            _, outcomes = self._outcomes(payload)
+            self.assertEqual(outcomes["is_original_report"].outcome, "malformed")
 
-    def test_bool_probability_is_malformed(self):
-        payload = valid_payload()
-        payload["answers"]["is_original_report"] = {"type": "noul", "noul": True}
-        _, outcomes = self._outcomes(payload)
-        self.assertEqual(outcomes["is_original_report"].outcome, "malformed")
+        def case_test_bool_probability_is_malformed():
+            payload = valid_payload()
+            payload["answers"]["is_original_report"] = {"type": "noul", "noul": True}
+            _, outcomes = self._outcomes(payload)
+            self.assertEqual(outcomes["is_original_report"].outcome, "malformed")
 
-    def test_undeclared_probability_key_is_malformed(self):
-        payload = valid_payload()
-        payload["answers"]["study_design"]["probabilities"] = {"randomised": 0.5, "x": 0.5}
-        _, outcomes = self._outcomes(payload)
-        self.assertEqual(outcomes["study_design"].outcome, "malformed")
+        def case_test_undeclared_probability_key_is_malformed():
+            payload = valid_payload()
+            payload["answers"]["study_design"]["probabilities"] = {"randomised": 0.5, "x": 0.5}
+            _, outcomes = self._outcomes(payload)
+            self.assertEqual(outcomes["study_design"].outcome, "malformed")
+
+        for label, case in (
+            ("test_type_mismatch_is_malformed", case_test_type_mismatch_is_malformed),
+            ("test_non_object_answer_is_malformed", case_test_non_object_answer_is_malformed),
+            ("test_out_of_range_probability_is_malformed", case_test_out_of_range_probability_is_malformed),
+            ("test_bool_probability_is_malformed", case_test_bool_probability_is_malformed),
+            ("test_undeclared_probability_key_is_malformed", case_test_undeclared_probability_key_is_malformed),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_box_question_is_unsupported(self):
         qs = questions() + [jev.QuestionDef("z_box", jev.BOX, "unsupported")]
@@ -505,141 +520,177 @@ class EnvelopeProtocolTests(unittest.TestCase):
     def _run(self, payload):
         return run(FakeTransport(resp(200, payload)))
 
-    def test_non_object_payload(self):
-        self.assertEqual(self._run(["not", "an", "object"]).status, "protocol_error")
+    def test_malformed_protocol_bodies(self):
+        # Each former standalone envelope/protocol test is preserved verbatim as
+        # a labelled subTest case.
+        def case_test_non_object_payload():
+            self.assertEqual(self._run(["not", "an", "object"]).status, "protocol_error")
 
-    def test_answers_not_a_map(self):
-        self.assertEqual(self._run({"model": "m", "answers": [], "usage": {}}).status, "protocol_error")
+        def case_test_answers_not_a_map():
+            self.assertEqual(self._run({"model": "m", "answers": [], "usage": {}}).status, "protocol_error")
 
-    def test_missing_answers_key(self):
-        self.assertEqual(self._run({"model": "m", "usage": {"input_tokens": 1, "output_tokens": 1}}).status, "protocol_error")
+        def case_test_missing_answers_key():
+            self.assertEqual(self._run({"model": "m", "usage": {"input_tokens": 1, "output_tokens": 1}}).status, "protocol_error")
 
-    def test_missing_usage(self):
-        payload = valid_payload()
-        del payload["usage"]
-        self.assertEqual(self._run(payload).status, "protocol_error")
+        def case_test_missing_usage():
+            payload = valid_payload()
+            del payload["usage"]
+            self.assertEqual(self._run(payload).status, "protocol_error")
 
-    def test_bad_usage_tokens(self):
-        payload = valid_payload()
-        payload["usage"]["input_tokens"] = -3
-        self.assertEqual(self._run(payload).status, "protocol_error")
+        def case_test_bad_usage_tokens():
+            payload = valid_payload()
+            payload["usage"]["input_tokens"] = -3
+            self.assertEqual(self._run(payload).status, "protocol_error")
 
-    def test_undeclared_question_name(self):
-        payload = valid_payload()
-        payload["answers"]["unexpected"] = {"type": "noul", "noul": 0.5}
-        self.assertEqual(self._run(payload).status, "protocol_error")
+        def case_test_undeclared_question_name():
+            payload = valid_payload()
+            payload["answers"]["unexpected"] = {"type": "noul", "noul": 0.5}
+            self.assertEqual(self._run(payload).status, "protocol_error")
 
-    def test_missing_model(self):
-        payload = valid_payload()
-        del payload["model"]
-        self.assertEqual(self._run(payload).status, "protocol_error")
+        def case_test_missing_model():
+            payload = valid_payload()
+            del payload["model"]
+            self.assertEqual(self._run(payload).status, "protocol_error")
 
-    def test_empty_answers_is_all_missing_not_protocol(self):
-        payload = valid_payload()
-        payload["answers"] = {}
-        result = self._run(payload)
-        self.assertEqual(result.status, "completed")
-        self.assertTrue(all(o.outcome == "partial_error" for o in result.outcomes.values()))
+        def case_test_empty_answers_is_all_missing_not_protocol():
+            payload = valid_payload()
+            payload["answers"] = {}
+            result = self._run(payload)
+            self.assertEqual(result.status, "completed")
+            self.assertTrue(all(o.outcome == "partial_error" for o in result.outcomes.values()))
 
-    def test_protocol_error_never_not_incurred(self):
-        payload = valid_payload()
-        payload["answers"] = ["nope"]
-        payload["usage"].pop("cost", None)
-        result = self._run(payload)
-        self.assertEqual(result.status, "protocol_error")
-        self.assertEqual(result.calls_attempted, 1)
-        self.assertNotEqual(result.cost.state, "not_incurred")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_protocol_error_never_not_incurred():
+            payload = valid_payload()
+            payload["answers"] = ["nope"]
+            payload["usage"].pop("cost", None)
+            result = self._run(payload)
+            self.assertEqual(result.status, "protocol_error")
+            self.assertEqual(result.calls_attempted, 1)
+            self.assertNotEqual(result.cost.state, "not_incurred")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_invalid_json_body(self):
-        result = run(FakeTransport(resp(200, "<html>nope</html>")))
-        self.assertEqual(result.status, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_invalid_json_body():
+            result = run(FakeTransport(resp(200, "<html>nope</html>")))
+            self.assertEqual(result.status, "protocol_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_non_finite_json_rejected(self):
-        body = '{"model":"m","answers":{"q":{"type":"noul","noul":NaN}},"usage":{"input_tokens":1,"output_tokens":1}}'
-        result = run(
-            FakeTransport(resp(200, body)),
-            qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
-        )
-        self.assertEqual(result.status, "protocol_error")
+        def case_test_non_finite_json_rejected():
+            body = '{"model":"m","answers":{"q":{"type":"noul","noul":NaN}},"usage":{"input_tokens":1,"output_tokens":1}}'
+            result = run(
+                FakeTransport(resp(200, body)),
+                qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
+            )
+            self.assertEqual(result.status, "protocol_error")
+
+        for label, case in (
+            ("test_non_object_payload", case_test_non_object_payload),
+            ("test_answers_not_a_map", case_test_answers_not_a_map),
+            ("test_missing_answers_key", case_test_missing_answers_key),
+            ("test_missing_usage", case_test_missing_usage),
+            ("test_bad_usage_tokens", case_test_bad_usage_tokens),
+            ("test_undeclared_question_name", case_test_undeclared_question_name),
+            ("test_missing_model", case_test_missing_model),
+            ("test_empty_answers_is_all_missing_not_protocol", case_test_empty_answers_is_all_missing_not_protocol),
+            ("test_protocol_error_never_not_incurred", case_test_protocol_error_never_not_incurred),
+            ("test_invalid_json_body", case_test_invalid_json_body),
+            ("test_non_finite_json_rejected", case_test_non_finite_json_rejected),
+        ):
+            with self.subTest(case=label):
+                case()
 
 
 # --------------------------------------------------------------------------- #
 # Post-dispatch cost accounting
 # --------------------------------------------------------------------------- #
 class PostDispatchCostTests(unittest.TestCase):
-    def test_ambiguous_500_retains_reserve_unknown(self):
-        result = run(FakeTransport(resp(500, {"error": {"code": 500, "message": "boom"}})))
-        self.assertEqual(result.status, "api_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
-        self.assertIsNone(result.cost.amount_usd)
+    def test_post_dispatch_cost_matrix(self):
+        # Each former standalone post-dispatch cost test is preserved verbatim
+        # as a labelled subTest case.
+        def case_test_ambiguous_500_retains_reserve_unknown():
+            result = run(FakeTransport(resp(500, {"error": {"code": 500, "message": "boom"}})))
+            self.assertEqual(result.status, "api_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
+            self.assertIsNone(result.cost.amount_usd)
 
-    def test_ambiguous_429_retains_reserve_unknown(self):
-        result = run(FakeTransport(resp(429, {"error": {"code": 429, "message": "slow"}})))
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_ambiguous_429_retains_reserve_unknown():
+            result = run(FakeTransport(resp(429, {"error": {"code": 429, "message": "slow"}})))
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_definitive_400_not_incurred(self):
-        result = run(FakeTransport(resp(400, {"error": {"code": 400, "message": "bad"}})))
-        self.assertEqual(result.status, "api_error")
-        self.assertEqual(result.cost.state, "not_incurred")
-        self.assertFalse(result.cost.reserve_retained)
-        self.assertIsNone(result.cost.amount_usd)
+        def case_test_definitive_400_not_incurred():
+            result = run(FakeTransport(resp(400, {"error": {"code": 400, "message": "bad"}})))
+            self.assertEqual(result.status, "api_error")
+            self.assertEqual(result.cost.state, "not_incurred")
+            self.assertFalse(result.cost.reserve_retained)
+            self.assertIsNone(result.cost.amount_usd)
 
-    def test_transport_error_unknown_retained(self):
-        transport = FakeTransport(raises=jev.JevTransportError("dropped"))
-        result = run(transport)
-        self.assertEqual(result.status, "transport_error")
-        self.assertEqual(result.calls_attempted, 1)
-        self.assertEqual(len(transport.calls), 1)
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_transport_error_unknown_retained():
+            transport = FakeTransport(raises=jev.JevTransportError("dropped"))
+            result = run(transport)
+            self.assertEqual(result.status, "transport_error")
+            self.assertEqual(result.calls_attempted, 1)
+            self.assertEqual(len(transport.calls), 1)
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_unexpected_transport_exception_still_unknown(self):
-        transport = FakeTransport(raises=RuntimeError("kaboom"))
-        result = run(transport)
-        self.assertEqual(result.status, "transport_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_unexpected_transport_exception_still_unknown():
+            transport = FakeTransport(raises=RuntimeError("kaboom"))
+            result = run(transport)
+            self.assertEqual(result.status, "transport_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_malformed_200_with_valid_cost_is_known(self):
-        payload = valid_payload()  # carries cost 0.00002037
-        payload["answers"] = ["not", "a", "map"]
-        result = run(FakeTransport(resp(200, payload)))
-        self.assertEqual(result.status, "protocol_error")
-        self.assertEqual(result.cost.state, "known")
-        self.assertEqual(result.cost.amount_usd, "0.00002037")
-        self.assertFalse(result.cost.reserve_retained)
+        def case_test_malformed_200_with_valid_cost_is_known():
+            payload = valid_payload()  # carries cost 0.00002037
+            payload["answers"] = ["not", "a", "map"]
+            result = run(FakeTransport(resp(200, payload)))
+            self.assertEqual(result.status, "protocol_error")
+            self.assertEqual(result.cost.state, "known")
+            self.assertEqual(result.cost.amount_usd, "0.00002037")
+            self.assertFalse(result.cost.reserve_retained)
 
-    def test_malformed_200_without_cost_stays_unknown(self):
-        payload = valid_payload()
-        payload["answers"] = ["not", "a", "map"]
-        payload["usage"].pop("cost", None)
-        result = run(FakeTransport(resp(200, payload)))
-        self.assertEqual(result.status, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_malformed_200_without_cost_stays_unknown():
+            payload = valid_payload()
+            payload["answers"] = ["not", "a", "map"]
+            payload["usage"].pop("cost", None)
+            result = run(FakeTransport(resp(200, payload)))
+            self.assertEqual(result.status, "protocol_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_oversize_response_is_protocol_error(self):
-        result = run(
-            FakeTransport(jev.TransportResponse(200, "x" * 50, truncated=True))
-        )
-        self.assertEqual(result.status, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_oversize_response_is_protocol_error():
+            result = run(
+                FakeTransport(jev.TransportResponse(200, "x" * 50, truncated=True))
+            )
+            self.assertEqual(result.status, "protocol_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_completed_without_cost_is_unknown_retained(self):
-        payload = valid_payload()
-        payload["usage"] = {"input_tokens": 10, "output_tokens": 2}
-        result = run(FakeTransport(resp(200, payload)))
-        self.assertEqual(result.status, "completed")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
-        self.assertIsNone(result.cost.amount_usd)
+        def case_test_completed_without_cost_is_unknown_retained():
+            payload = valid_payload()
+            payload["usage"] = {"input_tokens": 10, "output_tokens": 2}
+            result = run(FakeTransport(resp(200, payload)))
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
+            self.assertIsNone(result.cost.amount_usd)
+
+        for label, case in (
+            ("test_ambiguous_500_retains_reserve_unknown", case_test_ambiguous_500_retains_reserve_unknown),
+            ("test_ambiguous_429_retains_reserve_unknown", case_test_ambiguous_429_retains_reserve_unknown),
+            ("test_definitive_400_not_incurred", case_test_definitive_400_not_incurred),
+            ("test_transport_error_unknown_retained", case_test_transport_error_unknown_retained),
+            ("test_unexpected_transport_exception_still_unknown", case_test_unexpected_transport_exception_still_unknown),
+            ("test_malformed_200_with_valid_cost_is_known", case_test_malformed_200_with_valid_cost_is_known),
+            ("test_malformed_200_without_cost_stays_unknown", case_test_malformed_200_without_cost_stays_unknown),
+            ("test_oversize_response_is_protocol_error", case_test_oversize_response_is_protocol_error),
+            ("test_completed_without_cost_is_unknown_retained", case_test_completed_without_cost_is_unknown_retained),
+        ):
+            with self.subTest(case=label):
+                case()
 
 
 # --------------------------------------------------------------------------- #
@@ -865,33 +916,46 @@ NESTED_BODY = "[" * 200_000 + "]" * 200_000
 
 
 class RepairModelPlanTests(unittest.TestCase):
-    def test_plan_rejects_unrelated_model(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.plan_dispatch(
-                questions(), STATE, reserve_usd="0.25", model="openai/expensive-unrelated"
-            )
-
-    def test_build_request_rejects_unrelated_model(self):
-        with self.assertRaises(jev.JevValidationError):
-            jev.build_request(questions(), STATE, model="openai/expensive-unrelated")
-
-    def test_execute_blocks_unrelated_model_zero_calls(self):
-        transport = FakeTransport(resp(200, valid_payload()))
-        result = run(transport, model="openai/expensive-unrelated")
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.calls_attempted, 0)
-        self.assertEqual(transport.calls, [])
-
-    def test_plan_rejects_unbounded_timeout(self):
-        for bad in (float("nan"), float("inf"), float("-inf"), 0, -1, 1e9, True):
+    def test_plan_and_execute_reject_unrelated_model_and_timeout(self):
+        # Each former standalone model/timeout repair test is preserved verbatim
+        # as a labelled subTest case.
+        def case_test_plan_rejects_unrelated_model():
             with self.assertRaises(jev.JevValidationError):
-                jev.plan_dispatch(questions(), STATE, reserve_usd="0.25", timeout=bad)
+                jev.plan_dispatch(
+                    questions(), STATE, reserve_usd="0.25", model="openai/expensive-unrelated"
+                )
 
-    def test_execute_blocks_bad_timeout_zero_calls(self):
-        transport = FakeTransport(resp(200, valid_payload()))
-        result = run(transport, timeout=float("nan"))
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(transport.calls, [])
+        def case_test_build_request_rejects_unrelated_model():
+            with self.assertRaises(jev.JevValidationError):
+                jev.build_request(questions(), STATE, model="openai/expensive-unrelated")
+
+        def case_test_execute_blocks_unrelated_model_zero_calls():
+            transport = FakeTransport(resp(200, valid_payload()))
+            result = run(transport, model="openai/expensive-unrelated")
+            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.calls_attempted, 0)
+            self.assertEqual(transport.calls, [])
+
+        def case_test_plan_rejects_unbounded_timeout():
+            for bad in (float("nan"), float("inf"), float("-inf"), 0, -1, 1e9, True):
+                with self.assertRaises(jev.JevValidationError):
+                    jev.plan_dispatch(questions(), STATE, reserve_usd="0.25", timeout=bad)
+
+        def case_test_execute_blocks_bad_timeout_zero_calls():
+            transport = FakeTransport(resp(200, valid_payload()))
+            result = run(transport, timeout=float("nan"))
+            self.assertEqual(result.status, "blocked")
+            self.assertEqual(transport.calls, [])
+
+        for label, case in (
+            ("test_plan_rejects_unrelated_model", case_test_plan_rejects_unrelated_model),
+            ("test_build_request_rejects_unrelated_model", case_test_build_request_rejects_unrelated_model),
+            ("test_execute_blocks_unrelated_model_zero_calls", case_test_execute_blocks_unrelated_model_zero_calls),
+            ("test_plan_rejects_unbounded_timeout", case_test_plan_rejects_unbounded_timeout),
+            ("test_execute_blocks_bad_timeout_zero_calls", case_test_execute_blocks_bad_timeout_zero_calls),
+        ):
+            with self.subTest(case=label):
+                case()
 
 
 class PlanImmutabilityTests(unittest.TestCase):
@@ -998,24 +1062,35 @@ class StrictValidationRepairTests(unittest.TestCase):
     def _run(self, payload):
         return run(FakeTransport(resp(200, payload)))
 
-    def test_score_just_outside_range_is_malformed(self):
-        payload = valid_payload()
-        payload["answers"]["confidence_level"] = {"type": "score", "score": -0.0000001}
-        result = self._run(payload)
-        self.assertEqual(result.outcomes["confidence_level"].outcome, "malformed")
-
-    def test_score_just_above_max_is_malformed(self):
-        payload = valid_payload()
-        payload["answers"]["confidence_level"] = {"type": "score", "score": 2.0000001}
-        result = self._run(payload)
-        self.assertEqual(result.outcomes["confidence_level"].outcome, "malformed")
-
-    def test_score_at_bounds_is_answered(self):
-        for value in (0, 2):
+    def test_score_bounds_matrix(self):
+        # Each former standalone score-bound test is preserved verbatim as a
+        # labelled subTest case.
+        def case_test_score_just_outside_range_is_malformed():
             payload = valid_payload()
-            payload["answers"]["confidence_level"] = {"type": "score", "score": value}
+            payload["answers"]["confidence_level"] = {"type": "score", "score": -0.0000001}
             result = self._run(payload)
-            self.assertEqual(result.outcomes["confidence_level"].outcome, "answered")
+            self.assertEqual(result.outcomes["confidence_level"].outcome, "malformed")
+
+        def case_test_score_just_above_max_is_malformed():
+            payload = valid_payload()
+            payload["answers"]["confidence_level"] = {"type": "score", "score": 2.0000001}
+            result = self._run(payload)
+            self.assertEqual(result.outcomes["confidence_level"].outcome, "malformed")
+
+        def case_test_score_at_bounds_is_answered():
+            for value in (0, 2):
+                payload = valid_payload()
+                payload["answers"]["confidence_level"] = {"type": "score", "score": value}
+                result = self._run(payload)
+                self.assertEqual(result.outcomes["confidence_level"].outcome, "answered")
+
+        for label, case in (
+            ("test_score_just_outside_range_is_malformed", case_test_score_just_outside_range_is_malformed),
+            ("test_score_just_above_max_is_malformed", case_test_score_just_above_max_is_malformed),
+            ("test_score_at_bounds_is_answered", case_test_score_at_bounds_is_answered),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_legend_wrong_value_type_is_malformed_not_coerced(self):
         payload = valid_payload()
@@ -1288,78 +1363,103 @@ class R2ResponseModelTests(unittest.TestCase):
         payload = valid_payload(model=model)
         return run(FakeTransport(resp(200, payload))).status
 
-    def test_real_dated_snapshot_accepted(self):
-        self.assertEqual(self._status("typesafe/jev-1.14-20261014"), "completed")
-        self.assertEqual(self._status(jev.MODEL), "completed")
+    def test_response_model_matrix(self):
+        # Each former standalone response-model test is preserved verbatim as a
+        # labelled subTest case.
+        def case_test_real_dated_snapshot_accepted():
+            self.assertEqual(self._status("typesafe/jev-1.14-20261014"), "completed")
+            self.assertEqual(self._status(jev.MODEL), "completed")
 
-    def test_arbitrary_suffix_rejected(self):
-        for bad in (
-            "typesafe/jev-1.14-evil",
-            "typesafe/jev-1.14-2026",
-            "typesafe/jev-1.14-2026101",
-            "typesafe/jev-1.14-20261014-extra",
-            "typesafe/jev-1.14-evil-20261014",
-            "openai/gpt-4o",
+        def case_test_arbitrary_suffix_rejected():
+            for bad in (
+                "typesafe/jev-1.14-evil",
+                "typesafe/jev-1.14-2026",
+                "typesafe/jev-1.14-2026101",
+                "typesafe/jev-1.14-20261014-extra",
+                "typesafe/jev-1.14-evil-20261014",
+                "openai/gpt-4o",
+            ):
+                self.assertEqual(self._status(bad), "protocol_error", bad)
+
+        def case_test_overlong_model_rejected():
+            self.assertEqual(self._status("typesafe/jev-1.14-" + "9" * 300), "protocol_error")
+
+        for label, case in (
+            ("test_real_dated_snapshot_accepted", case_test_real_dated_snapshot_accepted),
+            ("test_arbitrary_suffix_rejected", case_test_arbitrary_suffix_rejected),
+            ("test_overlong_model_rejected", case_test_overlong_model_rejected),
         ):
-            self.assertEqual(self._status(bad), "protocol_error", bad)
-
-    def test_overlong_model_rejected(self):
-        self.assertEqual(self._status("typesafe/jev-1.14-" + "9" * 300), "protocol_error")
+            with self.subTest(case=label):
+                case()
 
 
 class R2MetadataAndDepthTests(unittest.TestCase):
-    def test_provider_and_id_bounded(self):
-        for payload in (
-            valid_payload(provider="P" * 300),
-            valid_payload(id="x" * 300),
-            valid_payload(provider=123),
-            valid_payload(id={"a": 1}),
-        ):
-            result = run(FakeTransport(resp(200, payload)))
+    def test_metadata_and_depth_bounds(self):
+        # Each former standalone metadata/depth test is preserved verbatim as a
+        # labelled subTest case. (test_deep_body_is_protocol_error_not_escape is
+        # kept standalone under K2.)
+        def case_test_provider_and_id_bounded():
+            for payload in (
+                valid_payload(provider="P" * 300),
+                valid_payload(id="x" * 300),
+                valid_payload(provider=123),
+                valid_payload(id={"a": 1}),
+            ):
+                result = run(FakeTransport(resp(200, payload)))
+                self.assertEqual(result.status, "protocol_error")
+
+        def case_test_json_depth_bound():
+            # modest nesting parses; a document deeper than 64 is refused.
+            jev._parse_json("[" * 32 + "]" * 32)
+            with self.assertRaises(jev.JevProtocolError):
+                jev._parse_json("[" * 200 + "]" * 200)
+
+        def case_test_response_body_over_byte_bound():
+            big = "x" * (jev.MAX_RESPONSE_BYTES + 1)
+            result = run(FakeTransport(jev.TransportResponse(200, big)))
+            self.assertEqual(result.status, "protocol_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
+
+        def case_test_huge_exponent_cost_is_bounded():
+            body = (
+                '{"model":"%s","answers":{"q":{"type":"noul","noul":0.5}},'
+                '"usage":{"input_tokens":1,"output_tokens":1,"cost":1e999999999}}' % jev.MODEL
+            )
+            result = run(
+                FakeTransport(resp(200, body)),
+                qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
+            )
+            self.assertEqual(result.status, "protocol_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
+
+        def case_test_duplicate_json_key_rejected_in_depth_check_path():
+            body = (
+                '{"model":"%s","answers":{"q":{"type":"noul","noul":0.5,"noul":0.6}},'
+                '"usage":{"input_tokens":1,"output_tokens":1}}' % jev.MODEL
+            )
+            result = run(
+                FakeTransport(resp(200, body)),
+                qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
+            )
             self.assertEqual(result.status, "protocol_error")
 
-    def test_json_depth_bound(self):
-        # modest nesting parses; a document deeper than 64 is refused.
-        jev._parse_json("[" * 32 + "]" * 32)
-        with self.assertRaises(jev.JevProtocolError):
-            jev._parse_json("[" * 200 + "]" * 200)
+        for label, case in (
+            ("test_provider_and_id_bounded", case_test_provider_and_id_bounded),
+            ("test_json_depth_bound", case_test_json_depth_bound),
+            ("test_response_body_over_byte_bound", case_test_response_body_over_byte_bound),
+            ("test_huge_exponent_cost_is_bounded", case_test_huge_exponent_cost_is_bounded),
+            ("test_duplicate_json_key_rejected_in_depth_check_path", case_test_duplicate_json_key_rejected_in_depth_check_path),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_deep_body_is_protocol_error_not_escape(self):
         result = run(FakeTransport(resp(200, "[" * 500 + "]" * 500)))
         self.assertEqual(result.status, "protocol_error")
         self.assertEqual(result.cost.state, "unknown")
         self.assertTrue(result.cost.reserve_retained)
-
-    def test_response_body_over_byte_bound(self):
-        big = "x" * (jev.MAX_RESPONSE_BYTES + 1)
-        result = run(FakeTransport(jev.TransportResponse(200, big)))
-        self.assertEqual(result.status, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
-
-    def test_huge_exponent_cost_is_bounded(self):
-        body = (
-            '{"model":"%s","answers":{"q":{"type":"noul","noul":0.5}},'
-            '"usage":{"input_tokens":1,"output_tokens":1,"cost":1e999999999}}' % jev.MODEL
-        )
-        result = run(
-            FakeTransport(resp(200, body)),
-            qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
-        )
-        self.assertEqual(result.status, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
-
-    def test_duplicate_json_key_rejected_in_depth_check_path(self):
-        body = (
-            '{"model":"%s","answers":{"q":{"type":"noul","noul":0.5,"noul":0.6}},'
-            '"usage":{"input_tokens":1,"output_tokens":1}}' % jev.MODEL
-        )
-        result = run(
-            FakeTransport(resp(200, body)),
-            qs=[jev.QuestionDef("q", jev.PREDICATE, "p")],
-        )
-        self.assertEqual(result.status, "protocol_error")
 
 
 class CriteriaStructureBoundTests(unittest.TestCase):

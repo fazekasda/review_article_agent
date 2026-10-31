@@ -561,6 +561,68 @@ metadata-only branch to `"fulltext"` made `test_explicit_failure_matrix` fail
 exactly on `case='metadata_only_both_sources_is_manual'`, confirming the
 parameterized test still detects a broken path.
 
+### 4.3 Batch B execution results (S19-PRUNE-B)
+
+Test-only, case-preserving `subTest` merges (P1) in the five Batch B modules.
+Every merged case keeps its original method name as the `subTest` label, so
+`grep test_<name>` still finds the behaviour text. No K1 (docs-cited) or K2
+(security/fail-closed) method was removed or renamed; all security-named tests
+stay standalone.
+
+| module | before | after |
+|---|---:|---:|
+| `test_jev_adapter` | 130 | 96 |
+| `test_lead_adapter` | 57 | 57 |
+| `test_extraction_transport` | 68 | 49 |
+| `test_discovery_transport` | 50 | 24 |
+| `test_parsing_pdf_adapter` | 26 | 13 |
+| **Batch B total** | **331** | **239** |
+
+Merges (old method count → new parameterized method; cases preserved):
+
+- `test_extraction_transport`: 9 → `test_never_a_silent_success`; 10 →
+  `test_status_resolution_matrix`; 3 → `test_invalid_plan_inputs_refused`.
+- `test_jev_adapter`: 5 → `test_malformed_answers`; 11 →
+  `test_malformed_protocol_bodies`; 9 → `test_post_dispatch_cost_matrix`; 5 →
+  `test_plan_and_execute_reject_unrelated_model_and_timeout`; 3 →
+  `test_score_bounds_matrix`; 3 → `test_response_model_matrix`; 5 →
+  `test_metadata_and_depth_bounds`.
+- `test_discovery_transport`: 6 → `test_constructor_bounds_refused`; 7 →
+  `test_retry_matrix`; 3 → `test_provenance_matrix`; 6 →
+  `test_parse_retry_after_matrix`; 3 → `test_transport_response_matrix`; 5 →
+  `test_broken_connection_matrix`; 3 → `test_local_interruption_matrix`.
+- `test_parsing_pdf_adapter`: 6 → `test_degraded_extraction_needs_review`; 9 →
+  `test_child_extraction_matrix`.
+- `test_lead_adapter`: already `subTest`-consolidated; no further merges.
+
+Skipped plan §4.1 group: the `test_extraction_transport` 11 forged-input tests
+were **not** merged — they are K2 (forged / fail-closed) and stay standalone, per
+the plan §4.1 K1/K2 exclusion and the task's binding keep rules.
+`test_lead_adapter` already consolidates its forged-plan table in
+`test_forged_plans_refused`.
+
+Cross-check (§6) on the removed standalone `def test_*` names:
+
+```bash
+comm -12 <(LC_ALL=C sort -u DEL) /tmp/docs_cited_noplan.txt   # empty
+comm -12 <(LC_ALL=C sort -u DEL) /tmp/sec_named.txt           # empty
+```
+
+The only docs-cited hits are the plan document's own §4.1 listing of the merge
+group members (self-citation); excluding `test-pruning-plan.md`, the docs-cited
+baseline is 438 names (matching §1) and the cross-check is empty.
+
+Sanity: temporarily adding `404` to `RETRYABLE_STATUSES` (scratch, not committed)
+made `RetryTests::test_retry_matrix` report
+`(case='test_permanent_status_never_retries')` failing; forcing
+`_parse_retry_after` to `1.0` made
+`RetryAfterOverflowTests::test_parse_retry_after_matrix` report each malformed
+case label failing. Source restored.
+
+Verification: `python3 scripts/run_tests.py --slow -j 4 <batch modules>` and the
+full fast tier `python3 scripts/run_tests.py -j 4` pass;
+`python3 scripts/check_contract_docs.py` OK; `git diff --check` clean.
+
 ## 5. Projected total and reachability
 
 | Group | before | after |
