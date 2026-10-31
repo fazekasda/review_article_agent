@@ -86,7 +86,9 @@ output/exit behavior, and the limits of the private snapshot. The model port and
 per-role hosted-use approval are documented in
 [Generative roles](docs/generation.md); the test tiers and CI jobs are in
 [Continuous integration](docs/ci.md) and the [Running tests](#running-tests) section
-below.
+below. When the pipeline stops at a human gate, the
+[Operator guide — approving the human gates](docs/operator-guide.md) walks you
+through each gate in order with the exact commands.
 
 ### Synthetic worker and job lifecycle (Step 03)
 
@@ -225,6 +227,7 @@ off-MVP-path tests; the **fast tier** excludes them. See
 - [Runtime language decision 001 (accepted)](docs/decisions/001-runtime-language.md)
 - [Step 01 kickoff](docs/implementation/kickoffs/01-contracts.md)
 - [Generative roles on the direct OpenRouter route (operator/developer reference)](docs/generation.md)
+- [Operator guide — approving the human gates](docs/operator-guide.md)
 - [Generative roles direct-route decision 005 (accepted)](docs/decisions/005-generative-roles-direct-route.md)
 - [Implementation decision record template](docs/implementation/decision-template.md)
 
