@@ -659,87 +659,114 @@ class MalformedTests(unittest.TestCase):
         self.assertEqual(result.failure, "malformed_response")
         return result
 
-    def test_non_json_body(self):
-        self._assert_malformed(b"not json at all")
+    def test_malformed_page_bodies_are_incomplete(self):
+        # P1 merge: each former standalone malformed-body test is preserved
+        # verbatim as a subTest case (original method name kept as the label).
+        def case_non_json_body():
+            self._assert_malformed(b"not json at all")
 
-    def test_non_object_body(self):
-        self._assert_malformed([1, 2, 3])
+        def case_non_object_body():
+            self._assert_malformed([1, 2, 3])
 
-    def test_missing_result_list(self):
-        self._assert_malformed({"hitCount": 1})
+        def case_missing_result_list():
+            self._assert_malformed({"hitCount": 1})
 
-    def test_result_not_a_list(self):
-        self._assert_malformed({"hitCount": 1, "resultList": {"result": {}}})
+        def case_result_not_a_list():
+            self._assert_malformed({"hitCount": 1, "resultList": {"result": {}}})
 
-    def test_missing_hit_count(self):
-        self._assert_malformed({"resultList": {"result": []}})
+        def case_missing_hit_count():
+            self._assert_malformed({"resultList": {"result": []}})
 
-    def test_boolean_hit_count(self):
-        self._assert_malformed({"hitCount": True, "resultList": {"result": []}})
+        def case_boolean_hit_count():
+            self._assert_malformed({"hitCount": True, "resultList": {"result": []}})
 
-    def test_negative_hit_count(self):
-        self._assert_malformed({"hitCount": -1, "resultList": {"result": []}})
+        def case_negative_hit_count():
+            self._assert_malformed({"hitCount": -1, "resultList": {"result": []}})
 
-    def test_result_entry_not_an_object(self):
-        self._assert_malformed(
-            epmc_payload(hit_count=1, results=["not-an-object"])
-        )
-
-    def test_missing_native_source(self):
-        self._assert_malformed(epmc_payload(hit_count=1, results=[{"id": "1"}]))
-
-    def test_non_string_identifier(self):
-        self._assert_malformed(
-            epmc_payload(hit_count=1, results=[item(123, source="MED")])
-        )
-
-    def test_identifier_with_whitespace(self):
-        self._assert_malformed(
-            epmc_payload(hit_count=1, results=[item("1 2", source="MED")])
-        )
-
-    def test_invalid_publication_year(self):
-        self._assert_malformed(
-            epmc_payload(
-                hit_count=1, results=[item("1", source="MED", pubYear="in press")]
+        def case_result_entry_not_an_object():
+            self._assert_malformed(
+                epmc_payload(hit_count=1, results=["not-an-object"])
             )
-        )
 
-    def test_over_long_title(self):
-        self._assert_malformed(
-            epmc_payload(
-                hit_count=1,
-                results=[
-                    item(
-                        "1",
-                        source="MED",
-                        title="x" * (records.MAX_TITLE_LEN + 1),
-                    )
-                ],
+        def case_missing_native_source():
+            self._assert_malformed(epmc_payload(hit_count=1, results=[{"id": "1"}]))
+
+        def case_non_string_identifier():
+            self._assert_malformed(
+                epmc_payload(hit_count=1, results=[item(123, source="MED")])
             )
-        )
 
-    def test_author_list_not_a_list(self):
-        self._assert_malformed(
-            epmc_payload(
-                hit_count=1,
-                results=[item("1", source="MED", authorList={"author": "Ada"})],
+        def case_identifier_with_whitespace():
+            self._assert_malformed(
+                epmc_payload(hit_count=1, results=[item("1 2", source="MED")])
             )
-        )
 
-    def test_over_long_author_list(self):
-        authors = [{"fullName": f"a{i}"} for i in range(records.MAX_AUTHORS + 1)]
-        self._assert_malformed(
-            epmc_payload(
-                hit_count=1,
-                results=[item("1", source="MED", authorList={"author": authors})],
+        def case_invalid_publication_year():
+            self._assert_malformed(
+                epmc_payload(
+                    hit_count=1, results=[item("1", source="MED", pubYear="in press")]
+                )
             )
-        )
 
-    def test_non_string_journal_title(self):
-        self._assert_malformed(
-            epmc_payload(hit_count=1, results=[item("1", source="MED", journalTitle=7)])
-        )
+        def case_over_long_title():
+            self._assert_malformed(
+                epmc_payload(
+                    hit_count=1,
+                    results=[
+                        item(
+                            "1",
+                            source="MED",
+                            title="x" * (records.MAX_TITLE_LEN + 1),
+                        )
+                    ],
+                )
+            )
+
+        def case_author_list_not_a_list():
+            self._assert_malformed(
+                epmc_payload(
+                    hit_count=1,
+                    results=[item("1", source="MED", authorList={"author": "Ada"})],
+                )
+            )
+
+        def case_over_long_author_list():
+            authors = [{"fullName": f"a{i}"} for i in range(records.MAX_AUTHORS + 1)]
+            self._assert_malformed(
+                epmc_payload(
+                    hit_count=1,
+                    results=[item("1", source="MED", authorList={"author": authors})],
+                )
+            )
+
+        def case_non_string_journal_title():
+            self._assert_malformed(
+                epmc_payload(
+                    hit_count=1, results=[item("1", source="MED", journalTitle=7)]
+                )
+            )
+
+        cases = [
+            ("test_non_json_body", case_non_json_body),
+            ("test_non_object_body", case_non_object_body),
+            ("test_missing_result_list", case_missing_result_list),
+            ("test_result_not_a_list", case_result_not_a_list),
+            ("test_missing_hit_count", case_missing_hit_count),
+            ("test_boolean_hit_count", case_boolean_hit_count),
+            ("test_negative_hit_count", case_negative_hit_count),
+            ("test_result_entry_not_an_object", case_result_entry_not_an_object),
+            ("test_missing_native_source", case_missing_native_source),
+            ("test_non_string_identifier", case_non_string_identifier),
+            ("test_identifier_with_whitespace", case_identifier_with_whitespace),
+            ("test_invalid_publication_year", case_invalid_publication_year),
+            ("test_over_long_title", case_over_long_title),
+            ("test_author_list_not_a_list", case_author_list_not_a_list),
+            ("test_over_long_author_list", case_over_long_author_list),
+            ("test_non_string_journal_title", case_non_string_journal_title),
+        ]
+        for name, case in cases:
+            with self.subTest(case=name):
+                case()
 
     def test_malformed_page_retains_attempt_provenance(self):
         script = [response(200, b"{not json")]

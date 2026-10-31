@@ -93,6 +93,29 @@ class WorkerCliTestCase(unittest.TestCase):
     def _args(self, *rest: str) -> list[str]:
         return ["--data-dir", self.data_dir, *rest]
 
+    def test_subcommands_forward_explicit_timeout(self) -> None:
+        # ``start``/``status``/``stop`` all forward an explicit ``--timeout`` as a
+        # float to the launcher API (one case per subcommand).
+        cases = (
+            ("test_start_forwards_explicit_timeout_as_float", "start_worker",
+             ["worker", "start", "--timeout", "2.5"],
+             _running_status(started=True), {"timeout": 2.5}),
+            ("test_status_forwards_explicit_timeout", "worker_status",
+             ["worker", "status", "--timeout", "0.5"],
+             _down_status("not_running"), {"timeout": 0.5}),
+            ("test_stop_forwards_explicit_timeout", "stop_worker",
+             ["worker", "stop", "--timeout", "3"],
+             {"stopped": True, "unresolved": False, "was_running": True,
+              "pid": 4321, "state": "running", "reason": None},
+             {"timeout": 3.0}),
+        )
+        for label, func, argv, returns, expected in cases:
+            with self.subTest(case=label):
+                with mock.patch.object(process, func, return_value=returns) as m:
+                    code, _out, _err = _run(self._args(*argv))
+                self.assertEqual(code, 0)
+                self.assertEqual(m.call_args.kwargs, expected)
+
 
 class HelpAndDispatchTest(WorkerCliTestCase):
     def test_worker_help_exits_zero(self) -> None:
@@ -147,14 +170,6 @@ class StartTest(WorkerCliTestCase):
         self.assertFalse(json.loads(out2)["worker"]["started"])
         self.assertEqual(m.call_count, 2)
 
-    def test_start_forwards_explicit_timeout_as_float(self) -> None:
-        with mock.patch.object(
-            process, "start_worker", return_value=_running_status(started=True)
-        ) as m:
-            code, _out, _err = _run(self._args("worker", "start", "--timeout", "2.5"))
-        self.assertEqual(code, 0)
-        self.assertEqual(m.call_args.kwargs, {"timeout": 2.5})
-
     def test_start_failure_is_typed_storage_and_curated(self) -> None:
         err = process.WorkerStartError(
             f"the worker did not become ready ({SECRET})", child_pid=111, returncode=3
@@ -169,22 +184,24 @@ class StartTest(WorkerCliTestCase):
 
 
 class StatusTest(WorkerCliTestCase):
-    def test_status_running(self) -> None:
-        with mock.patch.object(
-            process, "worker_status", return_value=_running_status()
-        ) as m:
-            code, out, _err = _run(self._args("worker", "status"))
-        self.assertEqual(code, 0)
-        self.assertEqual(m.call_args.args, (self.data_dir,))
-        worker = json.loads(out)["worker"]
-        self.assertTrue(worker["running"])
-        self.assertTrue(worker["verified"])
-        self.assertIsNone(worker["reason"])
-        self.assertFalse(worker["scientific_validation"])
-
-    def test_status_down_shows_explicit_reason(self) -> None:
+    def test_status_reports_running_or_explicit_reason(self) -> None:
+        # ``test_status_running``: a live worker reports running/verified and no
+        # reason, and the CLI forwards the resolved data dir as the only arg.
+        with self.subTest(case="test_status_running"):
+            with mock.patch.object(
+                process, "worker_status", return_value=_running_status()
+            ) as m:
+                code, out, _err = _run(self._args("worker", "status"))
+            self.assertEqual(code, 0)
+            self.assertEqual(m.call_args.args, (self.data_dir,))
+            worker = json.loads(out)["worker"]
+            self.assertTrue(worker["running"])
+            self.assertTrue(worker["verified"])
+            self.assertIsNone(worker["reason"])
+            self.assertFalse(worker["scientific_validation"])
+        # ``test_status_down_shows_explicit_reason``: every down reason is shown.
         for reason in ("not_running", "foreign_endpoint", "unavailable"):
-            with self.subTest(reason=reason):
+            with self.subTest(case=f"test_status_down_shows_explicit_reason:{reason}"):
                 with mock.patch.object(
                     process, "worker_status", return_value=_down_status(reason)
                 ):
@@ -194,13 +211,6 @@ class StatusTest(WorkerCliTestCase):
                 self.assertFalse(worker["running"])
                 self.assertFalse(worker["verified"])
                 self.assertEqual(worker["reason"], reason)
-
-    def test_status_forwards_explicit_timeout(self) -> None:
-        with mock.patch.object(
-            process, "worker_status", return_value=_down_status("not_running")
-        ) as m:
-            _run(self._args("worker", "status", "--timeout", "0.5"))
-        self.assertEqual(m.call_args.kwargs, {"timeout": 0.5})
 
 
 class StopTest(WorkerCliTestCase):
@@ -247,23 +257,24 @@ class StopTest(WorkerCliTestCase):
         self.assertTrue(worker["already_stopped"])
         self.assertFalse(worker["was_running"])
 
-    def test_stop_pending_is_nonzero_storage(self) -> None:
-        result = self._stop_result(reason="stop_unconfirmed")
-        with mock.patch.object(process, "stop_worker", return_value=result):
-            code, out, errtext = _run(self._args("worker", "stop"))
-        self.assertEqual(code, 4)
-        self.assertEqual(out, "")
-        self.assertEqual(json.loads(errtext)["error"]["category"], "storage")
-        self.assertNotIn("Traceback", errtext)
-
-    def test_stop_unavailable_is_nonzero_storage(self) -> None:
-        for reason in ("stop_unavailable", "unavailable"):
-            with self.subTest(reason=reason):
+    def test_stop_unresolved_is_nonzero_storage(self) -> None:
+        # ``test_stop_pending_is_nonzero_storage`` and
+        # ``test_stop_unavailable_is_nonzero_storage``: an unresolved stop is a
+        # curated storage error (exit 4), never a success.
+        cases = (
+            ("test_stop_pending_is_nonzero_storage", "stop_unconfirmed"),
+            ("test_stop_unavailable_is_nonzero_storage", "stop_unavailable"),
+            ("test_stop_unavailable_is_nonzero_storage:unavailable", "unavailable"),
+        )
+        for label, reason in cases:
+            with self.subTest(case=label):
                 result = self._stop_result(reason=reason)
                 with mock.patch.object(process, "stop_worker", return_value=result):
-                    code, _out, errtext = _run(self._args("worker", "stop"))
+                    code, out, errtext = _run(self._args("worker", "stop"))
                 self.assertEqual(code, 4)
+                self.assertEqual(out, "")
                 self.assertEqual(json.loads(errtext)["error"]["category"], "storage")
+                self.assertNotIn("Traceback", errtext)
 
     def test_stop_foreign_is_nonzero_conflict(self) -> None:
         result = self._stop_result(reason="foreign_endpoint")
@@ -279,12 +290,6 @@ class StopTest(WorkerCliTestCase):
             code, out, _err = _run(self._args("worker", "stop"))
         self.assertNotEqual(code, 0)
         self.assertNotIn("already_stopped", out)
-
-    def test_stop_forwards_explicit_timeout(self) -> None:
-        result = self._stop_result(stopped=True, unresolved=False, reason=None)
-        with mock.patch.object(process, "stop_worker", return_value=result) as m:
-            _run(self._args("worker", "stop", "--timeout", "3"))
-        self.assertEqual(m.call_args.kwargs, {"timeout": 3.0})
 
 
 class TimeoutValidationTest(WorkerCliTestCase):

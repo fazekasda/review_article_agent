@@ -571,43 +571,47 @@ class ExpandRoutesTest(DiscoveryJobRoutesBase):
         )
         return self.ingest_corpus([run.run_id])
 
-    def test_unapproved_plan_zero_http_and_escalates(self) -> None:
-        fake = _CitationProvider()
-        engine = self.engine(fake)
-        plan_ref = self.build_plan()  # never approved
-        corpus_ref = self._observed_corpus()
-        res = self._submit(
-            engine, request_id="exp-unapproved", mode="expand",
-            parameters={"plan_ref": plan_ref, "corpus_ref": corpus_ref,
-                        "roots": [{"source": "MED", "id": "1"}]},
-        )
-        self.assertTrue(res["ok"])
-        job_id = res["job"]["job_id"]
-        self._drive(engine)
-        self.assertEqual(fake.calls, [])
-        # No expansion relation run was recorded (only the corpus ingest run exists).
-        self.assertEqual(
-            [r for r in self.discovery.list_searches() if r.request_id.startswith("dsc_")],
-            [],
-        )
-        self.assertIn(self._job(engine, job_id)["state"], {"waiting_human"})
+    def test_zero_http_and_escalates(self) -> None:
+        # Both a never-approved plan and an out-of-corpus root must issue zero
+        # provider calls and escalate to ``waiting_human``. Original method names
+        # are preserved as ``subTest`` case labels.
+        with self.subTest(case="test_unapproved_plan_zero_http_and_escalates"):
+            fake = _CitationProvider()
+            engine = self.engine(fake)
+            plan_ref = self.build_plan()  # never approved
+            corpus_ref = self._observed_corpus()
+            res = self._submit(
+                engine, request_id="exp-unapproved", mode="expand",
+                parameters={"plan_ref": plan_ref, "corpus_ref": corpus_ref,
+                            "roots": [{"source": "MED", "id": "1"}]},
+            )
+            self.assertTrue(res["ok"])
+            job_id = res["job"]["job_id"]
+            self._drive(engine)
+            self.assertEqual(fake.calls, [])
+            # No expansion relation run was recorded (only the corpus ingest run exists).
+            self.assertEqual(
+                [r for r in self.discovery.list_searches() if r.request_id.startswith("dsc_")],
+                [],
+            )
+            self.assertIn(self._job(engine, job_id)["state"], {"waiting_human"})
 
-    def test_out_of_root_zero_http_and_escalates(self) -> None:
-        fake = _CitationProvider()
-        engine = self.engine(fake)
-        plan_ref = self.build_plan()
-        self.approve_plan(plan_ref)
-        corpus_ref = self._observed_corpus()
-        res = self._submit(
-            engine, request_id="exp-unobserved", mode="expand",
-            parameters={"plan_ref": plan_ref, "corpus_ref": corpus_ref,
-                        "roots": [{"source": "MED", "id": "999999"}]},
-        )
-        self.assertTrue(res["ok"])
-        job_id = res["job"]["job_id"]
-        self._drive(engine)
-        self.assertEqual(fake.calls, [])
-        self.assertIn(self._job(engine, job_id)["state"], {"waiting_human"})
+        with self.subTest(case="test_out_of_root_zero_http_and_escalates"):
+            fake = _CitationProvider()
+            engine = self.engine(fake)
+            plan_ref = self.build_plan()
+            self.approve_plan(plan_ref)
+            corpus_ref = self._observed_corpus()
+            res = self._submit(
+                engine, request_id="exp-unobserved", mode="expand",
+                parameters={"plan_ref": plan_ref, "corpus_ref": corpus_ref,
+                            "roots": [{"source": "MED", "id": "999999"}]},
+            )
+            self.assertTrue(res["ok"])
+            job_id = res["job"]["job_id"]
+            self._drive(engine)
+            self.assertEqual(fake.calls, [])
+            self.assertIn(self._job(engine, job_id)["state"], {"waiting_human"})
 
     def test_expand_bidirectional_lifecycle_and_summary(self) -> None:
         provider = _CitationProvider({

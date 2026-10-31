@@ -507,60 +507,9 @@ class PartialOutcomeTests(unittest.TestCase):
 # Malformed provider responses
 # --------------------------------------------------------------------------- #
 class MalformedResponseTests(unittest.TestCase):
-    def test_malformed_json_never_complete(self):
-        client, fake = make_client([ok(b"{not json")])
-        result = client.search("q", page_size=2, max_pages=3)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-        self.assertEqual(len(fake.calls), 1)
-
-    def test_missing_esearchresult_never_complete(self):
-        client, _ = make_client([ok(json.dumps({"header": {}}).encode())])
-        result = client.search("q", page_size=2, max_pages=3)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_errorlist_never_successful_empty_search(self):
-        client, _ = make_client([ok(esearch_body(0, [], errorlist=["Invalid query"]))])
-        result = client.search("q", page_size=2, max_pages=3)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_warninglist_never_successful_empty_search(self):
-        client, _ = make_client(
-            [ok(esearch_body(0, [], warninglist=["Quoted phrase not found"]))]
-        )
-        result = client.search("q", page_size=2, max_pages=3)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_malformed_xml_never_complete(self):
-        script = [
-            ok(esearch_body(1, [1], retstart=0, retmax=1)),
-            ok(b"<not-xml"),
-        ]
-        client, _ = make_client(script)
-        result = client.search("q", page_size=1, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_wrong_xml_root_never_complete(self):
-        script = [
-            ok(esearch_body(1, [1], retstart=0, retmax=1)),
-            ok(b"<OtherSet></OtherSet>"),
-        ]
-        client, _ = make_client(script)
-        result = client.search("q", page_size=1, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
     def test_entity_declaration_is_refused(self):
+        # K2 security/fail-closed: XXE entity declaration must be refused.
+        # Kept standalone (not merged) per the binding keep rules.
         evil = (
             b'<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
             b"<PubmedArticleSet>&xxe;</PubmedArticleSet>"
@@ -574,6 +523,225 @@ class MalformedResponseTests(unittest.TestCase):
 
         self.assertFalse(result.complete)
         self.assertEqual(result.failure, "malformed_response")
+
+    def test_malformed_bodies_are_never_complete(self):
+        # P1 merge: each former standalone malformed-body test is preserved
+        # verbatim as a subTest case (original method name kept as the label).
+        def case_malformed_json_never_complete():
+            client, fake = make_client([ok(b"{not json")])
+            result = client.search("q", page_size=2, max_pages=3)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+            self.assertEqual(len(fake.calls), 1)
+
+        def case_missing_esearchresult_never_complete():
+            client, _ = make_client([ok(json.dumps({"header": {}}).encode())])
+            result = client.search("q", page_size=2, max_pages=3)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_errorlist_never_successful_empty_search():
+            client, _ = make_client(
+                [ok(esearch_body(0, [], errorlist=["Invalid query"]))]
+            )
+            result = client.search("q", page_size=2, max_pages=3)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_warninglist_never_successful_empty_search():
+            client, _ = make_client(
+                [ok(esearch_body(0, [], warninglist=["Quoted phrase not found"]))]
+            )
+            result = client.search("q", page_size=2, max_pages=3)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_malformed_xml_never_complete():
+            script = [
+                ok(esearch_body(1, [1], retstart=0, retmax=1)),
+                ok(b"<not-xml"),
+            ]
+            client, _ = make_client(script)
+            result = client.search("q", page_size=1, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_wrong_xml_root_never_complete():
+            script = [
+                ok(esearch_body(1, [1], retstart=0, retmax=1)),
+                ok(b"<OtherSet></OtherSet>"),
+            ]
+            client, _ = make_client(script)
+            result = client.search("q", page_size=1, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_huge_count_digit_string_is_malformed():
+            body = json.dumps(
+                {
+                    "esearchresult": {
+                        "count": "1" * 5000,
+                        "retmax": "0",
+                        "retstart": "0",
+                        "idlist": [],
+                    }
+                }
+            ).encode()
+            client, _ = make_client([ok(body)])
+            result = client.search("q", page_size=1, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_deeply_nested_json_is_malformed():
+            body = ("[" * 200000 + "]" * 200000).encode()
+            client, _ = make_client([ok(body)])
+            result = client.search("q", page_size=1, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_invalid_utf8_esearch_is_malformed():
+            client, _ = make_client([ok(b"\xff\xfe")])
+            result = client.search("q", page_size=1, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_invalid_utf8_efetch_is_malformed():
+            script = [
+                ok(esearch_body(1, [1], retstart=0, retmax=1)),
+                ok(b"<PubmedArticleSet>\xff\xfe</PubmedArticleSet>"),
+            ]
+            client, _ = make_client(script)
+            result = client.search("q", page_size=1, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_duplicate_esearch_ids_are_malformed():
+            script = [ok(esearch_body(2, [1, 1], retstart=0, retmax=2))]
+            client, fake = make_client(script)
+            result = client.search("q", page_size=2, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+            self.assertEqual(len(fake.calls), 1)  # never reaches EFetch
+
+        def case_idlist_longer_than_retmax_is_malformed():
+            script = [ok(esearch_body(2, [1, 2], retstart=0, retmax=1))]
+            client, _ = make_client(script)
+            result = client.search("q", page_size=2, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_overlong_title_is_malformed_not_truncated():
+            long_title = "x" * (MAX_TITLE_LEN + 1)
+            script = [
+                ok(esearch_body(1, [1], retstart=0, retmax=1)),
+                ok(efetch_body([{"pmid": 1, "title": long_title}])),
+            ]
+            client, _ = make_client(script)
+            result = client.search("q", page_size=1, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_overlong_author_list_is_malformed_not_truncated():
+            authors = [{"last": f"a{i}"} for i in range(MAX_AUTHORS + 1)]
+            script = [
+                ok(esearch_body(1, [1], retstart=0, retmax=1)),
+                ok(efetch_body([{"pmid": 1, "authors": authors}])),
+            ]
+            client, _ = make_client(script)
+            result = client.search("q", page_size=1, max_pages=1)
+
+            self.assertFalse(result.complete)
+            self.assertEqual(result.failure, "malformed_response")
+
+        def case_huge_year_digit_string_does_not_crash():
+            raw = (
+                "<PubmedArticleSet><PubmedArticle><MedlineCitation>"
+                '<PMID Version="1">1</PMID>'
+                "<Article><ArticleTitle>Big year</ArticleTitle>"
+                "<Journal><JournalIssue><PubDate><Year>"
+                + "1" * 5000
+                + "</Year></PubDate></JournalIssue></Journal></Article>"
+                "</MedlineCitation></PubmedArticle></PubmedArticleSet>"
+            ).encode()
+            script = [ok(esearch_body(1, [1], retstart=0, retmax=1)), ok(raw)]
+            client, _ = make_client(script)
+            result = client.search("q", page_size=1, max_pages=1)
+
+            self.assertTrue(result.complete)
+            self.assertIsNone(result.records[0].publication_year)
+
+        cases = [
+            ("test_malformed_json_never_complete", case_malformed_json_never_complete),
+            (
+                "test_missing_esearchresult_never_complete",
+                case_missing_esearchresult_never_complete,
+            ),
+            (
+                "test_errorlist_never_successful_empty_search",
+                case_errorlist_never_successful_empty_search,
+            ),
+            (
+                "test_warninglist_never_successful_empty_search",
+                case_warninglist_never_successful_empty_search,
+            ),
+            ("test_malformed_xml_never_complete", case_malformed_xml_never_complete),
+            (
+                "test_wrong_xml_root_never_complete",
+                case_wrong_xml_root_never_complete,
+            ),
+            (
+                "test_huge_count_digit_string_is_malformed",
+                case_huge_count_digit_string_is_malformed,
+            ),
+            (
+                "test_deeply_nested_json_is_malformed",
+                case_deeply_nested_json_is_malformed,
+            ),
+            (
+                "test_invalid_utf8_esearch_is_malformed",
+                case_invalid_utf8_esearch_is_malformed,
+            ),
+            (
+                "test_invalid_utf8_efetch_is_malformed",
+                case_invalid_utf8_efetch_is_malformed,
+            ),
+            (
+                "test_duplicate_esearch_ids_are_malformed",
+                case_duplicate_esearch_ids_are_malformed,
+            ),
+            (
+                "test_idlist_longer_than_retmax_is_malformed",
+                case_idlist_longer_than_retmax_is_malformed,
+            ),
+            (
+                "test_overlong_title_is_malformed_not_truncated",
+                case_overlong_title_is_malformed_not_truncated,
+            ),
+            (
+                "test_overlong_author_list_is_malformed_not_truncated",
+                case_overlong_author_list_is_malformed_not_truncated,
+            ),
+            (
+                "test_huge_year_digit_string_does_not_crash",
+                case_huge_year_digit_string_does_not_crash,
+            ),
+        ]
+        for name, case in cases:
+            with self.subTest(case=name):
+                case()
 
 
 # --------------------------------------------------------------------------- #
@@ -856,108 +1024,6 @@ class MalformedInputSafetyTests(unittest.TestCase):
 
         self.assertFalse(result.complete)
         self.assertEqual(result.failure, "malformed_response")
-
-    def test_huge_count_digit_string_is_malformed(self):
-        body = json.dumps(
-            {
-                "esearchresult": {
-                    "count": "1" * 5000,
-                    "retmax": "0",
-                    "retstart": "0",
-                    "idlist": [],
-                }
-            }
-        ).encode()
-        client, _ = make_client([ok(body)])
-        result = client.search("q", page_size=1, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_deeply_nested_json_is_malformed(self):
-        body = ("[" * 200000 + "]" * 200000).encode()
-        client, _ = make_client([ok(body)])
-        result = client.search("q", page_size=1, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_invalid_utf8_esearch_is_malformed(self):
-        client, _ = make_client([ok(b"\xff\xfe")])
-        result = client.search("q", page_size=1, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_invalid_utf8_efetch_is_malformed(self):
-        script = [
-            ok(esearch_body(1, [1], retstart=0, retmax=1)),
-            ok(b"<PubmedArticleSet>\xff\xfe</PubmedArticleSet>"),
-        ]
-        client, _ = make_client(script)
-        result = client.search("q", page_size=1, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_duplicate_esearch_ids_are_malformed(self):
-        script = [ok(esearch_body(2, [1, 1], retstart=0, retmax=2))]
-        client, fake = make_client(script)
-        result = client.search("q", page_size=2, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-        self.assertEqual(len(fake.calls), 1)  # never reaches EFetch
-
-    def test_idlist_longer_than_retmax_is_malformed(self):
-        script = [ok(esearch_body(2, [1, 2], retstart=0, retmax=1))]
-        client, _ = make_client(script)
-        result = client.search("q", page_size=2, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_overlong_title_is_malformed_not_truncated(self):
-        long_title = "x" * (MAX_TITLE_LEN + 1)
-        script = [
-            ok(esearch_body(1, [1], retstart=0, retmax=1)),
-            ok(efetch_body([{"pmid": 1, "title": long_title}])),
-        ]
-        client, _ = make_client(script)
-        result = client.search("q", page_size=1, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_overlong_author_list_is_malformed_not_truncated(self):
-        authors = [{"last": f"a{i}"} for i in range(MAX_AUTHORS + 1)]
-        script = [
-            ok(esearch_body(1, [1], retstart=0, retmax=1)),
-            ok(efetch_body([{"pmid": 1, "authors": authors}])),
-        ]
-        client, _ = make_client(script)
-        result = client.search("q", page_size=1, max_pages=1)
-
-        self.assertFalse(result.complete)
-        self.assertEqual(result.failure, "malformed_response")
-
-    def test_huge_year_digit_string_does_not_crash(self):
-        raw = (
-            "<PubmedArticleSet><PubmedArticle><MedlineCitation>"
-            '<PMID Version="1">1</PMID>'
-            "<Article><ArticleTitle>Big year</ArticleTitle>"
-            "<Journal><JournalIssue><PubDate><Year>"
-            + "1" * 5000
-            + "</Year></PubDate></JournalIssue></Journal></Article>"
-            "</MedlineCitation></PubmedArticle></PubmedArticleSet>"
-        ).encode()
-        script = [ok(esearch_body(1, [1], retstart=0, retmax=1)), ok(raw)]
-        client, _ = make_client(script)
-        result = client.search("q", page_size=1, max_pages=1)
-
-        self.assertTrue(result.complete)
-        self.assertIsNone(result.records[0].publication_year)
-
 
 class QueryTranslationDriftTests(unittest.TestCase):
     def test_translation_drift_is_malformed_and_first_is_retained(self):

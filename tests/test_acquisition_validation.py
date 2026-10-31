@@ -174,54 +174,71 @@ class TestResultShape(_Base):
 # AC2: extension / content-type never establishes success (HTML/login)
 # --------------------------------------------------------------------------- #
 class TestHtmlNeverSucceeds(_Base):
-    def test_login_page_rejected_even_declared_pdf(self):
-        result = self.call(LOGIN_HTML, declared="application/pdf")
-        self.assertEqual(result["media_kind"], "html")
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("html_login_page", result["reasons"])
-        self.assertIn("html_not_an_article", result["reasons"])
-        self.assertIn("content_type_mismatch", result["reasons"])
+    def test_html_never_succeeds(self):
+        # One parameterized test: every HTML/login shape is rejected and never
+        # ready, whatever the declared media type.  Each former method is kept
+        # as a subTest case label.
+        def login_page_rejected_even_declared_pdf():
+            result = self.call(LOGIN_HTML, declared="application/pdf")
+            self.assertEqual(result["media_kind"], "html")
+            self.assertEqual(result["status"], "rejected")
+            self.assertIn("html_login_page", result["reasons"])
+            self.assertIn("html_not_an_article", result["reasons"])
+            self.assertIn("content_type_mismatch", result["reasons"])
 
-    def test_plain_html_rejected(self):
-        result = self.call(PLAIN_HTML, declared="text/html")
-        self.assertEqual(result["media_kind"], "html")
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("html_not_an_article", result["reasons"])
-        self.assertNotIn("content_type_mismatch", result["reasons"])
+        def plain_html_rejected():
+            result = self.call(PLAIN_HTML, declared="text/html")
+            self.assertEqual(result["media_kind"], "html")
+            self.assertEqual(result["status"], "rejected")
+            self.assertIn("html_not_an_article", result["reasons"])
+            self.assertNotIn("content_type_mismatch", result["reasons"])
 
-    def test_html_without_extension_hint_is_still_html(self):
-        # No declared media type at all; content decides.
-        result = self.call(LOGIN_HTML)
-        self.assertEqual(result["media_kind"], "html")
-        self.assertEqual(result["status"], "rejected")
+        def html_without_extension_hint_is_still_html():
+            # No declared media type at all; content decides.
+            result = self.call(LOGIN_HTML)
+            self.assertEqual(result["media_kind"], "html")
+            self.assertEqual(result["status"], "rejected")
 
-    def test_html_never_ready(self):
-        for declared in (None, "application/pdf", "text/html", "application/xml"):
-            self.assertNotEqual(self.call(LOGIN_HTML, declared=declared)["status"], "ready")
+        def html_never_ready():
+            for declared in (None, "application/pdf", "text/html", "application/xml"):
+                self.assertNotEqual(
+                    self.call(LOGIN_HTML, declared=declared)["status"], "ready")
 
-    def test_bom_prefixed_login_html_is_rejected_not_unknown(self):
-        # A leading UTF-8 BOM must not hide the HTML root and demote the asset to
-        # an inert "unknown" that a later human review might try to waive.
-        result = self.call(
-            BOM_LOGIN_HTML, {"pmid": "123"}, declared="application/pdf"
-        )
-        self.assertEqual(result["media_kind"], "html")
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("html_not_an_article", result["reasons"])
-        self.assertIn("html_login_page", result["reasons"])
-        self.assertIn("content_type_mismatch", result["reasons"])
-        self.assertNotIn("unrecognized_container", result["reasons"])
+        def bom_prefixed_login_html_is_rejected_not_unknown():
+            # A leading UTF-8 BOM must not hide the HTML root and demote the
+            # asset to an inert "unknown" a later human review might waive.
+            result = self.call(
+                BOM_LOGIN_HTML, {"pmid": "123"}, declared="application/pdf"
+            )
+            self.assertEqual(result["media_kind"], "html")
+            self.assertEqual(result["status"], "rejected")
+            self.assertIn("html_not_an_article", result["reasons"])
+            self.assertIn("html_login_page", result["reasons"])
+            self.assertIn("content_type_mismatch", result["reasons"])
+            self.assertNotIn("unrecognized_container", result["reasons"])
 
-    def test_leading_html_with_incidental_pdf_magic_is_hard_rejected(self):
-        # A login/HTML body that merely *contains* PDF magic must not be sniffed
-        # as a PDF ("pdf_not_inspected" would be a waivable needs_review).
-        result = self.call(
-            LEADING_HTML_FAKE_PDF, {"pmid": "123"}, declared="application/pdf"
-        )
-        self.assertEqual(result["media_kind"], "html")
-        self.assertEqual(result["status"], "rejected")
-        self.assertIn("html_not_an_article", result["reasons"])
-        self.assertNotIn("pdf_not_inspected", result["reasons"])
+        def leading_html_with_incidental_pdf_magic_is_hard_rejected():
+            # A login/HTML body that merely *contains* PDF magic must not be
+            # sniffed as a PDF ("pdf_not_inspected" would be a waivable review).
+            result = self.call(
+                LEADING_HTML_FAKE_PDF, {"pmid": "123"}, declared="application/pdf"
+            )
+            self.assertEqual(result["media_kind"], "html")
+            self.assertEqual(result["status"], "rejected")
+            self.assertIn("html_not_an_article", result["reasons"])
+            self.assertNotIn("pdf_not_inspected", result["reasons"])
+
+        cases = {
+            "test_login_page_rejected_even_declared_pdf": login_page_rejected_even_declared_pdf,
+            "test_plain_html_rejected": plain_html_rejected,
+            "test_html_without_extension_hint_is_still_html": html_without_extension_hint_is_still_html,
+            "test_html_never_ready": html_never_ready,
+            "test_bom_prefixed_login_html_is_rejected_not_unknown": bom_prefixed_login_html_is_rejected_not_unknown,
+            "test_leading_html_with_incidental_pdf_magic_is_hard_rejected": leading_html_with_incidental_pdf_magic_is_hard_rejected,
+        }
+        for label, check in cases.items():
+            with self.subTest(case=label):
+                check()
 
 
 # --------------------------------------------------------------------------- #
@@ -542,29 +559,43 @@ class TestJatsBodyTailAndEmptiness(_Base):
 
 
 class TestJatsBodyFailClosed(_Base):
-    def test_missing_body_needs_review(self):
-        result = self.call(jats(body=None), {"pmid": "12345678"})
-        self.assertEqual(result["status"], "needs_review")
-        self.assertEqual(result["checks"]["full_text"], "fail")
-        self.assertIn("jats_body_missing", result["reasons"])
+    def test_jats_body_fail_closed(self):
+        # One parameterized test: every missing/empty body or incomplete
+        # structure is needs_review.  Each former method is kept as a subTest
+        # case label.
+        def missing_body_needs_review():
+            result = self.call(jats(body=None), {"pmid": "12345678"})
+            self.assertEqual(result["status"], "needs_review")
+            self.assertEqual(result["checks"]["full_text"], "fail")
+            self.assertIn("jats_body_missing", result["reasons"])
 
-    def test_empty_body_needs_review(self):
-        result = self.call(jats(body=b""), {"pmid": "12345678"})
-        self.assertEqual(result["status"], "needs_review")
-        self.assertIn("jats_body_empty", result["reasons"])
+        def empty_body_needs_review():
+            result = self.call(jats(body=b""), {"pmid": "12345678"})
+            self.assertEqual(result["status"], "needs_review")
+            self.assertIn("jats_body_empty", result["reasons"])
 
-    def test_whitespace_only_body_needs_review(self):
-        result = self.call(jats(body=b"   \n\t  "), {"pmid": "12345678"})
-        self.assertEqual(result["status"], "needs_review")
-        self.assertIn("jats_body_empty", result["reasons"])
+        def whitespace_only_body_needs_review():
+            result = self.call(jats(body=b"   \n\t  "), {"pmid": "12345678"})
+            self.assertEqual(result["status"], "needs_review")
+            self.assertIn("jats_body_empty", result["reasons"])
 
-    def test_missing_article_meta_needs_review(self):
-        data = (
-            b'<?xml version="1.0"?><article><front/><body><p>x</p></body></article>'
-        )
-        result = self.call(data)
-        self.assertEqual(result["status"], "needs_review")
-        self.assertIn("jats_structure_incomplete", result["reasons"])
+        def missing_article_meta_needs_review():
+            data = (
+                b'<?xml version="1.0"?><article><front/><body><p>x</p></body></article>'
+            )
+            result = self.call(data)
+            self.assertEqual(result["status"], "needs_review")
+            self.assertIn("jats_structure_incomplete", result["reasons"])
+
+        cases = {
+            "test_missing_body_needs_review": missing_body_needs_review,
+            "test_empty_body_needs_review": empty_body_needs_review,
+            "test_whitespace_only_body_needs_review": whitespace_only_body_needs_review,
+            "test_missing_article_meta_needs_review": missing_article_meta_needs_review,
+        }
+        for label, check in cases.items():
+            with self.subTest(case=label):
+                check()
 
 
 # --------------------------------------------------------------------------- #
@@ -710,41 +741,49 @@ class TestRequestValidation(unittest.TestCase):
         self.assertTrue(issubclass(AcquisitionValidationError, ReviewAgentError))
         self.assertTrue(issubclass(AcquisitionValidationError, ValueError))
 
-    def test_data_must_be_bytes(self):
-        for bad in (None, "x", 5, [1, 2]):
-            with self.assertRaises(AcquisitionValidationError):
-                validate_asset(bad, expected_identifiers={})
-
     def test_bytes_like_is_accepted(self):
         result = validate_asset(bytearray(GOOD_PDF), expected_identifiers={})
         self.assertEqual(result["media_kind"], "pdf")
 
-    def test_expected_must_be_mapping(self):
-        with self.assertRaises(AcquisitionValidationError):
-            validate_asset(b"x", expected_identifiers=["pmid"])
-
-    def test_expected_key_must_be_known_namespace(self):
-        with self.assertRaises(AcquisitionValidationError):
-            validate_asset(b"x", expected_identifiers={"arxiv": "1234.5678"})
-
-    def test_expected_value_must_be_str(self):
-        with self.assertRaises(AcquisitionValidationError):
-            validate_asset(b"x", expected_identifiers={"pmid": 123})
-
-    def test_expected_shapes_enforced(self):
-        for namespace, value in (
-            ("pmid", "abc"),
-            ("pmcid", "12x"),
-            ("doi", "not-a-doi"),
-            ("pmid", ""),
-            ("doi", "10.1234/"),
-        ):
-            with self.assertRaises(AcquisitionValidationError):
-                validate_asset(b"x", expected_identifiers={namespace: value})
-
-    def test_declared_media_type_must_be_str_or_none(self):
-        with self.assertRaises(AcquisitionValidationError):
-            validate_asset(b"x", expected_identifiers={}, declared_media_type=5)
+    def test_invalid_validation_shapes(self):
+        # One parameterized test per validator: every malformed request shape
+        # must raise ``AcquisitionValidationError``.  Each former method is kept
+        # as a subTest case label.
+        cases = {
+            "test_data_must_be_bytes": [
+                (lambda bad=bad: validate_asset(bad, expected_identifiers={}))
+                for bad in (None, "x", 5, [1, 2])
+            ],
+            "test_expected_must_be_mapping": [
+                lambda: validate_asset(b"x", expected_identifiers=["pmid"])
+            ],
+            "test_expected_key_must_be_known_namespace": [
+                lambda: validate_asset(b"x", expected_identifiers={"arxiv": "1234.5678"})
+            ],
+            "test_expected_value_must_be_str": [
+                lambda: validate_asset(b"x", expected_identifiers={"pmid": 123})
+            ],
+            "test_expected_shapes_enforced": [
+                (lambda namespace=namespace, value=value: validate_asset(
+                    b"x", expected_identifiers={namespace: value}))
+                for namespace, value in (
+                    ("pmid", "abc"),
+                    ("pmcid", "12x"),
+                    ("doi", "not-a-doi"),
+                    ("pmid", ""),
+                    ("doi", "10.1234/"),
+                )
+            ],
+            "test_declared_media_type_must_be_str_or_none": [
+                lambda: validate_asset(
+                    b"x", expected_identifiers={}, declared_media_type=5)
+            ],
+        }
+        for label, invocations in cases.items():
+            for invoke in invocations:
+                with self.subTest(case=label):
+                    with self.assertRaises(AcquisitionValidationError):
+                        invoke()
 
     def test_identifier_namespaces_constant(self):
         self.assertEqual(IDENTIFIER_NAMESPACES, ("pmid", "pmcid", "doi"))

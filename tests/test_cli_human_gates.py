@@ -477,13 +477,28 @@ class GateConfirmRefusalTest(_Base):
         self.assertEqual(prompts, [])  # no terminal I/O before the check
         self.assert_no_rows()
 
-    def test_malformed_expected_digest_is_a_validation_error(self) -> None:
-        pid = self.project_with_revision()
-        proc, prompts = self.seam_cli(*self.confirm_args(pid=pid, digest="not-a-digest"))
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation")
-        self.assertEqual(prompts, [])
-        self.assert_no_rows()
+    def test_invalid_confirm_arguments_are_validation_before_terminal(self) -> None:
+        # ``test_malformed_expected_digest_is_a_validation_error`` and
+        # ``test_out_of_range_timeout_is_a_validation_error_before_the_terminal``:
+        # a malformed digest and an out-of-range timeout are both refused (exit 2)
+        # before any terminal I/O, and record no rows.
+        with self.subTest(case="test_malformed_expected_digest_is_a_validation_error"):
+            pid = self.project_with_revision()
+            proc, prompts = self.seam_cli(*self.confirm_args(pid=pid, digest="not-a-digest"))
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation")
+            self.assertEqual(prompts, [])
+            self.assert_no_rows()
+        with self.subTest(case="test_out_of_range_timeout_is_a_validation_error_before_the_terminal"):
+            pid = self.project_with_revision()
+            digest = self.preview_digest(pid=pid)
+            proc, prompts = self.seam_cli(
+                *self.confirm_args(pid=pid, digest=digest, extra=["--timeout-seconds", "0"])
+            )
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation")
+            self.assertEqual(prompts, [])
+            self.assert_no_rows()
 
     def test_stale_pins_are_refused_with_no_rows(self) -> None:
         pid = self.project_with_revision()
@@ -520,19 +535,6 @@ class GateConfirmRefusalTest(_Base):
         self.assertEqual(proc.returncode, 3, proc.stderr)
         self.assertEqual(json.loads(proc.stderr)["error"]["category"], "conflict")
         self.assertTrue(prompts)
-        self.assert_no_rows()
-
-    def test_out_of_range_timeout_is_a_validation_error_before_the_terminal(self) -> None:
-        pid = self.project_with_revision()
-        digest = self.preview_digest(pid=pid)
-        # The owner-auth bounded validator refuses an out-of-range timeout before
-        # any terminal I/O; nothing is recorded.
-        proc, prompts = self.seam_cli(
-            *self.confirm_args(pid=pid, digest=digest, extra=["--timeout-seconds", "0"])
-        )
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertEqual(json.loads(proc.stderr)["error"]["category"], "validation")
-        self.assertEqual(prompts, [])
         self.assert_no_rows()
 
     def test_imported_authority_flags_are_rejected_with_no_rows(self) -> None:

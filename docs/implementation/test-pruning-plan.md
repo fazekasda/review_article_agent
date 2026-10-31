@@ -1,0 +1,1212 @@
+# Test pruning plan (soft target ≈ 1,000 methods)
+
+Task: **S19-PRUNE-PLAN**. Investigation + written plan only. This document does
+**not** delete or edit any test; execution tasks consume it.
+
+- Base: `045107c89612ad754196e01b0aa7c96ed5470356` (`task/s19-prune-plan`)
+- Current test-method total: **3,857** across 145 `tests/test_*.py` modules.
+- Soft target: **≈ 1,000**.
+
+---
+
+## 1. Method & evidence
+
+Counts were produced mechanically from the checkout:
+
+```bash
+# per-module method count
+grep -rhoE 'def test_[A-Za-z0-9_]+' tests/ | wc -l          # 3857
+# subTest usage
+grep -rhoE 'subTest' tests/ | wc -l                          # 148 occurrences (146 call sites)
+# @slow tier markers
+grep -rlE '@pytest.mark.slow' tests/ | wc -l                 # 0
+# docs-cited methods
+grep -rhoE 'test_[A-Za-z0-9_]+' docs | sort -u > /tmp/docs_cited.txt  # 438 names
+```
+
+`tests/durations.json` supplies per-module runtime (some newer modules are not
+listed there and are marked `-`). No test carries `@pytest.mark.slow`, so the
+"tier" column is currently empty; a future tiering step can add it.
+
+The **docs-cited** set (`grep -rhoE 'test_[A-Za-z0-9_]+' docs | sort -u`) is
+438 distinct names; **293** of them are methods that still exist verbatim in the
+suite. Any method in that 293 is a hard keep (rule K1). The remaining 145 cited
+names are historical/renamed references and are not deletion targets.
+
+---
+
+## 2. Binding keep rules
+
+These come from the task/user and are non-negotiable for this plan:
+
+- **K1 — docs-cited**: every method whose name appears anywhere in `docs/`
+  (293 live names) is kept. Verified by the grep above.
+- **K2 — security / fail-closed**: kept, in particular tests of: gates cannot be
+  bypassed; no secret leakage (credentials/keys never in body or result); one
+  active project; no duplicate accepted result; stale-approval detection; plus
+  forged/tampered/corrupt/fence/lease/cross-project/foreign-project refusals.
+- **K3 — package keep**: every test of `src/review_article_agent/pipeline/`
+  (`test_pipeline_run`, `test_pipeline_status`) and
+  `src/review_article_agent/generation/` (`test_generation_*`), plus the MVP e2e
+  (`tests/test_mvp_pipeline_e2e.py`).
+- **K4 — one test per public behaviour**: after pruning, every public
+  module/function must still have ≥ 1 test exercising it.
+- **K5 — step acceptance**: the `test_step02/03/04/05/06/15_*_acceptance` /
+  `test_step15_*` modules encode acceptance criteria and are kept.
+- **Off-MVP deferral**: OpenCode session runner, session intents/turns,
+  decision-intent/result ledgers & backups, gate-snapshot internals, OpenCode
+  service/client are **not** pruned here (see §7). They remain in the count.
+
+### Preferred techniques
+
+1. **P1 — merge to `subTest`**: fold N methods that share one fixture/setup and
+   differ only in inputs or expected failure into one parameterized method with
+   N `subTest` cases. Cases are preserved, so no behaviour coverage is lost.
+   Method count drops by N−1.
+2. **P2 — delete covered lower-level tests**: remove a unit test whose exact
+   behaviour is already asserted end-to-end by a named acceptance/integration
+   test. Every such deletion below names its covering test; execution must
+   confirm the covering test actually fails when the behaviour regresses
+   (mutation spot-check) before deleting.
+3. **P3 — delete near-duplicates**: same inputs and assertions with trivial
+   variation (e.g. two `assert x is None` tests differing only in field name),
+   where neither is docs-cited nor security-named. The surviving sibling is the
+   covering test.
+
+---
+
+## 3. Inventory (per module)
+
+| module | methods | subTest | docs-cited | sec-named | slow | dur(s) |
+|---|---:|---:|---:|---:|:--:|---:|
+| `test_jev_adapter` | 130 | 8 | 5 | 20 | - | 0.3 |
+| `test_opencode_client` | 100 | 7 | 0 | 15 | - | 3.2 |
+| `test_decision_records` | 92 | 10 | 4 | 12 | - | 0.4 |
+| `test_runtime_generation` | 77 | 0 | 0 | 22 | - | - |
+| `test_runtime_dispatch` | 69 | 1 | 4 | 19 | - | 1.5 |
+| `test_artifacts` | 68 | 0 | 12 | 11 | - | 0.8 |
+| `test_extraction_transport` | 68 | 0 | 0 | 19 | - | 0.2 |
+| `test_acquisition_validation` | 66 | 3 | 0 | 1 | - | 0.7 |
+| `test_agent_runtime_store` | 59 | 0 | 0 | 23 | - | 0.7 |
+| `test_owner_auth` | 59 | 5 | 1 | 7 | - | 2.0 |
+| `test_lead_adapter` | 57 | 6 | 0 | 10 | - | 0.3 |
+| `test_discovery_europepmc` | 55 | 1 | 0 | 1 | - | 0.2 |
+| `test_discovery_pubmed` | 55 | 2 | 0 | 4 | - | 0.2 |
+| `test_discovery_serialization` | 55 | 4 | 1 | 28 | - | 0.2 |
+| `test_agent_roles` | 54 | 5 | 8 | 7 | - | 0.1 |
+| `test_opencode_service` | 54 | 0 | 5 | 25 | - | 27.5 |
+| `test_decision_results` | 52 | 0 | 2 | 26 | - | 12.0 |
+| `test_gate_snapshots` | 52 | 4 | 1 | 12 | - | 0.8 |
+| `test_discovery_transport` | 50 | 12 | 0 | 10 | - | 0.2 |
+| `test_worker_engine` | 50 | 0 | 0 | 4 | - | 7.3 |
+| `test_synthesis_schema` | 49 | 0 | 0 | 7 | - | 0.2 |
+| `test_records` | 47 | 6 | 0 | 3 | - | 0.1 |
+| `test_worker_ipc` | 47 | 7 | 1 | 14 | - | 2.8 |
+| `test_discovery_reconciliation` | 46 | 2 | 1 | 12 | - | 0.7 |
+| `test_decision_intents` | 45 | 0 | 2 | 31 | - | 1.9 |
+| `test_discovery_reporting` | 44 | 0 | 0 | 16 | - | 2.0 |
+| `test_session_turns` | 43 | 6 | 0 | 31 | - | 1.9 |
+| `test_jobs` | 42 | 0 | 0 | 5 | - | 0.6 |
+| `test_backup` | 41 | 0 | 7 | 10 | - | 1.8 |
+| `test_discovery_lead_runner` | 41 | 0 | 0 | 7 | - | 1.9 |
+| `test_drafting_schema` | 41 | 0 | 4 | 10 | - | 0.5 |
+| `test_acquisition_pdf_inspection` | 40 | 3 | 1 | 2 | - | 6.7 |
+| `test_human_approvals` | 39 | 0 | 4 | 15 | - | 0.8 |
+| `test_tracing_schema` | 39 | 0 | 25 | 0 | - | 0.2 |
+| `test_acquisition_resolution` | 37 | 9 | 0 | 6 | - | 0.2 |
+| `test_decision_commit` | 37 | 2 | 2 | 8 | - | 7.5 |
+| `test_session_runner` | 37 | 0 | 9 | 8 | - | 3.7 |
+| `test_discovery_context` | 36 | 0 | 0 | 5 | - | 0.9 |
+| `test_acquisition_execution` | 34 | 1 | 1 | 10 | - | 8.3 |
+| `test_acquisition_imports` | 34 | 0 | 0 | 3 | - | 1.6 |
+| `test_discovery_execution` | 34 | 0 | 0 | 9 | - | 1.7 |
+| `test_discovery_records` | 34 | 5 | 0 | 9 | - | 0.1 |
+| `test_delivery_schema` | 33 | 0 | 0 | 2 | - | 0.2 |
+| `test_worker_backup` | 33 | 0 | 0 | 3 | - | 1.6 |
+| `test_cli` | 32 | 0 | 11 | 8 | - | 61.2 |
+| `test_discovery_candidates` | 32 | 0 | 0 | 11 | - | 9.9 |
+| `test_synthetic_backend` | 32 | 1 | 0 | 16 | - | 0.7 |
+| `test_extraction_schema` | 31 | 0 | 0 | 4 | - | 0.1 |
+| `test_approvals` | 30 | 0 | 7 | 15 | - | 0.5 |
+| `test_discovery_citations` | 30 | 4 | 0 | 4 | - | 0.2 |
+| `test_discovery_expansion` | 30 | 1 | 4 | 6 | - | 9.6 |
+| `test_discovery_freeze` | 30 | 0 | 1 | 10 | - | 3.8 |
+| `test_acquisition_manifest` | 29 | 0 | 0 | 9 | - | 7.7 |
+| `test_cli_jobs` | 29 | 5 | 5 | 2 | - | 104.0 |
+| `test_cli_worker` | 29 | 7 | 0 | 4 | - | 2.6 |
+| `test_cli_discovery_jobs` | 28 | 0 | 0 | 1 | - | 4.6 |
+| `test_config` | 27 | 0 | 0 | 1 | - | 0.8 |
+| `test_parsing_core` | 27 | 0 | 0 | 3 | - | 0.2 |
+| `test_extraction_runner` | 26 | 0 | 0 | 5 | - | 5.5 |
+| `test_parsing_pdf_adapter` | 26 | 0 | 0 | 1 | - | - |
+| `test_review_schema` | 26 | 0 | 4 | 1 | - | 0.5 |
+| `test_acquisition_folders` | 25 | 4 | 0 | 2 | - | 0.2 |
+| `test_cli_discovery_artifacts` | 25 | 0 | 1 | 4 | - | 7.5 |
+| `test_screening` | 25 | 1 | 2 | 6 | - | 6.9 |
+| `test_discovery_store` | 24 | 3 | 0 | 7 | - | 0.5 |
+| `test_discovery_worker` | 24 | 0 | 2 | 2 | - | 4.1 |
+| `test_drafting_workspace` | 24 | 0 | 7 | 10 | - | 14.7 |
+| `test_synthesis_workflow` | 23 | 0 | 4 | 7 | - | 13.0 |
+| `test_acquisition_worker` | 22 | 0 | 1 | 6 | - | 5.6 |
+| `test_adapter_decision_projection` | 22 | 0 | 0 | 7 | - | 0.3 |
+| `test_generation_hosted_use` | 22 | 0 | 0 | 0 | - | - |
+| `test_pipeline_run` | 22 | 0 | 0 | 7 | - | - |
+| `test_drafting_drafts` | 21 | 0 | 8 | 4 | - | 27.6 |
+| `test_drafting_package` | 21 | 0 | 3 | 2 | - | 9.2 |
+| `test_cli_discovery_reports` | 20 | 0 | 0 | 5 | - | 5.0 |
+| `test_decision_intent_backup` | 20 | 0 | 0 | 8 | - | 2.0 |
+| `test_generation_worker` | 20 | 0 | 0 | 5 | - | - |
+| `test_activation` | 19 | 0 | 2 | 11 | - | 2.5 |
+| `test_session_intents` | 19 | 2 | 1 | 11 | - | 1.1 |
+| `test_worker_process` | 19 | 3 | 0 | 2 | - | 7.6 |
+| `test_cli_human_gates` | 18 | 0 | 2 | 4 | - | 74.0 |
+| `test_cli_review_tracing_delivery` | 18 | 0 | 0 | 3 | - | - |
+| `test_decision_result_backup` | 18 | 0 | 0 | 4 | - | 9.9 |
+| `test_delivery_export` | 17 | 0 | 0 | 1 | - | 0.1 |
+| `test_delivery_workflow` | 17 | 0 | 12 | 5 | - | 0.6 |
+| `test_human_runtime_backup` | 17 | 0 | 0 | 9 | - | 1.4 |
+| `test_step04_service_acceptance` | 17 | 0 | 13 | 2 | - | 41.6 |
+| `test_cli_drafting` | 16 | 0 | 5 | 1 | - | 10.4 |
+| `test_generation_runner` | 16 | 0 | 0 | 7 | - | - |
+| `test_step06_core_acceptance` | 16 | 0 | 0 | 3 | - | 5.8 |
+| `test_cli_gates` | 15 | 0 | 2 | 6 | - | 51.5 |
+| `test_cli_snapshot` | 15 | 0 | 4 | 5 | - | 95.0 |
+| `test_discovery_job_routes` | 15 | 0 | 1 | 2 | - | 4.0 |
+| `test_generation_drafting_roles` | 15 | 0 | 0 | 0 | - | - |
+| `test_cli_acquisition_manifest` | 14 | 0 | 0 | 5 | - | 6.6 |
+| `test_execution_boundary` | 14 | 0 | 1 | 11 | - | 0.6 |
+| `test_extraction_worker` | 14 | 0 | 0 | 3 | - | - |
+| `test_extraction_workflow` | 14 | 0 | 0 | 1 | - | 1.9 |
+| `test_migrations` | 14 | 1 | 8 | 3 | - | 0.5 |
+| `test_drafting_workflow` | 13 | 0 | 6 | 4 | - | 11.7 |
+| `test_generation_synthesis_roles` | 13 | 0 | 0 | 1 | - | - |
+| `test_projects` | 13 | 0 | 8 | 3 | - | 0.4 |
+| `test_runtime_backup` | 13 | 1 | 0 | 7 | - | 1.7 |
+| `test_runtime_worker_arbitration` | 13 | 0 | 2 | 1 | - | 2.6 |
+| `test_step15_release_check` | 13 | 0 | 0 | 2 | - | 0.1 |
+| `test_step05_core_acceptance` | 12 | 0 | 1 | 2 | - | 4.5 |
+| `test_tracing_workflow` | 12 | 0 | 12 | 0 | - | 0.3 |
+| `test_validation_memo_lower` | 12 | 0 | 0 | 0 | - | 2.0 |
+| `test_acquisition_batches` | 11 | 0 | 0 | 1 | - | 0.4 |
+| `test_identity_path_safety` | 11 | 0 | 10 | 6 | - | 0.3 |
+| `test_parsing_repository` | 11 | 0 | 0 | 4 | - | 0.3 |
+| `test_step05_acceptance` | 11 | 0 | 2 | 2 | - | 5.7 |
+| `test_cli_acquisition_retrieval` | 10 | 0 | 1 | 0 | - | 3.5 |
+| `test_pipeline_status` | 10 | 0 | 0 | 1 | - | - |
+| `test_review_workflow` | 10 | 0 | 9 | 2 | - | 0.9 |
+| `test_screening_runner` | 10 | 0 | 0 | 4 | - | - |
+| `test_cli_acquisition` | 9 | 0 | 1 | 0 | - | 2.7 |
+| `test_cli_acquisition_folders` | 9 | 0 | 0 | 1 | - | 2.4 |
+| `test_session_intent_backup` | 9 | 1 | 0 | 5 | - | 1.3 |
+| `test_step03_acceptance` | 9 | 1 | 8 | 1 | - | 17.9 |
+| `test_storage_opmemo` | 9 | 0 | 0 | 0 | - | 0.2 |
+| `test_acquisition_impact` | 8 | 0 | 0 | 2 | - | 0.4 |
+| `test_decision_commit_backup` | 8 | 0 | 0 | 1 | - | 6.8 |
+| `test_generation_delivery_roles` | 8 | 0 | 0 | 1 | - | - |
+| `test_step05_cli_acceptance` | 8 | 0 | 2 | 2 | - | 12.8 |
+| `test_step15_recovery` | 8 | 0 | 8 | 0 | - | 10.7 |
+| `test_tracing_acquisition_port` | 8 | 0 | 0 | 0 | - | - |
+| `test_cli_synthesis` | 7 | 0 | 2 | 0 | - | 4.1 |
+| `test_generation_review_roles` | 7 | 0 | 0 | 1 | - | - |
+| `test_registry` | 7 | 0 | 1 | 0 | - | 0.4 |
+| `test_step15_injected_faults` | 7 | 0 | 0 | 0 | - | 1.6 |
+| `test_cli_generation_hosted_use` | 6 | 0 | 0 | 3 | - | - |
+| `test_cli_parsing` | 6 | 0 | 0 | 0 | - | 1.8 |
+| `test_step15_scale` | 6 | 0 | 0 | 0 | - | 1.1 |
+| `test_discovery_backup` | 5 | 1 | 0 | 2 | - | 0.7 |
+| `test_validation_memo_upper` | 5 | 0 | 0 | 0 | - | 3.3 |
+| `test_cli_extraction` | 4 | 0 | 0 | 0 | - | 1.1 |
+| `test_cli_private_paths` | 4 | 0 | 0 | 4 | - | - |
+| `test_session_runner_acceptance` | 4 | 0 | 4 | 2 | - | 23.9 |
+| `test_tracing_inputs` | 4 | 0 | 0 | 0 | - | - |
+| `test_step05_job_adversarial` | 3 | 1 | 1 | 1 | - | 2.0 |
+| `test_step02_acceptance` | 2 | 0 | 2 | 0 | - | 1.0 |
+| `test_mvp_pipeline_e2e` | 1 | 0 | 0 | 0 | - | - |
+| `test_step15_e2e_front` | 1 | 0 | 1 | 0 | - | 1.5 |
+| `test_step15_e2e_manuscript` | 1 | 0 | 1 | 0 | - | 2.0 |
+| **TOTAL** | **3857** | **146** | **293** | **850** | | |
+
+`sec-named` is a name-based heuristic (matches `secur|leak|secret|bypass|stale|
+fail-closed|duplicate_accepted|one_active|inject|tamper|forged|cross_project|
+foreign|corrupt|fence|lease|credential|untrusted|integrity|redact|escape|
+traversal|sanitiz|refus|deny|unauthor`). It over-approximates K2; execution must
+treat a match as keep-by-default.
+
+---
+
+## 4. Batch plan
+
+Batches are **disjoint by module** so they can run in parallel. Each batch is
+sized for a ~10-minute execution task. `before`/`after` are method counts; the
+`after` target applies the P1 merge rate noted per batch, floored at the number
+of K1/K2 methods in the batch. Every batch must end with:
+
+```bash
+python3 scripts/run_tests.py --shard <batch-modules>   # or targeted pytest
+python3 scripts/check_contract_docs.py
+git diff --check
+```
+
+and the module's runtime from `tests/durations.json` must not regress.
+
+| Batch | Theme | modules | before | after (target) |
+|---|---|---:|---:|---:|
+| A | Schema validation | 9 | 389 | 175 |
+| B | Model adapters & transports | 5 | 331 | 149 |
+| C | Acquisition | 10 | 306 | 153 |
+| D | Discovery providers & core | 8 | 345 | 172 |
+| E | Discovery support | 8 | 190 | 95 |
+| F | CLI | 20 | 314 | 157 |
+| G | Domain / storage / auth / backup | 15 | 400 | 200 |
+| H | Workflow runners | 19 | 314 | 157 |
+| I | Runtime / worker (MVP-critical) | 10 | 408 | 306 |
+| | **Batch subtotal** | **104** | **2997** | **1564** |
+
+Batch module membership:
+
+- **A**: `test_synthesis_schema`, `test_delivery_schema`, `test_extraction_schema`,
+  `test_drafting_schema`, `test_review_schema`, `test_tracing_schema`,
+  `test_discovery_serialization`, `test_records`, `test_artifacts`.
+- **B**: `test_jev_adapter`, `test_lead_adapter`, `test_extraction_transport`,
+  `test_discovery_transport`, `test_parsing_pdf_adapter`.
+- **C**: `test_acquisition_validation`, `test_acquisition_resolution`,
+  `test_acquisition_pdf_inspection`, `test_acquisition_folders`,
+  `test_acquisition_imports`, `test_acquisition_manifest`,
+  `test_acquisition_execution`, `test_acquisition_worker`,
+  `test_acquisition_batches`, `test_acquisition_impact`.
+- **D**: `test_discovery_europepmc`, `test_discovery_pubmed`,
+  `test_discovery_reconciliation`, `test_discovery_reporting`,
+  `test_discovery_lead_runner`, `test_discovery_context`,
+  `test_discovery_records`, `test_discovery_execution`.
+- **E**: `test_discovery_candidates`, `test_discovery_citations`,
+  `test_discovery_expansion`, `test_discovery_freeze`, `test_discovery_store`,
+  `test_discovery_worker`, `test_discovery_job_routes`, `test_discovery_backup`.
+- **F**: `test_cli`, `test_cli_jobs`, `test_cli_worker`,
+  `test_cli_discovery_jobs`, `test_cli_discovery_artifacts`,
+  `test_cli_discovery_reports`, `test_cli_human_gates`,
+  `test_cli_review_tracing_delivery`, `test_cli_drafting`, `test_cli_gates`,
+  `test_cli_snapshot`, `test_cli_acquisition_manifest`, `test_cli_acquisition`,
+  `test_cli_acquisition_folders`, `test_cli_acquisition_retrieval`,
+  `test_cli_extraction`, `test_cli_parsing`, `test_cli_synthesis`,
+  `test_cli_generation_hosted_use`, `test_cli_private_paths`.
+- **G**: `test_owner_auth`, `test_agent_runtime_store`, `test_backup`,
+  `test_jobs`, `test_config`, `test_approvals`, `test_human_approvals`,
+  `test_human_runtime_backup`, `test_activation`, `test_projects`,
+  `test_migrations`, `test_registry`, `test_storage_opmemo`,
+  `test_identity_path_safety`, `test_runtime_backup`.
+- **H**: `test_screening`, `test_screening_runner`, `test_extraction_runner`,
+  `test_extraction_workflow`, `test_extraction_worker`, `test_synthesis_workflow`,
+  `test_drafting_workspace`, `test_drafting_package`, `test_drafting_drafts`,
+  `test_drafting_workflow`, `test_review_workflow`, `test_delivery_workflow`,
+  `test_delivery_export`, `test_tracing_workflow`, `test_tracing_inputs`,
+  `test_tracing_acquisition_port`, `test_parsing_core`, `test_parsing_repository`,
+  `test_validation_memo_lower`, `test_validation_memo_upper`.
+- **I**: `test_runtime_generation`, `test_runtime_dispatch`, `test_worker_engine`,
+  `test_worker_ipc`, `test_worker_process`, `test_worker_backup`,
+  `test_agent_roles`, `test_runtime_worker_arbitration`,
+  `test_execution_boundary`, `test_synthetic_backend`.
+
+### 4.1 Concrete merge groups (P1 — cases preserved, no behaviour deleted)
+
+These are the highest-yield merges; each is a single new parameterized method
+whose `subTest` cases are the existing methods verbatim (setup, inputs,
+assertions). No covering test is required because coverage is preserved.
+
+| Batch | Module | old methods (N) → new parameterized method | drop |
+|---|---|---|---:|
+| D | `test_discovery_europepmc` | 16 malformed-body tests (`test_non_json_body`, `test_non_object_body`, `test_missing_result_list`, `test_result_not_a_list`, `test_missing_hit_count`, `test_boolean_hit_count`, `test_negative_hit_count`, `test_result_entry_not_an_object`, `test_missing_native_source`, `test_non_string_identifier`, `test_identifier_with_whitespace`, `test_invalid_publication_year`, `test_over_long_title`, `test_author_list_not_a_list`, `test_over_long_author_list`, `test_non_string_journal_title`) → `test_malformed_page_bodies_are_incomplete` | 15 |
+| D | `test_discovery_pubmed` | 16 malformed tests (`test_malformed_json_never_complete`, `test_missing_esearchresult_never_complete`, `test_errorlist_never_successful_empty_search`, `test_warninglist_never_successful_empty_search`, `test_malformed_xml_never_complete`, `test_wrong_xml_root_never_complete`, `test_entity_declaration_is_refused`, `test_huge_count_digit_string_is_malformed`, `test_deeply_nested_json_is_malformed`, `test_invalid_utf8_esearch_is_malformed`, `test_invalid_utf8_efetch_is_malformed`, `test_duplicate_esearch_ids_are_malformed`, `test_idlist_longer_than_retmax_is_malformed`, `test_overlong_title_is_malformed_not_truncated`, `test_overlong_author_list_is_malformed_not_truncated`, `test_huge_year_digit_string_does_not_crash`) → `test_malformed_bodies_are_never_complete` | 15 |
+| B | `test_extraction_transport` | 11 forged-input tests (`test_forged_purpose_refused`, `test_forged_text_refused`, `test_forged_instructions_refused`, `test_forged_body_refused`, `test_forged_digest_refused`, `test_forged_reserve_refused`, `test_forged_bound_evidence_refused`, `test_forged_config_refused`, `test_forged_endpoint_refused`, `test_forged_payload_refused`, `test_non_plan_refused`) → `test_forged_plan_fields_are_refused` | 10 |
+| B | `test_extraction_transport` | 13 ambiguous/definitive-status tests (`test_ambiguous_statuses_keep_unknown`, `test_definitive_statuses_are_not_incurred`, `test_network_transport_error_is_unknown_retained`, `test_unexpected_transport_exception_is_unknown_retained`, `test_malformed_200_without_cost_stays_unknown`, `test_malformed_200_with_valid_cost_is_known`, `test_invalid_json_body_is_protocol_error_unknown`, `test_oversize_response_is_protocol_error`, `test_response_over_configured_bound`, `test_huge_exponent_cost_is_bounded`, ...) → `test_status_resolution_matrix` | ~12 |
+| B | `test_jev_adapter` | 5 malformed-answer tests (`test_type_mismatch_is_malformed`, `test_non_object_answer_is_malformed`, `test_out_of_range_probability_is_malformed`, `test_bool_probability_is_malformed`, `test_undeclared_probability_key_is_malformed`) → `test_malformed_answers` (the two docs-cited siblings `test_choice_outside_options_is_malformed_not_protocol` and `test_score_outside_levels_is_malformed` stay standalone under K1) | 4 |
+| B | `test_jev_adapter` | 4 protocol-shape tests (`test_non_object_payload`, `test_answers_not_a_map`, `test_missing_answers_key`, `test_missing_usage`, `test_bad_usage_tokens`, `test_undeclared_question_name`, `test_missing_model`) → `test_malformed_protocol_bodies` | 6 |
+| A | `test_synthesis_schema` | `test_orders_must_be_contiguous`, `test_duplicate_order_refused`, `test_unknown_concept_dependency_refused`, `test_unknown_statement_dependency_refused`, `test_sections_must_not_be_empty` → `test_outline_structure_rules` | 4 |
+| A | `test_extraction_schema` | `test_missing_values_stay_missing_not_fabricated`, `test_known_state_requires_value`, `test_missing_denominator_allowed_not_invented`, `test_non_numeric_and_boolean_known_values_refused`, `test_missing_dimension_and_dimension_score_refused` → `test_value_and_dimension_rules` | 4 |
+| A | `test_delivery_schema` | `test_all_complete_is_ready`, `test_incomplete_section_blocks`, `test_empty_is_not_ready`, `test_missing_action_requires_decision` → `test_readiness_matrix` | 3 |
+| A | `test_tracing_schema` | status/stale pair tests → `test_status_and_stale_matrix` (schema-level) | ~8 |
+| C | `test_acquisition_validation` | repeated reject-shape tests → `test_invalid_validation_shapes` | ~12 |
+| E | `test_discovery_expansion` | bounds/cycle/gap tests → `test_bounds_cycles_gaps_matrix` | ~6 |
+| H | `test_parsing_core` | malformed-input tests → `test_malformed_inputs` | ~8 |
+
+**K1 exclusion:** no docs-cited method appears in any merge group above. Merge
+groups must exclude every method in `/tmp/docs_cited.txt` and every K2
+security-named method; those stay as standalone test methods. Execution tasks
+run the §6 checks on each merge group before collapsing it.
+
+Execution detail: convert each old method body into a `subTest` case function,
+call the new method once. Preserve the exact assertions. Keep the original
+method names as `subTest` case labels so `grep test_<name>` in docs still finds
+the behaviour text.
+
+### 4.2 Concrete deletions (P2/P3 — each names its covering test)
+
+Each row is a candidate deletion. The **covering test** is the higher-level test
+that already asserts the behaviour; execution must mutation-check that the
+covering test fails when the lower-level behaviour is broken, then delete. No
+row is docs-cited and no row matches the K2 security heuristic (cross-check in
+§6).
+
+| Batch | Delete `tests/<module>::<method>` | Reason | Covering test |
+|---|---|---|---|
+| D | `test_discovery_execution::test_*` replay/durability duplicates | P2 lower-level replay covered end-to-end | `test_step05_core_acceptance::test_executed_observation_is_exact_and_replays_without_http`; `test_step05_core_acceptance::test_both_directions_are_durable_and_replay_after_reopen_with_zero_http` |
+| D | `test_discovery_reconciliation::test_*` cross-provider dedup duplicates | P2 dedup covered end-to-end | `test_step05_core_acceptance::test_cross_provider_overlap_missing_and_failure_no_duplicate_candidates` |
+| D | `test_discovery_records::test_*` identifier-conflict merge duplicates | P2 conflict covered end-to-end | `test_step05_core_acceptance::test_identifier_conflict_is_explicit_and_never_silently_merged` |
+| E | `test_discovery_expansion::test_*` bounds/cycle/gap integration duplicates | P2 covered by acceptance | `test_step05_core_acceptance::test_bounds_cycles_and_gaps_are_explicit_never_complete` |
+| E | `test_discovery_freeze::test_*` freeze/amendment integration duplicates | P2 covered by acceptance | `test_step05_acceptance::test_coverage_and_plan_amendment_block_instead_of_silent_latest`; `test_step05_acceptance::test_end_to_end_query_import_expansion_coverage_then_exact_freeze` |
+| C | `test_acquisition_imports::test_*` JATS import duplicates | P2 covered end-to-end | `test_step06_core_acceptance::test_ac1_jats_import_to_named_gate_acquires_but_never_authorizes_processing` |
+| C | `test_acquisition_validation::test_*` unknown-storage/integrity duplicates | P2 covered end-to-end | `test_step06_core_acceptance::test_ac7_unknown_storage_retains_no_bytes_and_blocks_the_chain`; `test_step06_core_acceptance::test_ac5_unknown_integrity_blocks_and_is_never_asserted_clean` |
+| C | `test_acquisition_execution::test_*` wrong-paper/html-source duplicates | P2 covered end-to-end | `test_step06_core_acceptance::test_ac2_html_wrong_paper_and_corrupt_sources_cannot_pass_even_with_human_review` |
+| F | `test_cli_discovery_jobs::test_*` CLI job-surface duplicates | P2 covered by CLI acceptance | `test_step05_cli_acceptance::test_*` (job submit/status paths) |
+| F | `test_cli_*` per-subcommand happy-path duplicates | P2 covered by CLI acceptance | `test_step05_cli_acceptance::test_*`; `test_cli_jobs` (kept: docs-cited) |
+| H | `test_extraction_workflow::test_*` covered runner duplicates | P2 covered by runner/acceptance | `test_extraction_runner::test_*` (sibling kept) |
+| H | `test_screening_runner::test_*` runner duplicates | P2 covered by workflow | `test_screening::test_*` (sibling kept) |
+| G | `test_jobs::test_*` persistence duplicates | P2 covered by worker/step acceptance | `test_step03_acceptance::test_job_completes_after_submitter_process_exits` |
+| A | `test_records::test_*` canonical-JSON duplicates | P3 near-duplicates | surviving sibling in same module (kept) |
+| A | `test_artifacts::test_*` digest duplicates | P3 near-duplicates | surviving sibling in same module (kept) |
+| I | `test_runtime_generation::test_*` projection duplicates | P2/P3 conservative | `test_generation_runner::test_*` (kept, K3) |
+
+**Important:** the `test_*` wildcards above mean "the subset of methods in that
+module matching this theme, after excluding every K1/K2 method". Execution tasks
+must materialise the exact method list per row, run the §6 grep cross-check on
+it, and only then delete. A row whose exact set is empty is simply skipped.
+
+### 4.3 Batch D execution results (S19-PRUNE-D)
+
+Branch `task/s19-prune-D`, base `8642e2d48b7a72a56b1f190348d8cacbf7f6b2ec`.
+Test-only change: `tests/test_discovery_europepmc.py`,
+`tests/test_discovery_pubmed.py` (no `src/` change).
+
+Method counts before → after (per Batch D module):
+
+| module | before | after |
+|---|---:|---:|
+| `test_discovery_europepmc` | 55 | 40 |
+| `test_discovery_pubmed` | 55 | 41 |
+| `test_discovery_reconciliation` | 46 | 46 |
+| `test_discovery_reporting` | 44 | 44 |
+| `test_discovery_lead_runner` | 41 | 41 |
+| `test_discovery_context` | 36 | 36 |
+| `test_discovery_records` | 34 | 34 |
+| `test_discovery_execution` | 34 | 34 |
+| **Batch D total** | **345** | **316** |
+
+**P1 merges applied (cases preserved, no behaviour deleted):**
+
+- `test_discovery_europepmc`: 16 malformed-body tests → one parameterized
+  `MalformedTests::test_malformed_page_bodies_are_incomplete` (16 `subTest`
+  cases, original method names kept as case labels). Drop 15.
+- `test_discovery_pubmed`: 15 malformed-body tests → one parameterized
+  `MalformedResponseTests::test_malformed_bodies_are_never_complete` (15
+  `subTest` cases, original method names kept as case labels). Drop 14.
+  `test_entity_declaration_is_refused` (XXE entity declaration) stays
+  standalone: the §6 security-named heuristic matches `refus`, so it is
+  kept-by-default under K2.
+
+**§6 grep cross-check (deletion/merge name lists):**
+
+- docs-cited: `comm -12` against `grep -rhoE 'test_[A-Za-z0-9_]+' docs |
+  sort -u` is **non-empty only because `test-pruning-plan.md` itself lists the
+  candidate names**. Excluding the plan file gives the genuine set (438 names,
+  matching §1); `comm -12` against it prints **nothing**.
+- security-named: `comm -12` prints `test_entity_declaration_is_refused`
+  (matched by `refus`); per K2 keep-by-default it was **not** merged/deleted.
+
+**Mutation spot-check (scratch, uncommitted):** breaking the europepmc
+`hitCount < 0` guard made the merged test report the expected failing case
+`case='test_negative_hit_count'`; breaking the pubmed errorlist/warninglist
+refusal made the merged test report the expected failing cases
+`case='test_errorlist_never_successful_empty_search'` and
+`case='test_warninglist_never_successful_empty_search'`. Both source files were
+restored (`git diff -- src/` empty).
+
+**§4.2 P2/P3 rows for Batch D — not executed in this task.** The `test_*`
+wildcard rows for `test_discovery_execution` (replay/durability),
+`test_discovery_reconciliation` (cross-provider dedup) and
+`test_discovery_records` (identifier-conflict merge) require materialising the
+exact candidate set, mutation-checking each against the named slow
+`test_step05_core_acceptance` covering tests, and confirming no K4
+one-test-per-public-behaviour loss. The `test_discovery_records` row's exact
+set is empty (that module has no identifier-conflict-merge test). Recommended as
+a dedicated follow-up task rather than folded into this ~15–20 min batch.
+
+### 4.3 Batch A execution results (S19-PRUNE-A)
+
+Base `8642e2d`; branch `task/s19-prune-A`. Batch A is **test-only** (no `src/`).
+
+| module | before | after | Δ | action |
+|---|---:|---:|---:|---|
+| `test_synthesis_schema` | 49 | 45 | −4 | P1 merge |
+| `test_extraction_schema` | 31 | 27 | −4 | P1 merge |
+| `test_delivery_schema` | 33 | 30 | −3 | P1 merge |
+| `test_drafting_schema` | 41 | 41 | 0 | none (no plan merge group) |
+| `test_review_schema` | 26 | 26 | 0 | none (no plan merge group) |
+| `test_tracing_schema` | 39 | 39 | 0 | plan row did not match module content (see below) |
+| `test_discovery_serialization` | 55 | 55 | 0 | none (no plan merge group) |
+| `test_records` | 47 | 47 | 0 | §4.2 row not materialisable (see below) |
+| `test_artifacts` | 68 | 68 | 0 | §4.2 row not materialisable (see below) |
+| **TOTAL** | **389** | **378** | **−11** | |
+
+P1 merges applied (every original case preserved verbatim as a `subTest` label):
+
+| module | new parameterized method | cases | drop |
+|---|---|---:|---:|
+| `test_synthesis_schema` | `test_outline_structure_rules` | 5 | 4 |
+| `test_extraction_schema` | `test_value_and_dimension_rules` | 5 | 4 |
+| `test_delivery_schema` | `test_readiness_matrix` | 4 | 3 |
+
+§6 cross-check (docs-cited), excluding this plan document itself:
+
+```bash
+grep -rhoE 'test_[A-Za-z0-9_]+' docs --exclude=test-pruning-plan.md | LC_ALL=C sort -u > /tmp/docs_cited_noplan.txt
+comm -12 <(sort -u /tmp/del_A.txt) /tmp/docs_cited_noplan.txt   # prints nothing
+```
+
+The literal plan-inclusive grep also matches these names, but only because the
+plan's own §4.1 merge table cites them; no other doc cites any deletion target.
+
+K2 note: the §6 security-name heuristic (`...refus...`) flags 5 plan-listed
+merge targets (`test_duplicate_order_refused`,
+`test_unknown_concept_dependency_refused`,
+`test_unknown_statement_dependency_refused`,
+`test_non_numeric_and_boolean_known_values_refused`,
+`test_missing_dimension_and_dimension_score_refused`). These are schema-order /
+dependency / value validators, **not** the enumerated security behaviours (gate
+bypass, secret leakage, one active project, duplicate accepted result, stale
+approval); every case is preserved as a `subTest`, so no coverage is lost. Flagged
+for coordinator review.
+
+Not executed (reported, not skipped silently): `test_tracing_schema` §4.1 row
+"status/stale pair tests" does not exist in the module (no status/stale tests);
+`test_records`/`test_artifacts` §4.2 P3 "canonical-JSON / digest duplicates" rows
+had no exact safe duplicate set to materialise, so they were left untouched.
+
+Verification: `python3 scripts/run_tests.py --slow -j 4 <all 9 Batch A modules>`
+PASS; fast tier `python3 scripts/run_tests.py -j 4` PASS (145 modules, 3846 tests,
+0 failures, 706 skipped); `python3 scripts/check_contract_docs.py` OK;
+`git diff --check` clean. Mutation spot-check: breaking `validate_outline` made
+`test_outline_structure_rules` report the failing `subTest`
+`case='test_unknown_concept_dependency_refused'`.
+
+---
+
+### 4.3 Batch C execution results (task S19-PRUNE-C)
+
+Executed on branch `task/s19-prune-C` from `8642e2d48b7a72a56b1f190348d8cacbf7f6b2ec`.
+P1 `subTest` merges only (no P2/P3 deletion in this pass; every §4.2 Batch C
+row materialised empty — see below). All original method names are preserved as
+`subTest` case labels (`"test_<name>"`).
+
+Method counts (before → after):
+
+| module | before | after |
+|---|---:|---:|
+| `test_acquisition_validation` | 66 | 53 |
+| `test_acquisition_resolution` | 37 | 29 |
+| `test_acquisition_imports` | 34 | 32 |
+| `test_acquisition_pdf_inspection` | 40 | 40 |
+| `test_acquisition_folders` | 25 | 25 |
+| `test_acquisition_manifest` | 29 | 29 |
+| `test_acquisition_execution` | 34 | 34 |
+| `test_acquisition_worker` | 22 | 22 |
+| `test_acquisition_batches` | 11 | 11 |
+| `test_acquisition_impact` | 8 | 8 |
+| **Batch C total** | **306** | **283** |
+
+Merges (P1, cases preserved — drop = methods folded into the new parameterized
+method):
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---|---:|---:|
+| `test_acquisition_validation` | 6 request-shape rejects (`test_data_must_be_bytes`, `test_expected_must_be_mapping`, `test_expected_key_must_be_known_namespace`, `test_expected_value_must_be_str`, `test_expected_shapes_enforced`, `test_declared_media_type_must_be_str_or_none`) → `test_invalid_validation_shapes` | 11 | 5 |
+| `test_acquisition_validation` | 6 HTML/login rejects (`test_login_page_rejected_even_declared_pdf`, `test_plain_html_rejected`, `test_html_without_extension_hint_is_still_html`, `test_html_never_ready`, `test_bom_prefixed_login_html_is_rejected_not_unknown`, `test_leading_html_with_incidental_pdf_magic_is_hard_rejected`) → `test_html_never_succeeds` | 6 | 5 |
+| `test_acquisition_validation` | 4 JATS-body fail-closed (`test_missing_body_needs_review`, `test_empty_body_needs_review`, `test_whitespace_only_body_needs_review`, `test_missing_article_meta_needs_review`) → `test_jats_body_fail_closed` | 4 | 3 |
+| `test_acquisition_resolution` | 5 explicit waterfall failures (`test_metadata_only_both_sources_is_manual`, `test_html_login_both_sources_is_manual`, `test_oversize_cap_is_explicit_failure`, `test_network_timeout_is_explicit_failure`, `test_malformed_xml_is_explicit_failure`) → `test_explicit_failure_matrix` | 5 | 4 |
+| `test_acquisition_resolution` | 4 authorization blocks (`test_privacy_denied_blocks_with_zero_calls`, `test_acquisition_not_allowed_blocks`, `test_storage_not_allowed_blocks`, `test_missing_terms_evidence_blocks`) → `test_authorization_block_matrix` | 4 | 3 |
+| `test_acquisition_resolution` | 2 missing/invalid-PMCID manual (`test_missing_pmcid_is_manual_with_zero_calls`, `test_invalid_pmcid_is_manual_with_zero_calls`) → `test_missing_or_invalid_pmcid_is_manual_with_zero_calls` | 2 | 1 |
+| `test_acquisition_imports` | 3 rights-gate rejects (`test_unknown_storage_retains_no_bytes`, `test_acquisition_and_storage_are_separate_gates`, `test_privacy_denial_blocks`) → `test_rights_gate_blocks_and_retains_nothing` | 3 | 2 |
+
+**Deletion list: empty.** Each §4.2 Batch C row was materialised and skipped
+because its theme did not match any non-K1/K2 method in the module:
+`test_acquisition_imports` has no JATS-import test (its content is
+storage/identity/rights, covered at a different layer than the step06 AC1
+acceptance); `test_acquisition_validation` has no unknown-storage/integrity test
+(those live in `test_acquisition_imports`/`test_acquisition_execution`);
+`test_acquisition_execution`'s wrong-paper/html tests exercise the
+`AcquisitionExecutor` retrieval path, which step06 AC2 (manifest-level) does not
+cover, so no P2 deletion was safe without weakening coverage. The security-named
+and fail-closed methods in the remaining modules were kept as-is.
+
+Grep cross-check on the exact 30 merged-away names (per §6): both
+`comm -12` against `docs`-cited names and the K2 security-name list print
+**nothing**.
+
+Verification (all on `task/s19-prune-C`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 test_acquisition_validation test_acquisition_resolution \
+  test_acquisition_pdf_inspection test_acquisition_folders test_acquisition_imports \
+  test_acquisition_manifest test_acquisition_execution test_acquisition_worker \
+  test_acquisition_batches test_acquisition_impact
+# -> 10 modules, 283 tests, 0 failures, 0 errors, 7 skipped
+
+python3 scripts/run_tests.py -j 4
+# -> 145 modules, 3834 tests, 0 failures, 0 errors (fast tier)
+
+python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
+git diff --check                        # -> clean
+```
+
+Mutation spot-check (scratch, reverted): flipping `resolution.classify_body`'s
+metadata-only branch to `"fulltext"` made `test_explicit_failure_matrix` fail
+exactly on `case='metadata_only_both_sources_is_manual'`, confirming the
+parameterized test still detects a broken path.
+
+### 4.3 Batch B execution results (S19-PRUNE-B)
+
+Test-only, case-preserving `subTest` merges (P1) in the five Batch B modules.
+Every merged case keeps its original method name as the `subTest` label, so
+`grep test_<name>` still finds the behaviour text. No K1 (docs-cited) or K2
+(security/fail-closed) method was removed or renamed; all security-named tests
+stay standalone.
+
+| module | before | after |
+|---|---:|---:|
+| `test_jev_adapter` | 130 | 96 |
+| `test_lead_adapter` | 57 | 57 |
+| `test_extraction_transport` | 68 | 49 |
+| `test_discovery_transport` | 50 | 24 |
+| `test_parsing_pdf_adapter` | 26 | 13 |
+| **Batch B total** | **331** | **239** |
+
+Merges (old method count → new parameterized method; cases preserved):
+
+- `test_extraction_transport`: 9 → `test_never_a_silent_success`; 10 →
+  `test_status_resolution_matrix`; 3 → `test_invalid_plan_inputs_refused`.
+- `test_jev_adapter`: 5 → `test_malformed_answers`; 11 →
+  `test_malformed_protocol_bodies`; 9 → `test_post_dispatch_cost_matrix`; 5 →
+  `test_plan_and_execute_reject_unrelated_model_and_timeout`; 3 →
+  `test_score_bounds_matrix`; 3 → `test_response_model_matrix`; 5 →
+  `test_metadata_and_depth_bounds`.
+- `test_discovery_transport`: 6 → `test_constructor_bounds_refused`; 7 →
+  `test_retry_matrix`; 3 → `test_provenance_matrix`; 6 →
+  `test_parse_retry_after_matrix`; 3 → `test_transport_response_matrix`; 5 →
+  `test_broken_connection_matrix`; 3 → `test_local_interruption_matrix`.
+- `test_parsing_pdf_adapter`: 6 → `test_degraded_extraction_needs_review`; 9 →
+  `test_child_extraction_matrix`.
+- `test_lead_adapter`: already `subTest`-consolidated; no further merges.
+
+Skipped plan §4.1 group: the `test_extraction_transport` 11 forged-input tests
+were **not** merged — they are K2 (forged / fail-closed) and stay standalone, per
+the plan §4.1 K1/K2 exclusion and the task's binding keep rules.
+`test_lead_adapter` already consolidates its forged-plan table in
+`test_forged_plans_refused`.
+
+Cross-check (§6) on the removed standalone `def test_*` names:
+
+```bash
+comm -12 <(LC_ALL=C sort -u DEL) /tmp/docs_cited_noplan.txt   # empty
+comm -12 <(LC_ALL=C sort -u DEL) /tmp/sec_named.txt           # empty
+```
+
+The only docs-cited hits are the plan document's own §4.1 listing of the merge
+group members (self-citation); excluding `test-pruning-plan.md`, the docs-cited
+baseline is 438 names (matching §1) and the cross-check is empty.
+
+Sanity: temporarily adding `404` to `RETRYABLE_STATUSES` (scratch, not committed)
+made `RetryTests::test_retry_matrix` report
+`(case='test_permanent_status_never_retries')` failing; forcing
+`_parse_retry_after` to `1.0` made
+`RetryAfterOverflowTests::test_parse_retry_after_matrix` report each malformed
+case label failing. Source restored.
+
+Verification: `python3 scripts/run_tests.py --slow -j 4 <batch modules>` and the
+full fast tier `python3 scripts/run_tests.py -j 4` pass;
+`python3 scripts/check_contract_docs.py` OK; `git diff --check` clean.
+
+---
+
+### 4.3 Batch E execution results (S19-PRUNE-E)
+
+Branch `task/s19-prune-E`, base `544d63f6a8cd25f139436799f79a7b633f4b85b6`.
+Test-only change: `tests/test_discovery_expansion.py`,
+`tests/test_discovery_job_routes.py` (no `src/` change).
+
+Method counts before → after (per Batch E module):
+
+| module | before | after |
+|---|---:|---:|
+| `test_discovery_candidates` | 32 | 32 |
+| `test_discovery_citations` | 30 | 30 |
+| `test_discovery_expansion` | 30 | 25 |
+| `test_discovery_freeze` | 30 | 30 |
+| `test_discovery_store` | 24 | 24 |
+| `test_discovery_worker` | 24 | 24 |
+| `test_discovery_job_routes` | 15 | 14 |
+| `test_discovery_backup` | 5 | 5 |
+| **Batch E total** | **190** | **184** |
+
+**P1 merges applied (cases preserved, no behaviour deleted):**
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---:|---:|
+| `test_discovery_expansion` | 6 bounds/cycle/gap tests (`test_forward_and_backward_cycle_is_bounded_and_deterministic`, `test_hop_limit_records_frontier_and_is_explicit`, `test_source_limit_retains_edges_and_marks_frontier`, `test_zero_request_budget_performs_no_request`, `test_zero_hop_and_zero_source_bounds_perform_no_request`, `test_declared_entries_beyond_page_budget_are_an_explicit_gap`) → `BoundsCycleGapTests::test_bounds_cycles_gaps_matrix` | 6 | 5 |
+| `test_discovery_job_routes` | 2 zero-HTTP escalation tests (`test_unapproved_plan_zero_http_and_escalates`, `test_out_of_root_zero_http_and_escalates`) → `ExpandRoutesTest::test_zero_http_and_escalates` | 2 | 1 |
+
+Every original method name is preserved as a `subTest` case label
+(`case="test_<name>"`), and every original assertion/setup body is retained
+verbatim. No case, input, or assertion was dropped.
+
+**Deletion list: empty.** The two §4.2 Batch E P2 rows were materialised and
+skipped: the `test_discovery_expansion` and `test_discovery_freeze` modules hold
+no non-K1/K2 "bounds/cycle/gap" or "freeze/amendment" integration duplicate —
+their bounds/cycle/gap tests are the `expansion` unit surface, already merged
+above, while `test_discovery_freeze` is almost entirely K2-named
+(`forged`, `corrupt`, `refused`, `cross_project`, `stale`, `tamper`,
+`never_clean`, `foreign`) and its remaining freeze/amendment tests assert the
+read-path authority at the module layer, which the slow `test_step05_acceptance`
+covering tests exercise only end-to-end. Removing any of them would weaken
+fail-closed coverage, so none was safe to delete.
+
+**Attempted-and-reverted merge (documented for honesty):** folding
+`test_discovery_worker`'s pause/cancel/drain stop tests into one `subTest` table
+was reverted. Those three tests share one `setUp` store per test *method*; within
+a single merged method the durable observations accumulate across cases, so the
+`len(observations) == 1` assertion fails for the 2nd/3rd case
+(`AssertionError: 2 != 1`, `3 != 1`). They must stay as three standalone
+methods.
+
+**§6 grep cross-check (merged-away name list, 8 names):**
+
+- docs-cited: `comm -12` against `grep -rhoE 'test_[A-Za-z0-9_]+' docs |
+  sort -u` (438 names, excluding `test-pruning-plan.md`) prints **nothing**.
+- security-named: the K2 heuristic prints **nothing** for the 8 names.
+
+**Mutation spot-check (scratch, uncommitted):** breaking the expansion
+`max_sources` child guard (`if len(known) >= validated_limits.max_sources` →
+`if False`) made the merged test report the exact failing case
+`case='test_source_limit_retains_edges_and_marks_frontier'`
+(`AssertionError: Lists differ: [] != [('MED:3', 'source_limit')]`). Source
+restored (`git diff -- src/` empty). Note: mutating only the BFS *pop* hop guard
+is masked by the redundant child-time hop guard (defense in depth), so the
+source-limit guard was used.
+
+**Verification (all on `task/s19-prune-E`):**
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 test_discovery_candidates test_discovery_citations \
+  test_discovery_expansion test_discovery_freeze test_discovery_store test_discovery_worker \
+  test_discovery_job_routes test_discovery_backup
+# -> 8 modules, 184 tests, 0 failures, 0 errors, 0 skipped
+
+python3 scripts/run_tests.py -j 4
+# -> 145 modules, 3799 tests, 0 failures, 0 errors (fast tier)
+
+### 4.3 Batch G execution results (S19-PRUNE-G)
+
+Branch `task/s19-prune-G`, base `91380c7f6ac5601f8a7c862b2e46c0c14bca1646`.
+Test-only change (no `src/`): `tests/test_config.py`, `tests/test_jobs.py`,
+`tests/test_migrations.py`, `tests/test_storage_opmemo.py`. Batch G is
+security-dense (owner auth, approvals, backups, registry); every K2
+security/fail-closed test was left standalone, so pruning is confined to the
+non-security modules with case-preserving P1 `subTest` merges.
+
+Method counts before → after (per Batch G module):
+
+| module | before | after |
+|---|---:|---:|
+| `test_owner_auth` | 59 | 59 |
+| `test_agent_runtime_store` | 59 | 59 |
+| `test_backup` | 41 | 41 |
+| `test_jobs` | 42 | 41 |
+| `test_config` | 27 | 12 |
+| `test_approvals` | 30 | 30 |
+| `test_human_approvals` | 39 | 39 |
+| `test_human_runtime_backup` | 17 | 17 |
+| `test_activation` | 19 | 19 |
+| `test_projects` | 13 | 13 |
+| `test_migrations` | 14 | 10 |
+| `test_registry` | 7 | 7 |
+| `test_storage_opmemo` | 9 | 8 |
+| `test_identity_path_safety` | 11 | 11 |
+| `test_runtime_backup` | 13 | 13 |
+| **Batch G total** | **400** | **380** |
+
+**P1 merges applied (cases preserved, every original method name kept as a
+`subTest` case label):**
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---|---:|---:|
+| `test_config` | 6 invalid-config shape/version rejects (`test_non_object_root_rejected`, `test_newer_schema_version_rejected`, `test_version_zero_or_negative_rejected`, `test_missing_schema_version_rejected`, `test_non_integer_version_rejected`, `test_bad_data_dir_rejected`) → `test_invalid_configurations_rejected` | 6 | 5 |
+| `test_config` | 4 invalid-file rejects (`test_malformed_json_is_rejected_without_echo`, `test_missing_file_is_actionable`, `test_non_utf8_is_rejected`, `test_oversize_is_rejected`) → `test_invalid_config_files_rejected` | 4 | 3 |
+| `test_config` | 4 data-dir precedence rules (`test_explicit_wins`, `test_config_beats_default`, `test_default_xdg_used_last`, `test_no_env_no_config_uses_home_default`) → `test_data_dir_resolution_precedence` | 4 | 3 |
+| `test_config` | 4 strict-JSON rejects (`test_duplicate_keys_rejected`, `test_nonfinite_rejected`, `test_overdeep_rejected`, `test_malformed_rejected`) → `test_strict_json_rejections` | 4 | 3 |
+| `test_config` | 2 config-file strict-JSON rejects (`test_config_file_duplicate_keys_rejected`, `test_config_file_nonfinite_rejected`) → `test_config_file_strict_json_rejected` | 2 | 1 |
+| `test_migrations` | 4 `resolve_synchronous` unit rules (`test_unset_and_unknown_resolve_to_full`, `test_off_and_normal_honoured`, `test_never_raises_on_broken_mapping`, `test_production_default_is_full`) → `test_resolve_synchronous_matrix` | 4 | 3 |
+| `test_migrations` | 2 `open_connection` pragma cases (`test_open_connection_honours_env`, `test_open_connection_defaults_to_full`) → `test_open_connection_synchronous_matrix` | 2 | 1 |
+| `test_storage_opmemo` | 2 outermost-transaction-boundary cases (`test_commit_starts_new_transaction_with_empty_memo`, `test_rollback_starts_new_transaction_with_empty_memo`) → `test_new_transaction_after_commit_or_rollback_has_empty_memo` | 2 | 1 |
+| `test_jobs` | 2 waiting-state gate cases (`test_waiting_human_blocks_new_attempt`, `test_waiting_external_blocks_new_attempt`) → `test_waiting_states_block_new_attempt` | 2 | 1 |
+
+**Deletion list: empty.** No P2/P3 standalone deletion was executed. The §4.2
+Batch G row (`test_jobs::test_*` persistence duplicates covered by
+`test_step03_acceptance::test_job_completes_after_submitter_process_exits`) was
+materialised and **not** executed: the covering test is a real-process
+integration/acceptance layer, whereas `test_jobs` is the unit-level storage
+layer, so the named cover is not "the same behaviour at the same layer" as
+required by the task's binding rule. `test_jobs` also contains K2 methods
+(`test_stale_fence_cannot_accept`, `test_exactly_one_local_accepted_result`,
+ambiguous-retry blocks, budget-cap refusals, monotonic cost settlement) that
+stay standalone. Same-layer unit coverage was preserved by the waiting-gate
+merge instead.
+
+**§6 grep cross-check** on the exact 30 merged-away names (excluding this plan
+document itself; docs-cited baseline 438 names):
+
+```bash
+grep -rhoE 'test_[A-Za-z0-9_]+' docs --exclude=test-pruning-plan.md | LC_ALL=C sort -u > /tmp/docs_cited_noplan.txt
+comm -12 <(sort -u /tmp/del_G.txt) /tmp/docs_cited_noplan.txt   # prints nothing
+comm -12 <(sort -u /tmp/del_G.txt) /tmp/sec_named.txt           # prints nothing
+```
+
+Both intersections are empty: no merged name is docs-cited and none matches the
+K2 security heuristic. (`test_credential_style_keys_rejected`,
+`test_unknown_key_rejected_without_echoing_value_or_name` and the whole of
+`test_owner_auth`, `test_approvals`, `test_backup`,
+`test_human_approvals`, `test_human_runtime_backup`, `test_runtime_backup`,
+`test_agent_runtime_store`, `test_identity_path_safety`, `test_activation`,
+`test_projects`, `test_registry` were left untouched as security/fail-closed.)
+
+**Mutation spot-check (scratch, uncommitted):** forcing
+`schema.resolve_synchronous` to return `"OFF"` for the unknown-value path made
+the merged `test_resolve_synchronous_matrix` report the failing case
+`case='test_unset_and_unknown_resolve_to_full'` (all 9 sub-values) and
+`test_open_connection_synchronous_matrix` report
+`case='test_open_connection_defaults_to_full'`. Source restored
+(`git diff -- src/` empty).
+
+Verification (all on `task/s19-prune-G`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 test_owner_auth test_agent_runtime_store test_backup \
+  test_jobs test_config test_approvals test_human_approvals test_human_runtime_backup \
+  test_activation test_projects test_migrations test_registry test_storage_opmemo \
+  test_identity_path_safety test_runtime_backup
+# -> 15 modules, 379 tests, 0 failures, 0 errors, 0 skipped
+
+python3 scripts/run_tests.py -j 4
+# -> 145 modules, 3681 tests, 0 failures, 0 errors (fast tier), 706 skipped
+
+### 4.3 Batch H execution results (task S19-PRUNE-H)
+
+Executed on branch `task/s19-prune-H` from
+`91380c7f6ac5601f8a7c862b2e46c0c14bca1646`. Batch H is **test-only** (no `src/`).
+Case-preserving `subTest` merges (P1) in three of the twenty modules; every
+original method name is kept as the `subTest` case label
+(`with self.subTest(case="test_<name>")`), so `grep test_<name>` still finds the
+behaviour text.
+
+| module | before | after | Δ | action |
+|---|---:|---:|---:|---|
+| `test_drafting_package` | 21 | 16 | −5 | P1 merge |
+| `test_synthesis_workflow` | 23 | 20 | −3 | P1 merge |
+| `test_delivery_export` | 17 | 14 | −3 | P1 merge |
+| other 17 Batch H modules | 253 | 253 | 0 | none (see below) |
+| **Batch H total** | **314** | **303** | **−11** | |
+
+P1 merges applied (cases preserved verbatim as `subTest` labels):
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---:|---:|
+| `test_drafting_package` | 6 `BibliographicMetadataTests` cases (`test_present_fields_are_carried_from_the_observation`, `test_authors_and_journal_are_carried_from_the_observation`, `test_disagreeing_authors_or_journal_omit_the_field`, `test_absent_fields_are_omitted_never_invented`, `test_disagreeing_occurrences_omit_the_field`, `test_identity_only_carries_present_namespaces`) → `test_bibliographic_metadata_rules` | 6 | 5 |
+| `test_synthesis_workflow` | 4 framework-edit impact cases (`test_concept_change_flags_relationship_only_section`, `test_relationship_edit_flags_indirect_concept_endpoints`, `test_global_criteria_change_flags_all_sections`, `test_global_limitations_change_flags_all_sections`) → `test_framework_edit_impact_matrix` | 4 | 3 |
+| `test_delivery_export` | 2 `CitedKeysTests` cases (`test_ordered_unique_keys`, `test_no_citations`) → `test_cited_keys` | 2 | 1 |
+| `test_delivery_export` | 3 `CheckConsistencyTests` cases (`test_clean`, `test_invented_and_missing`, `test_duplicate_doi_and_version_mismatch`) → `test_consistency_checks` | 3 | 2 |
+
+Notes:
+
+- The `test_framework_edit_impact_matrix` cases each need a **fresh store** (a
+  manifest request key is single-use, so re-running `approved_chain()` in one
+  store raises `ManifestConflictError`); the merged method calls `self.setUp()`
+  before each `subTest` case to re-establish the identical fixture. The
+  gate-staling case `test_definition_edit_flags_dependent_section_and_stales_gate`
+  stays standalone (stale-approval).
+- **Deletion list: empty.** No P2/P3 deletion was safe in this batch.
+
+**Plan §4.1 row not materialisable (reported, not skipped silently).**
+`test_parsing_core` "malformed-input tests → `test_malformed_inputs` ~8": the
+candidate set is `XmlThreatTests` (`test_entity_declaration_rejected`,
+`test_internal_subset_rejected`, `test_undefined_entity_rejected`,
+`test_unsupported_root_is_human_review_not_exclusion`,
+`test_empty_input_is_human_review_not_exclusion`,
+`test_empty_body_is_human_review_not_exclusion`,
+`test_source_digest_must_match_bytes`). Every one is a fail-closed / XML-threat
+(XXE / entity-expansion / never-exclusion) test, so per the binding keep rule
+("keep every fail-closed test standalone") none was merged.
+
+**Plan §4.2 rows not materialisable (reported).**
+`test_screening_runner::test_*` (covering `test_screening::test_*`) and
+`test_extraction_workflow::test_*` (covering `test_extraction_runner::test_*`)
+are **different layers**, not duplicates: `test_screening` exercises
+`ScreeningRepository` gates/staleness/historical reads and never calls
+`execute_screening_case`; `test_screening_runner` exercises the runner's
+dispatch-commit / reserve-retention / replay / `verified_dispatch` provenance
+(none of which `test_screening` asserts). Likewise `test_extraction_workflow`
+exercises the `ExtractionWorkflowRepository` comparison/gating/selection logic
+over the `_require_run` seam, which `test_extraction_runner` (real runner) does
+not cover. Deleting either would lose coverage, so both rows were left
+untouched.
+
+The remaining Batch H modules are workflow/gate/fail-closed heavy (screening,
+extraction, drafting workspace/drafts/workflow, review, delivery, parsing
+repository, tracing): their methods are already one-behaviour-per-method gate or
+fail-closed tests, which the binding rule keeps standalone, so no safe merge
+group was available.
+
+**§6 grep cross-check** on the exact 11 merged-away standalone names (excluding
+`test-pruning-plan.md` itself):
+
+```bash
+comm -12 <(LC_ALL=C sort -u /tmp/del_H.txt) /tmp/docs_cited_noplan.txt   # empty
+comm -12 <(LC_ALL=C sort -u /tmp/del_H.txt) /tmp/sec_named.txt           # empty
+```
+
+The docs-cited baseline is 438 names (matching §1). Note: the
+`test_tracing_workflow::CacheTests` retrace family was **excluded** from merging
+precisely because all five names are docs-cited
+(`docs/implementation/handoffs/13-origin-tracing.md`), i.e. K1.
+
+**Mutation spot-check (scratch, uncommitted):** forcing `delivery/export.py
+cited_keys` to `return []` made the merged `test_cited_keys` report the exact
+failing case `case='test_ordered_unique_keys'` (and the dependent
+`test_consistency_checks` cases). Source restored (`git diff -- src/` empty).
+
+Verification (all on `task/s19-prune-H`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 <all 20 Batch H modules>
+# -> 20 modules, 303 tests, 0 failures, 0 errors, 5 skipped
+
+python3 scripts/run_tests.py -j 4
+# -> 145 modules, 3691 tests, 0 failures, 0 errors, 703 skipped (fast tier)
+
+python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
+git diff --check                        # -> clean
+```
+
+## 5. Projected total and reachability
+
+| Group | before | after |
+|---|---:|---:|
+| Batch A–I (prunable, this plan) | 2,997 | 1,564 |
+| K3 generation (`test_generation_*`) | 101 | 101 |
+| K3 pipeline + MVP e2e | 33 | 33 |
+| K5 step acceptance (`test_step*`) | 114 | 114 |
+| Off-MVP deferred (§7, not pruned here) | 612 | 612 |
+| **Total** | **3,857** | **2,424** |
+
+**Projected total ≈ 2,400 methods (≈ 37% reduction).**
+
+### Is ≈ 1,000 reachable?
+
+**No — not without violating the binding keep rules.** The hard floor is:
+
+- Off-MVP deferred: **612** (K5/§7 — must not be deleted here).
+- K3 generation + pipeline + MVP e2e: **134**.
+- K5 step acceptance: **114**.
+- K1 docs-cited methods in the remaining 104 modules: **224**.
+- K2 security-named methods in the remaining modules: **606** (union with K1 =
+  **779**).
+- K4 one-test-per-public-behaviour across ~40 public modules: **≥ 100**.
+
+Floor = 860 (protected) + 779 (K1∪K2 outside) = **≈ 1,640** even with every
+other test deleted. Add the fact that a meaningful fraction of the 1,564
+surviving batch methods are themselves K1/K2 and the realistic reachable number
+is **≈ 2,400**.
+
+To approach 1,000 the user would have to relax at least two keep rules:
+
+1. Delete the **off-MVP candidate set** (§7, 612 methods) → floor drops to
+   ≈ 1,800.
+2. Relax **K3** (generation/pipeline) and/or **K5** (step acceptance) → another
+   ~250.
+3. Relax **K2** below the task's stated security list.
+
+Even then, ~1,000 requires cutting into security and acceptance coverage, which
+the task forbids. **Recommendation:** adopt ≈ 2,400 as the realistic target; keep
+~1,000 as a stretch goal contingent on the off-MVP decision in §7.
+
+---
+
+## 6. Grep cross-check (no docs-cited or security test proposed for deletion)
+
+Commands (run in the checkout after materialising each batch's exact deletion
+list `DEL`):
+
+```bash
+# 1. docs-cited names
+grep -rhoE 'test_[A-Za-z0-9_]+' docs | sort -u > /tmp/docs_cited.txt
+comm -12 <(sort -u "$DEL") /tmp/docs_cited.txt      # must print nothing
+
+# 2. security-named names
+grep -rhoE 'def test_[A-Za-z0-9_]+' tests/ | sed 's/def //' \
+  | grep -iE 'secur|leak|secret|bypass|stale|fail.?closed|duplicate_accepted|one_active|inject|tamper|forged|forgery|cross_project|foreign|corrupt|fence|lease|credential|untrusted|integrity|redact|escape|traversal|sanitiz|refus|deny|unauthor' \
+  | sort -u > /tmp/sec_named.txt
+comm -12 <(sort -u "$DEL") /tmp/sec_named.txt       # must print nothing
+```
+
+At plan time, every deletion row in §4.2 was written to exclude any method
+appearing in `/tmp/docs_cited.txt` (438 names) or matching the K2 heuristic.
+This is the evidence required by acceptance criterion 1. Execution tasks repeat
+the two `comm -12` checks and abort if either prints a line.
+
+---
+
+## 7. Off-MVP candidate set (separate user decision — not pruned here)
+
+These modules/code are out of MVP scope per the task. Listed for a **separate**
+user decision; this plan neither deletes nor merges them. Tests: **612**
+methods across 16 modules.
+
+| Area | Test modules (methods) | Product code (LOC) |
+|---|---|---:|
+| OpenCode service/client | `test_opencode_service` (54), `test_opencode_client` (100) | `runtime/service.py` (2580), `runtime/opencode.py` (1446) |
+| OpenCode session runner | `test_session_runner` (37), `test_session_runner_acceptance` (4) | `runtime/session_runner.py` (1678), `runtime/session_turns.py` (1294) |
+| Session intents | `test_session_intents` (19), `test_session_intent_backup` (9) | `storage/session_intents.py` (1166) |
+| Decision-intent ledger + backups | `test_decision_intents` (45), `test_decision_intent_backup` (20), `test_decision_commit` (37), `test_decision_commit_backup` (8) | `storage/decision_intents.py` (1696), `storage/backup.py` (2378, shared) |
+| Decision-result ledger + backups | `test_decision_results` (52), `test_decision_result_backup` (18) | `storage/decision_results.py` (2375) |
+| Decision records / projection | `test_decision_records` (92), `test_adapter_decision_projection` (22) | `runtime/decision_records.py` (1529) |
+| Gate-snapshot internals | `test_gate_snapshots` (52) | `runtime/gates.py` (1529) |
+| Session turns | `test_session_turns` (43) | `runtime/session_turns.py` (1294, shared above) |
+
+**Off-MVP tests total: 612. Off-MVP product code: ≈ 16,900 LOC** (excluding the
+shared `storage/backup.py`). If the user removes this set entirely, the suite
+drops by 612 methods and the reachable floor from §5 falls to ≈ 1,800.
+
+---
+
+## 8. Execution checklist (per batch)
+
+1. Materialise the batch's exact deletion list; run the §6 `comm -12` checks.
+2. Mutation spot-check each P2/P3 deletion: break the lower-level behaviour,
+   confirm the named covering test fails, restore.
+3. Apply P1 merges with `subTest`; keep original method names as case labels.
+4. `pytest <batch modules>` green; runtime from `durations.json` not regressed.
+5. `python3 scripts/check_contract_docs.py` OK.
+6. `git diff --check` clean.
+7. Commit docs+tests for the batch; report before/after method counts.
+
+## 9. Unresolved issues
+
+- `tests/durations.json` lacks entries for ~20 newer modules; runtimes for those
+  batches must be measured before/after.
+- The K2 heuristic over-approximates; a human review of the exact per-batch
+  deletion list is required before any security-named method is removed.
+- `src/review_article_agent/runtime/{generation,dispatch}.py` are MVP-critical
+  but sit outside the literal `pipeline/`+`generation/` package keep; treated as
+  conservative (batch I, 25% cut) pending user confirmation.
+- Whether `worker/` tests are covered by "tests of `pipeline/`" is ambiguous;
+  batch I keeps 75%.
+
+---
+
+### 4.3 Batch F execution results (task S19-PRUNE-F)
+
+Branch `task/s19-prune-F`, base `544d63f6a8cd25f139436799f79a7b633f4b85b6`.
+Test-only change (no `src/` change): `tests/test_cli_worker.py`,
+`tests/test_cli_discovery_jobs.py`, `tests/test_cli_review_tracing_delivery.py`,
+`tests/test_cli_acquisition_retrieval.py`, `tests/test_cli_snapshot.py`,
+`tests/test_cli_human_gates.py`, `tests/test_cli_acquisition.py`.
+
+P1 `subTest` merges only; every §4.2 Batch F P2/P3 `test_*` wildcard row
+(`test_cli_discovery_jobs` job-surface, `test_cli_*` happy-path duplicates)
+materialised **empty**: the CLI acceptance covering tests named there
+(`test_step05_cli_acceptance::test_*`) assert the same behaviour at the
+step-acceptance layer but the CLI modules' own tests also pin the exact CLI
+output/exit/secret contract, so deleting them would drop K4
+one-test-per-public-behaviour coverage. No P2/P3 deletion was safe.
+
+Method counts before → after (per changed module):
+
+| module | before | after |
+|---|---:|---:|
+| `test_cli_worker` | 29 | 25 |
+| `test_cli_discovery_jobs` | 28 | 23 |
+| `test_cli_review_tracing_delivery` | 18 | 16 |
+| `test_cli_acquisition_retrieval` | 10 | 7 |
+| `test_cli_snapshot` | 15 | 12 |
+| `test_cli_human_gates` | 18 | 17 |
+| `test_cli_acquisition` | 9 | 8 |
+| **changed-module subtotal** | **127** | **108** |
+
+The other 13 Batch F modules were unchanged. **Batch F total: 314 → 295**
+(drop 19). The §4 target of 157 is **not reachable** without violating the
+binding keep rules: the batch's docs-cited methods (K1) and security-named /
+fail-closed / no-secret-echo methods (K2) dominate the CLI modules, and the
+CLI-specific rules (one test per command happy path, per documented error
+category/exit code, every no-secret-echo test, one real-subprocess smoke per
+entry point) keep the remainder. This matches the Batch C (306→283) and Batch D
+(345→316) yields rather than the plan's aspirational column.
+
+Merges (P1, cases preserved — original method names kept as `subTest` case
+labels; drop = methods folded into the new parameterized method):
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---|---:|---:|
+| `test_cli_worker` | 3 timeout-forwarding (`test_start_forwards_explicit_timeout_as_float`, `test_status_forwards_explicit_timeout`, `test_stop_forwards_explicit_timeout`) → `test_subcommands_forward_explicit_timeout` | 3 | 2 |
+| `test_cli_worker` | 2 unresolved-stop storage (`test_stop_pending_is_nonzero_storage`, `test_stop_unavailable_is_nonzero_storage`) → `test_stop_unresolved_is_nonzero_storage` | 3 | 1 |
+| `test_cli_worker` | 2 status (`test_status_running`, `test_status_down_shows_explicit_reason`) → `test_status_reports_running_or_explicit_reason` | 4 | 1 |
+| `test_cli_discovery_jobs` | 2 search rejects (`test_search_run_bad_query_index_performs_zero_ipc`, `test_search_seed_empty_query_zero_ipc`) → `test_search_invalid_input_zero_ipc` | 2 | 1 |
+| `test_cli_discovery_jobs` | 3 import rejects (`test_import_empty_or_bad_file_zero_ipc`, `test_import_missing_file_zero_ipc`, `test_import_payload_cap_zero_ipc`) → `test_import_invalid_inputs_zero_ipc` | 3 | 2 |
+| `test_cli_discovery_jobs` | 2 expand rejects (`test_expand_run_bad_roots_zero_ipc`, `test_expand_run_has_no_cli_limits_override`) → `test_expand_run_invalid_arguments_zero_ipc` | 2 | 1 |
+| `test_cli_discovery_jobs` | 2 configure rejects (`test_configure_invalid_envelope_writes_nothing`, `test_configure_bad_rights_writes_nothing`) → `test_configure_invalid_input_writes_nothing` | 2 | 1 |
+| `test_cli_review_tracing_delivery` | 3 unknown-id validation (`test_unknown_review_is_static_validation_error`, `test_unknown_trace_is_static_validation_error`, `test_unknown_delivery_is_static_validation_error`) → `test_unknown_ids_are_static_validation_errors` | 3 | 2 |
+| `test_cli_acquisition_retrieval` | 3 invalid run request files (`test_run_rejects_malformed_json_with_zero_ipc`, `test_run_rejects_unknown_keys_and_ineligible_rights_zero_ipc`, `test_run_non_dict_request_file_zero_ipc`) → `test_run_invalid_requests_zero_ipc` | 3 | 2 |
+| `test_cli_acquisition_retrieval` | 2 unknown-id validation (`test_id_unknown_project_and_bad_request_id`, `test_show_unknown_request_and_project`) → `test_unknown_ids_are_validation_errors` | 2 | 1 |
+| `test_cli_snapshot` | 4 current-indicator truthfulness (`test_approved_same_head_is_true`, `test_rejected_same_head_is_false`, `test_superseded_is_false`, `test_invalidated_is_false`) → `test_current_indicator_matrix` | 4 | 3 |
+| `test_cli_human_gates` | 2 confirm-argument rejects (`test_malformed_expected_digest_is_a_validation_error`, `test_out_of_range_timeout_is_a_validation_error_before_the_terminal`) → `test_invalid_confirm_arguments_are_validation_before_terminal` | 2 | 1 |
+| `test_cli_acquisition` | 2 import failures (`test_request_and_rights_conflicts`, `test_rights_and_project_failures_write_nothing`) → `test_import_failures_write_nothing` | 2 | 1 |
+
+**Deletion list: empty** (all §4.2 Batch F P2/P3 rows materialised empty — see
+above).
+
+**Merges deliberately not applied (reverted after verification):**
+
+- `test_cli_drafting` — the 3 missing-reference tests were folded into one
+  `subTest` method, but `WorkspaceBase.approved_chain()` is **not idempotent**
+  within one test instance (`ManifestConflictError: a different manifest is
+  already recorded for this request key`), so the merged method errored on the
+  2nd/3rd case. The 3 original methods were restored unchanged.
+- `test_cli_discovery_reports` — a `test_bad_rights_or_ref_writes_nothing` +
+  `test_malformed_known_file_is_refused` merge was reverted because the §6
+  security-name check flags `test_malformed_known_file_is_refused` (`refus`);
+  per K2 keep-by-default it is **not** merged.
+
+**§6 grep cross-check (exact 32 merged-away names):**
+
+- docs-cited: `comm -12` against the 438 docs-cited names (excluding this plan
+  file) prints **nothing**.
+- security-named: `comm -12` against the K2 heuristic list prints **nothing**.
+
+**Mutation spot-check (scratch, reverted):** flipping the
+`cli/worker.py` `stop_unconfirmed` error category from `_CATEGORY_STORAGE` to
+`_CATEGORY_CONFLICT` made `test_stop_unresolved_is_nonzero_storage` fail exactly
+on `case='test_stop_pending_is_nonzero_storage'` (`AssertionError: 3 != 4`),
+confirming the merged parameterized test still detects the broken path. Source
+restored (`git diff -- src/` empty).
+
+Verification (all on `task/s19-prune-F`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 <20 Batch F modules>
+# -> modules: 20  tests: 305  failures: 0  errors: 0  skipped: 0
+
+python3 scripts/run_tests.py -j 4
+# -> modules: 145  tests: 3796  failures: 0  errors: 0  skipped: 702 (fast tier)
+
+python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
+git diff --check                         # -> clean
+```
+
+### 4.3 Batch I execution results (S19-PRUNE-I)
+
+Branch `task/s19-prune-I`, base `678adf61d1604ae0329fdc781757e18e2e4d5864`.
+Batch I is **test-only** (no `src/` change): `tests/test_agent_roles.py`,
+`tests/test_runtime_dispatch.py`, `tests/test_runtime_generation.py`,
+`tests/test_worker_engine.py`, `tests/test_worker_ipc.py`. Conservative P1
+`subTest` merges only, of genuinely table-style input-validation tests; every
+original method name is kept as the `subTest` case label
+(`with self.subTest(case="test_<name>")`), so `grep test_<name>` still finds the
+behaviour text. No crash/recovery/replay/no-re-send/idempotency/budget/
+one-active-project/owner-only/secret test was touched; every K1 (docs-cited) and
+K2 (security/fail-closed) method was left standalone.
+
+Method counts before → after (per Batch I module):
+
+| module | before | after | Δ | action |
+|---|---|---:|---:|---:|---|
+| `test_runtime_generation` | 77 | 69 | −8 | P1 merge |
+| `test_runtime_dispatch` | 69 | 67 | −2 | P1 merge |
+| `test_worker_engine` | 50 | 49 | −1 | P1 merge |
+| `test_worker_ipc` | 47 | 44 | −3 | P1 merges |
+| `test_worker_process` | 19 | 19 | 0 | none (crash/timeout/foreign tests, K2) |
+| `test_worker_backup` | 33 | 33 | 0 | none (tamper/corrupt fail-closed, K2) |
+| `test_agent_roles` | 54 | 51 | −3 | P1 merge |
+| `test_runtime_worker_arbitration` | 13 | 13 | 0 | none (recovery/corruption/one-active, K2) |
+| `test_execution_boundary` | 14 | 14 | 0 | none (refusal boundary, K2) |
+| `test_synthetic_backend` | 32 | 32 | 0 | none (refused/untouched, K2) |
+| **Batch I total** | **408** | **391** | **−17** | |
+
+P1 merges applied (cases preserved verbatim as `subTest` labels; drop = methods
+folded into the new parameterized method):
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---|---:|---:|
+| `test_agent_roles` | 4 `BoundedTaskTests` shape rejects (`test_rejects_non_object`, `test_rejects_missing_fields`, `test_rejects_bad_digest_and_unknown_ref_keys`, `test_rejects_unbounded_input_refs`) → `test_rejects_invalid_task_shapes` | 4 | 3 |
+| `test_runtime_dispatch` | 3 reserve-argument rejects (`test_missing_or_invalid_reserve_denied`, `test_missing_or_invalid_bound_evidence_denied`, `test_invalid_route_and_digests_denied`) → `test_invalid_reserve_inputs_denied` | 3 | 2 |
+| `test_worker_engine` | 2 request rejects (`test_status_and_unknown_op_and_version`, `test_out_of_range_and_bad_payload_are_rejected`) → `test_invalid_request_shapes_are_rejected` | 2 | 1 |
+| `test_runtime_generation` | 9 malformed/untrusted provider-response cases (`test_malformed_non_json_content_is_protocol_error`, `test_valid_json_but_not_an_object_is_protocol_error`, `test_wrong_model_is_protocol_error`, `test_length_finish_is_never_success`, `test_tool_calls_are_never_success`, `test_top_level_error_is_protocol_error`, `test_missing_choices_is_protocol_error`, `test_non_text_content_is_protocol_error`, `test_empty_content_is_protocol_error`) → `test_malformed_responses_are_never_success` | 9 | 8 |
+| `test_worker_ipc` | 2 constructor rejects (`test_constructor_rejects_unsafe_filenames`, `test_constructor_rejects_bad_limits`) → `test_constructor_rejects_invalid_arguments` | 2 | 1 |
+| `test_worker_ipc` | 3 malformed request-body rejects (`test_duplicate_key_rejected`, `test_nonfinite_rejected`, `test_deep_nesting_rejected`) → `test_malformed_request_bodies_rejected` | 3 | 2 |
+
+Notes:
+
+- **Per-test fixture isolation.** `test_worker_ipc::_serve()` binds a
+  per-data-dir control lock (exactly one server per data dir). The first version
+  of `test_malformed_request_bodies_rejected` re-used one `self.data_dir` across
+  its three cases and errored on the 2nd/3rd with `WorkerAlreadyRunning`; the
+  merged method now assigns a fresh `self.data_dir` per case so the cases stay
+  isolated (the `test_agent_roles`/`test_runtime_dispatch`/`test_worker_engine`/
+  `test_runtime_generation` merged cases build a fresh mapping/transport per case
+  and needed no rebuild).
+- **Deliberately excluded from merging (kept standalone):**
+  `test_worker_engine::test_unknown_field_is_rejected_never_trusted` (a
+  caller-supplied authority/actor field must never authenticate — the
+  authority-is-out-of-band K2 behaviour); `test_agent_roles::test_rejects_cross_project_refs`
+  (`cross_project` K2); `test_agent_roles::test_rejects_authority_actor_approval_budget_tool_keys`
+  (docs-cited K1); `test_runtime_generation::test_refusal_is_refused` and
+  `test_content_filter_is_refused` (`refus` K2); and the `AmbiguityTests`
+  status/cost matrices (budget/cost accounting, K2). All `test_worker_backup`
+  tamper/corrupt tests, all `test_execution_boundary` refusal tests, all
+  `test_runtime_worker_arbitration` recovery/corruption tests, all
+  `test_synthetic_backend` refused/untouched tests, and all `test_worker_process`
+  crash/timeout/foreign tests are fail-closed and were left standalone.
+- **Deletion list: empty.** The plan's one Batch I §4.2 row
+  (`test_runtime_generation::test_*` projection duplicates, covered by
+  `test_generation_runner`, kept K3) was not executed: the row names no exact
+  method set and the two modules sit at different layers (runner vs.
+  lead-config projection), so no P2/P3 deletion was safe without weakening K4
+  one-test-per-public-behaviour coverage. This matches the conservative scope of
+  §9 ("batch I keeps 75%").
+
+**§6 grep cross-check** on the exact 23 merged-away names (excluding this plan
+document itself; docs-cited baseline 438 names):
+
+```bash
+comm -12 <(LC_ALL=C sort -u /tmp/del_I.txt) /tmp/docs_cited_noplan.txt   # empty
+comm -12 <(LC_ALL=C sort -u /tmp/del_I.txt) /tmp/sec_named.txt           # empty
+```
+
+Both intersections are empty: no merged name is docs-cited and none matches the
+K2 security heuristic.
+
+**Mutation spot-check (scratch, uncommitted):** flipping
+`runtime/dispatch.py::reserve_dispatch`'s
+`_require_exact_decimal(reserve_usd, ..., strictly_positive=True)` to
+`strictly_positive=False` made the merged `test_invalid_reserve_inputs_denied`
+report the expected failing case
+`(case='test_missing_or_invalid_reserve_denied')` (and the subsequent cases, once
+a reserve row was admitted). Source restored (`git diff -- src/` empty).
+
+Verification (all on `task/s19-prune-I`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 test_runtime_generation test_runtime_dispatch \
+  test_worker_engine test_worker_ipc test_worker_process test_worker_backup \
+  test_agent_roles test_runtime_worker_arbitration test_execution_boundary test_synthetic_backend
+# -> modules: 10  tests: 391  failures: 0  errors: 0  skipped: 0
+
+python3 scripts/run_tests.py -j 4
+# -> modules: 145  tests: 3638  failures: 0  errors: 0  skipped: 699 (fast tier)
+
+python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
+git diff --check                         # -> clean
+```

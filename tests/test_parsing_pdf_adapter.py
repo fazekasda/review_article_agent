@@ -121,59 +121,73 @@ class InjectedExtractorTests(unittest.TestCase):
         )
         self.assertEqual(first["passages"][0]["passage_id"], "p0001")
 
-    def test_blank_pages_need_review(self):
-        blank = extraction(page_count=2, pages=[
-            {"page": 1, "text": ""}, {"page": 2, "text": "   "},
-        ])
-        result = parse_pdf(self.PDF, extractor=lambda data: blank)
-        self.assertEqual(result["status"], "needs_review")
-        self.assertEqual(result["passages"], [])
-        self.assertIn("pdf_scan_or_blank_page", result["reasons"])
-        self.assertTrue(result["human_action_required"])
-        self.assertFalse(result["excludes_candidate"])
+    def test_degraded_extraction_needs_review(self):
+        # Each former standalone needs-review test is preserved verbatim as a
+        # labelled subTest case.
+        def case_test_blank_pages_need_review():
+            blank = extraction(page_count=2, pages=[
+                {"page": 1, "text": ""}, {"page": 2, "text": "   "},
+            ])
+            result = parse_pdf(self.PDF, extractor=lambda data: blank)
+            self.assertEqual(result["status"], "needs_review")
+            self.assertEqual(result["passages"], [])
+            self.assertIn("pdf_scan_or_blank_page", result["reasons"])
+            self.assertTrue(result["human_action_required"])
+            self.assertFalse(result["excludes_candidate"])
 
-    def test_very_short_text_needs_review(self):
-        short = extraction(page_count=1, pages=[{"page": 1, "text": "tiny"}])
-        result = parse_pdf(self.PDF, extractor=lambda data: short)
-        self.assertEqual(result["status"], "needs_review")
-        self.assertIn("pdf_text_too_short", result["reasons"])
-        self.assertFalse(result["excludes_candidate"])
+        def case_test_very_short_text_needs_review():
+            short = extraction(page_count=1, pages=[{"page": 1, "text": "tiny"}])
+            result = parse_pdf(self.PDF, extractor=lambda data: short)
+            self.assertEqual(result["status"], "needs_review")
+            self.assertIn("pdf_text_too_short", result["reasons"])
+            self.assertFalse(result["excludes_candidate"])
 
-    def test_garbled_text_needs_review(self):
-        garbled = extraction(page_count=1, pages=[{"page": 1, "text": "\ufffd" * 400}])
-        result = parse_pdf(self.PDF, extractor=lambda data: garbled)
-        self.assertEqual(result["status"], "needs_review")
-        self.assertIn("pdf_text_garbled", result["reasons"])
+        def case_test_garbled_text_needs_review():
+            garbled = extraction(page_count=1, pages=[{"page": 1, "text": "\ufffd" * 400}])
+            result = parse_pdf(self.PDF, extractor=lambda data: garbled)
+            self.assertEqual(result["status"], "needs_review")
+            self.assertIn("pdf_text_garbled", result["reasons"])
 
-    def test_limited_extraction_needs_review_but_keeps_text(self):
-        limited = extraction("limited", failure_code="page_limit", page_count=100,
-                             pages=[{"page": 1, "text": _LONG}])
-        result = parse_pdf(self.PDF, extractor=lambda data: limited)
-        self.assertEqual(result["status"], "needs_review")
-        self.assertIn("pdf_limited", result["reasons"])
-        self.assertIn("pdf_column_order_uncertain", result["reasons"])
-        self.assertGreaterEqual(len(result["passages"]), 1)
+        def case_test_limited_extraction_needs_review_but_keeps_text():
+            limited = extraction("limited", failure_code="page_limit", page_count=100,
+                                 pages=[{"page": 1, "text": _LONG}])
+            result = parse_pdf(self.PDF, extractor=lambda data: limited)
+            self.assertEqual(result["status"], "needs_review")
+            self.assertIn("pdf_limited", result["reasons"])
+            self.assertIn("pdf_column_order_uncertain", result["reasons"])
+            self.assertGreaterEqual(len(result["passages"]), 1)
 
-    def test_unavailable_maps_to_human_action(self):
-        unavailable = extraction("unavailable", failure_code="dependency_missing")
-        result = parse_pdf(self.PDF, extractor=lambda data: unavailable)
-        self.assertEqual(result["status"], "needs_review")
-        self.assertEqual(result["passages"], [])
-        self.assertIn("ocr_or_parser_unavailable", result["reasons"])
-        self.assertIn("pdf_full_extraction_unsupported", result["reasons"])
-        self.assertTrue(result["human_action_required"])
-        self.assertFalse(result["excludes_candidate"])
+        def case_test_unavailable_maps_to_human_action():
+            unavailable = extraction("unavailable", failure_code="dependency_missing")
+            result = parse_pdf(self.PDF, extractor=lambda data: unavailable)
+            self.assertEqual(result["status"], "needs_review")
+            self.assertEqual(result["passages"], [])
+            self.assertIn("ocr_or_parser_unavailable", result["reasons"])
+            self.assertIn("pdf_full_extraction_unsupported", result["reasons"])
+            self.assertTrue(result["human_action_required"])
+            self.assertFalse(result["excludes_candidate"])
 
-    def test_failed_and_encrypted_map_to_review(self):
-        malformed = extraction("failed", failure_code="malformed_pdf")
-        result = parse_pdf(self.PDF, extractor=lambda data: malformed)
-        self.assertEqual(result["status"], "needs_review")
-        self.assertIn("pdf_malformed", result["reasons"])
+        def case_test_failed_and_encrypted_map_to_review():
+            malformed = extraction("failed", failure_code="malformed_pdf")
+            result = parse_pdf(self.PDF, extractor=lambda data: malformed)
+            self.assertEqual(result["status"], "needs_review")
+            self.assertIn("pdf_malformed", result["reasons"])
 
-        encrypted = extraction("failed", failure_code="encrypted")
-        result = parse_pdf(self.PDF, extractor=lambda data: encrypted)
-        self.assertIn("pdf_encrypted", result["reasons"])
-        self.assertFalse(result["excludes_candidate"])
+            encrypted = extraction("failed", failure_code="encrypted")
+            result = parse_pdf(self.PDF, extractor=lambda data: encrypted)
+            self.assertIn("pdf_encrypted", result["reasons"])
+            self.assertFalse(result["excludes_candidate"])
+
+        for label, case in (
+            ("test_blank_pages_need_review", case_test_blank_pages_need_review),
+            ("test_very_short_text_needs_review", case_test_very_short_text_needs_review),
+            ("test_garbled_text_needs_review", case_test_garbled_text_needs_review),
+            ("test_limited_extraction_needs_review_but_keeps_text", case_test_limited_extraction_needs_review_but_keeps_text),
+            ("test_unavailable_maps_to_human_action", case_test_unavailable_maps_to_human_action),
+            ("test_failed_and_encrypted_map_to_review", case_test_failed_and_encrypted_map_to_review),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_extractor_exception_never_crashes(self):
         def boom(data):  # pragma: no cover - must be caught
@@ -223,54 +237,71 @@ class ChildLogicTests(unittest.TestCase):
             b"%PDF-fake", max_pages, max_text_chars, pypdf=fake
         )
 
-    def test_two_pages(self):
-        r = self.run_child(FakePypdf([FakePage("alpha"), FakePage("beta")]))
-        self.assertEqual(r["status"], "ok")
-        self.assertIsNone(r["failure_code"])
-        self.assertEqual(r["page_count"], 2)
-        self.assertEqual(r["pages"], [{"page": 1, "text": "alpha"}, {"page": 2, "text": "beta"}])
+    def test_child_extraction_matrix(self):
+        # Each former standalone child-logic test is preserved verbatim as a
+        # labelled subTest case. (test_corrupt_is_static_failure stays standalone.)
+        def case_test_two_pages():
+            r = self.run_child(FakePypdf([FakePage("alpha"), FakePage("beta")]))
+            self.assertEqual(r["status"], "ok")
+            self.assertIsNone(r["failure_code"])
+            self.assertEqual(r["page_count"], 2)
+            self.assertEqual(r["pages"], [{"page": 1, "text": "alpha"}, {"page": 2, "text": "beta"}])
 
-    def test_blank_pages_are_empty_strings(self):
-        r = self.run_child(FakePypdf([FakePage(""), FakePage("  \n ")]))
-        self.assertEqual(r["pages"], [{"page": 1, "text": ""}, {"page": 2, "text": "  \n "}])
+        def case_test_blank_pages_are_empty_strings():
+            r = self.run_child(FakePypdf([FakePage(""), FakePage("  \n ")]))
+            self.assertEqual(r["pages"], [{"page": 1, "text": ""}, {"page": 2, "text": "  \n "}])
+
+        def case_test_encrypted():
+            r = self.run_child(FakePypdf([FakePage("x")], encrypted=True))
+            self.assertEqual((r["status"], r["failure_code"]), ("failed", "encrypted"))
+
+        def case_test_no_pages():
+            r = self.run_child(FakePypdf([]))
+            self.assertEqual((r["status"], r["failure_code"]), ("failed", "no_pages"))
+
+        def case_test_page_cap_limits():
+            fake = FakePypdf([FakePage("a"), FakePage("b"), FakePage("c")])
+            r = self.run_child(fake, max_pages=2)
+            self.assertEqual((r["status"], r["failure_code"]), ("limited", "page_limit"))
+            self.assertEqual([p["page"] for p in r["pages"]], [1, 2])
+
+        def case_test_text_cap_limits():
+            r = self.run_child(FakePypdf([FakePage("abcdef")]), max_text_chars=3)
+            self.assertEqual((r["status"], r["failure_code"]), ("limited", "text_limit"))
+            self.assertEqual(r["pages"][0]["text"], "abc")
+
+        def case_test_per_page_extract_error_is_limited():
+            r = self.run_child(FakePypdf([FakePage(RuntimeError("x")), FakePage("ok")]))
+            self.assertEqual((r["status"], r["failure_code"]), ("limited", "page_extract_error"))
+            self.assertEqual(r["pages"][0]["text"], "")
+
+        def case_test_control_characters_stripped():
+            r = self.run_child(FakePypdf([FakePage("a\x00\x07b")]))
+            self.assertNotIn("\x00", r["pages"][0]["text"])
+
+        def case_test_missing_dependency_in_child():
+            with mock.patch.dict(sys.modules, {"pypdf": None}):
+                r = _pdf_text_child.extract_pages(b"%PDF-", 5, 5)
+            self.assertEqual((r["status"], r["failure_code"]), ("unavailable", "dependency_missing"))
+
+        for label, case in (
+            ("test_two_pages", case_test_two_pages),
+            ("test_blank_pages_are_empty_strings", case_test_blank_pages_are_empty_strings),
+            ("test_encrypted", case_test_encrypted),
+            ("test_no_pages", case_test_no_pages),
+            ("test_page_cap_limits", case_test_page_cap_limits),
+            ("test_text_cap_limits", case_test_text_cap_limits),
+            ("test_per_page_extract_error_is_limited", case_test_per_page_extract_error_is_limited),
+            ("test_control_characters_stripped", case_test_control_characters_stripped),
+            ("test_missing_dependency_in_child", case_test_missing_dependency_in_child),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_corrupt_is_static_failure(self):
         r = self.run_child(FakePypdf(open_error=ValueError("boom")))
         self.assertEqual((r["status"], r["failure_code"]), ("failed", "malformed_pdf"))
         self.assertNotIn("boom", json.dumps(r))
-
-    def test_encrypted(self):
-        r = self.run_child(FakePypdf([FakePage("x")], encrypted=True))
-        self.assertEqual((r["status"], r["failure_code"]), ("failed", "encrypted"))
-
-    def test_no_pages(self):
-        r = self.run_child(FakePypdf([]))
-        self.assertEqual((r["status"], r["failure_code"]), ("failed", "no_pages"))
-
-    def test_page_cap_limits(self):
-        fake = FakePypdf([FakePage("a"), FakePage("b"), FakePage("c")])
-        r = self.run_child(fake, max_pages=2)
-        self.assertEqual((r["status"], r["failure_code"]), ("limited", "page_limit"))
-        self.assertEqual([p["page"] for p in r["pages"]], [1, 2])
-
-    def test_text_cap_limits(self):
-        r = self.run_child(FakePypdf([FakePage("abcdef")]), max_text_chars=3)
-        self.assertEqual((r["status"], r["failure_code"]), ("limited", "text_limit"))
-        self.assertEqual(r["pages"][0]["text"], "abc")
-
-    def test_per_page_extract_error_is_limited(self):
-        r = self.run_child(FakePypdf([FakePage(RuntimeError("x")), FakePage("ok")]))
-        self.assertEqual((r["status"], r["failure_code"]), ("limited", "page_extract_error"))
-        self.assertEqual(r["pages"][0]["text"], "")
-
-    def test_control_characters_stripped(self):
-        r = self.run_child(FakePypdf([FakePage("a\x00\x07b")]))
-        self.assertNotIn("\x00", r["pages"][0]["text"])
-
-    def test_missing_dependency_in_child(self):
-        with mock.patch.dict(sys.modules, {"pypdf": None}):
-            r = _pdf_text_child.extract_pages(b"%PDF-", 5, 5)
-        self.assertEqual((r["status"], r["failure_code"]), ("unavailable", "dependency_missing"))
 
 
 @unittest.skipUnless(REAL_PYPDF, "optional dependency pypdf not installed ([pdf] extra)")

@@ -715,23 +715,24 @@ class ConcurrencyTest(JobTestBase):
 
 
 class WaitingGateTest(JobTestBase):
-    def test_waiting_human_blocks_new_attempt(self) -> None:
-        job = self.jobs.submit("req-1", task_kind="probe")
-        self.jobs.escalate_to_human(job.job_id)
-        self.assertEqual(self.jobs.get(job.job_id).state, "waiting_human")
-        with self.assertRaises(JobStateError):
-            self.jobs.begin_attempt(
-                job.job_id, dispatch_kind="local", retry_authorized_by="owner"
-            )
+    def test_waiting_states_block_new_attempt(self) -> None:
+        with self.subTest(case="test_waiting_human_blocks_new_attempt"):
+            job = self.jobs.submit("req-1", task_kind="probe")
+            self.jobs.escalate_to_human(job.job_id)
+            self.assertEqual(self.jobs.get(job.job_id).state, "waiting_human")
+            with self.assertRaises(JobStateError):
+                self.jobs.begin_attempt(
+                    job.job_id, dispatch_kind="local", retry_authorized_by="owner"
+                )
 
-    def test_waiting_external_blocks_new_attempt(self) -> None:
-        job = self.jobs.submit("req-1", task_kind="probe")
-        self.jobs.mark_waiting_external(job.job_id)
-        self.assertEqual(self.jobs.get(job.job_id).state, "waiting_external")
-        with self.assertRaises(JobStateError):
-            self.jobs.begin_attempt(
-                job.job_id, dispatch_kind="local", retry_authorized_by="owner"
-            )
+        with self.subTest(case="test_waiting_external_blocks_new_attempt"):
+            job = self.jobs.submit("req-1", task_kind="probe")
+            self.jobs.mark_waiting_external(job.job_id)
+            self.assertEqual(self.jobs.get(job.job_id).state, "waiting_external")
+            with self.assertRaises(JobStateError):
+                self.jobs.begin_attempt(
+                    job.job_id, dispatch_kind="local", retry_authorized_by="owner"
+                )
 
 
 class MigrationTest(JobTestBase):
