@@ -165,6 +165,57 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+  # Single aggregate required check. Branch rules on `main` can require this one
+  # stable name instead of every matrix shard: shard names change with the shard
+  # count, and when `full` is skipped its check appears with the literal
+  # unexpanded name `full (py${{ matrix.python }}, shard ...)`. See docs/ci.md.
+  ci-gate:
+    name: ci-gate
+    needs: [fast, full]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Verify required jobs succeeded
+        shell: bash
+        env:
+          FAST_RESULT: ${{ needs.fast.result }}
+          FULL_RESULT: ${{ needs.full.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          echo "fast: ${FAST_RESULT}"
+          echo "full: ${FULL_RESULT}"
+          echo "event: ${EVENT_NAME} (base_ref=${BASE_REF})"
+
+          # `fast` runs on every event, so it must always succeed.
+          if [ "${FAST_RESULT}" != "success" ]; then
+            echo "::error::fast did not succeed (result=${FAST_RESULT})"
+            exit 1
+          fi
+
+          # `full` must succeed when it runs.
+          if [ "${FULL_RESULT}" = "success" ]; then
+            echo "all required jobs succeeded"
+            exit 0
+          fi
+
+          # `full` is only skipped on events where it is not required: a PR to
+          # main must run it, so a skip there is a failure. Any other result
+          # (failure, cancelled) is a failure.
+          if [ "${FULL_RESULT}" = "skipped" ]; then
+            if [ "${EVENT_NAME}" = "pull_request" ] && [ "${BASE_REF}" = "main" ]; then
+              echo "::error::full was skipped on a pull request targeting main; it must run and succeed"
+              exit 1
+            fi
+            echo "full was skipped on ${EVENT_NAME} (not a pull request to main); acceptable"
+            exit 0
+          fi
+
+          echo "::error::full did not succeed (result=${FULL_RESULT})"
+          exit 1
+
   # Merge the 3.14 shard durations into one file so tests/durations.json can be
   # refreshed by hand from this artifact (see docs/ci.md).
   full-durations:

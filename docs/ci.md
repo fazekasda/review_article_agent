@@ -46,6 +46,14 @@ superseded run on the same ref. The workflow declares
   --durations-out durations-<py>-<shard>.json $(python scripts/test_shards.py
   --shards <shards> --index <shard>)` and uploads its durations JSON as an
   artifact (`if: always()`, 14-day retention).
+- **`ci-gate`** (`needs: [fast, full]`, `if: always()`, `timeout-minutes: 5`) —
+  one aggregate required check with a stable name. A single bash step reads
+  `needs.fast.result`, `needs.full.result`, `github.event_name` and
+  `github.base_ref` (through `env:`) and fails unless `fast` succeeded and
+  either `full` succeeded, or `full` was skipped on an event that does not
+  require it. On a pull request targeting `main`, `full` must run and succeed,
+  so a skipped `full` there fails the gate; `failure`/`cancelled` of either
+  needed job also fails it. It needs no checkout.
 - **`full-durations`** (`needs: full`, `if: always()` and only when `full` ran)
   — downloads the 3.14 shard duration artifacts, merges them with
   `python scripts/test_shards.py --merge durations-merged.json
@@ -194,6 +202,16 @@ python3 scripts/test_shards.py --merge durations-merged.json durations-3.14-*.js
 ## Repository settings
 
 Branch protection on `main` is a **repository setting** the owner enables (CI
-cannot change it): require the `fast` and `full` checks to pass before merge.
-Because `full` only runs on PRs that target `main`, require it there; `fast`
-runs on every PR.
+cannot change it). The recommended required check for the `main` ruleset is the
+single aggregate **`ci-gate`** job: it always runs, its name is stable, and it
+encodes the real policy (the `fast` tier must pass; the `full` tier must pass
+whenever it is required, i.e. on PRs targeting `main`).
+
+Optionally also require **`fast (py3.11)`** and **`fast (py3.14)`** if the
+per-interpreter `fast` results should be visible as individual required checks.
+Prefer `ci-gate` over requiring individual `full` shard names: the shard checks
+are `full (py<version>, shard <n>/<shards>)`, so requiring them couples the
+ruleset to the shard count and version list, and when `full` is skipped (e.g. a
+`push` to `main`) its check appears with the literal unexpanded name
+`full (py${{ matrix.python }}, shard ${{ matrix.shard }}/${{ matrix.shards }})`,
+which can never be satisfied by a required check.
