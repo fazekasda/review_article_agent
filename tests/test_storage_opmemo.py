@@ -137,37 +137,38 @@ class SavepointRollbackTests(OpMemoTestBase):
 
 
 class CrossOperationTests(OpMemoTestBase):
-    def test_commit_starts_new_transaction_with_empty_memo(self):
-        store = self.new_store()
-        conn = store.connection
-        calls: list[int] = []
+    def test_new_transaction_after_commit_or_rollback_has_empty_memo(self):
+        with self.subTest(case="test_commit_starts_new_transaction_with_empty_memo"):
+            store = self.new_store("commit")
+            conn = store.connection
+            calls: list[int] = []
 
-        def compute():
-            calls.append(1)
-            return len(calls)
+            def compute():
+                calls.append(1)
+                return len(calls)
 
-        with store.transaction():
-            opmemo.memoize(conn, ("k",), compute)
-        with store.transaction():
-            opmemo.memoize(conn, ("k",), compute)
-        self.assertEqual(len(calls), 2)
-
-    def test_rollback_starts_new_transaction_with_empty_memo(self):
-        store = self.new_store()
-        conn = store.connection
-        calls: list[int] = []
-
-        def compute():
-            calls.append(1)
-            return len(calls)
-
-        with self.assertRaises(RuntimeError):
             with store.transaction():
                 opmemo.memoize(conn, ("k",), compute)
-                raise RuntimeError("rollback")
-        with store.transaction():
-            opmemo.memoize(conn, ("k",), compute)
-        self.assertEqual(len(calls), 2)
+            with store.transaction():
+                opmemo.memoize(conn, ("k",), compute)
+            self.assertEqual(len(calls), 2)
+
+        with self.subTest(case="test_rollback_starts_new_transaction_with_empty_memo"):
+            store = self.new_store("rollback")
+            conn = store.connection
+            calls = []
+
+            def compute():
+                calls.append(1)
+                return len(calls)
+
+            with self.assertRaises(RuntimeError):
+                with store.transaction():
+                    opmemo.memoize(conn, ("k",), compute)
+                    raise RuntimeError("rollback")
+            with store.transaction():
+                opmemo.memoize(conn, ("k",), compute)
+            self.assertEqual(len(calls), 2)
 
 
 class ExceptionAndIsolationTests(OpMemoTestBase):
