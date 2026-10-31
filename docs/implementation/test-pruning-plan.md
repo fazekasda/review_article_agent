@@ -818,3 +818,103 @@ drops by 612 methods and the reachable floor from §5 falls to ≈ 1,800.
   conservative (batch I, 25% cut) pending user confirmation.
 - Whether `worker/` tests are covered by "tests of `pipeline/`" is ambiguous;
   batch I keeps 75%.
+
+---
+
+### 4.3 Batch F execution results (task S19-PRUNE-F)
+
+Branch `task/s19-prune-F`, base `544d63f6a8cd25f139436799f79a7b633f4b85b6`.
+Test-only change (no `src/` change): `tests/test_cli_worker.py`,
+`tests/test_cli_discovery_jobs.py`, `tests/test_cli_review_tracing_delivery.py`,
+`tests/test_cli_acquisition_retrieval.py`, `tests/test_cli_snapshot.py`,
+`tests/test_cli_human_gates.py`, `tests/test_cli_acquisition.py`.
+
+P1 `subTest` merges only; every §4.2 Batch F P2/P3 `test_*` wildcard row
+(`test_cli_discovery_jobs` job-surface, `test_cli_*` happy-path duplicates)
+materialised **empty**: the CLI acceptance covering tests named there
+(`test_step05_cli_acceptance::test_*`) assert the same behaviour at the
+step-acceptance layer but the CLI modules' own tests also pin the exact CLI
+output/exit/secret contract, so deleting them would drop K4
+one-test-per-public-behaviour coverage. No P2/P3 deletion was safe.
+
+Method counts before → after (per changed module):
+
+| module | before | after |
+|---|---:|---:|
+| `test_cli_worker` | 29 | 25 |
+| `test_cli_discovery_jobs` | 28 | 23 |
+| `test_cli_review_tracing_delivery` | 18 | 16 |
+| `test_cli_acquisition_retrieval` | 10 | 7 |
+| `test_cli_snapshot` | 15 | 12 |
+| `test_cli_human_gates` | 18 | 17 |
+| `test_cli_acquisition` | 9 | 8 |
+| **changed-module subtotal** | **127** | **108** |
+
+The other 13 Batch F modules were unchanged. **Batch F total: 314 → 295**
+(drop 19). The §4 target of 157 is **not reachable** without violating the
+binding keep rules: the batch's docs-cited methods (K1) and security-named /
+fail-closed / no-secret-echo methods (K2) dominate the CLI modules, and the
+CLI-specific rules (one test per command happy path, per documented error
+category/exit code, every no-secret-echo test, one real-subprocess smoke per
+entry point) keep the remainder. This matches the Batch C (306→283) and Batch D
+(345→316) yields rather than the plan's aspirational column.
+
+Merges (P1, cases preserved — original method names kept as `subTest` case
+labels; drop = methods folded into the new parameterized method):
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---|---:|---:|
+| `test_cli_worker` | 3 timeout-forwarding (`test_start_forwards_explicit_timeout_as_float`, `test_status_forwards_explicit_timeout`, `test_stop_forwards_explicit_timeout`) → `test_subcommands_forward_explicit_timeout` | 3 | 2 |
+| `test_cli_worker` | 2 unresolved-stop storage (`test_stop_pending_is_nonzero_storage`, `test_stop_unavailable_is_nonzero_storage`) → `test_stop_unresolved_is_nonzero_storage` | 3 | 1 |
+| `test_cli_worker` | 2 status (`test_status_running`, `test_status_down_shows_explicit_reason`) → `test_status_reports_running_or_explicit_reason` | 4 | 1 |
+| `test_cli_discovery_jobs` | 2 search rejects (`test_search_run_bad_query_index_performs_zero_ipc`, `test_search_seed_empty_query_zero_ipc`) → `test_search_invalid_input_zero_ipc` | 2 | 1 |
+| `test_cli_discovery_jobs` | 3 import rejects (`test_import_empty_or_bad_file_zero_ipc`, `test_import_missing_file_zero_ipc`, `test_import_payload_cap_zero_ipc`) → `test_import_invalid_inputs_zero_ipc` | 3 | 2 |
+| `test_cli_discovery_jobs` | 2 expand rejects (`test_expand_run_bad_roots_zero_ipc`, `test_expand_run_has_no_cli_limits_override`) → `test_expand_run_invalid_arguments_zero_ipc` | 2 | 1 |
+| `test_cli_discovery_jobs` | 2 configure rejects (`test_configure_invalid_envelope_writes_nothing`, `test_configure_bad_rights_writes_nothing`) → `test_configure_invalid_input_writes_nothing` | 2 | 1 |
+| `test_cli_review_tracing_delivery` | 3 unknown-id validation (`test_unknown_review_is_static_validation_error`, `test_unknown_trace_is_static_validation_error`, `test_unknown_delivery_is_static_validation_error`) → `test_unknown_ids_are_static_validation_errors` | 3 | 2 |
+| `test_cli_acquisition_retrieval` | 3 invalid run request files (`test_run_rejects_malformed_json_with_zero_ipc`, `test_run_rejects_unknown_keys_and_ineligible_rights_zero_ipc`, `test_run_non_dict_request_file_zero_ipc`) → `test_run_invalid_requests_zero_ipc` | 3 | 2 |
+| `test_cli_acquisition_retrieval` | 2 unknown-id validation (`test_id_unknown_project_and_bad_request_id`, `test_show_unknown_request_and_project`) → `test_unknown_ids_are_validation_errors` | 2 | 1 |
+| `test_cli_snapshot` | 4 current-indicator truthfulness (`test_approved_same_head_is_true`, `test_rejected_same_head_is_false`, `test_superseded_is_false`, `test_invalidated_is_false`) → `test_current_indicator_matrix` | 4 | 3 |
+| `test_cli_human_gates` | 2 confirm-argument rejects (`test_malformed_expected_digest_is_a_validation_error`, `test_out_of_range_timeout_is_a_validation_error_before_the_terminal`) → `test_invalid_confirm_arguments_are_validation_before_terminal` | 2 | 1 |
+| `test_cli_acquisition` | 2 import failures (`test_request_and_rights_conflicts`, `test_rights_and_project_failures_write_nothing`) → `test_import_failures_write_nothing` | 2 | 1 |
+
+**Deletion list: empty** (all §4.2 Batch F P2/P3 rows materialised empty — see
+above).
+
+**Merges deliberately not applied (reverted after verification):**
+
+- `test_cli_drafting` — the 3 missing-reference tests were folded into one
+  `subTest` method, but `WorkspaceBase.approved_chain()` is **not idempotent**
+  within one test instance (`ManifestConflictError: a different manifest is
+  already recorded for this request key`), so the merged method errored on the
+  2nd/3rd case. The 3 original methods were restored unchanged.
+- `test_cli_discovery_reports` — a `test_bad_rights_or_ref_writes_nothing` +
+  `test_malformed_known_file_is_refused` merge was reverted because the §6
+  security-name check flags `test_malformed_known_file_is_refused` (`refus`);
+  per K2 keep-by-default it is **not** merged.
+
+**§6 grep cross-check (exact 32 merged-away names):**
+
+- docs-cited: `comm -12` against the 438 docs-cited names (excluding this plan
+  file) prints **nothing**.
+- security-named: `comm -12` against the K2 heuristic list prints **nothing**.
+
+**Mutation spot-check (scratch, reverted):** flipping the
+`cli/worker.py` `stop_unconfirmed` error category from `_CATEGORY_STORAGE` to
+`_CATEGORY_CONFLICT` made `test_stop_unresolved_is_nonzero_storage` fail exactly
+on `case='test_stop_pending_is_nonzero_storage'` (`AssertionError: 3 != 4`),
+confirming the merged parameterized test still detects the broken path. Source
+restored (`git diff -- src/` empty).
+
+Verification (all on `task/s19-prune-F`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 <20 Batch F modules>
+# -> modules: 20  tests: 305  failures: 0  errors: 0  skipped: 0
+
+python3 scripts/run_tests.py -j 4
+# -> modules: 145  tests: 3796  failures: 0  errors: 0  skipped: 702 (fast tier)
+
+python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
+git diff --check                         # -> clean
+```

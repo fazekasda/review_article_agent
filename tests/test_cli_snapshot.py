@@ -234,23 +234,62 @@ class FixtureCurrentIndicatorTest(_Base):
         return self.cli("--data-dir", str(self.state), "fixture", "status",
                         approval_id, "--project", pid)["fixture_approval"]
 
-    def test_approved_same_head_is_true(self) -> None:
-        pid = self._project()
-        rec = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
-                                  gate_id="g1", decision="approved", rationale="ok")
-        st = self._status(pid, rec["fixture_approval"]["approval_id"])
-        self.assertEqual(st["status"], "active")
-        self.assertTrue(st["snapshot_verified"])
-        self.assertIs(st["current_revision_fixture_approved"], True)
-
-    def test_rejected_same_head_is_false(self) -> None:
-        pid = self._project()
-        rec = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
-                                  gate_id="g1", decision="rejected", rationale="no")
-        st = self._status(pid, rec["fixture_approval"]["approval_id"])
-        self.assertEqual(st["decision"], "rejected")
-        self.assertEqual(st["current_revision_id"], "rev-A1")  # same head
-        self.assertIs(st["current_revision_fixture_approved"], False)
+    def test_current_indicator_matrix(self) -> None:
+        # ``current_revision_fixture_approved`` is true only for an active
+        # approved same-head record, and false for rejected/superseded/invalidated.
+        with self.subTest(case="test_approved_same_head_is_true"):
+            pid = self._project()
+            rec = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
+                                      gate_id="g1", decision="approved", rationale="ok")
+            st = self._status(pid, rec["fixture_approval"]["approval_id"])
+            self.assertEqual(st["status"], "active")
+            self.assertTrue(st["snapshot_verified"])
+            self.assertIs(st["current_revision_fixture_approved"], True)
+        with self.subTest(case="test_rejected_same_head_is_false"):
+            pid = self._project()
+            rec = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
+                                      gate_id="g1", decision="rejected", rationale="no")
+            st = self._status(pid, rec["fixture_approval"]["approval_id"])
+            self.assertEqual(st["decision"], "rejected")
+            self.assertEqual(st["current_revision_id"], "rev-A1")  # same head
+            self.assertIs(st["current_revision_fixture_approved"], False)
+        with self.subTest(case="test_superseded_is_false"):
+            pid = self._project()
+            first = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
+                                        gate_id="g1", decision="approved", rationale="first")
+            second = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
+                                         gate_id="g1", decision="approved", rationale="second")
+            first_id = first["fixture_approval"]["approval_id"]
+            second_id = second["fixture_approval"]["approval_id"]
+            self.assertNotEqual(first_id, second_id)
+            old = self._status(pid, first_id)
+            self.assertEqual(old["status"], "superseded")
+            self.assertIs(old["current_revision_fixture_approved"], False)
+            self.assertIs(
+                self._status(pid, second_id)["current_revision_fixture_approved"], True
+            )
+        with self.subTest(case="test_invalidated_is_false"):
+            pid = self._project()
+            rec = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
+                                      gate_id="g1", decision="approved", rationale="ok")
+            approval_id = rec["fixture_approval"]["approval_id"]
+            # Corrupt the stored snapshot digest directly (test-only DB tamper:
+            # drop the immutability trigger on a throwaway project DB, then update).
+            db = paths.store_path_for(str(self.tmp / "proj"))
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute("DROP TRIGGER fixture_approval_no_update")
+                conn.execute(
+                    "UPDATE fixture_approval SET snapshot_digest = ? WHERE approval_id = ?",
+                    ("sha256:" + "0" * 64, approval_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            st = self._status(pid, approval_id)
+            self.assertEqual(st["status"], "invalidated")
+            self.assertIs(st["snapshot_verified"], False)
+            self.assertIs(st["current_revision_fixture_approved"], False)
 
     def test_upstream_edit_stales_unchanged_target_is_false(self) -> None:
         pid = self._project()
@@ -273,45 +312,6 @@ class FixtureCurrentIndicatorTest(_Base):
         st = self._status(pid, rec["fixture_approval"]["approval_id"])
         self.assertEqual(st["status"], "stale")
         self.assertEqual(st["current_revision_id"], "rev-B1")  # target unchanged
-        self.assertIs(st["current_revision_fixture_approved"], False)
-
-    def test_superseded_is_false(self) -> None:
-        pid = self._project()
-        first = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
-                                    gate_id="g1", decision="approved", rationale="first")
-        second = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
-                                     gate_id="g1", decision="approved", rationale="second")
-        first_id = first["fixture_approval"]["approval_id"]
-        second_id = second["fixture_approval"]["approval_id"]
-        self.assertNotEqual(first_id, second_id)
-        old = self._status(pid, first_id)
-        self.assertEqual(old["status"], "superseded")
-        self.assertIs(old["current_revision_fixture_approved"], False)
-        self.assertIs(
-            self._status(pid, second_id)["current_revision_fixture_approved"], True
-        )
-
-    def test_invalidated_is_false(self) -> None:
-        pid = self._project()
-        rec = self.fixture_record(pid=pid, artifact_id="art-A", revision_id="rev-A1",
-                                  gate_id="g1", decision="approved", rationale="ok")
-        approval_id = rec["fixture_approval"]["approval_id"]
-        # Corrupt the stored snapshot digest directly (test-only DB tamper: drop
-        # the immutability trigger on a throwaway project DB, then update).
-        db = paths.store_path_for(str(self.tmp / "proj"))
-        conn = sqlite3.connect(db)
-        try:
-            conn.execute("DROP TRIGGER fixture_approval_no_update")
-            conn.execute(
-                "UPDATE fixture_approval SET snapshot_digest = ? WHERE approval_id = ?",
-                ("sha256:" + "0" * 64, approval_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        st = self._status(pid, approval_id)
-        self.assertEqual(st["status"], "invalidated")
-        self.assertIs(st["snapshot_verified"], False)
         self.assertIs(st["current_revision_fixture_approved"], False)
 
 

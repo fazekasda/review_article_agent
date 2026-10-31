@@ -438,15 +438,6 @@ class ReviewCliTest(CliBase):
         self.assertIn("payload", content)
         self.assertIn("paragraphs", json.dumps(content["payload"]))
 
-    def test_unknown_review_is_static_validation_error(self):
-        error = self.cli(
-            "review", "show", "--project", self.pid, "--review-id", "no-such-review",
-            expect=cli_main.EXIT_VALIDATION,
-        )
-        self.assertEqual(error["error"]["category"], "validation")
-        self.assertNotIn("no-such-review", json.dumps(error))
-        self.assertNotIn("Traceback", json.dumps(error))
-
 
 class TracingCliTest(CliBase):
     def _run_trace(self, *, trace_id="trace-1", policy_file=None, expect=0):
@@ -514,14 +505,6 @@ class TracingCliTest(CliBase):
         with mock.patch.object(socket, "socket", _no_socket):
             run = self._run_trace(trace_id="trace-nonet", policy_file=policy_file)
         self.assertEqual(run["trace_id"], "trace-nonet")
-
-    def test_unknown_trace_is_static_validation_error(self):
-        error = self.cli(
-            "tracing", "show", "--project", self.pid, "--trace-id", "no-such-trace",
-            expect=cli_main.EXIT_VALIDATION,
-        )
-        self.assertEqual(error["error"]["category"], "validation")
-        self.assertNotIn("no-such-trace", json.dumps(error))
 
 
 class DeliveryCliTest(CliBase):
@@ -803,13 +786,30 @@ class DeliveryCliTest(CliBase):
         self.assertEqual(result["revalidation_required"], [])
         self.assertEqual(result["revalidation_record_count"], 1)
 
-    def test_unknown_delivery_is_static_validation_error(self):
-        error = self.cli(
-            "delivery", "status", "--project", self.pid, "--delivery-id", "no-such-delivery",
-            expect=cli_main.EXIT_VALIDATION,
+
+class UnknownIdValidationTest(CliBase):
+    def test_unknown_ids_are_static_validation_errors(self):
+        # ``test_unknown_review_is_static_validation_error``,
+        # ``test_unknown_trace_is_static_validation_error`` and
+        # ``test_unknown_delivery_is_static_validation_error``: an unknown id in
+        # each group is a static validation error that never echoes the id.
+        cases = (
+            ("test_unknown_review_is_static_validation_error",
+             ("review", "show", "--project", self.pid, "--review-id", "no-such-review"),
+             "no-such-review"),
+            ("test_unknown_trace_is_static_validation_error",
+             ("tracing", "show", "--project", self.pid, "--trace-id", "no-such-trace"),
+             "no-such-trace"),
+            ("test_unknown_delivery_is_static_validation_error",
+             ("delivery", "status", "--project", self.pid, "--delivery-id", "no-such-delivery"),
+             "no-such-delivery"),
         )
-        self.assertEqual(error["error"]["category"], "validation")
-        self.assertNotIn("no-such-delivery", json.dumps(error))
+        for label, argv, echoed in cases:
+            with self.subTest(case=label):
+                error = self.cli(*argv, expect=cli_main.EXIT_VALIDATION)
+                self.assertEqual(error["error"]["category"], "validation")
+                self.assertNotIn(echoed, json.dumps(error))
+                self.assertNotIn("Traceback", json.dumps(error))
 
 
 if __name__ == "__main__":

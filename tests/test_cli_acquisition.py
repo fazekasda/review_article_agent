@@ -252,37 +252,41 @@ class AcquisitionCliTestCase(unittest.TestCase):
         self.assertNotIn("reason", shown)
         self.assertIsNone(shown["source_ref"])
 
-    def test_rights_and_project_failures_write_nothing(self) -> None:
-        src = self.write_bytes("src.bin", _BYTES)
-        before = self.store_counts()
-        # storage not allowed -> no bytes retained
-        denied = self.cli(
-            *self.import_args(file=src, src_rights=rights(self.pid, "ART-1", "REV-1", storage="unknown")),
-            expect=cli_main.EXIT_VALIDATION,
-        )
-        self.assertEqual(denied["error"]["category"], "validation")
-        # occurrence rights bound to the wrong subject
-        wrong = self.cli(
-            *self.import_args(file=src, occ_rights=rights(self.pid, "OTHER", "OREV-1")),
-            expect=cli_main.EXIT_VALIDATION,
-        )
-        self.assertEqual(wrong["error"]["category"], "validation")
-        # unknown project
-        self.cli(
-            "acquisition", "impact", "--project", "no-such-project",
-            "--artifact-id", "A", "--revision-id", "R",
-            expect=cli_main.EXIT_VALIDATION,
-        )
-        self.assertEqual(self.store_counts(), before)
-
-    def test_request_and_rights_conflicts(self) -> None:
-        src = self.write_bytes("src.bin", _BYTES)
-        self.cli(*self.import_args(file=src))
-        other = self.write_bytes("other.bin", b"different bytes")
-        conflict = self.cli(
-            *self.import_args(file=other), expect=cli_main.EXIT_CONFLICT
-        )
-        self.assertEqual(conflict["error"]["category"], "conflict")
+    def test_import_failures_write_nothing(self) -> None:
+        # ``test_request_and_rights_conflicts`` and
+        # ``test_rights_and_project_failures_write_nothing``: a divergent request
+        # key is a conflict; a rights/project failure is a validation error; both
+        # leave the store unchanged.
+        with self.subTest(case="test_request_and_rights_conflicts"):
+            src = self.write_bytes("src.bin", _BYTES)
+            self.cli(*self.import_args(file=src))
+            other = self.write_bytes("other.bin", b"different bytes")
+            conflict = self.cli(
+                *self.import_args(file=other), expect=cli_main.EXIT_CONFLICT
+            )
+            self.assertEqual(conflict["error"]["category"], "conflict")
+        with self.subTest(case="test_rights_and_project_failures_write_nothing"):
+            src = self.write_bytes("src.bin", _BYTES)
+            before = self.store_counts()
+            # storage not allowed -> no bytes retained
+            denied = self.cli(
+                *self.import_args(file=src, src_rights=rights(self.pid, "ART-1", "REV-1", storage="unknown")),
+                expect=cli_main.EXIT_VALIDATION,
+            )
+            self.assertEqual(denied["error"]["category"], "validation")
+            # occurrence rights bound to the wrong subject
+            wrong = self.cli(
+                *self.import_args(file=src, occ_rights=rights(self.pid, "OTHER", "OREV-1")),
+                expect=cli_main.EXIT_VALIDATION,
+            )
+            self.assertEqual(wrong["error"]["category"], "validation")
+            # unknown project
+            self.cli(
+                "acquisition", "impact", "--project", "no-such-project",
+                "--artifact-id", "A", "--revision-id", "R",
+                expect=cli_main.EXIT_VALIDATION,
+            )
+            self.assertEqual(self.store_counts(), before)
 
     def test_malformed_and_unsafe_inputs(self) -> None:
         src = self.write_bytes("src.bin", _BYTES)

@@ -368,16 +368,29 @@ class SearchSubmitTest(DiscoveryJobsCliBase):
         self.assertEqual(out["result_kind"], "discovery_observation")
         self.assertEqual(out["job_id"], "job-fake-1")
 
-    def test_search_run_bad_query_index_performs_zero_ipc(self) -> None:
+    def test_search_invalid_input_zero_ipc(self) -> None:
+        # ``test_search_run_bad_query_index_performs_zero_ipc`` and
+        # ``test_search_seed_empty_query_zero_ipc``: a rejected search argument is
+        # a validation error (exit 2) that performs zero IPC.
         pid = self.create_project()
-        with self.fake_worker() as captured:
-            self.cli(
-                "discovery", "search", "run", "--project", pid,
-                "--artifact-id", "a-plan", "--revision-id", "rev-plan",
-                "--query-index", "not-an-int", "--request-id", "req-1",
-                expect=2,
-            )
-        self.assertEqual(captured, {})
+        with self.subTest(case="test_search_run_bad_query_index_performs_zero_ipc"):
+            with self.fake_worker() as captured:
+                self.cli(
+                    "discovery", "search", "run", "--project", pid,
+                    "--artifact-id", "a-plan", "--revision-id", "rev-plan",
+                    "--query-index", "not-an-int", "--request-id", "req-1",
+                    expect=2,
+                )
+            self.assertEqual(captured, {})
+        with self.subTest(case="test_search_seed_empty_query_zero_ipc"):
+            with self.fake_worker() as captured:
+                self.cli(
+                    "discovery", "search", "seed", "--project", pid,
+                    "--source", "europepmc", "--query", "   ",
+                    "--page-size", "5", "--max-pages", "1", "--request-id", "seed-3",
+                    expect=2,
+                )
+            self.assertEqual(captured, {})
 
     def test_search_seed_is_provisional_and_exact(self) -> None:
         pid = self.create_project()
@@ -415,17 +428,6 @@ class SearchSubmitTest(DiscoveryJobsCliBase):
             )
         self.assertIn("request", captured)
 
-    def test_search_seed_empty_query_zero_ipc(self) -> None:
-        pid = self.create_project()
-        with self.fake_worker() as captured:
-            self.cli(
-                "discovery", "search", "seed", "--project", pid,
-                "--source", "europepmc", "--query", "   ",
-                "--page-size", "5", "--max-pages", "1", "--request-id", "seed-3",
-                expect=2,
-            )
-        self.assertEqual(captured, {})
-
 
 # --------------------------------------------------------------------------- #
 # metadata import
@@ -459,31 +461,32 @@ class ImportSubmitTest(DiscoveryJobsCliBase):
         self.assertNotIn("reg:set-1", json.dumps(out))
         self.assertNotIn("title", json.dumps(out))
 
-    def test_import_empty_or_bad_file_zero_ipc(self) -> None:
+    def test_import_invalid_inputs_zero_ipc(self) -> None:
+        # ``test_import_empty_or_bad_file_zero_ipc``,
+        # ``test_import_missing_file_zero_ipc`` and
+        # ``test_import_payload_cap_zero_ipc``: every rejected import input is a
+        # validation error (exit 2) that performs zero IPC.
         pid = self.create_project()
-        for bad in ([], "not-a-list", {"a": 1}, [1, 2]):
-            path = self.write_json(f"bad-{abs(hash(json.dumps(bad)))}.json", bad)
+        with self.subTest(case="test_import_empty_or_bad_file_zero_ipc"):
+            for bad in ([], "not-a-list", {"a": 1}, [1, 2]):
+                path = self.write_json(f"bad-{abs(hash(json.dumps(bad)))}.json", bad)
+                with self.fake_worker() as captured:
+                    self.cli(*self._import_args(pid, path), expect=2)
+                self.assertEqual(captured, {})
+        with self.subTest(case="test_import_missing_file_zero_ipc"):
+            with self.fake_worker() as captured:
+                self.cli(*self._import_args(pid, self.tmp / "nope.json"), expect=2)
+            self.assertEqual(captured, {})
+        with self.subTest(case="test_import_payload_cap_zero_ipc"):
+            # Far larger than the 64 KiB control-transport request bound.
+            records = [
+                {"source": "regulatory", "source_id": f"R-{i}", "title": "x" * 200}
+                for i in range(1000)
+            ]
+            path = self.write_json("huge.json", records)
             with self.fake_worker() as captured:
                 self.cli(*self._import_args(pid, path), expect=2)
             self.assertEqual(captured, {})
-
-    def test_import_missing_file_zero_ipc(self) -> None:
-        pid = self.create_project()
-        with self.fake_worker() as captured:
-            self.cli(*self._import_args(pid, self.tmp / "nope.json"), expect=2)
-        self.assertEqual(captured, {})
-
-    def test_import_payload_cap_zero_ipc(self) -> None:
-        pid = self.create_project()
-        # Far larger than the 64 KiB control-transport request bound.
-        records = [
-            {"source": "regulatory", "source_id": f"R-{i}", "title": "x" * 200}
-            for i in range(1000)
-        ]
-        path = self.write_json("huge.json", records)
-        with self.fake_worker() as captured:
-            self.cli(*self._import_args(pid, path), expect=2)
-        self.assertEqual(captured, {})
 
 
 # --------------------------------------------------------------------------- #
@@ -513,34 +516,37 @@ class ExpandSubmitTest(DiscoveryJobsCliBase):
         )
         self.assertEqual(out["result_kind"], "discovery_expansion")
 
-    def test_expand_run_bad_roots_zero_ipc(self) -> None:
+    def test_expand_run_invalid_arguments_zero_ipc(self) -> None:
+        # ``test_expand_run_bad_roots_zero_ipc`` and
+        # ``test_expand_run_has_no_cli_limits_override``: a bad roots file and an
+        # unsupported ``--limits`` override are both validation errors (exit 2)
+        # with zero IPC.
         pid = self.create_project()
-        for bad in ([], [{"source": "MED"}], [{"source": "", "id": "1"}],
-                    [{"source": "MED", "id": "1", "extra": 2}], "nope"):
-            path = self.write_json(f"roots-{abs(hash(json.dumps(bad)))}.json", bad)
+        with self.subTest(case="test_expand_run_bad_roots_zero_ipc"):
+            for bad in ([], [{"source": "MED"}], [{"source": "", "id": "1"}],
+                        [{"source": "MED", "id": "1", "extra": 2}], "nope"):
+                path = self.write_json(f"roots-{abs(hash(json.dumps(bad)))}.json", bad)
+                with self.fake_worker() as captured:
+                    self.cli(
+                        "discovery", "expand", "run", "--project", pid,
+                        "--artifact-id", "a-plan", "--revision-id", "rev-plan",
+                        "--corpus-artifact-id", "a-corpus", "--corpus-revision-id", "rev-corpus",
+                        "--roots-file", str(path), "--request-id", "exp-2",
+                        expect=2,
+                    )
+                self.assertEqual(captured, {})
+        with self.subTest(case="test_expand_run_has_no_cli_limits_override"):
+            path = self.write_json("roots.json", [{"source": "MED", "id": "1"}])
             with self.fake_worker() as captured:
                 self.cli(
                     "discovery", "expand", "run", "--project", pid,
                     "--artifact-id", "a-plan", "--revision-id", "rev-plan",
                     "--corpus-artifact-id", "a-corpus", "--corpus-revision-id", "rev-corpus",
-                    "--roots-file", str(path), "--request-id", "exp-2",
+                    "--roots-file", str(path), "--request-id", "exp-3",
+                    "--limits", "max_requests=999",
                     expect=2,
                 )
             self.assertEqual(captured, {})
-
-    def test_expand_run_has_no_cli_limits_override(self) -> None:
-        pid = self.create_project()
-        path = self.write_json("roots.json", [{"source": "MED", "id": "1"}])
-        with self.fake_worker() as captured:
-            self.cli(
-                "discovery", "expand", "run", "--project", pid,
-                "--artifact-id", "a-plan", "--revision-id", "rev-plan",
-                "--corpus-artifact-id", "a-corpus", "--corpus-revision-id", "rev-corpus",
-                "--roots-file", str(path), "--request-id", "exp-3",
-                "--limits", "max_requests=999",
-                expect=2,
-            )
-        self.assertEqual(captured, {})
 
 
 class ExpandShowTest(DiscoveryJobsCliBase):
@@ -686,24 +692,27 @@ class LeadConfigureTest(DiscoveryJobsCliBase):
         )
         self.assertEqual(out["approval_request"]["gate_id"], "discovery.hosted_use.framing")
 
-    def test_configure_invalid_envelope_writes_nothing(self) -> None:
-        pid = self.create_project()
-        self.make_brief(pid)
-        bad = self._hosted_use(pid)
-        bad["document_type"] = "discovery_not_hosted_use"
-        self._configure(pid, bad, expect=2)
-        with self.store(pid) as store:
-            self.assertIsNone(ArtifactRepository(store).get_artifact("a-batch"))
-
-    def test_configure_bad_rights_writes_nothing(self) -> None:
-        pid = self.create_project()
-        self.make_brief(pid)
-        self._configure(
-            pid, self._hosted_use(pid), rights={"operations": {}},
-            request_id="conf-rights", expect=2,
-        )
-        with self.store(pid) as store:
-            self.assertIsNone(ArtifactRepository(store).get_artifact("a-batch"))
+    def test_configure_invalid_input_writes_nothing(self) -> None:
+        # ``test_configure_invalid_envelope_writes_nothing`` and
+        # ``test_configure_bad_rights_writes_nothing``: an invalid envelope or a
+        # bad rights record is refused (exit 2) and writes no artifact.
+        with self.subTest(case="test_configure_invalid_envelope_writes_nothing"):
+            pid = self.create_project()
+            self.make_brief(pid)
+            bad = self._hosted_use(pid)
+            bad["document_type"] = "discovery_not_hosted_use"
+            self._configure(pid, bad, expect=2)
+            with self.store(pid) as store:
+                self.assertIsNone(ArtifactRepository(store).get_artifact("a-batch"))
+        with self.subTest(case="test_configure_bad_rights_writes_nothing"):
+            pid = self.create_project()
+            self.make_brief(pid)
+            self._configure(
+                pid, self._hosted_use(pid), rights={"operations": {}},
+                request_id="conf-rights", expect=2,
+            )
+            with self.store(pid) as store:
+                self.assertIsNone(ArtifactRepository(store).get_artifact("a-batch"))
 
     def test_configure_replay_and_conflict(self) -> None:
         pid = self.create_project()

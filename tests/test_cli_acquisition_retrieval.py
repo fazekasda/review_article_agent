@@ -210,19 +210,37 @@ class RetrieveIdTest(RetrievalCliBase):
         self.assertEqual(self.store_counts(), before)
         self.assertEqual(self.job_count(), jobs_before)
 
-    def test_id_unknown_project_and_bad_request_id(self):
-        unknown = self.cli(
-            "acquisition", "retrieve", "id",
-            "--project", "no-such-project", "--request-id", "req-id",
-            expect=cli_main.EXIT_VALIDATION,
-        )
-        self.assertEqual(unknown["error"]["category"], "validation")
-        bad = self.cli(
-            "acquisition", "retrieve", "id",
-            "--project", self.project_id, "--request-id", "bad id",
-            expect=cli_main.EXIT_VALIDATION,
-        )
-        self.assertEqual(bad["error"]["category"], "validation")
+    def test_unknown_ids_are_validation_errors(self):
+        # ``test_id_unknown_project_and_bad_request_id`` and
+        # ``test_show_unknown_request_and_project``: an unknown project / bad id
+        # is a static validation error on both ``retrieve id`` and
+        # ``retrieve show``.
+        with self.subTest(case="test_id_unknown_project_and_bad_request_id"):
+            unknown = self.cli(
+                "acquisition", "retrieve", "id",
+                "--project", "no-such-project", "--request-id", "req-id",
+                expect=cli_main.EXIT_VALIDATION,
+            )
+            self.assertEqual(unknown["error"]["category"], "validation")
+            bad = self.cli(
+                "acquisition", "retrieve", "id",
+                "--project", self.project_id, "--request-id", "bad id",
+                expect=cli_main.EXIT_VALIDATION,
+            )
+            self.assertEqual(bad["error"]["category"], "validation")
+        with self.subTest(case="test_show_unknown_request_and_project"):
+            missing = self.cli(
+                "acquisition", "retrieve", "show",
+                "--project", self.project_id, "--request-id", "never-stored",
+                expect=cli_main.EXIT_VALIDATION,
+            )
+            self.assertEqual(missing["error"]["category"], "validation")
+            unknown = self.cli(
+                "acquisition", "retrieve", "show",
+                "--project", "no-such-project", "--request-id", "req-id",
+                expect=cli_main.EXIT_VALIDATION,
+            )
+            self.assertEqual(unknown["error"]["category"], "validation")
 
 
 # --------------------------------------------------------------------------- #
@@ -264,39 +282,40 @@ class RetrieveRunTest(RetrievalCliBase):
         self.assertNotIn("freeze_ref", json.dumps(out))
         self.assertNotIn("source_rights", json.dumps(out))
 
-    def test_run_rejects_malformed_json_with_zero_ipc(self):
-        for bad in (b"{", b"[1, 2]", b'{"a": 1, "a": 2}', b'{"a": NaN}', b"\xff\xfe"):
-            path = self.write_bytes("bad.json", bad)
+    def test_run_invalid_requests_zero_ipc(self):
+        # ``test_run_rejects_malformed_json_with_zero_ipc``,
+        # ``test_run_rejects_unknown_keys_and_ineligible_rights_zero_ipc`` and
+        # ``test_run_non_dict_request_file_zero_ipc``: every invalid request file
+        # is a validation error (exit 2) that performs zero IPC.
+        with self.subTest(case="test_run_rejects_malformed_json_with_zero_ipc"):
+            for bad in (b"{", b"[1, 2]", b'{"a": 1, "a": 2}', b'{"a": NaN}', b"\xff\xfe"):
+                path = self.write_bytes("bad.json", bad)
+                with self.fake_worker() as captured:
+                    err = self.cli(*self._run_args(path), expect=cli_main.EXIT_VALIDATION)
+                self.assertEqual(err["error"]["category"], "validation")
+                self.assertEqual(captured, {})
+        with self.subTest(case="test_run_rejects_unknown_keys_and_ineligible_rights_zero_ipc"):
+            valid = self.acquire_parameters("run-1", self.no_pmcid)
+            unknown = dict(valid, an_unknown_field=1)
+            path = self.write_json("unknown.json", unknown)
             with self.fake_worker() as captured:
                 err = self.cli(*self._run_args(path), expect=cli_main.EXIT_VALIDATION)
             self.assertEqual(err["error"]["category"], "validation")
             self.assertEqual(captured, {})
-
-    def test_run_rejects_unknown_keys_and_ineligible_rights_zero_ipc(self):
-        valid = self.acquire_parameters("run-1", self.no_pmcid)
-
-        unknown = dict(valid, an_unknown_field=1)
-        path = self.write_json("unknown.json", unknown)
-        with self.fake_worker() as captured:
-            err = self.cli(*self._run_args(path), expect=cli_main.EXIT_VALIDATION)
-        self.assertEqual(err["error"]["category"], "validation")
-        self.assertEqual(captured, {})
-
-        # The source rights must allow acquisition AND storage, with no denial.
-        denied = json.loads(json.dumps(valid))
-        denied["source_rights"]["operations"]["acquisition"] = "unknown"
-        path = self.write_json("rights.json", denied)
-        with self.fake_worker() as captured:
-            err = self.cli(*self._run_args(path), expect=cli_main.EXIT_VALIDATION)
-        self.assertEqual(err["error"]["category"], "validation")
-        self.assertEqual(captured, {})
-
-    def test_run_non_dict_request_file_zero_ipc(self):
-        path = self.write_json("list.json", [1, 2, 3])
-        with self.fake_worker() as captured:
-            err = self.cli(*self._run_args(path), expect=cli_main.EXIT_VALIDATION)
-        self.assertEqual(err["error"]["category"], "validation")
-        self.assertEqual(captured, {})
+            # The source rights must allow acquisition AND storage, no denial.
+            denied = json.loads(json.dumps(valid))
+            denied["source_rights"]["operations"]["acquisition"] = "unknown"
+            path = self.write_json("rights.json", denied)
+            with self.fake_worker() as captured:
+                err = self.cli(*self._run_args(path), expect=cli_main.EXIT_VALIDATION)
+            self.assertEqual(err["error"]["category"], "validation")
+            self.assertEqual(captured, {})
+        with self.subTest(case="test_run_non_dict_request_file_zero_ipc"):
+            path = self.write_json("list.json", [1, 2, 3])
+            with self.fake_worker() as captured:
+                err = self.cli(*self._run_args(path), expect=cli_main.EXIT_VALIDATION)
+            self.assertEqual(err["error"]["category"], "validation")
+            self.assertEqual(captured, {})
 
 
 # --------------------------------------------------------------------------- #
@@ -382,16 +401,6 @@ class RetrieveShowTest(RetrievalCliBase):
         self.assertEqual(content["report"]["failures"], [{"code": "missing_pmcid"}])
         self.assertEqual(content["report"]["scientific_acceptance"], "not_assessed")
         self.assertIn("report_ref", content)
-
-    def test_show_unknown_request_and_project(self):
-        missing = self._show("never-stored", expect=cli_main.EXIT_VALIDATION)
-        self.assertEqual(missing["error"]["category"], "validation")
-        unknown = self.cli(
-            "acquisition", "retrieve", "show",
-            "--project", "no-such-project", "--request-id", "req-id",
-            expect=cli_main.EXIT_VALIDATION,
-        )
-        self.assertEqual(unknown["error"]["category"], "validation")
 
 
 # --------------------------------------------------------------------------- #
