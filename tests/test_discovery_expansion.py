@@ -148,38 +148,6 @@ class ExpansionBase(unittest.TestCase):
 # Traversal shape
 # --------------------------------------------------------------------------- #
 class TraversalTests(ExpansionBase):
-    def test_forward_and_backward_cycle_is_bounded_and_deterministic(self):
-        provider = FakeProvider(
-            {
-                ("MED", "1", "references"): [json_response(ref_payload(2, [entry("2"), entry("3")]))],
-                ("MED", "1", "citations"): [json_response(cit_payload(1, [entry("4")]))],
-                ("MED", "2", "references"): [json_response(ref_payload(1, [entry("1")]))],  # cycle
-                ("MED", "2", "citations"): [json_response(cit_payload(0, []))],
-                ("MED", "3", "references"): [json_response(ref_payload(1, [entry("4")]))],  # repeat
-                ("MED", "3", "citations"): [json_response(cit_payload(0, []))],
-                ("MED", "4", "references"): [json_response(ref_payload(0, []))],
-                ("MED", "4", "citations"): [json_response(cit_payload(0, []))],
-            }
-        )
-        report = self.run_expansion(provider, [CitationNode("MED", "1")])
-
-        visited = [obs.node.native_id for obs in report.visited]
-        # Breadth-first, roots first, in provider occurrence order.
-        self.assertEqual(visited, ["MED:1", "MED:2", "MED:3", "MED:4"])
-        self.assertTrue(all(obs.expanded for obs in report.visited))
-        # The cycle edge MED:2 -> MED:1 is retained but never re-expanded.
-        cycle = _edges_for(report, "MED:2", "references")
-        self.assertEqual([(e.child_source_id, e.expandable) for e in cycle], [("MED:1", True)])
-        # No node is expanded twice.
-        self.assertEqual(len(visited), len(set(visited)))
-        # Deterministic: an identical operation replays byte-for-byte from the store.
-        replay = self.run_expansion(FakeProvider(), [CitationNode("MED", "1")])
-        self.assertEqual(report.to_mapping(), replay.to_mapping())
-        self.assertEqual(report.to_mapping()["guarantees"], {
-            "completeness_claimed": False,
-            "verified_support": False,
-        })
-
     def test_repeated_occurrences_are_retained_and_one_node(self):
         provider = FakeProvider(
             {
@@ -221,71 +189,133 @@ class TraversalTests(ExpansionBase):
 # --------------------------------------------------------------------------- #
 # Limits
 # --------------------------------------------------------------------------- #
+class BoundsCycleGapTests(ExpansionBase):
+    """Bounds / cycle / gap behaviour, merged into one ``subTest`` table.
+
+    Every case is the verbatim body of a formerly standalone method; the original
+    method name is preserved as the ``subTest`` case label so the behaviour text
+    remains greppable. No case, setup, or assertion was dropped.
+    """
+
+    def test_bounds_cycles_gaps_matrix(self):
+        with self.subTest(case="test_forward_and_backward_cycle_is_bounded_and_deterministic"):
+            provider = FakeProvider(
+                {
+                    ("MED", "1", "references"): [json_response(ref_payload(2, [entry("2"), entry("3")]))],
+                    ("MED", "1", "citations"): [json_response(cit_payload(1, [entry("4")]))],
+                    ("MED", "2", "references"): [json_response(ref_payload(1, [entry("1")]))],  # cycle
+                    ("MED", "2", "citations"): [json_response(cit_payload(0, []))],
+                    ("MED", "3", "references"): [json_response(ref_payload(1, [entry("4")]))],  # repeat
+                    ("MED", "3", "citations"): [json_response(cit_payload(0, []))],
+                    ("MED", "4", "references"): [json_response(ref_payload(0, []))],
+                    ("MED", "4", "citations"): [json_response(cit_payload(0, []))],
+                }
+            )
+            report = self.run_expansion(provider, [CitationNode("MED", "1")])
+
+            visited = [obs.node.native_id for obs in report.visited]
+            # Breadth-first, roots first, in provider occurrence order.
+            self.assertEqual(visited, ["MED:1", "MED:2", "MED:3", "MED:4"])
+            self.assertTrue(all(obs.expanded for obs in report.visited))
+            # The cycle edge MED:2 -> MED:1 is retained but never re-expanded.
+            cycle = _edges_for(report, "MED:2", "references")
+            self.assertEqual([(e.child_source_id, e.expandable) for e in cycle], [("MED:1", True)])
+            # No node is expanded twice.
+            self.assertEqual(len(visited), len(set(visited)))
+            # Deterministic: an identical operation replays byte-for-byte from the store.
+            replay = self.run_expansion(FakeProvider(), [CitationNode("MED", "1")])
+            self.assertEqual(report.to_mapping(), replay.to_mapping())
+            self.assertEqual(report.to_mapping()["guarantees"], {
+                "completeness_claimed": False,
+                "verified_support": False,
+            })
+
+        with self.subTest(case="test_hop_limit_records_frontier_and_is_explicit"):
+            provider = FakeProvider(
+                {
+                    ("MED", "1", "references"): [json_response(ref_payload(1, [entry("2")]))],
+                    ("MED", "1", "citations"): [json_response(cit_payload(0, []))],
+                }
+            )
+            report = self.run_expansion(provider, [CitationNode("MED", "1")], limits=limits(max_hops=1))
+            self.assertEqual([obs.node.native_id for obs in report.visited], ["MED:1"])
+            self.assertEqual(
+                [(f.node.native_id, f.reason) for f in report.frontier],
+                [("MED:2", "hop_limit")],
+            )
+            self.assertIn("hop_limit", {stop.reason for stop in report.stops})
+            # Only the root was ever queried.
+            self.assertEqual({r.parent.native_id for r in report.relations}, {"MED:1"})
+
+        with self.subTest(case="test_source_limit_retains_edges_and_marks_frontier"):
+            provider = FakeProvider(
+                {
+                    ("MED", "1", "references"): [
+                        json_response(ref_payload(2, [entry("2"), entry("3")]))
+                    ],
+                    ("MED", "1", "citations"): [json_response(cit_payload(0, []))],
+                    ("MED", "2", "references"): [json_response(ref_payload(0, []))],
+                    ("MED", "2", "citations"): [json_response(cit_payload(0, []))],
+                }
+            )
+            report = self.run_expansion(
+                provider, [CitationNode("MED", "1")], limits=limits(max_sources=2)
+            )
+            # Both occurrences are retained; the over-budget node is an explicit frontier.
+            self.assertEqual(len(_edges_for(report, "MED:1", "references")), 2)
+            self.assertEqual(
+                [(f.node.native_id, f.reason) for f in report.frontier],
+                [("MED:3", "source_limit")],
+            )
+            self.assertIn("source_limit", {stop.reason for stop in report.stops})
+            self.assertNotIn("MED:3", {r.parent.native_id for r in report.relations})
+
+        with self.subTest(case="test_zero_request_budget_performs_no_request"):
+            provider = FakeProvider()
+            report = self.run_expansion(
+                provider, [CitationNode("MED", "1")], limits=limits(max_requests=0)
+            )
+            self.assertEqual(provider.calls, [])
+            self.assertEqual(report.relations, ())
+            self.assertEqual(report.visited, ())
+            self.assertEqual(
+                [(f.node.native_id, f.reason) for f in report.frontier],
+                [("MED:1", "request_limit")],
+            )
+            self.assertIn("request_limit", {stop.reason for stop in report.stops})
+
+        with self.subTest(case="test_zero_hop_and_zero_source_bounds_perform_no_request"):
+            provider = FakeProvider()
+            report = self.run_expansion(
+                provider,
+                [CitationNode("MED", "1")],
+                limits=limits(max_hops=0, max_sources=0),
+            )
+            self.assertEqual(provider.calls, [])
+            self.assertIn("source_limit", {stop.reason for stop in report.stops})
+
+        with self.subTest(case="test_declared_entries_beyond_page_budget_are_an_explicit_gap"):
+            provider = FakeProvider(
+                {
+                    ("MED", "1", "references"): [
+                        json_response(ref_payload(2, [entry("2")])),  # declares 2, returns 1
+                    ],
+                    ("MED", "1", "citations"): [json_response(cit_payload(0, []))],
+                }
+            )
+            report = self.run_expansion(
+                provider, [CitationNode("MED", "1")], limits=limits(max_pages=1)
+            )
+            references = [r for r in report.relations if r.direction == "references"][0]
+            self.assertFalse(references.complete)
+            self.assertEqual(references.stop_reason, "page_limit")
+            self.assertIn("relation_incomplete", {stop.reason for stop in report.stops})
+            # A known-relevant entry the bounded retrieval did not reach is an explicit
+            # gap; completeness is never claimed.
+            self.assertFalse(report.to_mapping()["guarantees"]["completeness_claimed"])
+
+
 class LimitTests(ExpansionBase):
-    def test_hop_limit_records_frontier_and_is_explicit(self):
-        provider = FakeProvider(
-            {
-                ("MED", "1", "references"): [json_response(ref_payload(1, [entry("2")]))],
-                ("MED", "1", "citations"): [json_response(cit_payload(0, []))],
-            }
-        )
-        report = self.run_expansion(provider, [CitationNode("MED", "1")], limits=limits(max_hops=1))
-        self.assertEqual([obs.node.native_id for obs in report.visited], ["MED:1"])
-        self.assertEqual(
-            [(f.node.native_id, f.reason) for f in report.frontier],
-            [("MED:2", "hop_limit")],
-        )
-        self.assertIn("hop_limit", {stop.reason for stop in report.stops})
-        # Only the root was ever queried.
-        self.assertEqual({r.parent.native_id for r in report.relations}, {"MED:1"})
-
-    def test_source_limit_retains_edges_and_marks_frontier(self):
-        provider = FakeProvider(
-            {
-                ("MED", "1", "references"): [
-                    json_response(ref_payload(2, [entry("2"), entry("3")]))
-                ],
-                ("MED", "1", "citations"): [json_response(cit_payload(0, []))],
-                ("MED", "2", "references"): [json_response(ref_payload(0, []))],
-                ("MED", "2", "citations"): [json_response(cit_payload(0, []))],
-            }
-        )
-        report = self.run_expansion(
-            provider, [CitationNode("MED", "1")], limits=limits(max_sources=2)
-        )
-        # Both occurrences are retained; the over-budget node is an explicit frontier.
-        self.assertEqual(len(_edges_for(report, "MED:1", "references")), 2)
-        self.assertEqual(
-            [(f.node.native_id, f.reason) for f in report.frontier],
-            [("MED:3", "source_limit")],
-        )
-        self.assertIn("source_limit", {stop.reason for stop in report.stops})
-        self.assertNotIn("MED:3", {r.parent.native_id for r in report.relations})
-
-    def test_zero_request_budget_performs_no_request(self):
-        provider = FakeProvider()
-        report = self.run_expansion(
-            provider, [CitationNode("MED", "1")], limits=limits(max_requests=0)
-        )
-        self.assertEqual(provider.calls, [])
-        self.assertEqual(report.relations, ())
-        self.assertEqual(report.visited, ())
-        self.assertEqual(
-            [(f.node.native_id, f.reason) for f in report.frontier],
-            [("MED:1", "request_limit")],
-        )
-        self.assertIn("request_limit", {stop.reason for stop in report.stops})
-
-    def test_zero_hop_and_zero_source_bounds_perform_no_request(self):
-        provider = FakeProvider()
-        report = self.run_expansion(
-            provider,
-            [CitationNode("MED", "1")],
-            limits=limits(max_hops=0, max_sources=0),
-        )
-        self.assertEqual(provider.calls, [])
-        self.assertIn("source_limit", {stop.reason for stop in report.stops})
-
     @slow
     def test_request_budget_counts_every_retry_attempt(self):
         provider = FakeProvider(
@@ -325,26 +355,6 @@ class LimitTests(ExpansionBase):
         reasons = {stop.reason for stop in report.stops}
         self.assertIn("request_limit", reasons)
         self.assertIn("relation_interrupted", reasons)
-
-    def test_declared_entries_beyond_page_budget_are_an_explicit_gap(self):
-        provider = FakeProvider(
-            {
-                ("MED", "1", "references"): [
-                    json_response(ref_payload(2, [entry("2")])),  # declares 2, returns 1
-                ],
-                ("MED", "1", "citations"): [json_response(cit_payload(0, []))],
-            }
-        )
-        report = self.run_expansion(
-            provider, [CitationNode("MED", "1")], limits=limits(max_pages=1)
-        )
-        references = [r for r in report.relations if r.direction == "references"][0]
-        self.assertFalse(references.complete)
-        self.assertEqual(references.stop_reason, "page_limit")
-        self.assertIn("relation_incomplete", {stop.reason for stop in report.stops})
-        # A known-relevant entry the bounded retrieval did not reach is an explicit
-        # gap; completeness is never claimed.
-        self.assertFalse(report.to_mapping()["guarantees"]["completeness_claimed"])
 
 
 # --------------------------------------------------------------------------- #
