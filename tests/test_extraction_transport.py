@@ -302,29 +302,40 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(evidence["pricing_ref"], config_mapping()["pricing_ref"])
         self.assertEqual(evidence["reserve_usd"], "0.0147456")
 
-    def test_purpose_required(self):
-        for bad in ("other", "", None, 3):
-            with self.assertRaises(lead.LeadValidationError):
+    def test_invalid_plan_inputs_refused(self):
+        # Each former standalone input-validation test is preserved verbatim as
+        # a labelled subTest case.
+        def case_test_purpose_required():
+            for bad in ("other", "", None, 3):
+                with self.assertRaises(lead.LeadValidationError):
+                    extraction.plan_extraction(
+                        cfg(), purpose=bad, instructions=INSTRUCTIONS, text=TEXT
+                    )
+            for good in extraction.PURPOSES:
                 extraction.plan_extraction(
-                    cfg(), purpose=bad, instructions=INSTRUCTIONS, text=TEXT
-                )
-        for good in extraction.PURPOSES:
-            extraction.plan_extraction(
-                cfg(), purpose=good, instructions=INSTRUCTIONS, text=TEXT
-            )
-
-    def test_instructions_required(self):
-        for bad in (None, "", "   ", 3):
-            with self.assertRaises(lead.LeadValidationError):
-                extraction.plan_extraction(
-                    cfg(), purpose="extraction", instructions=bad, text=TEXT
+                    cfg(), purpose=good, instructions=INSTRUCTIONS, text=TEXT
                 )
 
-    def test_text_must_be_a_string(self):
-        with self.assertRaises(lead.LeadValidationError):
-            extraction.plan_extraction(
-                cfg(), purpose="extraction", instructions=INSTRUCTIONS, text=3
-            )
+        def case_test_instructions_required():
+            for bad in (None, "", "   ", 3):
+                with self.assertRaises(lead.LeadValidationError):
+                    extraction.plan_extraction(
+                        cfg(), purpose="extraction", instructions=bad, text=TEXT
+                    )
+
+        def case_test_text_must_be_a_string():
+            with self.assertRaises(lead.LeadValidationError):
+                extraction.plan_extraction(
+                    cfg(), purpose="extraction", instructions=INSTRUCTIONS, text=3
+                )
+
+        for label, case in (
+            ("test_purpose_required", case_test_purpose_required),
+            ("test_instructions_required", case_test_instructions_required),
+            ("test_text_must_be_a_string", case_test_text_must_be_a_string),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_oversize_input_refused(self):
         with self.assertRaises(lead.LeadValidationError):
@@ -446,40 +457,85 @@ class NeverSuccessTests(unittest.TestCase):
     def _run_body(self, **overrides):
         return run(FakeTransport(resp(200, valid_body(**overrides))))
 
-    def test_malformed_non_json_content_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = "not json at all"
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertIsNone(result.proposal_json)
-        self.assertIsNone(result.proposal_text)
+    def test_never_a_silent_success(self):
+        # One table per malformed/refused 200 body: each former standalone test
+        # is preserved verbatim as a labelled subTest case (no behaviour lost).
+        def case_test_malformed_non_json_content_is_protocol_error():
+            choice = valid_choices()
+            choice["message"]["content"] = "not json at all"
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertIsNone(result.proposal_json)
+            self.assertIsNone(result.proposal_text)
 
-    def test_valid_json_but_not_an_object_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = "[1, 2, 3]"
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertIsNone(result.proposal_json)
+        def case_test_valid_json_but_not_an_object_is_protocol_error():
+            choice = valid_choices()
+            choice["message"]["content"] = "[1, 2, 3]"
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertIsNone(result.proposal_json)
 
-    def test_wrong_model_is_protocol_error(self):
-        result = run(FakeTransport(resp(200, valid_body(model="openai/other-model"))))
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertIsNone(result.proposal_json)
-        # The reported cost is still salvaged and retained as known.
-        self.assertEqual(result.cost.state, "known")
-        self.assertEqual(result.cost.amount_usd, "0.0001024")
+        def case_test_wrong_model_is_protocol_error():
+            result = run(FakeTransport(resp(200, valid_body(model="openai/other-model"))))
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertIsNone(result.proposal_json)
+            # The reported cost is still salvaged and retained as known.
+            self.assertEqual(result.cost.state, "known")
+            self.assertEqual(result.cost.amount_usd, "0.0001024")
 
-    def test_length_finish_is_never_success(self):
-        result = self._run_body(choices=[valid_choices(finish_reason="length")])
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertIsNone(result.proposal_json)
+        def case_test_length_finish_is_never_success():
+            result = self._run_body(choices=[valid_choices(finish_reason="length")])
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertIsNone(result.proposal_json)
 
-    def test_tool_calls_are_never_success(self):
-        choice = valid_choices()
-        choice["message"]["tool_calls"] = [{"id": "t1", "type": "function"}]
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
+        def case_test_tool_calls_are_never_success():
+            choice = valid_choices()
+            choice["message"]["tool_calls"] = [{"id": "t1", "type": "function"}]
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
 
+        def case_test_top_level_error_is_protocol_error():
+            body = valid_body()
+            body["error"] = {"code": 500, "message": CANARY}
+            result = run(FakeTransport(resp(200, body)))
+            self.assertEqual(result.outcome, "protocol_error")
+
+        def case_test_missing_choices_is_protocol_error():
+            body = valid_body()
+            del body["choices"]
+            result = run(FakeTransport(resp(200, body)))
+            self.assertEqual(result.outcome, "protocol_error")
+
+        def case_test_non_text_content_is_protocol_error():
+            choice = valid_choices()
+            choice["message"]["content"] = [{"type": "text", "text": "hi"}]
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
+
+        def case_test_empty_content_is_protocol_error():
+            choice = valid_choices()
+            choice["message"]["content"] = "   "
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
+
+        cases = [
+            ("test_malformed_non_json_content_is_protocol_error",
+             case_test_malformed_non_json_content_is_protocol_error),
+            ("test_valid_json_but_not_an_object_is_protocol_error",
+             case_test_valid_json_but_not_an_object_is_protocol_error),
+            ("test_wrong_model_is_protocol_error", case_test_wrong_model_is_protocol_error),
+            ("test_length_finish_is_never_success", case_test_length_finish_is_never_success),
+            ("test_tool_calls_are_never_success", case_test_tool_calls_are_never_success),
+            ("test_top_level_error_is_protocol_error", case_test_top_level_error_is_protocol_error),
+            ("test_missing_choices_is_protocol_error", case_test_missing_choices_is_protocol_error),
+            ("test_non_text_content_is_protocol_error", case_test_non_text_content_is_protocol_error),
+            ("test_empty_content_is_protocol_error", case_test_empty_content_is_protocol_error),
+        ]
+        for label, case in cases:
+            with self.subTest(case=label):
+                case()
+
+    # K2 security/fail-closed: kept standalone (refusals are never merged).
     def test_refusal_is_refused(self):
         choice = valid_choices()
         choice["message"]["refusal"] = "I cannot help with that."
@@ -493,120 +549,115 @@ class NeverSuccessTests(unittest.TestCase):
         result = self._run_body(choices=[valid_choices(finish_reason="content_filter")])
         self.assertEqual(result.outcome, "refused")
 
-    def test_top_level_error_is_protocol_error(self):
-        body = valid_body()
-        body["error"] = {"code": 500, "message": CANARY}
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
-
-    def test_missing_choices_is_protocol_error(self):
-        body = valid_body()
-        del body["choices"]
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
-
-    def test_non_text_content_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = [{"type": "text", "text": "hi"}]
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
-
-    def test_empty_content_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = "   "
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
-
 
 # --------------------------------------------------------------------------- #
 # Ambiguity / cost accounting
 # --------------------------------------------------------------------------- #
 class AmbiguityTests(unittest.TestCase):
-    def test_ambiguous_statuses_keep_unknown(self):
-        for status in (429, 500, 502, 503, 504, 301, 302, 201, 204):
-            body = json.dumps({"error": {"code": status, "message": CANARY}})
-            result = run(FakeTransport(lead.TransportResponse(status, body)))
-            self.assertEqual(result.outcome, "unknown", status)
-            self.assertEqual(result.cost.state, "unknown", status)
-            self.assertTrue(result.cost.reserve_retained, status)
-            self.assertIsNone(result.cost.amount_usd, status)
+    def test_status_resolution_matrix(self):
+        # Status/transport outcome -> cost-state matrix. Every former standalone
+        # test is preserved verbatim as a labelled subTest case.
+        def case_test_ambiguous_statuses_keep_unknown():
+            for status in (429, 500, 502, 503, 504, 301, 302, 201, 204):
+                body = json.dumps({"error": {"code": status, "message": CANARY}})
+                result = run(FakeTransport(lead.TransportResponse(status, body)))
+                self.assertEqual(result.outcome, "unknown", status)
+                self.assertEqual(result.cost.state, "unknown", status)
+                self.assertTrue(result.cost.reserve_retained, status)
+                self.assertIsNone(result.cost.amount_usd, status)
 
-    def test_definitive_statuses_are_not_incurred(self):
-        for status in (400, 401, 402, 403, 404, 413):
-            body = json.dumps({"error": {"code": status, "message": CANARY}})
-            result = run(FakeTransport(lead.TransportResponse(status, body)))
-            self.assertEqual(result.outcome, "failed", status)
-            self.assertEqual(result.cost.state, "not_incurred", status)
-            self.assertFalse(result.cost.reserve_retained, status)
+        def case_test_definitive_statuses_are_not_incurred():
+            for status in (400, 401, 402, 403, 404, 413):
+                body = json.dumps({"error": {"code": status, "message": CANARY}})
+                result = run(FakeTransport(lead.TransportResponse(status, body)))
+                self.assertEqual(result.outcome, "failed", status)
+                self.assertEqual(result.cost.state, "not_incurred", status)
+                self.assertFalse(result.cost.reserve_retained, status)
 
-    def test_network_transport_error_is_unknown_retained(self):
-        transport = FakeTransport(raises=lead.LeadTransportError("dropped"))
-        result = run(transport)
-        self.assertEqual(result.outcome, "unknown")
-        self.assertEqual(result.calls_attempted, 1)
-        self.assertEqual(len(transport.calls), 1)
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
-        self.assertIsNone(result.cost.amount_usd)
+        def case_test_network_transport_error_is_unknown_retained():
+            transport = FakeTransport(raises=lead.LeadTransportError("dropped"))
+            result = run(transport)
+            self.assertEqual(result.outcome, "unknown")
+            self.assertEqual(result.calls_attempted, 1)
+            self.assertEqual(len(transport.calls), 1)
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
+            self.assertIsNone(result.cost.amount_usd)
 
-    def test_unexpected_transport_exception_is_unknown_retained(self):
-        result = run(FakeTransport(raises=RuntimeError("kaboom")))
-        self.assertEqual(result.outcome, "unknown")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_unexpected_transport_exception_is_unknown_retained():
+            result = run(FakeTransport(raises=RuntimeError("kaboom")))
+            self.assertEqual(result.outcome, "unknown")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_malformed_200_without_cost_stays_unknown(self):
-        body = valid_body()
-        body["choices"] = ["not", "a", "map"]
-        body["usage"].pop("cost", None)
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
-        self.assertNotEqual(result.cost.state, "not_incurred")
+        def case_test_malformed_200_without_cost_stays_unknown():
+            body = valid_body()
+            body["choices"] = ["not", "a", "map"]
+            body["usage"].pop("cost", None)
+            result = run(FakeTransport(resp(200, body)))
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
+            self.assertNotEqual(result.cost.state, "not_incurred")
 
-    def test_malformed_200_with_valid_cost_is_known(self):
-        body = valid_body()
-        body["choices"] = ["not", "a", "map"]
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertEqual(result.cost.state, "known")
-        self.assertEqual(result.cost.amount_usd, "0.0001024")
+        def case_test_malformed_200_with_valid_cost_is_known():
+            body = valid_body()
+            body["choices"] = ["not", "a", "map"]
+            result = run(FakeTransport(resp(200, body)))
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertEqual(result.cost.state, "known")
+            self.assertEqual(result.cost.amount_usd, "0.0001024")
 
-    def test_invalid_json_body_is_protocol_error_unknown(self):
-        result = run(FakeTransport(resp(200, "<html>nope</html>")))
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_invalid_json_body_is_protocol_error_unknown():
+            result = run(FakeTransport(resp(200, "<html>nope</html>")))
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_oversize_response_is_protocol_error(self):
-        result = run(
-            FakeTransport(lead.TransportResponse(200, "x" * 50, truncated=True)),
-            max_response_bytes=100000,
-        )
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_oversize_response_is_protocol_error():
+            result = run(
+                FakeTransport(lead.TransportResponse(200, "x" * 50, truncated=True)),
+                max_response_bytes=100000,
+            )
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
 
-    def test_response_over_configured_bound(self):
-        result = run(
-            FakeTransport(lead.TransportResponse(200, json.dumps(valid_body()))),
-            max_response_bytes=10,
-        )
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertEqual(result.cost.state, "unknown")
+        def case_test_response_over_configured_bound():
+            result = run(
+                FakeTransport(lead.TransportResponse(200, json.dumps(valid_body()))),
+                max_response_bytes=10,
+            )
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertEqual(result.cost.state, "unknown")
 
-    def test_huge_exponent_cost_is_bounded(self):
-        raw = (
-            '{"model":"%s","choices":[{"finish_reason":"stop",'
-            '"message":{"role":"assistant","content":"{\\"a\\":1}"}}],'
-            '"usage":{"prompt_tokens":1,"completion_tokens":1,"cost":1e999999999}}'
-            % MODEL
-        )
-        result = run(FakeTransport(resp(200, raw)))
-        self.assertEqual(result.outcome, "completed")
-        self.assertEqual(result.cost.state, "unknown")
-        self.assertTrue(result.cost.reserve_retained)
+        def case_test_huge_exponent_cost_is_bounded():
+            raw = (
+                '{"model":"%s","choices":[{"finish_reason":"stop",'
+                '"message":{"role":"assistant","content":"{\\"a\\":1}"}}],'
+                '"usage":{"prompt_tokens":1,"completion_tokens":1,"cost":1e999999999}}'
+                % MODEL
+            )
+            result = run(FakeTransport(resp(200, raw)))
+            self.assertEqual(result.outcome, "completed")
+            self.assertEqual(result.cost.state, "unknown")
+            self.assertTrue(result.cost.reserve_retained)
+
+        cases = [
+            ("test_ambiguous_statuses_keep_unknown", case_test_ambiguous_statuses_keep_unknown),
+            ("test_definitive_statuses_are_not_incurred", case_test_definitive_statuses_are_not_incurred),
+            ("test_network_transport_error_is_unknown_retained", case_test_network_transport_error_is_unknown_retained),
+            ("test_unexpected_transport_exception_is_unknown_retained", case_test_unexpected_transport_exception_is_unknown_retained),
+            ("test_malformed_200_without_cost_stays_unknown", case_test_malformed_200_without_cost_stays_unknown),
+            ("test_malformed_200_with_valid_cost_is_known", case_test_malformed_200_with_valid_cost_is_known),
+            ("test_invalid_json_body_is_protocol_error_unknown", case_test_invalid_json_body_is_protocol_error_unknown),
+            ("test_oversize_response_is_protocol_error", case_test_oversize_response_is_protocol_error),
+            ("test_response_over_configured_bound", case_test_response_over_configured_bound),
+            ("test_huge_exponent_cost_is_bounded", case_test_huge_exponent_cost_is_bounded),
+        ]
+        for label, case in cases:
+            with self.subTest(case=label):
+                case()
 
 
 # --------------------------------------------------------------------------- #
