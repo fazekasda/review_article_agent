@@ -429,6 +429,64 @@ one-test-per-public-behaviour loss. The `test_discovery_records` row's exact
 set is empty (that module has no identifier-conflict-merge test). Recommended as
 a dedicated follow-up task rather than folded into this ~15–20 min batch.
 
+### 4.3 Batch A execution results (S19-PRUNE-A)
+
+Base `8642e2d`; branch `task/s19-prune-A`. Batch A is **test-only** (no `src/`).
+
+| module | before | after | Δ | action |
+|---|---:|---:|---:|---|
+| `test_synthesis_schema` | 49 | 45 | −4 | P1 merge |
+| `test_extraction_schema` | 31 | 27 | −4 | P1 merge |
+| `test_delivery_schema` | 33 | 30 | −3 | P1 merge |
+| `test_drafting_schema` | 41 | 41 | 0 | none (no plan merge group) |
+| `test_review_schema` | 26 | 26 | 0 | none (no plan merge group) |
+| `test_tracing_schema` | 39 | 39 | 0 | plan row did not match module content (see below) |
+| `test_discovery_serialization` | 55 | 55 | 0 | none (no plan merge group) |
+| `test_records` | 47 | 47 | 0 | §4.2 row not materialisable (see below) |
+| `test_artifacts` | 68 | 68 | 0 | §4.2 row not materialisable (see below) |
+| **TOTAL** | **389** | **378** | **−11** | |
+
+P1 merges applied (every original case preserved verbatim as a `subTest` label):
+
+| module | new parameterized method | cases | drop |
+|---|---|---:|---:|
+| `test_synthesis_schema` | `test_outline_structure_rules` | 5 | 4 |
+| `test_extraction_schema` | `test_value_and_dimension_rules` | 5 | 4 |
+| `test_delivery_schema` | `test_readiness_matrix` | 4 | 3 |
+
+§6 cross-check (docs-cited), excluding this plan document itself:
+
+```bash
+grep -rhoE 'test_[A-Za-z0-9_]+' docs --exclude=test-pruning-plan.md | LC_ALL=C sort -u > /tmp/docs_cited_noplan.txt
+comm -12 <(sort -u /tmp/del_A.txt) /tmp/docs_cited_noplan.txt   # prints nothing
+```
+
+The literal plan-inclusive grep also matches these names, but only because the
+plan's own §4.1 merge table cites them; no other doc cites any deletion target.
+
+K2 note: the §6 security-name heuristic (`...refus...`) flags 5 plan-listed
+merge targets (`test_duplicate_order_refused`,
+`test_unknown_concept_dependency_refused`,
+`test_unknown_statement_dependency_refused`,
+`test_non_numeric_and_boolean_known_values_refused`,
+`test_missing_dimension_and_dimension_score_refused`). These are schema-order /
+dependency / value validators, **not** the enumerated security behaviours (gate
+bypass, secret leakage, one active project, duplicate accepted result, stale
+approval); every case is preserved as a `subTest`, so no coverage is lost. Flagged
+for coordinator review.
+
+Not executed (reported, not skipped silently): `test_tracing_schema` §4.1 row
+"status/stale pair tests" does not exist in the module (no status/stale tests);
+`test_records`/`test_artifacts` §4.2 P3 "canonical-JSON / digest duplicates" rows
+had no exact safe duplicate set to materialise, so they were left untouched.
+
+Verification: `python3 scripts/run_tests.py --slow -j 4 <all 9 Batch A modules>`
+PASS; fast tier `python3 scripts/run_tests.py -j 4` PASS (145 modules, 3846 tests,
+0 failures, 706 skipped); `python3 scripts/check_contract_docs.py` OK;
+`git diff --check` clean. Mutation spot-check: breaking `validate_outline` made
+`test_outline_structure_rules` report the failing `subTest`
+`case='test_unknown_concept_dependency_refused'`.
+
 ---
 
 ### 4.3 Batch C execution results (task S19-PRUNE-C)
