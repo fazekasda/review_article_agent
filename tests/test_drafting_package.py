@@ -534,7 +534,24 @@ class BibliographicMetadataTests(unittest.TestCase):
         doc.update(overrides)
         return doc
 
-    def test_present_fields_are_carried_from_the_observation(self):
+    def test_bibliographic_metadata_rules(self):
+        """One parameterized method preserving every original case verbatim.
+
+        Each ``subTest`` case label is the original standalone method name.
+        """
+        cases = (
+            ("test_present_fields_are_carried_from_the_observation", self._present_fields),
+            ("test_authors_and_journal_are_carried_from_the_observation", self._authors_and_journal),
+            ("test_disagreeing_authors_or_journal_omit_the_field", self._disagreeing_authors_or_journal),
+            ("test_absent_fields_are_omitted_never_invented", self._absent_fields),
+            ("test_disagreeing_occurrences_omit_the_field", self._disagreeing_occurrences),
+            ("test_identity_only_carries_present_namespaces", self._identity_only),
+        )
+        for name, case in cases:
+            with self.subTest(case=name):
+                case()
+
+    def _present_fields(self):
         discovery = _FakeDiscovery({"run1": _Observation([_Rec("Real title", 2020)])})
         observed = _observed_bibliographic_fields(self._candidate(), discovery)
         self.assertEqual(observed, {"title": "Real title", "year": 2020})
@@ -550,7 +567,7 @@ class BibliographicMetadataTests(unittest.TestCase):
         self.assertNotIn("authors", record)
         self.assertNotIn("journal", record)
 
-    def test_authors_and_journal_are_carried_from_the_observation(self):
+    def _authors_and_journal(self):
         discovery = _FakeDiscovery(
             {
                 "run1": _Observation(
@@ -581,7 +598,7 @@ class BibliographicMetadataTests(unittest.TestCase):
         self.assertEqual(record["authors"], ["Ada Lovelace", "Alan Turing"])
         self.assertEqual(record["journal"], "Journal of Synthetic Studies")
 
-    def test_disagreeing_authors_or_journal_omit_the_field(self):
+    def _disagreeing_authors_or_journal(self):
         discovery = _FakeDiscovery(
             {
                 "run1": _Observation([_Rec("T", 2020, authors=("A",), journal="J1")]),
@@ -595,7 +612,7 @@ class BibliographicMetadataTests(unittest.TestCase):
         # The title agrees, so it is still carried.
         self.assertEqual(observed["title"], "T")
 
-    def test_absent_fields_are_omitted_never_invented(self):
+    def _absent_fields(self):
         discovery = _FakeDiscovery({"run1": _Observation([_Rec(None, None)])})
         observed = _observed_bibliographic_fields(self._candidate(), discovery)
         self.assertEqual(observed, {})
@@ -607,7 +624,7 @@ class BibliographicMetadataTests(unittest.TestCase):
         self.assertNotIn("authors", record)
         self.assertNotIn("journal", record)
 
-    def test_disagreeing_occurrences_omit_the_field(self):
+    def _disagreeing_occurrences(self):
         discovery = _FakeDiscovery(
             {
                 "run1": _Observation([_Rec("Title A", 2020)]),
@@ -619,7 +636,7 @@ class BibliographicMetadataTests(unittest.TestCase):
         self.assertNotIn("title", observed)
         self.assertNotIn("year", observed)
 
-    def test_identity_only_carries_present_namespaces(self):
+    def _identity_only(self):
         candidate = self._candidate(tokens=[["native:pubmed", "a"], ["pmid", "111"]])
         record = _bibliographic_record(
             "P", candidate, self._CORPUS_REF, self._FREEZE_REF, [], {}

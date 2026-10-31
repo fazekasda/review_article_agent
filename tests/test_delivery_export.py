@@ -49,40 +49,45 @@ CORPUS = {
 
 
 class CitedKeysTests(unittest.TestCase):
-    def test_ordered_unique_keys(self):
-        text = "See [@b; @a] and again [@b, p. 4] and [@c]."
-        self.assertEqual(cited_keys(text), ["b", "a", "c"])
-
-    def test_no_citations(self):
-        self.assertEqual(cited_keys("plain text"), [])
+    def test_cited_keys(self):
+        """One parameterized method preserving every original case verbatim."""
+        cases = (
+            ("test_ordered_unique_keys", "See [@b; @a] and again [@b, p. 4] and [@c].", ["b", "a", "c"]),
+            ("test_no_citations", "plain text", []),
+        )
+        for name, text, expected in cases:
+            with self.subTest(case=name):
+                self.assertEqual(cited_keys(text), expected)
 
 
 class CheckConsistencyTests(unittest.TestCase):
-    def test_clean(self):
-        refs = [_ref("smith2020", doi="10.1/x"), _ref("jones2021", pmid="999", version="2")]
-        result = check_consistency("A [@smith2020] and B [@jones2021].", refs, CORPUS)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["errors"], [])
+    def test_consistency_checks(self):
+        """One parameterized method preserving every original case verbatim."""
+        with self.subTest(case="test_clean"):
+            refs = [_ref("smith2020", doi="10.1/x"), _ref("jones2021", pmid="999", version="2")]
+            result = check_consistency("A [@smith2020] and B [@jones2021].", refs, CORPUS)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["errors"], [])
 
-    def test_invented_and_missing(self):
-        refs = [_ref("ghost", doi="10.9/z")]
-        result = check_consistency("A [@smith2020].", refs, CORPUS)
-        codes = {e["code"] for e in result["errors"]}
-        self.assertFalse(result["ok"])
-        self.assertIn("missing_reference", codes)
-        self.assertIn("invented_reference", codes)
+        with self.subTest(case="test_invented_and_missing"):
+            refs = [_ref("ghost", doi="10.9/z")]
+            result = check_consistency("A [@smith2020].", refs, CORPUS)
+            codes = {e["code"] for e in result["errors"]}
+            self.assertFalse(result["ok"])
+            self.assertIn("missing_reference", codes)
+            self.assertIn("invented_reference", codes)
 
-    def test_duplicate_doi_and_version_mismatch(self):
-        refs = [
-            _ref("smith2020", doi="10.1/x", version="2"),
-            _ref("other", doi="10.1/x"),
-        ]
-        corpus = dict(CORPUS)
-        corpus["other"] = {"identity": {"doi": "10.1/x"}, "version": "1"}
-        result = check_consistency("A [@smith2020] and B [@other].", refs, corpus)
-        codes = [e["code"] for e in result["errors"]]
-        self.assertIn("version_mismatch", codes)
-        self.assertIn("duplicate_identity", codes)
+        with self.subTest(case="test_duplicate_doi_and_version_mismatch"):
+            refs = [
+                _ref("smith2020", doi="10.1/x", version="2"),
+                _ref("other", doi="10.1/x"),
+            ]
+            corpus = dict(CORPUS)
+            corpus["other"] = {"identity": {"doi": "10.1/x"}, "version": "1"}
+            result = check_consistency("A [@smith2020] and B [@other].", refs, corpus)
+            codes = [e["code"] for e in result["errors"]]
+            self.assertIn("version_mismatch", codes)
+            self.assertIn("duplicate_identity", codes)
 
 
 class RenderTests(unittest.TestCase):
