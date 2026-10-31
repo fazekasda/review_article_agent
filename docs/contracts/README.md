@@ -19,7 +19,7 @@
 | Document | Doc version | Status | What it represents |
 | --- | --- | --- | --- |
 | [`01-identities.md`](01-identities.md) | `v1.4` | Behavior approved 2026-10-27; representation reviewable | Artifact/revision identity, evidence and attribution records, provenance, dependency links, missing/unknown states, rights **projection**, worked examples. |
-| [`02-gates-and-runtime.md`](02-gates-and-runtime.md) | `v3.2` | Behavior approved 2026-10-27; representation reviewable | Revision-specific approvals and dependency snapshots, findings/issue lifecycle, review budgets, machine vs. human decisions, runtime safety (pause/cancel, project switching, restart reconciliation). |
+| [`02-gates-and-runtime.md`](02-gates-and-runtime.md) | `v3.3` | Behavior approved 2026-10-27; representation reviewable | Revision-specific approvals and dependency snapshots, findings/issue lifecycle, review budgets, machine vs. human decisions, runtime safety (pause/cancel, project switching, restart reconciliation). |
 | [`03-policy-decisions.md`](03-policy-decisions.md) | `v1` | **ACCEPTED** (all items, 2026-10-27) | The decision **register** for P1–P6 and operational/technical items, the canonical `RightsRecord` v1, and the accepted architecture direction. |
 
 Confirmed sources that must not be weakened (read-only authority) are
