@@ -701,6 +701,100 @@ python3 scripts/run_tests.py --slow -j 4 test_discovery_candidates test_discover
 python3 scripts/run_tests.py -j 4
 # -> 145 modules, 3799 tests, 0 failures, 0 errors (fast tier)
 
+### 4.3 Batch G execution results (S19-PRUNE-G)
+
+Branch `task/s19-prune-G`, base `91380c7f6ac5601f8a7c862b2e46c0c14bca1646`.
+Test-only change (no `src/`): `tests/test_config.py`, `tests/test_jobs.py`,
+`tests/test_migrations.py`, `tests/test_storage_opmemo.py`. Batch G is
+security-dense (owner auth, approvals, backups, registry); every K2
+security/fail-closed test was left standalone, so pruning is confined to the
+non-security modules with case-preserving P1 `subTest` merges.
+
+Method counts before → after (per Batch G module):
+
+| module | before | after |
+|---|---:|---:|
+| `test_owner_auth` | 59 | 59 |
+| `test_agent_runtime_store` | 59 | 59 |
+| `test_backup` | 41 | 41 |
+| `test_jobs` | 42 | 41 |
+| `test_config` | 27 | 12 |
+| `test_approvals` | 30 | 30 |
+| `test_human_approvals` | 39 | 39 |
+| `test_human_runtime_backup` | 17 | 17 |
+| `test_activation` | 19 | 19 |
+| `test_projects` | 13 | 13 |
+| `test_migrations` | 14 | 10 |
+| `test_registry` | 7 | 7 |
+| `test_storage_opmemo` | 9 | 8 |
+| `test_identity_path_safety` | 11 | 11 |
+| `test_runtime_backup` | 13 | 13 |
+| **Batch G total** | **400** | **380** |
+
+**P1 merges applied (cases preserved, every original method name kept as a
+`subTest` case label):**
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---|---:|---:|
+| `test_config` | 6 invalid-config shape/version rejects (`test_non_object_root_rejected`, `test_newer_schema_version_rejected`, `test_version_zero_or_negative_rejected`, `test_missing_schema_version_rejected`, `test_non_integer_version_rejected`, `test_bad_data_dir_rejected`) → `test_invalid_configurations_rejected` | 6 | 5 |
+| `test_config` | 4 invalid-file rejects (`test_malformed_json_is_rejected_without_echo`, `test_missing_file_is_actionable`, `test_non_utf8_is_rejected`, `test_oversize_is_rejected`) → `test_invalid_config_files_rejected` | 4 | 3 |
+| `test_config` | 4 data-dir precedence rules (`test_explicit_wins`, `test_config_beats_default`, `test_default_xdg_used_last`, `test_no_env_no_config_uses_home_default`) → `test_data_dir_resolution_precedence` | 4 | 3 |
+| `test_config` | 4 strict-JSON rejects (`test_duplicate_keys_rejected`, `test_nonfinite_rejected`, `test_overdeep_rejected`, `test_malformed_rejected`) → `test_strict_json_rejections` | 4 | 3 |
+| `test_config` | 2 config-file strict-JSON rejects (`test_config_file_duplicate_keys_rejected`, `test_config_file_nonfinite_rejected`) → `test_config_file_strict_json_rejected` | 2 | 1 |
+| `test_migrations` | 4 `resolve_synchronous` unit rules (`test_unset_and_unknown_resolve_to_full`, `test_off_and_normal_honoured`, `test_never_raises_on_broken_mapping`, `test_production_default_is_full`) → `test_resolve_synchronous_matrix` | 4 | 3 |
+| `test_migrations` | 2 `open_connection` pragma cases (`test_open_connection_honours_env`, `test_open_connection_defaults_to_full`) → `test_open_connection_synchronous_matrix` | 2 | 1 |
+| `test_storage_opmemo` | 2 outermost-transaction-boundary cases (`test_commit_starts_new_transaction_with_empty_memo`, `test_rollback_starts_new_transaction_with_empty_memo`) → `test_new_transaction_after_commit_or_rollback_has_empty_memo` | 2 | 1 |
+| `test_jobs` | 2 waiting-state gate cases (`test_waiting_human_blocks_new_attempt`, `test_waiting_external_blocks_new_attempt`) → `test_waiting_states_block_new_attempt` | 2 | 1 |
+
+**Deletion list: empty.** No P2/P3 standalone deletion was executed. The §4.2
+Batch G row (`test_jobs::test_*` persistence duplicates covered by
+`test_step03_acceptance::test_job_completes_after_submitter_process_exits`) was
+materialised and **not** executed: the covering test is a real-process
+integration/acceptance layer, whereas `test_jobs` is the unit-level storage
+layer, so the named cover is not "the same behaviour at the same layer" as
+required by the task's binding rule. `test_jobs` also contains K2 methods
+(`test_stale_fence_cannot_accept`, `test_exactly_one_local_accepted_result`,
+ambiguous-retry blocks, budget-cap refusals, monotonic cost settlement) that
+stay standalone. Same-layer unit coverage was preserved by the waiting-gate
+merge instead.
+
+**§6 grep cross-check** on the exact 30 merged-away names (excluding this plan
+document itself; docs-cited baseline 438 names):
+
+```bash
+grep -rhoE 'test_[A-Za-z0-9_]+' docs --exclude=test-pruning-plan.md | LC_ALL=C sort -u > /tmp/docs_cited_noplan.txt
+comm -12 <(sort -u /tmp/del_G.txt) /tmp/docs_cited_noplan.txt   # prints nothing
+comm -12 <(sort -u /tmp/del_G.txt) /tmp/sec_named.txt           # prints nothing
+```
+
+Both intersections are empty: no merged name is docs-cited and none matches the
+K2 security heuristic. (`test_credential_style_keys_rejected`,
+`test_unknown_key_rejected_without_echoing_value_or_name` and the whole of
+`test_owner_auth`, `test_approvals`, `test_backup`,
+`test_human_approvals`, `test_human_runtime_backup`, `test_runtime_backup`,
+`test_agent_runtime_store`, `test_identity_path_safety`, `test_activation`,
+`test_projects`, `test_registry` were left untouched as security/fail-closed.)
+
+**Mutation spot-check (scratch, uncommitted):** forcing
+`schema.resolve_synchronous` to return `"OFF"` for the unknown-value path made
+the merged `test_resolve_synchronous_matrix` report the failing case
+`case='test_unset_and_unknown_resolve_to_full'` (all 9 sub-values) and
+`test_open_connection_synchronous_matrix` report
+`case='test_open_connection_defaults_to_full'`. Source restored
+(`git diff -- src/` empty).
+
+Verification (all on `task/s19-prune-G`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 test_owner_auth test_agent_runtime_store test_backup \
+  test_jobs test_config test_approvals test_human_approvals test_human_runtime_backup \
+  test_activation test_projects test_migrations test_registry test_storage_opmemo \
+  test_identity_path_safety test_runtime_backup
+# -> 15 modules, 379 tests, 0 failures, 0 errors, 0 skipped
+
+python3 scripts/run_tests.py -j 4
+# -> 145 modules, 3681 tests, 0 failures, 0 errors (fast tier), 706 skipped
+
 python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
 git diff --check                        # -> clean
 ```
