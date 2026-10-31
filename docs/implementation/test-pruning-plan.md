@@ -370,6 +370,65 @@ module matching this theme, after excluding every K1/K2 method". Execution tasks
 must materialise the exact method list per row, run the §6 grep cross-check on
 it, and only then delete. A row whose exact set is empty is simply skipped.
 
+### 4.3 Batch D execution results (S19-PRUNE-D)
+
+Branch `task/s19-prune-D`, base `8642e2d48b7a72a56b1f190348d8cacbf7f6b2ec`.
+Test-only change: `tests/test_discovery_europepmc.py`,
+`tests/test_discovery_pubmed.py` (no `src/` change).
+
+Method counts before → after (per Batch D module):
+
+| module | before | after |
+|---|---:|---:|
+| `test_discovery_europepmc` | 55 | 40 |
+| `test_discovery_pubmed` | 55 | 41 |
+| `test_discovery_reconciliation` | 46 | 46 |
+| `test_discovery_reporting` | 44 | 44 |
+| `test_discovery_lead_runner` | 41 | 41 |
+| `test_discovery_context` | 36 | 36 |
+| `test_discovery_records` | 34 | 34 |
+| `test_discovery_execution` | 34 | 34 |
+| **Batch D total** | **345** | **316** |
+
+**P1 merges applied (cases preserved, no behaviour deleted):**
+
+- `test_discovery_europepmc`: 16 malformed-body tests → one parameterized
+  `MalformedTests::test_malformed_page_bodies_are_incomplete` (16 `subTest`
+  cases, original method names kept as case labels). Drop 15.
+- `test_discovery_pubmed`: 15 malformed-body tests → one parameterized
+  `MalformedResponseTests::test_malformed_bodies_are_never_complete` (15
+  `subTest` cases, original method names kept as case labels). Drop 14.
+  `test_entity_declaration_is_refused` (XXE entity declaration) stays
+  standalone: the §6 security-named heuristic matches `refus`, so it is
+  kept-by-default under K2.
+
+**§6 grep cross-check (deletion/merge name lists):**
+
+- docs-cited: `comm -12` against `grep -rhoE 'test_[A-Za-z0-9_]+' docs |
+  sort -u` is **non-empty only because `test-pruning-plan.md` itself lists the
+  candidate names**. Excluding the plan file gives the genuine set (438 names,
+  matching §1); `comm -12` against it prints **nothing**.
+- security-named: `comm -12` prints `test_entity_declaration_is_refused`
+  (matched by `refus`); per K2 keep-by-default it was **not** merged/deleted.
+
+**Mutation spot-check (scratch, uncommitted):** breaking the europepmc
+`hitCount < 0` guard made the merged test report the expected failing case
+`case='test_negative_hit_count'`; breaking the pubmed errorlist/warninglist
+refusal made the merged test report the expected failing cases
+`case='test_errorlist_never_successful_empty_search'` and
+`case='test_warninglist_never_successful_empty_search'`. Both source files were
+restored (`git diff -- src/` empty).
+
+**§4.2 P2/P3 rows for Batch D — not executed in this task.** The `test_*`
+wildcard rows for `test_discovery_execution` (replay/durability),
+`test_discovery_reconciliation` (cross-provider dedup) and
+`test_discovery_records` (identifier-conflict merge) require materialising the
+exact candidate set, mutation-checking each against the named slow
+`test_step05_core_acceptance` covering tests, and confirming no K4
+one-test-per-public-behaviour loss. The `test_discovery_records` row's exact
+set is empty (that module has no identifier-conflict-merge test). Recommended as
+a dedicated follow-up task rather than folded into this ~15–20 min batch.
+
 ---
 
 ## 5. Projected total and reachability
