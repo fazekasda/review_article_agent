@@ -1105,3 +1105,108 @@ python3 scripts/run_tests.py -j 4
 python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
 git diff --check                         # -> clean
 ```
+
+### 4.3 Batch I execution results (S19-PRUNE-I)
+
+Branch `task/s19-prune-I`, base `678adf61d1604ae0329fdc781757e18e2e4d5864`.
+Batch I is **test-only** (no `src/` change): `tests/test_agent_roles.py`,
+`tests/test_runtime_dispatch.py`, `tests/test_runtime_generation.py`,
+`tests/test_worker_engine.py`, `tests/test_worker_ipc.py`. Conservative P1
+`subTest` merges only, of genuinely table-style input-validation tests; every
+original method name is kept as the `subTest` case label
+(`with self.subTest(case="test_<name>")`), so `grep test_<name>` still finds the
+behaviour text. No crash/recovery/replay/no-re-send/idempotency/budget/
+one-active-project/owner-only/secret test was touched; every K1 (docs-cited) and
+K2 (security/fail-closed) method was left standalone.
+
+Method counts before → after (per Batch I module):
+
+| module | before | after | Δ | action |
+|---|---|---:|---:|---:|---|
+| `test_runtime_generation` | 77 | 69 | −8 | P1 merge |
+| `test_runtime_dispatch` | 69 | 67 | −2 | P1 merge |
+| `test_worker_engine` | 50 | 49 | −1 | P1 merge |
+| `test_worker_ipc` | 47 | 44 | −3 | P1 merges |
+| `test_worker_process` | 19 | 19 | 0 | none (crash/timeout/foreign tests, K2) |
+| `test_worker_backup` | 33 | 33 | 0 | none (tamper/corrupt fail-closed, K2) |
+| `test_agent_roles` | 54 | 51 | −3 | P1 merge |
+| `test_runtime_worker_arbitration` | 13 | 13 | 0 | none (recovery/corruption/one-active, K2) |
+| `test_execution_boundary` | 14 | 14 | 0 | none (refusal boundary, K2) |
+| `test_synthetic_backend` | 32 | 32 | 0 | none (refused/untouched, K2) |
+| **Batch I total** | **408** | **391** | **−17** | |
+
+P1 merges applied (cases preserved verbatim as `subTest` labels; drop = methods
+folded into the new parameterized method):
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---|---:|---:|
+| `test_agent_roles` | 4 `BoundedTaskTests` shape rejects (`test_rejects_non_object`, `test_rejects_missing_fields`, `test_rejects_bad_digest_and_unknown_ref_keys`, `test_rejects_unbounded_input_refs`) → `test_rejects_invalid_task_shapes` | 4 | 3 |
+| `test_runtime_dispatch` | 3 reserve-argument rejects (`test_missing_or_invalid_reserve_denied`, `test_missing_or_invalid_bound_evidence_denied`, `test_invalid_route_and_digests_denied`) → `test_invalid_reserve_inputs_denied` | 3 | 2 |
+| `test_worker_engine` | 2 request rejects (`test_status_and_unknown_op_and_version`, `test_out_of_range_and_bad_payload_are_rejected`) → `test_invalid_request_shapes_are_rejected` | 2 | 1 |
+| `test_runtime_generation` | 9 malformed/untrusted provider-response cases (`test_malformed_non_json_content_is_protocol_error`, `test_valid_json_but_not_an_object_is_protocol_error`, `test_wrong_model_is_protocol_error`, `test_length_finish_is_never_success`, `test_tool_calls_are_never_success`, `test_top_level_error_is_protocol_error`, `test_missing_choices_is_protocol_error`, `test_non_text_content_is_protocol_error`, `test_empty_content_is_protocol_error`) → `test_malformed_responses_are_never_success` | 9 | 8 |
+| `test_worker_ipc` | 2 constructor rejects (`test_constructor_rejects_unsafe_filenames`, `test_constructor_rejects_bad_limits`) → `test_constructor_rejects_invalid_arguments` | 2 | 1 |
+| `test_worker_ipc` | 3 malformed request-body rejects (`test_duplicate_key_rejected`, `test_nonfinite_rejected`, `test_deep_nesting_rejected`) → `test_malformed_request_bodies_rejected` | 3 | 2 |
+
+Notes:
+
+- **Per-test fixture isolation.** `test_worker_ipc::_serve()` binds a
+  per-data-dir control lock (exactly one server per data dir). The first version
+  of `test_malformed_request_bodies_rejected` re-used one `self.data_dir` across
+  its three cases and errored on the 2nd/3rd with `WorkerAlreadyRunning`; the
+  merged method now assigns a fresh `self.data_dir` per case so the cases stay
+  isolated (the `test_agent_roles`/`test_runtime_dispatch`/`test_worker_engine`/
+  `test_runtime_generation` merged cases build a fresh mapping/transport per case
+  and needed no rebuild).
+- **Deliberately excluded from merging (kept standalone):**
+  `test_worker_engine::test_unknown_field_is_rejected_never_trusted` (a
+  caller-supplied authority/actor field must never authenticate — the
+  authority-is-out-of-band K2 behaviour); `test_agent_roles::test_rejects_cross_project_refs`
+  (`cross_project` K2); `test_agent_roles::test_rejects_authority_actor_approval_budget_tool_keys`
+  (docs-cited K1); `test_runtime_generation::test_refusal_is_refused` and
+  `test_content_filter_is_refused` (`refus` K2); and the `AmbiguityTests`
+  status/cost matrices (budget/cost accounting, K2). All `test_worker_backup`
+  tamper/corrupt tests, all `test_execution_boundary` refusal tests, all
+  `test_runtime_worker_arbitration` recovery/corruption tests, all
+  `test_synthetic_backend` refused/untouched tests, and all `test_worker_process`
+  crash/timeout/foreign tests are fail-closed and were left standalone.
+- **Deletion list: empty.** The plan's one Batch I §4.2 row
+  (`test_runtime_generation::test_*` projection duplicates, covered by
+  `test_generation_runner`, kept K3) was not executed: the row names no exact
+  method set and the two modules sit at different layers (runner vs.
+  lead-config projection), so no P2/P3 deletion was safe without weakening K4
+  one-test-per-public-behaviour coverage. This matches the conservative scope of
+  §9 ("batch I keeps 75%").
+
+**§6 grep cross-check** on the exact 23 merged-away names (excluding this plan
+document itself; docs-cited baseline 438 names):
+
+```bash
+comm -12 <(LC_ALL=C sort -u /tmp/del_I.txt) /tmp/docs_cited_noplan.txt   # empty
+comm -12 <(LC_ALL=C sort -u /tmp/del_I.txt) /tmp/sec_named.txt           # empty
+```
+
+Both intersections are empty: no merged name is docs-cited and none matches the
+K2 security heuristic.
+
+**Mutation spot-check (scratch, uncommitted):** flipping
+`runtime/dispatch.py::reserve_dispatch`'s
+`_require_exact_decimal(reserve_usd, ..., strictly_positive=True)` to
+`strictly_positive=False` made the merged `test_invalid_reserve_inputs_denied`
+report the expected failing case
+`(case='test_missing_or_invalid_reserve_denied')` (and the subsequent cases, once
+a reserve row was admitted). Source restored (`git diff -- src/` empty).
+
+Verification (all on `task/s19-prune-I`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 test_runtime_generation test_runtime_dispatch \
+  test_worker_engine test_worker_ipc test_worker_process test_worker_backup \
+  test_agent_roles test_runtime_worker_arbitration test_execution_boundary test_synthetic_backend
+# -> modules: 10  tests: 391  failures: 0  errors: 0  skipped: 0
+
+python3 scripts/run_tests.py -j 4
+# -> modules: 145  tests: 3638  failures: 0  errors: 0  skipped: 699 (fast tier)
+
+python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
+git diff --check                         # -> clean
+```

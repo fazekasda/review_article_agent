@@ -243,26 +243,38 @@ class ReserveDispatchTest(DispatchTestBase):
         record = self.reserve(route="direct_call")
         self.assertEqual(record.accounting_bucket, "direct_call")
 
-    def test_missing_or_invalid_reserve_denied(self) -> None:
-        for bad in (None, "0", "-1", 0.1, True, "not-a-decimal", "1e999999"):
-            with self.assertRaises(DispatchValidationError):
-                self.reserve(reserve_usd=bad)  # type: ignore[arg-type]
-        self.assertEqual(self.dispatch.list_dispatches(), [])
+    def test_invalid_reserve_inputs_denied(self) -> None:
+        """Table of reserve-argument input-validation cases (case labels are the
+        original method names; every case/assertion is preserved verbatim)."""
 
-    def test_missing_or_invalid_bound_evidence_denied(self) -> None:
-        for bad in (None, "", "nothex", "A" * 64, "a" * 63):
-            with self.assertRaises(DispatchValidationError):
-                self.reserve(bound_evidence_digest=bad)  # type: ignore[arg-type]
-        self.assertEqual(self.dispatch.list_dispatches(), [])
+        def missing_or_invalid_reserve():
+            for bad in (None, "0", "-1", 0.1, True, "not-a-decimal", "1e999999"):
+                with self.assertRaises(DispatchValidationError):
+                    self.reserve(reserve_usd=bad)  # type: ignore[arg-type]
+            self.assertEqual(self.dispatch.list_dispatches(), [])
 
-    def test_invalid_route_and_digests_denied(self) -> None:
-        with self.assertRaises(DispatchValidationError):
-            self.reserve(route="batch")
-        with self.assertRaises(DispatchValidationError):
-            self.reserve(input_digest="short")
-        with self.assertRaises(DispatchValidationError):
-            self.reserve(version_digest=123)  # type: ignore[arg-type]
-        self.assertEqual(self.dispatch.list_dispatches(), [])
+        def missing_or_invalid_bound_evidence():
+            for bad in (None, "", "nothex", "A" * 64, "a" * 63):
+                with self.assertRaises(DispatchValidationError):
+                    self.reserve(bound_evidence_digest=bad)  # type: ignore[arg-type]
+            self.assertEqual(self.dispatch.list_dispatches(), [])
+
+        def invalid_route_and_digests():
+            with self.assertRaises(DispatchValidationError):
+                self.reserve(route="batch")
+            with self.assertRaises(DispatchValidationError):
+                self.reserve(input_digest="short")
+            with self.assertRaises(DispatchValidationError):
+                self.reserve(version_digest=123)  # type: ignore[arg-type]
+            self.assertEqual(self.dispatch.list_dispatches(), [])
+
+        for label, case in (
+            ("test_missing_or_invalid_reserve_denied", missing_or_invalid_reserve),
+            ("test_missing_or_invalid_bound_evidence_denied", missing_or_invalid_bound_evidence),
+            ("test_invalid_route_and_digests_denied", invalid_route_and_digests),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_idempotent_same_identity_no_double_reserve(self) -> None:
         first = self.reserve()

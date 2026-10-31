@@ -556,38 +556,80 @@ class NeverSuccessTests(unittest.TestCase):
     def _run_body(self, **overrides):
         return run(FakeTransport(resp(200, valid_body(**overrides))))
 
-    def test_malformed_non_json_content_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = "not json at all"
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertIsNone(result.proposal_json)
-        self.assertIsNone(result.proposal_text)
+    def test_malformed_responses_are_never_success(self):
+        """Table of malformed-provider-response input-validation cases (case
+        labels are the original method names; every case/assertion preserved)."""
 
-    def test_valid_json_but_not_an_object_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = "[1, 2, 3]"
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertIsNone(result.proposal_json)
+        def malformed_non_json_content():
+            choice = valid_choices()
+            choice["message"]["content"] = "not json at all"
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertIsNone(result.proposal_json)
+            self.assertIsNone(result.proposal_text)
 
-    def test_wrong_model_is_protocol_error(self):
-        result = run(FakeTransport(resp(200, valid_body(model="openai/other-model"))))
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertIsNone(result.proposal_json)
-        self.assertEqual(result.cost.state, "known")
-        self.assertEqual(result.cost.amount_usd, "0.0001024")
+        def valid_json_but_not_an_object():
+            choice = valid_choices()
+            choice["message"]["content"] = "[1, 2, 3]"
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertIsNone(result.proposal_json)
 
-    def test_length_finish_is_never_success(self):
-        result = self._run_body(choices=[valid_choices(finish_reason="length")])
-        self.assertEqual(result.outcome, "protocol_error")
-        self.assertIsNone(result.proposal_json)
+        def wrong_model():
+            result = run(FakeTransport(resp(200, valid_body(model="openai/other-model"))))
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertIsNone(result.proposal_json)
+            self.assertEqual(result.cost.state, "known")
+            self.assertEqual(result.cost.amount_usd, "0.0001024")
 
-    def test_tool_calls_are_never_success(self):
-        choice = valid_choices()
-        choice["message"]["tool_calls"] = [{"id": "t1", "type": "function"}]
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
+        def length_finish():
+            result = self._run_body(choices=[valid_choices(finish_reason="length")])
+            self.assertEqual(result.outcome, "protocol_error")
+            self.assertIsNone(result.proposal_json)
+
+        def tool_calls():
+            choice = valid_choices()
+            choice["message"]["tool_calls"] = [{"id": "t1", "type": "function"}]
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
+
+        def top_level_error():
+            body = valid_body()
+            body["error"] = {"code": 500, "message": CANARY}
+            result = run(FakeTransport(resp(200, body)))
+            self.assertEqual(result.outcome, "protocol_error")
+
+        def missing_choices():
+            body = valid_body()
+            del body["choices"]
+            result = run(FakeTransport(resp(200, body)))
+            self.assertEqual(result.outcome, "protocol_error")
+
+        def non_text_content():
+            choice = valid_choices()
+            choice["message"]["content"] = [{"type": "text", "text": "hi"}]
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
+
+        def empty_content():
+            choice = valid_choices()
+            choice["message"]["content"] = "   "
+            result = self._run_body(choices=[choice])
+            self.assertEqual(result.outcome, "protocol_error")
+
+        for label, case in (
+            ("test_malformed_non_json_content_is_protocol_error", malformed_non_json_content),
+            ("test_valid_json_but_not_an_object_is_protocol_error", valid_json_but_not_an_object),
+            ("test_wrong_model_is_protocol_error", wrong_model),
+            ("test_length_finish_is_never_success", length_finish),
+            ("test_tool_calls_are_never_success", tool_calls),
+            ("test_top_level_error_is_protocol_error", top_level_error),
+            ("test_missing_choices_is_protocol_error", missing_choices),
+            ("test_non_text_content_is_protocol_error", non_text_content),
+            ("test_empty_content_is_protocol_error", empty_content),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_refusal_is_refused(self):
         choice = valid_choices()
@@ -601,30 +643,6 @@ class NeverSuccessTests(unittest.TestCase):
     def test_content_filter_is_refused(self):
         result = self._run_body(choices=[valid_choices(finish_reason="content_filter")])
         self.assertEqual(result.outcome, "refused")
-
-    def test_top_level_error_is_protocol_error(self):
-        body = valid_body()
-        body["error"] = {"code": 500, "message": CANARY}
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
-
-    def test_missing_choices_is_protocol_error(self):
-        body = valid_body()
-        del body["choices"]
-        result = run(FakeTransport(resp(200, body)))
-        self.assertEqual(result.outcome, "protocol_error")
-
-    def test_non_text_content_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = [{"type": "text", "text": "hi"}]
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
-
-    def test_empty_content_is_protocol_error(self):
-        choice = valid_choices()
-        choice["message"]["content"] = "   "
-        result = self._run_body(choices=[choice])
-        self.assertEqual(result.outcome, "protocol_error")
 
 
 # --------------------------------------------------------------------------- #

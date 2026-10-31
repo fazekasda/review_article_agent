@@ -177,25 +177,40 @@ class WorkerIPCTest(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "request_too_large")
         self.assertNotIn(canary, raw)
 
-    def test_duplicate_key_rejected(self) -> None:
-        server = self._serve()
-        body = _decode(self._raw_request(server, b'{"a":1,"a":2}\n'))
-        self.assertFalse(body["ok"])
-        self.assertEqual(body["error"]["code"], "malformed_request")
+    def test_malformed_request_bodies_rejected(self) -> None:
+        """Table of malformed request-body input-validation cases (case labels
+        are the original method names; every case/assertion is preserved)."""
 
-    def test_nonfinite_rejected(self) -> None:
-        server = self._serve()
-        for payload in (b'{"x": NaN}\n', b'{"x": Infinity}\n', b'{"x": -Infinity}\n'):
+        def duplicate_key() -> None:
+            server = self._serve()
+            body = _decode(self._raw_request(server, b'{"a":1,"a":2}\n'))
+            self.assertFalse(body["ok"])
+            self.assertEqual(body["error"]["code"], "malformed_request")
+
+        def nonfinite() -> None:
+            server = self._serve()
+            for payload in (b'{"x": NaN}\n', b'{"x": Infinity}\n', b'{"x": -Infinity}\n'):
+                body = _decode(self._raw_request(server, payload))
+                self.assertFalse(body["ok"])
+                self.assertEqual(body["error"]["code"], "malformed_request")
+
+        def deep_nesting() -> None:
+            server = self._serve()
+            payload = b'{"a":' + b"[" * 32 + b"]" * 32 + b"}\n"
             body = _decode(self._raw_request(server, payload))
             self.assertFalse(body["ok"])
             self.assertEqual(body["error"]["code"], "malformed_request")
 
-    def test_deep_nesting_rejected(self) -> None:
-        server = self._serve()
-        payload = b'{"a":' + b"[" * 32 + b"]" * 32 + b"}\n"
-        body = _decode(self._raw_request(server, payload))
-        self.assertFalse(body["ok"])
-        self.assertEqual(body["error"]["code"], "malformed_request")
+        for label, case in (
+            ("test_duplicate_key_rejected", duplicate_key),
+            ("test_nonfinite_rejected", nonfinite),
+            ("test_deep_nesting_rejected", deep_nesting),
+        ):
+            # Each case binds the per-data-dir control lock; give each a fresh
+            # data dir so the cases stay isolated within one merged method.
+            self.data_dir = str(self.tmp / ("state-" + label))
+            with self.subTest(case=label):
+                case()
 
     def test_client_refuses_nonfinite_local_request(self) -> None:
         self._serve()
@@ -499,27 +514,38 @@ class WorkerIPCTest(unittest.TestCase):
         self.assertIsNone(server._lock_fd)
 
     # -- R1 repairs: constructor guards -------------------------------------- #
-    def test_constructor_rejects_unsafe_filenames(self) -> None:
-        for bad in ("../evil.sock", "/abs.sock", "a/b", ".", "..", "", "a\x00b", 123):
-            with self.subTest(bad=bad):
-                with self.assertRaises(ipc.IPCError):
-                    ipc.WorkerIPCServer(self.data_dir, self.handler, socket_filename=bad)
-        with self.assertRaises(ipc.IPCError):
-            ipc.WorkerIPCServer(
-                self.data_dir, self.handler, socket_filename="same", lock_filename="same"
-            )
-        with self.assertRaises(ipc.IPCError):
-            ipc.WorkerIPCClient(self.data_dir, socket_filename="../x")
+    def test_constructor_rejects_invalid_arguments(self) -> None:
+        """Table of constructor input-validation cases (case labels are the
+        original method names; every case/assertion is preserved verbatim)."""
 
-    def test_constructor_rejects_bad_limits(self) -> None:
-        for bad in (0, -1, True, ipc.MAX_REQUEST_BYTES_CAP + 1, "x", 1.5):
-            with self.subTest(max_request_bytes=bad):
-                with self.assertRaises(ipc.IPCError):
-                    ipc.WorkerIPCServer(self.data_dir, self.handler, max_request_bytes=bad)
-        for bad in (0, -1.0, float("nan"), float("inf"), ipc.MAX_TIMEOUT_SECONDS + 1):
-            with self.subTest(io_timeout=bad):
-                with self.assertRaises(ipc.IPCError):
-                    ipc.WorkerIPCServer(self.data_dir, self.handler, io_timeout=bad)
+        def rejects_unsafe_filenames() -> None:
+            for bad in ("../evil.sock", "/abs.sock", "a/b", ".", "..", "", "a\x00b", 123):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(ipc.IPCError):
+                        ipc.WorkerIPCServer(self.data_dir, self.handler, socket_filename=bad)
+            with self.assertRaises(ipc.IPCError):
+                ipc.WorkerIPCServer(
+                    self.data_dir, self.handler, socket_filename="same", lock_filename="same"
+                )
+            with self.assertRaises(ipc.IPCError):
+                ipc.WorkerIPCClient(self.data_dir, socket_filename="../x")
+
+        def rejects_bad_limits() -> None:
+            for bad in (0, -1, True, ipc.MAX_REQUEST_BYTES_CAP + 1, "x", 1.5):
+                with self.subTest(max_request_bytes=bad):
+                    with self.assertRaises(ipc.IPCError):
+                        ipc.WorkerIPCServer(self.data_dir, self.handler, max_request_bytes=bad)
+            for bad in (0, -1.0, float("nan"), float("inf"), ipc.MAX_TIMEOUT_SECONDS + 1):
+                with self.subTest(io_timeout=bad):
+                    with self.assertRaises(ipc.IPCError):
+                        ipc.WorkerIPCServer(self.data_dir, self.handler, io_timeout=bad)
+
+        for label, case in (
+            ("test_constructor_rejects_unsafe_filenames", rejects_unsafe_filenames),
+            ("test_constructor_rejects_bad_limits", rejects_bad_limits),
+        ):
+            with self.subTest(case=label):
+                case()
 
     # -- R1 repairs: client framing + trust ---------------------------------- #
     def _fake_server(self, responder):

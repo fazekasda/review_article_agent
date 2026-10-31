@@ -348,43 +348,67 @@ class BoundedTaskTests(unittest.TestCase):
         self.assertEqual(task.canonical_bytes(), task.canonical_bytes())
         self.assertEqual(task.canonical_bytes(), canonical_json(task.to_mapping()))
 
-    def test_rejects_non_object(self):
-        with self.assertRaises(TaskBoundaryError):
-            BoundedTask.from_mapping(["not", "an", "object"], configuration=_config())
+    def test_rejects_invalid_task_shapes(self):
+        """Table of task-mapping input-validation cases (case labels are the
+        original method names; every case/assertion is preserved verbatim)."""
 
-    def test_rejects_authority_actor_approval_budget_tool_keys(self):
-        for key, value in (
-            ("actor", {"actor_kind": "human"}),
-            ("approval", {"decision": "approved"}),
-            ("authority", "owner_authenticated"),
-            ("owner_auth_ref", "oa_1"),
-            ("budget", {"budget_usd": "25"}),
-            ("budget_usd", "25"),
-            ("permissions", [{"action": "*", "effect": "allow"}]),
-            ("tools", ["shell"]),
-            ("tool_permissions", {"shell": "allow"}),
-            ("approved", True),
-        ):
-            with self.assertRaises(TaskBoundaryError, msg=key):
-                BoundedTask.from_mapping(
-                    _task_mapping(**{key: value}), configuration=_config()
-                )
+        def non_object():
+            with self.assertRaises(TaskBoundaryError):
+                BoundedTask.from_mapping(["not", "an", "object"], configuration=_config())
 
-    def test_rejects_missing_fields(self):
-        for key in (
-            "project_id",
-            "role",
-            "target",
-            "input_refs",
-            "scope",
-            "prompt_version",
-            "size_limit",
-            "step_limit",
-        ):
+        def missing_fields():
+            for key in (
+                "project_id",
+                "role",
+                "target",
+                "input_refs",
+                "scope",
+                "prompt_version",
+                "size_limit",
+                "step_limit",
+            ):
+                mapping = _task_mapping()
+                del mapping[key]
+                with self.assertRaises(TaskBoundaryError, msg=key):
+                    BoundedTask.from_mapping(mapping, configuration=_config())
+
+        def bad_digest_and_unknown_ref_keys():
             mapping = _task_mapping()
-            del mapping[key]
-            with self.assertRaises(TaskBoundaryError, msg=key):
+            mapping["input_refs"] = [
+                {"project_id": "prj_demo", "artifact_id": "a", "revision_id": "r", "digest": "XYZ"}
+            ]
+            with self.assertRaises(TaskBoundaryError):
                 BoundedTask.from_mapping(mapping, configuration=_config())
+
+            mapping = _task_mapping()
+            mapping["input_refs"] = [
+                {
+                    "project_id": "prj_demo",
+                    "artifact_id": "a",
+                    "revision_id": "r",
+                    "digest": "b" * 64,
+                    "approved": True,
+                }
+            ]
+            with self.assertRaises(TaskBoundaryError):
+                BoundedTask.from_mapping(mapping, configuration=_config())
+
+        def unbounded_input_refs():
+            mapping = _task_mapping()
+            mapping["input_refs"] = [
+                {"project_id": "prj_demo", "artifact_id": "a", "revision_id": "r", "digest": "c" * 64}
+            ] * (roles.MAX_INPUT_REFS + 1)
+            with self.assertRaises(TaskBoundaryError):
+                BoundedTask.from_mapping(mapping, configuration=_config())
+
+        for label, case in (
+            ("test_rejects_non_object", non_object),
+            ("test_rejects_missing_fields", missing_fields),
+            ("test_rejects_bad_digest_and_unknown_ref_keys", bad_digest_and_unknown_ref_keys),
+            ("test_rejects_unbounded_input_refs", unbounded_input_refs),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_rejects_cross_project_refs(self):
         mapping = _task_mapping()
@@ -404,26 +428,23 @@ class BoundedTaskTests(unittest.TestCase):
         with self.assertRaises(TaskBoundaryError):
             BoundedTask.from_mapping(mapping, configuration=_config())
 
-    def test_rejects_bad_digest_and_unknown_ref_keys(self):
-        mapping = _task_mapping()
-        mapping["input_refs"] = [
-            {"project_id": "prj_demo", "artifact_id": "a", "revision_id": "r", "digest": "XYZ"}
-        ]
-        with self.assertRaises(TaskBoundaryError):
-            BoundedTask.from_mapping(mapping, configuration=_config())
-
-        mapping = _task_mapping()
-        mapping["input_refs"] = [
-            {
-                "project_id": "prj_demo",
-                "artifact_id": "a",
-                "revision_id": "r",
-                "digest": "b" * 64,
-                "approved": True,
-            }
-        ]
-        with self.assertRaises(TaskBoundaryError):
-            BoundedTask.from_mapping(mapping, configuration=_config())
+    def test_rejects_authority_actor_approval_budget_tool_keys(self):
+        for key, value in (
+            ("actor", {"actor_kind": "human"}),
+            ("approval", {"decision": "approved"}),
+            ("authority", "owner_authenticated"),
+            ("owner_auth_ref", "oa_1"),
+            ("budget", {"budget_usd": "25"}),
+            ("budget_usd", "25"),
+            ("permissions", [{"action": "*", "effect": "allow"}]),
+            ("tools", ["shell"]),
+            ("tool_permissions", {"shell": "allow"}),
+            ("approved", True),
+        ):
+            with self.assertRaises(TaskBoundaryError, msg=key):
+                BoundedTask.from_mapping(
+                    _task_mapping(**{key: value}), configuration=_config()
+                )
 
     def test_rejects_unconfigured_role(self):
         partial = _single_role_config("writer", _WRITER_MODEL)
@@ -459,14 +480,6 @@ class BoundedTaskTests(unittest.TestCase):
             _task(prompt_version=" writer.v1")
         with self.assertRaises(TaskBoundaryError):
             _task(prompt_version="writer v1")
-
-    def test_rejects_unbounded_input_refs(self):
-        mapping = _task_mapping()
-        mapping["input_refs"] = [
-            {"project_id": "prj_demo", "artifact_id": "a", "revision_id": "r", "digest": "c" * 64}
-        ] * (roles.MAX_INPUT_REFS + 1)
-        with self.assertRaises(TaskBoundaryError):
-            BoundedTask.from_mapping(mapping, configuration=_config())
 
 
 class ProposalBoundaryTests(unittest.TestCase):

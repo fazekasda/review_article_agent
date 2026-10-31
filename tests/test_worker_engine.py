@@ -178,22 +178,42 @@ class EngineTestBase(unittest.TestCase):
 
 
 class ValidationTest(EngineTestBase):
-    def test_status_and_unknown_op_and_version(self) -> None:
-        self._activate()
-        ok = self.engine.handle(_req("status"))
-        self.assertTrue(ok["ok"])
-        self.assertEqual(ok["app"], APP_NAME)
-        self.assertEqual(ok["protocol_version"], PROTOCOL_VERSION)
-        self.assertEqual(ok["pid"], os.getpid())
-        self.assertTrue(ok["state"])
+    def test_invalid_request_shapes_are_rejected(self) -> None:
+        """Table of request input-validation cases (case labels are the original
+        method names; every case/assertion is preserved verbatim)."""
 
-        bad_version = self.engine.handle({"version": 2, "op": "status"})
-        self.assertFalse(bad_version["ok"])
-        self.assertEqual(bad_version["code"], "unsupported_version")
+        def status_and_unknown_op_and_version():
+            self._activate()
+            ok = self.engine.handle(_req("status"))
+            self.assertTrue(ok["ok"])
+            self.assertEqual(ok["app"], APP_NAME)
+            self.assertEqual(ok["protocol_version"], PROTOCOL_VERSION)
+            self.assertEqual(ok["pid"], os.getpid())
+            self.assertTrue(ok["state"])
 
-        unknown = self.engine.handle({"version": PROTOCOL_VERSION, "op": "rm -rf"})
-        self.assertFalse(unknown["ok"])
-        self.assertEqual(unknown["code"], "unknown_op")
+            bad_version = self.engine.handle({"version": 2, "op": "status"})
+            self.assertFalse(bad_version["ok"])
+            self.assertEqual(bad_version["code"], "unsupported_version")
+
+            unknown = self.engine.handle({"version": PROTOCOL_VERSION, "op": "rm -rf"})
+            self.assertFalse(unknown["ok"])
+            self.assertEqual(unknown["code"], "unknown_op")
+
+        def out_of_range_and_bad_payload():
+            self._activate()
+            self.assertEqual(self._submit_numeric("r1", steps=0)["code"], "bad_value")
+            self.assertEqual(self._submit_numeric("r2", steps=1001)["code"], "bad_value")
+            self.assertEqual(self._submit_numeric("r3", delay_ms=60001)["code"], "bad_value")
+            self.assertEqual(self._submit_numeric("r4", outcome="explode")["code"], "bad_value")
+            self.assertEqual(self._submit_numeric("r5", reserve_usd="-1")["code"], "bad_value")
+            self.assertEqual(self._submit_numeric("r6", reserve_usd=0.1)["code"], "bad_type")
+
+        for label, case in (
+            ("test_status_and_unknown_op_and_version", status_and_unknown_op_and_version),
+            ("test_out_of_range_and_bad_payload_are_rejected", out_of_range_and_bad_payload),
+        ):
+            with self.subTest(case=label):
+                case()
 
     def test_unknown_field_is_rejected_never_trusted(self) -> None:
         self._activate()
@@ -258,15 +278,6 @@ class ValidationTest(EngineTestBase):
         )
         self.assertFalse(res["ok"])
         self.assertEqual(res["code"], "wrong_project")
-
-    def test_out_of_range_and_bad_payload_are_rejected(self) -> None:
-        self._activate()
-        self.assertEqual(self._submit_numeric("r1", steps=0)["code"], "bad_value")
-        self.assertEqual(self._submit_numeric("r2", steps=1001)["code"], "bad_value")
-        self.assertEqual(self._submit_numeric("r3", delay_ms=60001)["code"], "bad_value")
-        self.assertEqual(self._submit_numeric("r4", outcome="explode")["code"], "bad_value")
-        self.assertEqual(self._submit_numeric("r5", reserve_usd="-1")["code"], "bad_value")
-        self.assertEqual(self._submit_numeric("r6", reserve_usd=0.1)["code"], "bad_type")
 
 
 class NumericCompletionTest(EngineTestBase):
