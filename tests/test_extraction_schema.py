@@ -165,19 +165,40 @@ class CompletenessTests(unittest.TestCase):
 
 
 class MissingValueTests(unittest.TestCase):
-    def test_missing_values_stay_missing_not_fabricated(self):
-        out = valid_output()
-        out["findings"][0]["context"]["population"] = {"state": "missing", "value": "C57BL/6"}
-        with self.assertRaises(ExtractionError):
-            validate(out)
-        self.assertEqual(validate(valid_output())["findings"][0]["context"]["population"],
-                         {"state": "missing", "value": None})
+    def test_value_and_dimension_rules(self):
+        # P1 merge (S19-PRUNE-A): the original standalone methods are preserved
+        # verbatim as subTest cases (labels keep their names for docs grep).
+        with self.subTest(case="test_missing_values_stay_missing_not_fabricated"):
+            out = valid_output()
+            out["findings"][0]["context"]["population"] = {"state": "missing", "value": "C57BL/6"}
+            with self.assertRaises(ExtractionError):
+                validate(out)
+            self.assertEqual(validate(valid_output())["findings"][0]["context"]["population"],
+                             {"state": "missing", "value": None})
 
-    def test_known_state_requires_value(self):
-        out = valid_output()
-        out["findings"][0]["context"]["species"] = {"state": "known", "value": "  "}
-        with self.assertRaises(ExtractionError):
-            validate(out)
+        with self.subTest(case="test_known_state_requires_value"):
+            out = valid_output()
+            out["findings"][0]["context"]["species"] = {"state": "known", "value": "  "}
+            with self.assertRaises(ExtractionError):
+                validate(out)
+
+        with self.subTest(case="test_missing_denominator_allowed_not_invented"):
+            out = valid_output()
+            out["findings"][1]["numeric_details"][0]["denominator"] = missing()
+            self.assertEqual(validate(out)["findings"][1]["numeric_details"][0]["denominator"]["state"], "missing")
+
+        with self.subTest(case="test_non_numeric_and_boolean_known_values_refused"):
+            for bad in ("about twelve", True):
+                out = valid_output()
+                out["findings"][1]["numeric_details"][0]["value"] = {"state": "known", "value": bad}
+                with self.assertRaises(ExtractionError):
+                    validate(out)
+
+        with self.subTest(case="test_missing_dimension_and_dimension_score_refused"):
+            with self.assertRaises(ExtractionError):
+                validate(valid_output(), dims=[{"dimension_id": "risk_of_bias"}])
+            with self.assertRaises(ExtractionError):
+                validate(valid_output(), dims=[{"dimension_id": "x", "score": 1}])
 
 
 class NumberTests(unittest.TestCase):
@@ -185,18 +206,6 @@ class NumberTests(unittest.TestCase):
         detail = validate(valid_output())["findings"][1]["numeric_details"][0]
         self.assertEqual((detail["value"]["value"], detail["unit"]["value"], detail["denominator"]["value"]),
                          (12.5, "mm3", "per mouse"))
-
-    def test_missing_denominator_allowed_not_invented(self):
-        out = valid_output()
-        out["findings"][1]["numeric_details"][0]["denominator"] = missing()
-        self.assertEqual(validate(out)["findings"][1]["numeric_details"][0]["denominator"]["state"], "missing")
-
-    def test_non_numeric_and_boolean_known_values_refused(self):
-        for bad in ("about twelve", True):
-            out = valid_output()
-            out["findings"][1]["numeric_details"][0]["value"] = {"state": "known", "value": bad}
-            with self.assertRaises(ExtractionError):
-                validate(out)
 
 
 class ContextSpinTests(unittest.TestCase):
@@ -284,12 +293,6 @@ class AppraisalAndScopeTests(unittest.TestCase):
         result = validate(out, dims=dims)
         self.assertEqual([a["state"] for a in result["appraisal"]], ["assessed", "unassessed"])
         self.assertEqual(len(result["findings"]), 3)  # a weak appraisal never excludes findings
-
-    def test_missing_dimension_and_dimension_score_refused(self):
-        with self.assertRaises(ExtractionError):
-            validate(valid_output(), dims=[{"dimension_id": "risk_of_bias"}])
-        with self.assertRaises(ExtractionError):
-            validate(valid_output(), dims=[{"dimension_id": "x", "score": 1}])
 
     def test_no_universal_score_or_exclusion_keys(self):
         for key in ("score", "quality_score", "global_score", "excluded"):

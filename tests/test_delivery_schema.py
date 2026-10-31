@@ -27,25 +27,32 @@ from review_article_agent.delivery.schema import (
 
 
 class GlobalReviewReadyTests(unittest.TestCase):
-    def test_all_complete_is_ready(self):
-        sections = [
-            {"section_id": "s1", "review_status": "complete", "origin_complete": True},
-            {"section_id": "s2", "review_status": "complete", "origin_complete": True},
-        ]
-        self.assertEqual(global_review_ready(sections), {"ready": True, "incomplete": []})
+    def test_readiness_matrix(self):
+        # P1 merge (S19-PRUNE-A): the original standalone methods are preserved
+        # verbatim as subTest cases (labels keep their names for docs grep).
+        with self.subTest(case="test_all_complete_is_ready"):
+            sections = [
+                {"section_id": "s1", "review_status": "complete", "origin_complete": True},
+                {"section_id": "s2", "review_status": "complete", "origin_complete": True},
+            ]
+            self.assertEqual(global_review_ready(sections), {"ready": True, "incomplete": []})
 
-    def test_incomplete_section_blocks(self):
-        sections = [
-            {"section_id": "s1", "review_status": "complete", "origin_complete": True},
-            {"section_id": "s2", "review_status": "in_progress", "origin_complete": True},
-            {"section_id": "s3", "review_status": "complete", "origin_complete": False},
-        ]
-        result = global_review_ready(sections)
-        self.assertFalse(result["ready"])
-        self.assertEqual(result["incomplete"], ["s2", "s3"])
+        with self.subTest(case="test_incomplete_section_blocks"):
+            sections = [
+                {"section_id": "s1", "review_status": "complete", "origin_complete": True},
+                {"section_id": "s2", "review_status": "in_progress", "origin_complete": True},
+                {"section_id": "s3", "review_status": "complete", "origin_complete": False},
+            ]
+            result = global_review_ready(sections)
+            self.assertFalse(result["ready"])
+            self.assertEqual(result["incomplete"], ["s2", "s3"])
 
-    def test_empty_is_not_ready(self):
-        self.assertEqual(global_review_ready([]), {"ready": False, "incomplete": []})
+        with self.subTest(case="test_empty_is_not_ready"):
+            self.assertEqual(global_review_ready([]), {"ready": False, "incomplete": []})
+
+        with self.subTest(case="test_missing_action_requires_decision"):
+            self.assertEqual(freshness_checkpoint("2026-01-01", {})["status"], "decision_required")
+            self.assertEqual(freshness_checkpoint("2026-01-01", {"action": "extend"})["status"], "decision_required")
 
 
 class InspectOmissionsTests(unittest.TestCase):
@@ -100,10 +107,6 @@ class EvaluateGlobalTests(unittest.TestCase):
 
 
 class FreshnessCheckpointTests(unittest.TestCase):
-    def test_missing_action_requires_decision(self):
-        self.assertEqual(freshness_checkpoint("2026-01-01", {})["status"], "decision_required")
-        self.assertEqual(freshness_checkpoint("2026-01-01", {"action": "extend"})["status"], "decision_required")
-
     def test_accept_cutoff(self):
         result = freshness_checkpoint("2026-01-01", {"action": "accept_cutoff"})
         self.assertEqual(result["status"], "cutoff_accepted")

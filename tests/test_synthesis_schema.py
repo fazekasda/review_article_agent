@@ -371,45 +371,40 @@ class OutlineTests(unittest.TestCase):
         self.assertEqual(outline["dependency_index"]["concepts"]["C1"], ["sec1", "sec2"])
         self.assertEqual(outline["dependency_index"]["statements"]["S-1"], ["sec2"])
 
-    def test_orders_must_be_contiguous(self):
+    def test_outline_structure_rules(self):
+        # P1 merge (S19-PRUNE-A): the original standalone methods are preserved
+        # verbatim as subTest cases (labels keep their names for docs grep).
         framework = framework_example()
         synthesis = synthesis_example()
-        payload = _outline_payload()
-        payload["sections"][2]["order"] = 4
-        with self.assertRaises(SynthesisError):
-            validate_outline(payload, framework=framework, synthesis=synthesis)
 
-    def test_duplicate_order_refused(self):
-        framework = framework_example()
-        synthesis = synthesis_example()
-        payload = _outline_payload()
-        payload["sections"][1]["order"] = 1
-        with self.assertRaises(SynthesisError):
-            validate_outline(payload, framework=framework, synthesis=synthesis)
+        def orders_not_contiguous(payload):
+            payload["sections"][2]["order"] = 4
 
-    def test_unknown_concept_dependency_refused(self):
-        framework = framework_example()
-        synthesis = synthesis_example()
-        payload = _outline_payload()
-        payload["sections"][0]["concept_dependencies"] = ["C9"]
-        with self.assertRaises(SynthesisError):
-            validate_outline(payload, framework=framework, synthesis=synthesis)
+        def duplicate_order(payload):
+            payload["sections"][1]["order"] = 1
 
-    def test_unknown_statement_dependency_refused(self):
-        framework = framework_example()
-        synthesis = synthesis_example()
-        payload = _outline_payload()
-        payload["sections"][1]["statement_dependencies"] = ["S-99"]
-        with self.assertRaises(SynthesisError):
-            validate_outline(payload, framework=framework, synthesis=synthesis)
+        def unknown_concept_dependency(payload):
+            payload["sections"][0]["concept_dependencies"] = ["C9"]
 
-    def test_sections_must_not_be_empty(self):
-        framework = framework_example()
-        synthesis = synthesis_example()
-        payload = _outline_payload()
-        payload["sections"] = []
-        with self.assertRaises(SynthesisError):
-            validate_outline(payload, framework=framework, synthesis=synthesis)
+        def unknown_statement_dependency(payload):
+            payload["sections"][1]["statement_dependencies"] = ["S-99"]
+
+        def empty_sections(payload):
+            payload["sections"] = []
+
+        cases = {
+            "test_orders_must_be_contiguous": orders_not_contiguous,
+            "test_duplicate_order_refused": duplicate_order,
+            "test_unknown_concept_dependency_refused": unknown_concept_dependency,
+            "test_unknown_statement_dependency_refused": unknown_statement_dependency,
+            "test_sections_must_not_be_empty": empty_sections,
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                payload = _outline_payload()
+                mutate(payload)
+                with self.assertRaises(SynthesisError):
+                    validate_outline(payload, framework=framework, synthesis=synthesis)
 
 
 def _shared_source_cases(rev_a="v1", rev_b="v1"):
