@@ -592,6 +592,10 @@ guard. A recorded approval satisfies **only** its one named gate instance
 manuscript-export, scientific-correctness, or final-release-validation claim. No
 named gate — including `final_release` — waives scientific validation.
 
+> **Operator walkthrough.** For a gate-by-gate guide to approving the human gates
+> (what each gate approves, what to inspect, and the exact commands), see the
+> [operator guide](operator-guide.md).
+
 | Command | Synopsis |
 | --- | --- |
 | `gate prepare --artifact-id A --revision-id R --gate-kind KIND --gate-id G --decision approved\|rejected --rationale TEXT [--project ID]` | **Read-only preview** of the exact gate snapshot over the target plus its full transitive dependency closure. Records **no** approval, mints no authority, and writes nothing. |
