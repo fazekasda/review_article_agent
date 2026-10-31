@@ -431,6 +431,78 @@ a dedicated follow-up task rather than folded into this ~15–20 min batch.
 
 ---
 
+### 4.3 Batch C execution results (task S19-PRUNE-C)
+
+Executed on branch `task/s19-prune-C` from `8642e2d48b7a72a56b1f190348d8cacbf7f6b2ec`.
+P1 `subTest` merges only (no P2/P3 deletion in this pass; every §4.2 Batch C
+row materialised empty — see below). All original method names are preserved as
+`subTest` case labels (`"test_<name>"`).
+
+Method counts (before → after):
+
+| module | before | after |
+|---|---:|---:|
+| `test_acquisition_validation` | 66 | 53 |
+| `test_acquisition_resolution` | 37 | 29 |
+| `test_acquisition_imports` | 34 | 32 |
+| `test_acquisition_pdf_inspection` | 40 | 40 |
+| `test_acquisition_folders` | 25 | 25 |
+| `test_acquisition_manifest` | 29 | 29 |
+| `test_acquisition_execution` | 34 | 34 |
+| `test_acquisition_worker` | 22 | 22 |
+| `test_acquisition_batches` | 11 | 11 |
+| `test_acquisition_impact` | 8 | 8 |
+| **Batch C total** | **306** | **283** |
+
+Merges (P1, cases preserved — drop = methods folded into the new parameterized
+method):
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---|---:|---:|
+| `test_acquisition_validation` | 6 request-shape rejects (`test_data_must_be_bytes`, `test_expected_must_be_mapping`, `test_expected_key_must_be_known_namespace`, `test_expected_value_must_be_str`, `test_expected_shapes_enforced`, `test_declared_media_type_must_be_str_or_none`) → `test_invalid_validation_shapes` | 11 | 5 |
+| `test_acquisition_validation` | 6 HTML/login rejects (`test_login_page_rejected_even_declared_pdf`, `test_plain_html_rejected`, `test_html_without_extension_hint_is_still_html`, `test_html_never_ready`, `test_bom_prefixed_login_html_is_rejected_not_unknown`, `test_leading_html_with_incidental_pdf_magic_is_hard_rejected`) → `test_html_never_succeeds` | 6 | 5 |
+| `test_acquisition_validation` | 4 JATS-body fail-closed (`test_missing_body_needs_review`, `test_empty_body_needs_review`, `test_whitespace_only_body_needs_review`, `test_missing_article_meta_needs_review`) → `test_jats_body_fail_closed` | 4 | 3 |
+| `test_acquisition_resolution` | 5 explicit waterfall failures (`test_metadata_only_both_sources_is_manual`, `test_html_login_both_sources_is_manual`, `test_oversize_cap_is_explicit_failure`, `test_network_timeout_is_explicit_failure`, `test_malformed_xml_is_explicit_failure`) → `test_explicit_failure_matrix` | 5 | 4 |
+| `test_acquisition_resolution` | 4 authorization blocks (`test_privacy_denied_blocks_with_zero_calls`, `test_acquisition_not_allowed_blocks`, `test_storage_not_allowed_blocks`, `test_missing_terms_evidence_blocks`) → `test_authorization_block_matrix` | 4 | 3 |
+| `test_acquisition_resolution` | 2 missing/invalid-PMCID manual (`test_missing_pmcid_is_manual_with_zero_calls`, `test_invalid_pmcid_is_manual_with_zero_calls`) → `test_missing_or_invalid_pmcid_is_manual_with_zero_calls` | 2 | 1 |
+| `test_acquisition_imports` | 3 rights-gate rejects (`test_unknown_storage_retains_no_bytes`, `test_acquisition_and_storage_are_separate_gates`, `test_privacy_denial_blocks`) → `test_rights_gate_blocks_and_retains_nothing` | 3 | 2 |
+
+**Deletion list: empty.** Each §4.2 Batch C row was materialised and skipped
+because its theme did not match any non-K1/K2 method in the module:
+`test_acquisition_imports` has no JATS-import test (its content is
+storage/identity/rights, covered at a different layer than the step06 AC1
+acceptance); `test_acquisition_validation` has no unknown-storage/integrity test
+(those live in `test_acquisition_imports`/`test_acquisition_execution`);
+`test_acquisition_execution`'s wrong-paper/html tests exercise the
+`AcquisitionExecutor` retrieval path, which step06 AC2 (manifest-level) does not
+cover, so no P2 deletion was safe without weakening coverage. The security-named
+and fail-closed methods in the remaining modules were kept as-is.
+
+Grep cross-check on the exact 30 merged-away names (per §6): both
+`comm -12` against `docs`-cited names and the K2 security-name list print
+**nothing**.
+
+Verification (all on `task/s19-prune-C`):
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 test_acquisition_validation test_acquisition_resolution \
+  test_acquisition_pdf_inspection test_acquisition_folders test_acquisition_imports \
+  test_acquisition_manifest test_acquisition_execution test_acquisition_worker \
+  test_acquisition_batches test_acquisition_impact
+# -> 10 modules, 283 tests, 0 failures, 0 errors, 7 skipped
+
+python3 scripts/run_tests.py -j 4
+# -> 145 modules, 3834 tests, 0 failures, 0 errors (fast tier)
+
+python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
+git diff --check                        # -> clean
+```
+
+Mutation spot-check (scratch, reverted): flipping `resolution.classify_body`'s
+metadata-only branch to `"fulltext"` made `test_explicit_failure_matrix` fail
+exactly on `case='metadata_only_both_sources_is_manual'`, confirming the
+parameterized test still detects a broken path.
+
 ## 5. Projected total and reachability
 
 | Group | before | after |

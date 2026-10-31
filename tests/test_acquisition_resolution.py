@@ -341,23 +341,68 @@ class WaterfallTests(unittest.TestCase):
             result["failures"],
         )
 
-    def test_metadata_only_both_sources_is_manual(self):
-        result, _ = resolve(
-            [xml_response(jats_metadata_only()), xml_response(jats_metadata_only())]
-        )
-        self.assertEqual(result["status"], "manual_required")
-        self.assertIsNone(result["content"])
-        codes = [f["code"] for f in result["failures"]]
-        self.assertEqual(codes.count("metadata_only"), 2)
+    def test_explicit_failure_matrix(self):
+        # One parameterized test: each failing body/transport condition is an
+        # explicit ``manual_required`` failure (never silently accepted).  Each
+        # former method is kept as a subTest case label.
+        def metadata_only_both_sources_is_manual():
+            result, _ = resolve(
+                [xml_response(jats_metadata_only()), xml_response(jats_metadata_only())]
+            )
+            self.assertEqual(result["status"], "manual_required")
+            self.assertIsNone(result["content"])
+            codes = [f["code"] for f in result["failures"]]
+            self.assertEqual(codes.count("metadata_only"), 2)
 
-    def test_html_login_both_sources_is_manual(self):
-        result, _ = resolve(
-            [xml_response(HTML_LOGIN, media="text/html"), xml_response(HTML_LOGIN, media="text/html")]
-        )
-        self.assertEqual(result["status"], "manual_required")
-        self.assertIsNone(result["content"])
-        codes = [f["code"] for f in result["failures"]]
-        self.assertEqual(codes.count("html_login"), 2)
+        def html_login_both_sources_is_manual():
+            result, _ = resolve(
+                [xml_response(HTML_LOGIN, media="text/html"), xml_response(HTML_LOGIN, media="text/html")]
+            )
+            self.assertEqual(result["status"], "manual_required")
+            self.assertIsNone(result["content"])
+            codes = [f["code"] for f in result["failures"]]
+            self.assertEqual(codes.count("html_login"), 2)
+
+        def oversize_cap_is_explicit_failure():
+            result, _ = resolve(
+                [response(200, b"x" * 64, truncated=True), response(200, b"x" * 64, truncated=True)]
+            )
+            self.assertEqual(result["status"], "manual_required")
+            codes = [f["code"] for f in result["failures"]]
+            self.assertEqual(codes.count("response_too_large"), 2)
+
+        def network_timeout_is_explicit_failure():
+            result, _ = resolve(
+                [transport.TransportNetworkError("x"), transport.TransportNetworkError("x")],
+                max_attempts=1,
+            )
+            self.assertEqual(result["status"], "manual_required")
+            codes = [f["code"] for f in result["failures"]]
+            self.assertEqual(codes.count("network_error"), 2)
+            outcomes = [a["outcome"] for a in result["attempts"]]
+            self.assertEqual(outcomes, ["network_error", "network_error"])
+
+        def malformed_xml_is_explicit_failure():
+            result, _ = resolve(
+                [
+                    xml_response(b"<article><body>oops"),
+                    xml_response(b"<article><body>oops"),
+                ]
+            )
+            self.assertEqual(result["status"], "manual_required")
+            codes = [f["code"] for f in result["failures"]]
+            self.assertEqual(codes.count("malformed_xml"), 2)
+
+        cases = {
+            "test_metadata_only_both_sources_is_manual": metadata_only_both_sources_is_manual,
+            "test_html_login_both_sources_is_manual": html_login_both_sources_is_manual,
+            "test_oversize_cap_is_explicit_failure": oversize_cap_is_explicit_failure,
+            "test_network_timeout_is_explicit_failure": network_timeout_is_explicit_failure,
+            "test_malformed_xml_is_explicit_failure": malformed_xml_is_explicit_failure,
+        }
+        for label, check in cases.items():
+            with self.subTest(case=label):
+                check()
 
     def test_redirect_status_is_permanent_and_falls_back(self):
         result, fake = resolve(
@@ -371,36 +416,6 @@ class WaterfallTests(unittest.TestCase):
             self.assertNotIn("elsewhere.example", url)
         self.assertEqual(result["attempts"][0]["outcome"], "permanent")
         self.assertEqual(result["attempts"][0]["status"], 302)
-
-    def test_oversize_cap_is_explicit_failure(self):
-        result, _ = resolve(
-            [response(200, b"x" * 64, truncated=True), response(200, b"x" * 64, truncated=True)]
-        )
-        self.assertEqual(result["status"], "manual_required")
-        codes = [f["code"] for f in result["failures"]]
-        self.assertEqual(codes.count("response_too_large"), 2)
-
-    def test_network_timeout_is_explicit_failure(self):
-        result, _ = resolve(
-            [transport.TransportNetworkError("x"), transport.TransportNetworkError("x")],
-            max_attempts=1,
-        )
-        self.assertEqual(result["status"], "manual_required")
-        codes = [f["code"] for f in result["failures"]]
-        self.assertEqual(codes.count("network_error"), 2)
-        outcomes = [a["outcome"] for a in result["attempts"]]
-        self.assertEqual(outcomes, ["network_error", "network_error"])
-
-    def test_malformed_xml_is_explicit_failure(self):
-        result, _ = resolve(
-            [
-                xml_response(b"<article><body>oops"),
-                xml_response(b"<article><body>oops"),
-            ]
-        )
-        self.assertEqual(result["status"], "manual_required")
-        codes = [f["code"] for f in result["failures"]]
-        self.assertEqual(codes.count("malformed_xml"), 2)
 
     def test_retryable_status_retries_then_falls_back(self):
         result, fake = resolve(
@@ -419,17 +434,28 @@ class WaterfallTests(unittest.TestCase):
 # Identifiers / manual queue
 # --------------------------------------------------------------------------- #
 class IdentifierTests(unittest.TestCase):
-    def test_missing_pmcid_is_manual_with_zero_calls(self):
-        result, fake = resolve([], identifiers={"pmid": "31452104", "doi": "10.1/x"})
-        self.assertEqual(result["status"], "manual_required")
-        self.assertEqual(fake.calls, [])
-        self.assertIn({"code": "missing_pmcid"}, result["failures"])
+    def test_missing_or_invalid_pmcid_is_manual_with_zero_calls(self):
+        # One parameterized test: a missing or malformed PMCID becomes a manual
+        # item with zero network calls.  Each former method is a subTest label.
+        def missing_pmcid_is_manual_with_zero_calls():
+            result, fake = resolve([], identifiers={"pmid": "31452104", "doi": "10.1/x"})
+            self.assertEqual(result["status"], "manual_required")
+            self.assertEqual(fake.calls, [])
+            self.assertIn({"code": "missing_pmcid"}, result["failures"])
 
-    def test_invalid_pmcid_is_manual_with_zero_calls(self):
-        result, fake = resolve([], identifiers={"pmcid": "pmc-not-valid"})
-        self.assertEqual(result["status"], "manual_required")
-        self.assertEqual(fake.calls, [])
-        self.assertIn({"code": "invalid_pmcid"}, result["failures"])
+        def invalid_pmcid_is_manual_with_zero_calls():
+            result, fake = resolve([], identifiers={"pmcid": "pmc-not-valid"})
+            self.assertEqual(result["status"], "manual_required")
+            self.assertEqual(fake.calls, [])
+            self.assertIn({"code": "invalid_pmcid"}, result["failures"])
+
+        cases = {
+            "test_missing_pmcid_is_manual_with_zero_calls": missing_pmcid_is_manual_with_zero_calls,
+            "test_invalid_pmcid_is_manual_with_zero_calls": invalid_pmcid_is_manual_with_zero_calls,
+        }
+        for label, check in cases.items():
+            with self.subTest(case=label):
+                check()
 
     def test_unofficial_locator_is_never_fetched(self):
         result, fake = resolve([], identifiers={"url": "https://sci-hub.example/paper.pdf"})
@@ -476,41 +502,54 @@ class AuthorizationTests(unittest.TestCase):
         self.assertIn({"code": "authorization_missing"}, result["failures"])
         self.assertFalse(result["authorization_checked"])
 
-    def test_privacy_denied_blocks_with_zero_calls(self):
-        result, fake = resolve(
-            [], auth=authorization(privacy_denied=True)
-        )
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(fake.calls, [])
-        self.assertIn({"code": "privacy_denied"}, result["failures"])
+    def test_authorization_block_matrix(self):
+        # One parameterized test: each authorization denial blocks with zero
+        # network calls.  Each former method is kept as a subTest case label.
+        def privacy_denied_blocks_with_zero_calls():
+            result, fake = resolve(
+                [], auth=authorization(privacy_denied=True)
+            )
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(fake.calls, [])
+            self.assertIn({"code": "privacy_denied"}, result["failures"])
 
-    def test_acquisition_not_allowed_blocks(self):
-        auth = authorization()
-        auth["acquisition"] = {
-            "allowed": False,
-            "terms_ref": "r",
-            "checked_at": "t",
+        def acquisition_not_allowed_blocks():
+            auth = authorization()
+            auth["acquisition"] = {
+                "allowed": False,
+                "terms_ref": "r",
+                "checked_at": "t",
+            }
+            result, fake = resolve([], auth=auth)
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(fake.calls, [])
+            self.assertIn({"code": "acquisition_not_authorized"}, result["failures"])
+
+        def storage_not_allowed_blocks():
+            auth = authorization()
+            auth["storage"] = {"allowed": False, "terms_ref": "r", "checked_at": "t"}
+            result, fake = resolve([], auth=auth)
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(fake.calls, [])
+            self.assertIn({"code": "storage_not_authorized"}, result["failures"])
+
+        def missing_terms_evidence_blocks():
+            auth = authorization()
+            auth["acquisition"] = {"allowed": True, "terms_ref": "", "checked_at": "t"}
+            result, fake = resolve([], auth=auth)
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(fake.calls, [])
+            self.assertIn({"code": "terms_evidence_missing"}, result["failures"])
+
+        cases = {
+            "test_privacy_denied_blocks_with_zero_calls": privacy_denied_blocks_with_zero_calls,
+            "test_acquisition_not_allowed_blocks": acquisition_not_allowed_blocks,
+            "test_storage_not_allowed_blocks": storage_not_allowed_blocks,
+            "test_missing_terms_evidence_blocks": missing_terms_evidence_blocks,
         }
-        result, fake = resolve([], auth=auth)
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(fake.calls, [])
-        self.assertIn({"code": "acquisition_not_authorized"}, result["failures"])
-
-    def test_storage_not_allowed_blocks(self):
-        auth = authorization()
-        auth["storage"] = {"allowed": False, "terms_ref": "r", "checked_at": "t"}
-        result, fake = resolve([], auth=auth)
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(fake.calls, [])
-        self.assertIn({"code": "storage_not_authorized"}, result["failures"])
-
-    def test_missing_terms_evidence_blocks(self):
-        auth = authorization()
-        auth["acquisition"] = {"allowed": True, "terms_ref": "", "checked_at": "t"}
-        result, fake = resolve([], auth=auth)
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(fake.calls, [])
-        self.assertIn({"code": "terms_evidence_missing"}, result["failures"])
+        for label, check in cases.items():
+            with self.subTest(case=label):
+                check()
 
     def test_malformed_authorization_blocks(self):
         for auth in ("nope", {}, {"privacy_denied": "no"}):
