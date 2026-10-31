@@ -623,6 +623,88 @@ Verification: `python3 scripts/run_tests.py --slow -j 4 <batch modules>` and the
 full fast tier `python3 scripts/run_tests.py -j 4` pass;
 `python3 scripts/check_contract_docs.py` OK; `git diff --check` clean.
 
+---
+
+### 4.3 Batch E execution results (S19-PRUNE-E)
+
+Branch `task/s19-prune-E`, base `544d63f6a8cd25f139436799f79a7b633f4b85b6`.
+Test-only change: `tests/test_discovery_expansion.py`,
+`tests/test_discovery_job_routes.py` (no `src/` change).
+
+Method counts before → after (per Batch E module):
+
+| module | before | after |
+|---|---:|---:|
+| `test_discovery_candidates` | 32 | 32 |
+| `test_discovery_citations` | 30 | 30 |
+| `test_discovery_expansion` | 30 | 25 |
+| `test_discovery_freeze` | 30 | 30 |
+| `test_discovery_store` | 24 | 24 |
+| `test_discovery_worker` | 24 | 24 |
+| `test_discovery_job_routes` | 15 | 14 |
+| `test_discovery_backup` | 5 | 5 |
+| **Batch E total** | **190** | **184** |
+
+**P1 merges applied (cases preserved, no behaviour deleted):**
+
+| module | old methods (N) → new parameterized method | cases | drop |
+|---|---|---:|---:|
+| `test_discovery_expansion` | 6 bounds/cycle/gap tests (`test_forward_and_backward_cycle_is_bounded_and_deterministic`, `test_hop_limit_records_frontier_and_is_explicit`, `test_source_limit_retains_edges_and_marks_frontier`, `test_zero_request_budget_performs_no_request`, `test_zero_hop_and_zero_source_bounds_perform_no_request`, `test_declared_entries_beyond_page_budget_are_an_explicit_gap`) → `BoundsCycleGapTests::test_bounds_cycles_gaps_matrix` | 6 | 5 |
+| `test_discovery_job_routes` | 2 zero-HTTP escalation tests (`test_unapproved_plan_zero_http_and_escalates`, `test_out_of_root_zero_http_and_escalates`) → `ExpandRoutesTest::test_zero_http_and_escalates` | 2 | 1 |
+
+Every original method name is preserved as a `subTest` case label
+(`case="test_<name>"`), and every original assertion/setup body is retained
+verbatim. No case, input, or assertion was dropped.
+
+**Deletion list: empty.** The two §4.2 Batch E P2 rows were materialised and
+skipped: the `test_discovery_expansion` and `test_discovery_freeze` modules hold
+no non-K1/K2 "bounds/cycle/gap" or "freeze/amendment" integration duplicate —
+their bounds/cycle/gap tests are the `expansion` unit surface, already merged
+above, while `test_discovery_freeze` is almost entirely K2-named
+(`forged`, `corrupt`, `refused`, `cross_project`, `stale`, `tamper`,
+`never_clean`, `foreign`) and its remaining freeze/amendment tests assert the
+read-path authority at the module layer, which the slow `test_step05_acceptance`
+covering tests exercise only end-to-end. Removing any of them would weaken
+fail-closed coverage, so none was safe to delete.
+
+**Attempted-and-reverted merge (documented for honesty):** folding
+`test_discovery_worker`'s pause/cancel/drain stop tests into one `subTest` table
+was reverted. Those three tests share one `setUp` store per test *method*; within
+a single merged method the durable observations accumulate across cases, so the
+`len(observations) == 1` assertion fails for the 2nd/3rd case
+(`AssertionError: 2 != 1`, `3 != 1`). They must stay as three standalone
+methods.
+
+**§6 grep cross-check (merged-away name list, 8 names):**
+
+- docs-cited: `comm -12` against `grep -rhoE 'test_[A-Za-z0-9_]+' docs |
+  sort -u` (438 names, excluding `test-pruning-plan.md`) prints **nothing**.
+- security-named: the K2 heuristic prints **nothing** for the 8 names.
+
+**Mutation spot-check (scratch, uncommitted):** breaking the expansion
+`max_sources` child guard (`if len(known) >= validated_limits.max_sources` →
+`if False`) made the merged test report the exact failing case
+`case='test_source_limit_retains_edges_and_marks_frontier'`
+(`AssertionError: Lists differ: [] != [('MED:3', 'source_limit')]`). Source
+restored (`git diff -- src/` empty). Note: mutating only the BFS *pop* hop guard
+is masked by the redundant child-time hop guard (defense in depth), so the
+source-limit guard was used.
+
+**Verification (all on `task/s19-prune-E`):**
+
+```bash
+python3 scripts/run_tests.py --slow -j 4 test_discovery_candidates test_discovery_citations \
+  test_discovery_expansion test_discovery_freeze test_discovery_store test_discovery_worker \
+  test_discovery_job_routes test_discovery_backup
+# -> 8 modules, 184 tests, 0 failures, 0 errors, 0 skipped
+
+python3 scripts/run_tests.py -j 4
+# -> 145 modules, 3799 tests, 0 failures, 0 errors (fast tier)
+
+python3 scripts/check_contract_docs.py   # -> 15 ok, 0 failed
+git diff --check                        # -> clean
+```
+
 ## 5. Projected total and reachability
 
 | Group | before | after |
