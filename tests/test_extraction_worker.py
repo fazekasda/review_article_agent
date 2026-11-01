@@ -220,6 +220,29 @@ class ExtractAdmissionAndCompletionTest(ExtractionWorkerBase):
         self.assertNotIn("sk-or-test", json.dumps(job))
         self.assertNotIn("raw_output", json.dumps(result))
 
+    def test_protocol_error_run_carries_static_diagnostic_code(self) -> None:
+        # A malformed 200 (wrong model) is an accepted diagnostic, never a
+        # completion; the safe projection surfaces the bounded static code and
+        # the settled cost, and never the response body, model, or credential.
+        self.transport.responses.append(fx._completion({"x": 1}, model="openai/other"))
+        engine = self.engine(api_key="sk-or-test")
+        res = self.submit(engine, request_id="run-diag")
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        accepted = job["accepted_result"]
+        self.assertIsNotNone(accepted)
+        result = accepted["result"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "protocol_error")
+        self.assertEqual(result["diagnostic_code"], "response_model_mismatch")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        blob = json.dumps(job)
+        for marker in ("sk-or-test", "openai/other", "gen-1"):
+            self.assertNotIn(marker, blob)
+
 
 # --------------------------------------------------------------------------- #
 # Missing credential / missing gate => zero POST
@@ -428,6 +451,38 @@ class ExtractionRunCliTest(cli_fx.DiscoveryJobsCliBase):
             "extraction", "run", "status", "--project", pid, "--request-id", "absent",
             expect=2,
         )
+
+    def test_run_status_surfaces_diagnostic_code(self) -> None:
+        # A protocol_error run's bounded static diagnostic code and settled cost
+        # are surfaced by the readback CLI (no raw body, no model output).
+        pid = self.create_project()
+
+        def _make(store):
+            repo = JobRepository(store)
+            job = repo.submit("run-1", task_kind="extraction_run", parameters={})
+            attempt = repo.begin_attempt(job.job_id, dispatch_kind="local")
+            repo.accept_result(
+                attempt.attempt_id,
+                result_kind="extraction_run",
+                result={
+                    "kind": "extraction_run",
+                    "mode": "extraction_run",
+                    "status": "completed",
+                    "outcome": "protocol_error",
+                    "diagnostic_code": "response_finish_length",
+                    "cost_state": "known",
+                    "cost_amount_usd": "0.0002",
+                    "authorizing": False,
+                },
+            )
+
+        self.with_store(pid, _make)
+        out = self.cli(
+            "extraction", "run", "status", "--project", pid, "--request-id", "run-1"
+        )
+        self.assertEqual(out["run"]["outcome"], "protocol_error")
+        self.assertEqual(out["run"]["diagnostic_code"], "response_finish_length")
+        self.assertEqual(out["run"]["cost_amount_usd"], "0.0002")
 
     def test_help_documents_run_commands(self) -> None:
         parser = cli_fx.cli_main.build_parser()

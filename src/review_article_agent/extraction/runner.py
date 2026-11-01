@@ -937,6 +937,10 @@ def _execution_metadata(*, dispatch_id, result, input_digest, model_ref):
             "completion_tokens": result.usage.completion_tokens,
             "total_tokens": result.usage.total_tokens,
         }
+    # A bounded, static parser-failure code (never peer text or a provider
+    # message) so a non-completed run's reason is durable and distinguishable.
+    diagnostic = result.diagnostic
+    diagnostic_code = diagnostic.code if diagnostic is not None else None
     return {
         "actual_model": result.actual_model,
         "upstream_provider": result.provider,
@@ -945,6 +949,7 @@ def _execution_metadata(*, dispatch_id, result, input_digest, model_ref):
         "version_set_json": canonical_json(versions).decode("utf-8"),
         "http_status": result.http_status,
         "request_sha256": result.request_sha256,
+        "diagnostic_code": diagnostic_code,
         "dispatch_id": dispatch_id,
         "no_automatic_retry": True,
     }
@@ -1718,6 +1723,7 @@ def _readback(store, request_id: str, *, run_ref, posted: bool) -> dict:
         "usage": None,
         "http_status": None,
         "request_sha256": None,
+        "diagnostic_code": None,
     }
     if dispatch_record is None:
         return mapping
@@ -1748,6 +1754,7 @@ def _readback(store, request_id: str, *, run_ref, posted: bool) -> dict:
             mapping["usage"] = metadata.get("usage")
             mapping["http_status"] = metadata.get("http_status")
             mapping["request_sha256"] = metadata.get("request_sha256")
+            mapping["diagnostic_code"] = metadata.get("diagnostic_code")
             break
     return mapping
 

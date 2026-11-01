@@ -619,6 +619,80 @@ class ReplayTest(RunnerTestBase):
             self.run_extraction(request_id="run-x", artifact_id="a-run-other", revision_id="rev-run-other")
 
 
+class ProtocolErrorDiagnosticTest(RunnerTestBase):
+    """A non-completed run persists a bounded, static diagnostic code (S19).
+
+    The exact live failure could not be reproduced (no raw body was retained);
+    these tests pin the *observability* that makes the next live call
+    distinguishable, and prove the code is durable, cost is preserved, and no
+    secret/source/peer marker leaks into the readback or the stored metadata.
+    """
+
+    def _malformed_completion(self, *, model=_MODEL, finish_reason="stop", cost=0.0002):
+        payload = {
+            "id": "gen-diag", "model": model, "provider": "deepseek",
+            "choices": [{
+                "finish_reason": finish_reason,
+                "message": {"role": "assistant", "content": json.dumps({"x": 1})},
+            }],
+            "usage": {
+                "prompt_tokens": 12, "completion_tokens": 8,
+                "total_tokens": 20, "cost": cost,
+            },
+        }
+        return TransportResponse(status=200, body_text=json.dumps(payload), truncated=False)
+
+    def _metadata_for(self, result):
+        from review_article_agent.storage.agent_runtime import RuntimeRepository
+
+        record = RuntimeRepository(self.store).get_proposal(result["proposal_record_id"])
+        return json.loads(record.canonical.decode("utf-8"))["content"]["execution_metadata"]
+
+    def test_wrong_model_persists_code_and_keeps_known_cost(self):
+        self.transport.responses.append(self._malformed_completion(model="openai/other"))
+        result = self.run_extraction(
+            request_id="run-diag-model", artifact_id="a-run-diag", revision_id="rev-run-diag"
+        )
+        self.assertEqual(result["outcome"], "protocol_error")
+        self.assertEqual(result["status"], "completed")  # accepted diagnostic
+        self.assertEqual(result["diagnostic_code"], "response_model_mismatch")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        # Durable in the accepted (non-authorizing) proposal's metadata.
+        self.assertEqual(
+            self._metadata_for(result)["diagnostic_code"], "response_model_mismatch"
+        )
+
+    def test_length_finish_is_distinguished_from_other_branches(self):
+        self.transport.responses.append(self._malformed_completion(finish_reason="length"))
+        result = self.run_extraction(
+            request_id="run-diag-len", artifact_id="a-run-len", revision_id="rev-run-len"
+        )
+        self.assertEqual(result["outcome"], "protocol_error")
+        self.assertEqual(result["diagnostic_code"], "response_finish_length")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+
+    def test_envelope_not_json_is_distinguished(self):
+        self.transport.responses.append(
+            TransportResponse(status=200, body_text="<html>nope</html>", truncated=False)
+        )
+        result = self.run_extraction(
+            request_id="run-diag-env", artifact_id="a-run-env", revision_id="rev-run-env"
+        )
+        self.assertEqual(result["outcome"], "protocol_error")
+        self.assertEqual(result["diagnostic_code"], "response_envelope_not_json")
+
+    def test_readback_carries_no_private_markers(self):
+        self.transport.responses.append(self._malformed_completion(model="openai/other"))
+        result = self.run_extraction(
+            request_id="run-diag-leak", artifact_id="a-run-leak", revision_id="rev-run-leak"
+        )
+        blob = json.dumps(result)
+        for marker in ("sk-or-test", "PRIVATE_SOURCE", "openai/other", "gen-diag"):
+            self.assertNotIn(marker, blob)
+
+
 class DirectCallRetryTest(RunnerTestBase):
     """The bounded automatic direct-call retry wired into ``execute_run`` (ADR 006)."""
 
