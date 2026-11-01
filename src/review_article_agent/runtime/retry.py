@@ -50,11 +50,13 @@ Runner integration recipe
 
 A runner's dispatch loop becomes::
 
+    import time
+
     from review_article_agent.runtime.retry import next_attempt
 
     base_request_id = ...                       # the logical call's base id
     while True:
-        decision = next_attempt(store, base_request_id)   # sleep defaults to time.sleep
+        decision = next_attempt(store, base_request_id, sleep=time.sleep)
         if decision.outcome == "dispatch":
             # Reuse today's exact path for this NEW id: record the task, reserve,
             # mark_submitted, POST, and commit the result/cost under
@@ -70,6 +72,8 @@ A runner's dispatch loop becomes::
 ``next_attempt`` owns the supersede/abandon transitions; the runner must **not**
 re-implement them. The runner still calls ``recover`` after a crash so an
 outstanding ``submitted`` row becomes ``unknown`` and is then retryable here.
+``sleep`` defaults to ``None`` (no backoff sleep): production runners pass
+:func:`time.sleep`, and tests pass a no-op.
 """
 
 from __future__ import annotations
@@ -178,8 +182,22 @@ def next_attempt(
     performed here, in the same durable ledger the runners already use.
 
     ``sleep`` is called with the backoff delay before a retry ``dispatch``
-    decision is returned (attempt >= 1); pass a no-op in tests. The default is
-    :func:`time.sleep`, imported lazily so the module stays import-light.
+    decision is returned (attempt >= 1). The default is ``None``, which means
+    **no** backoff sleep is performed; the four runners pass :func:`time.sleep`
+    in production, and tests pass a no-op (or ``None``). No ``time`` import is
+    made unless a caller supplies it, so the module stays import-light.
+
+    The overhead cap is re-evaluated on **every** run before a successor is
+    created — including when the predecessor is already resolved with no
+    successor row yet (a crash between resolving the predecessor and reserving
+    the successor). ``abandon_unknown_after_retries`` (a cap refusal) leaves the
+    same terminal ``failed``/``estimated`` shape as
+    ``supersede_unknown_for_retry``, so without this re-check a refused retry
+    would be dispatched unchecked on the next run. A refusal here leaves the
+    resolved predecessor untouched (no new transition) and returns
+    ``refused_overhead`` for it; being refused again later is expected, and the
+    retry becomes allowed only once the stage's base spend grows enough — still
+    bounded by the cap by construction.
     """
     dispatches = repo if repo is not None else RuntimeDispatchRepository(store)
     chain = retry_request_ids(base_request_id)
@@ -212,7 +230,22 @@ def next_attempt(
                 )
                 return _dispatch_decision(request_id, index, sleep)
             if is_retry_resolved(previous):
-                # The predecessor was already superseded; send the successor.
+                # The predecessor was already resolved (superseded, or abandoned
+                # after a cap refusal) on an earlier run, but its successor has no
+                # row yet: the run crashed between resolving the predecessor and
+                # reserving the successor. ``abandon_unknown_after_retries``
+                # leaves the same resolved shape as ``supersede_unknown_for_retry``,
+                # so re-apply the overhead cap on every run before creating the
+                # successor; otherwise a cap refusal would be bypassed here.
+                if not _overhead_allows(dispatches, previous, chain_ids, ratio):
+                    # Leave the resolved predecessor untouched (no new
+                    # transition); refuse the successor again.
+                    return RetryDecision(
+                        "refused_overhead",
+                        previous.request_id,
+                        previous,
+                        attempt=index - 1,
+                    )
                 return _dispatch_decision(request_id, index, sleep)
             raise DispatchStateError(
                 "the retry predecessor is neither ambiguous nor a resolved retry; "
@@ -281,6 +314,13 @@ def _overhead_allows(
     stage's **other** (non-chain) dispatches at their known/estimated cost, or
     reserve while still outstanding. The retry is allowed iff
     ``superseded_total + retry_reserve <= max(ratio * base_total, retry_reserve)``.
+
+    The predecessor itself is **excluded** from ``superseded_total`` because its
+    own reserve is the ``retry_reserve`` added below; counting it in both places
+    would double-count it. This matters when the predecessor is already resolved
+    (a crash between superseding it and reserving its successor): the re-check
+    then reproduces exactly the arithmetic that originally allowed the retry,
+    rather than a stricter one that would spuriously refuse crash recovery.
     """
     retry_reserve = Decimal(predecessor.reserve_usd)
     stage = predecessor.stage
@@ -288,6 +328,11 @@ def _overhead_allows(
     base_total = Decimal("0")
     for record in dispatches.list_dispatches():
         if record.stage != stage:
+            continue
+        if record.dispatch_id == predecessor.dispatch_id:
+            # The predecessor's own reserve is added as ``retry_reserve`` below;
+            # skip it here so it is counted exactly once even when it is already
+            # resolved (crash recovery).
             continue
         if is_retry_resolved(record):
             superseded_total = _add_exact(

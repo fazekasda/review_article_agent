@@ -79,7 +79,12 @@ human approval, under all of the following.
    dispatches at their known/estimated cost (or reserve while outstanding). The
    `max(..., retry_reserve)` floor lets the **first** retry in a fresh stage
    happen. All existing caps still apply unchanged to the new reserve; a cap
-   refusal is a definitive pre-send refusal as today.
+   refusal is a definitive pre-send refusal as today. The check is re-evaluated
+   on **every** run before a successor is created, including when the predecessor
+   is already resolved with no successor row yet (a crash between resolving the
+   predecessor and reserving the successor): a predecessor abandoned by a cap
+   refusal is left resolved and the successor is refused again, so a refusal can
+   never be bypassed on a later run.
 6. **Backoff.** 2 s then 8 s between attempts, injected as a `sleep` callable
    (tests pass a no-op).
 7. **Crash recovery.** A `submitted` row recovered to `unknown` after a crash

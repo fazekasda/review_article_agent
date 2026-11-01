@@ -403,6 +403,61 @@ class NextAttemptTest(RetryTestBase):
             runtime_dispatch_remote_state(self.store.connection, self.pid), "none"
         )
 
+    def test_refused_overhead_is_not_bypassed_on_rerun(self) -> None:
+        # No non-chain spend: the first retry is floored, the second is refused.
+        self.make_unknown("call-1")
+        first = self._next("call-1")
+        self.assertEqual(first.request_id, "call-1-r1")
+        self.make_unknown("call-1-r1")
+        refused = self._next("call-1")
+        self.assertEqual(refused.outcome, "refused_overhead")
+        self.assertEqual(refused.request_id, "call-1-r1")
+        resolved_before = self.dispatch.get_dispatch_by_request("call-1-r1")
+        self.assertTrue(is_retry_resolved(resolved_before))
+        # A later run with unchanged stage spend must not create the successor
+        # and must not transition the already-resolved predecessor again.
+        again = self._next("call-1")
+        self.assertEqual(again.outcome, "refused_overhead")
+        self.assertEqual(again.request_id, "call-1-r1")
+        self.assertIsNone(self.dispatch.get_dispatch_by_request("call-1-r2"))
+        resolved_after = self.dispatch.get_dispatch_by_request("call-1-r1")
+        self.assertTrue(is_retry_resolved(resolved_after))
+        self.assertEqual(resolved_after.ended_at_utc, resolved_before.ended_at_utc)
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.pid), "none"
+        )
+
+    def test_crash_between_supersede_and_successor_reserve_dispatches(self) -> None:
+        # Enough non-chain spend so the overhead cap allows the retry.
+        self.reserve("other", reserve_usd="1.00")
+        base = self.make_unknown("call-1")
+        # Simulate a crash after superseding X but before reserving X-r1.
+        self.dispatch.supersede_unknown_for_retry(
+            base.dispatch_id, successor_request_id="call-1-r1"
+        )
+        self.assertIsNone(self.dispatch.get_dispatch_by_request("call-1-r1"))
+        decision = self._next("call-1")
+        self.assertEqual(decision.outcome, "dispatch")
+        self.assertEqual(decision.request_id, "call-1-r1")
+        self.assertEqual(decision.attempt, 1)
+        self.assertEqual(decision.delay_seconds, 2.0)
+
+    def test_refused_overhead_becomes_allowed_when_stage_spend_grows(self) -> None:
+        self.make_unknown("call-1")
+        first = self._next("call-1")
+        self.assertEqual(first.request_id, "call-1-r1")
+        self.make_unknown("call-1-r1")
+        refused = self._next("call-1")
+        self.assertEqual(refused.outcome, "refused_overhead")
+        self.assertEqual(refused.request_id, "call-1-r1")
+        # The stage's base spend grows enough to clear the 30% cap: the successor
+        # (call-1-r2) is now allowed and the resolved predecessor is untouched.
+        self.reserve("other", reserve_usd="1.00")
+        decision = self._next("call-1")
+        self.assertEqual(decision.outcome, "dispatch")
+        self.assertEqual(decision.request_id, "call-1-r2")
+        self.assertEqual(decision.attempt, 2)
+
     def test_crash_recovered_submitted_is_retryable(self) -> None:
         submitted = self.make_submitted("call-1")
         self.assertEqual(submitted.state, "submitted")
