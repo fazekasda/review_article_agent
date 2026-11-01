@@ -15,8 +15,9 @@ acceptance criteria and the C02/C03 runtime and rights boundaries:
 * the reserve + submission committed **before** the single POST;
 * shared cumulative caps (a stage cap blocks before any send);
 * replay / reopen zero-POST, a divergent request conflict, and a drained token;
-* malformed-200 / refusal / ambiguous-transport outcomes that preserve the
-  reserve and never blindly retry;
+* malformed-200 / refusal outcomes that preserve the reserve; an ambiguous
+  transport error is retried under a new deterministic id (ADR 006) and never
+  re-POSTs the same identity;
 * a valid, immutable, non-authorizing proposal on success.
 
 Synthetic data only. Run::
@@ -56,7 +57,11 @@ from review_article_agent.discovery.records import (  # noqa: E402
     SearchResult,
 )
 from review_article_agent.runtime import owner_auth  # noqa: E402
-from review_article_agent.runtime.dispatch import RuntimeDispatchRepository  # noqa: E402
+from review_article_agent.runtime.dispatch import (  # noqa: E402
+    RuntimeDispatchRepository,
+    is_retry_resolved,
+    runtime_dispatch_remote_state,
+)
 from review_article_agent.runtime.gates import prepare_gate_snapshot  # noqa: E402
 from review_article_agent.runtime.jobs import (  # noqa: E402
     BudgetExceededError,
@@ -489,7 +494,7 @@ class RunnerTestBase(unittest.TestCase):
 
     # -- runner helper ------------------------------------------------------- #
     def run_lead(self, *, request_id="req-1", batch_ref=None, transport=None,
-                 token=None, api_key="sk-or-test-key"):
+                 token=None, api_key="sk-or-test-key", sleep=None):
         return execute_lead_proposal(
             self.store,
             registry=self.registry,
@@ -498,6 +503,7 @@ class RunnerTestBase(unittest.TestCase):
             request_id=request_id,
             api_key=api_key,
             transport=self.transport if transport is None else transport,
+            sleep=(lambda _delay: None) if sleep is None else sleep,
         )
 
     def assert_no_dispatch(self):
@@ -874,21 +880,89 @@ class ExecuteLeadProposalTest(RunnerTestBase):
         self.assertEqual(content["outcome"], "refused")
         self.assertIsNone(content["proposal_text"])
 
-    def test_transport_unknown_retains_reserve_and_never_resends(self) -> None:
+    def test_transport_error_then_success_two_posts(self) -> None:
+        # ADR 006: an ambiguous transport error is retried under a new id; the base
+        # becomes a conservative terminal failure and the retried success is found
+        # by the base request id.
         self.approve_batch(self.interview_batch, "interview")
         self.transport.responses.append(RuntimeError("synthetic network failure"))
-        first = self.run_lead()
-        self.assertEqual(first["status"], "unknown")
-        self.assertEqual(first["dispatch_state"], "unknown")
-        self.assertEqual(first["cost_state"], "unknown")
-        self.assertEqual(first["reserve_usd"], "0.065536")
-        # The reserve and remote occupancy are retained; a re-run never re-sends.
-        self.assertEqual(len(self.dispatch.list_dispatches()), 1)
-        replay_transport = _FakeTransport()
-        second = self.run_lead(transport=replay_transport)
-        self.assertEqual(second["status"], "unknown")
-        self.assertEqual(replay_transport.call_count, 0)
-        self.assertEqual(self.transport.call_count, 1)
+        self.transport.responses.append(
+            TransportResponse(status=200, body_text=_completion_body())
+        )
+        outcome = self.run_lead()
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(outcome["status"], "completed")
+        self.assertEqual(outcome["outcome"], "completed")
+        base = self.dispatch.get_dispatch_by_request("req-1")
+        self.assertTrue(is_retry_resolved(base))
+        self.assertEqual(base.state, "failed")
+        self.assertEqual(base.cost_state, "estimated")
+        self.assertEqual(base.cost_amount_usd, "0.065536")
+        retry = self.dispatch.get_dispatch_by_request("req-1-r1")
+        self.assertEqual(retry.state, "completed")
+        # Readback by the base id resolves the chain to the completed member.
+        readback = get_lead_outcome(self.store, "req-1")
+        self.assertEqual(readback["status"], "completed")
+        self.assertEqual(readback["dispatch_id"], retry.dispatch_id)
+
+    def test_three_ambiguous_exhausts_and_frees_slot(self) -> None:
+        self.approve_batch(self.interview_batch, "interview")
+        # A large non-chain spend in the stage lets the retries clear the overhead
+        # cap, so all three attempts are sent and the last is abandoned.
+        self._seed_non_chain_stage_spend(reserve="0.50")
+        for _ in range(3):
+            self.transport.responses.append(RuntimeError("synthetic network failure"))
+        outcome = self.run_lead()
+        self.assertEqual(self.transport.call_count, 3)
+        self.assertEqual(outcome["status"], "failed")
+        for rid in ("req-1", "req-1-r1", "req-1-r2"):
+            self.assertTrue(is_retry_resolved(self.dispatch.get_dispatch_by_request(rid)), rid)
+        # The serial remote slot is released and readback reports a non-completion.
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id), "none"
+        )
+        self.assertEqual(get_lead_outcome(self.store, "req-1")["status"], "failed")
+
+    def _seed_non_chain_stage_spend(self, *, reserve="0.50", role="section_writer"):
+        """Seed a non-chain ``discovery``-stage dispatch to clear the overhead cap."""
+        from review_article_agent.runtime.roles import (
+            BoundedTask,
+            ModelRef,
+            RoleConfig,
+            RoleConfiguration,
+        )
+
+        model = ModelRef(provider_id="openrouter", model_id=_MODEL_ID, variant="direct")
+        role_config = RoleConfig(role=role, model=model, steps=1)
+        role_set = RoleConfiguration(roles=(role_config,))
+        bounded = BoundedTask(
+            project_id=self.project_id,
+            role=role,
+            target={
+                "project_id": self.project_id,
+                "artifact_id": self.brief_ref["artifact_id"],
+                "revision_id": self.brief_ref["revision_id"],
+            },
+            input_refs=[],
+            scope=["discovery", f"role={role}", "non-chain-spend"],
+            prompt_version="section_writer.generation.v1",
+            size_limit=262_144,
+            step_limit=1,
+            role_config=role_config,
+        )
+        task = self.runtime.record_task(
+            bounded, request_id="non-chain-spend", configuration=role_set
+        )
+        self.dispatch.reserve_dispatch(
+            task,
+            request_id="non-chain-spend",
+            route="direct_call",
+            stage="discovery",
+            input_digest="a" * 64,
+            version_digest="b" * 64,
+            reserve_usd=reserve,
+            bound_evidence_digest="c" * 64,
+        )
 
     def test_outcome_has_no_secret_or_source_text(self) -> None:
         self.approve_batch(self.interview_batch, "interview")
@@ -1227,31 +1301,30 @@ class MetadataPersistenceTest(RunnerTestBase):
         ):
             self.assertEqual(reopened[key], first[key])
 
-    def test_unknown_metadata_survives_reopen(self) -> None:
+    def test_exhausted_readback_survives_reopen(self) -> None:
+        # ADR 006: a lone ambiguous transport error is retried; with no stage base
+        # spend the second retry is refused, so the chain is exhausted and the
+        # readback reports a definitive non-completion (never "unknown").
         self.approve_batch(self.interview_batch, "interview")
         self.transport.responses.append(RuntimeError("synthetic network failure"))
         first = self.run_lead()
-        self.assertEqual(first["status"], "unknown")
-        self.assertEqual(first["cost_state"], "unknown")
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(first["cost_state"], "estimated")
         self.assertEqual(first["reserve_usd"], "0.065536")
-        self.assertIsNotNone(first["request_sha256"])
-        self.assertIsNotNone(first["versions"])
         self.assertIsNone(first["proposal_id"])
-        self.assertIsNotNone(first["diagnostic_record_id"])
         reopened = get_lead_outcome(self.store, "req-1")
         for key in (
             "status",
-            "actual_model",
-            "response_id",
-            "usage",
-            "versions",
-            "request_sha256",
-            "diagnostic_record_id",
+            "outcome",
+            "dispatch_state",
+            "cost_state",
+            "cost_amount_usd",
             "reserve_usd",
         ):
             self.assertEqual(reopened[key], first[key])
-        # No rerun and the reserve is retained.
-        self.assertEqual(self.transport.call_count, 1)
+        # The base error and one retry were sent; the base is a resolved failure.
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertTrue(is_retry_resolved(self.dispatch.get_dispatch_by_request("req-1")))
 
     def test_cost_is_dispatch_authoritative_not_copied(self) -> None:
         self.approve_batch(self.interview_batch, "interview")

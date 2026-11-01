@@ -213,7 +213,9 @@ class SynthesisProposerTest(RoleProposerBase):
         result = self.run_synthesis(audit_ref=audit_ref, artifact_id="syn-fail")
         self.assertEqual(result["status"], "model_not_completed")
         self.assertIsNone(self.artifacts.get_revision("syn-fail", "r1"))
-        self.assertEqual(self.transport.call_count, 1)
+        # ADR 006: the ambiguous 503 is retried once under a new id (then the
+        # overhead cap refuses the second retry), so two POSTs, no completion.
+        self.assertEqual(self.transport.call_count, 2)
 
     def test_replay_no_second_post_same_ref(self):
         audit_ref, _batch = self.accepted_audit()
@@ -269,7 +271,8 @@ class FrameworkProposerTest(RoleProposerBase):
         result = self.run_framework(synthesis_ref=synthesis_ref, artifact_id="fw-fail")
         self.assertEqual(result["status"], "model_not_completed")
         self.assertIsNone(self.artifacts.get_revision("fw-fail", "r1"))
-        self.assertEqual(self.transport.call_count, 1)
+        # ADR 006: the ambiguous 503 is retried once (then refused by overhead).
+        self.assertEqual(self.transport.call_count, 2)
 
     def test_literal_reserved_key_is_refused_no_write(self):
         synthesis_ref = self.accepted_synthesis()
@@ -336,7 +339,8 @@ class OutlineProposerTest(RoleProposerBase):
                                   artifact_id="out-fail")
         self.assertEqual(result["status"], "model_not_completed")
         self.assertIsNone(self.artifacts.get_revision("out-fail", "r1"))
-        self.assertEqual(self.transport.call_count, 1)
+        # ADR 006: the ambiguous 503 is retried once (then refused by overhead).
+        self.assertEqual(self.transport.call_count, 2)
 
     def test_replay_no_second_post_same_ref(self):
         synthesis_ref, framework_ref = self.accepted_framework()

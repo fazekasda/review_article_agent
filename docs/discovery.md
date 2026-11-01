@@ -646,11 +646,17 @@ get_lead_outcome(store, request_id) -> dict | None
   scientific determination.
 - `execute_lead_proposal` re-reads the exact approved batch, revalidates the named
   gate and every pinned source's hosted-transfer rights and context, records a
-  one-step lead task, and reserves a `direct_call` dispatch **before** the single
-  POST. One logical request per durable job: an already-recorded request is
-  returned from storage without a second POST; an ambiguous outcome keeps its
-  reserve and is **never** re-sent; a process restart reconciles to `unknown`
-  (no blind retry). It never activates execution itself.
+  one-step lead task, and reserves a `direct_call` dispatch **before** each POST.
+  One logical request per durable job: an already-recorded request is returned
+  from storage without a second POST. Under
+  [ADR 006](decisions/006-direct-call-retry.md) an **ambiguous** (`unknown`)
+  `direct_call` outcome is retried automatically under a **new** deterministic id
+  (`{base}-r1`, `{base}-r2`) via `runtime.retry.next_attempt`; the same request
+  identity is never re-POSTed, the user-visible request id stays the base, and
+  readback resolves the retry chain to its completed member (or reports a
+  definitive non-completion). A process restart reconciles an outstanding
+  `submitted` row to `unknown`, which is then retryable on the next run. It never
+  activates execution itself.
 - The underlying `runtime.lead` adapter is stdlib-only, single-shot, tool-free,
   and POSTs **one** documented endpoint (`ENDPOINT`); `plan_lead` computes an
   exact `Decimal` reserve from the **full configured model context capacity** plus
