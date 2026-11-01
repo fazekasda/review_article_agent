@@ -1,8 +1,8 @@
 # Review-article agent pilot: status and improvement handout
 
-**Snapshot:** 1 November 2026, after the explicitly authorized single extraction call.  
-**Project:** `prj_a8128474930448fca0de7d8ba18f5fca`  
-**Status:** screening complete; extraction pilot blocked; no accepted extraction, synthesis, manuscript or export.  
+**Snapshot:** 1 November 2026, after the explicitly authorized single extraction call.<br>
+**Project:** `prj_a8128474930448fca0de7d8ba18f5fca`<br>
+**Status:** screening complete; extraction pilot blocked; no accepted extraction, synthesis, manuscript or export.<br>
 **Authorization:** no further paid calls authorized at this stopping point. This document proposes future work; it does not approve execution or merge a pull request.
 
 > **Provenance:** This is a historical snapshot dated 2026-11-01, moved into this repository at the owner's request. The original execution data and raw pilot material remain outside the repository. Later states of the pilot may differ from this snapshot.
