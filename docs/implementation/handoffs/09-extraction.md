@@ -111,3 +111,20 @@ this amendment on:
 - A schema-invalid escalation now keeps `validation_error`: the validator's first
   failing field path, which uses schema vocabulary only and never model or source
   text. The run readback shows it.
+
+## Amendment 2026-11-01 (b): identifiers and snippets (prompt `extraction.direct.v3`)
+
+The first v2 live call met the numeric contract: no numeric strings, and qualified
+values went into `reported_as`. It was still rejected, for these reasons:
+
+- It used short passage ids (`p0021` for `rep-…:p0021`).
+- It gave asset-caption passage ids (`asset-0`) where the asset ids belong, so it
+  missed the double coverage that an asset caption passage needs.
+- Its `report_ref` was free text.
+- One snippet joined two spans with "...".
+
+The instructions now require copying ids exactly from the headers. They explain the
+asset-id versus passage-id distinction and the double coverage, tell the model to
+leave out `report_ref`, and forbid ellipsis-joined snippets. The example no longer
+shows a `report_ref`. The validator is unchanged and still strict.
+`extraction run status` now prints `validation_error`.

@@ -216,6 +216,21 @@ class NumericRepresentationTests(unittest.TestCase):
                 self.assertIsInstance(d["value"]["value"], (int, float))
         extraction_example()  # the shown example passes the real validator
 
+    def test_instructions_state_the_identifier_and_snippet_rules(self):
+        # Second pilot rejection: short passage ids ("p0021" for "rep-x:p0021"),
+        # asset passage ids used as asset ids, a free-text report_ref, and a
+        # snippet joined with "...". The validator still refuses all of them.
+        self.assertIn('never "p0021"', EXTRACTION_INSTRUCTIONS)
+        self.assertIn("NOT that header's passage_id", EXTRACTION_INSTRUCTIONS)
+        self.assertIn("omit `report_ref`", EXTRACTION_INSTRUCTIONS)
+        self.assertIn("Never join separate parts", EXTRACTION_INSTRUCTIONS)
+        for record in raw_extraction_example()["source_records"]:
+            self.assertNotIn("report_ref", record)
+        out = valid_output()
+        out["findings"][1]["snippet"] = "The 50 mg dose ... per mouse"
+        with self.assertRaises(ExtractionError):
+            validate(out)
+
 
 class MissingValueTests(unittest.TestCase):
     def test_value_and_dimension_rules(self):
