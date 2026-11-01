@@ -457,7 +457,7 @@ if __name__ == "__main__":  # pragma: no cover
 
 # Anchors for the outcomes already covered elsewhere (not duplicated here):
 # * paid-unknown caps + never-re-POST: test_discovery_job_routes.LeadRoutesTest
-#   .test_unknown_retains_occupancy_and_never_reposts and
+#   .test_unknown_retries_new_identity_and_frees_slot and
 #   test_discovery_worker.RestartRecoveryTest.
 # * pause/cancel/drain keep partial pages: test_discovery_worker
 #   .StopBetweenAttemptsTest.*; test_step05_core_acceptance.ExpansionInterruptedTest.

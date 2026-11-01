@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from typing import Any, Mapping
 
 from ..acquisition.manifest import AcquisitionRepository, ManifestNotAcquiredError
@@ -48,8 +49,9 @@ from ..domain.records import (
 from ..parsing.repository import ParsingRepository, _NestedStore
 from ..runtime import extraction as runtime_extraction
 from ..runtime import lead
-from ..runtime.dispatch import RuntimeDispatchRepository
+from ..runtime.dispatch import RuntimeDispatchRepository, retry_request_ids
 from ..runtime.lead import LeadConfig
+from ..runtime.retry import RETRY_MAX_ATTEMPTS, next_attempt
 from ..runtime.roles import (
     BoundedTask,
     ModelRef,
@@ -109,6 +111,15 @@ PURPOSE_ROLES = {"extraction": "extractor", "quality": "fact_checker"}
 
 TASK_SIZE_LIMIT = 262_144
 MAX_IDENTIFIER_LEN = 512
+
+#: The default backoff sleeper for the bounded direct-call retry (ADR 006); tests
+#: inject a no-op via ``execute_run(sleep=...)`` or by patching this alias.
+_SLEEP = time.sleep
+
+#: The longest deterministic retry suffix appended to a base request id
+#: (``-r{RETRY_MAX_ATTEMPTS - 1}``); a base must leave room for it so every
+#: attempt's request id stays within :data:`MAX_IDENTIFIER_LEN` (ADR 006).
+_RETRY_SUFFIX_LEN = len(f"-r{RETRY_MAX_ATTEMPTS - 1}")
 
 #: Fixed limitation line added to the material when any source is a PDF report,
 #: so a model can never treat extracted PDF text as reliable column-ordered text
@@ -1339,6 +1350,7 @@ def execute_run(
     api_key: str,
     extraction_ref=None,
     transport=None,
+    sleep=None,
     mode: str = "pilot",
     pilot_ref=None,
     artifact_id: str,
@@ -1356,8 +1368,23 @@ def execute_run(
     accepted dispatch result and its settled cost are all committed in **one**
     nested transaction from caller-supplied rights. An already-recorded request is
     observed, never re-sent.
+
+    An **ambiguous** direct-call outcome (a transport error/timeout/ambiguous
+    status the adapter classifies as ``unknown``) is retried automatically and
+    boundedly (ADR 006): the logical call is ``request_id``; each attempt is a new
+    deterministic identity (``request_id``, ``request_id-r1``, ``request_id-r2``)
+    and the same identity is never re-POSTed. ``next_attempt`` owns the
+    supersede/abandon ledger transitions and the backoff; ``sleep`` is injectable
+    (tests pass a no-op). A definitive non-completion is reported when every
+    attempt is ambiguous or the overhead cap refuses a further retry.
     """
     request_id = _require_identifier(request_id, "request_id")
+    # Leave room for the deterministic retry suffix (``-r2``) so every attempt's
+    # request id stays within the runner's identifier bound (ADR 006).
+    if len(request_id) > MAX_IDENTIFIER_LEN - _RETRY_SUFFIX_LEN:
+        raise ExtractionRunnerError(
+            "request_id: must leave room for the deterministic retry suffix"
+        )
     if not isinstance(api_key, str) or api_key == "":
         raise ExtractionRunnerError("api_key: a non-empty credential is required")
     if purpose not in PURPOSES:
@@ -1432,32 +1459,11 @@ def execute_run(
 
     runtime = RuntimeRepository(store)
     dispatch = RuntimeDispatchRepository(store)
-    task_record = runtime.record_task(bounded, request_id=request_id, configuration=role_configuration)
-
-    with registry.execution_write_guard(activation_token, store.project_id):
-        existing = dispatch.get_dispatch_by_request(request_id)
-        if existing is not None:
-            return _replay(store, request_id)
-        dispatch_record = dispatch.reserve_dispatch(
-            task_record, request_id=request_id, route="direct_call", stage=EXTRACTION_STAGE,
-            input_digest=input_digest, version_digest=version_digest,
-            reserve_usd=plan.reserve_usd, bound_evidence_digest=bound_evidence_digest,
-        )
-        dispatch_record = dispatch.mark_submitted(dispatch_record.dispatch_id)
-
-    # Point-in-time revalidation immediately before the POST (no lock over network).
-    _revalidate_before_send(
-        store, registry=registry, activation_token=activation_token, hosted_ref=hosted_ref,
-        purpose=purpose, mode=mode, config_ref=config_ref, report_refs=report_refs,
-        extraction_ref=extraction_ref, acquisition_ref=acquisition_ref, pilot_ref=pilot_ref,
-    )
-
-    result = runtime_extraction.execute_extraction(plan, api_key=api_key, transport=transport)
-
-    outcome, content, result_kind = _classify_result(
-        result, purpose=purpose, config=config, passages=passages,
-        instructions_sha256=plan.instructions_sha256, dispatch_id=dispatch_record.dispatch_id,
-        input_digest=input_digest, model_ref=model_ref,
+    # Record (or return) the base attempt's immutable task up front. This is
+    # idempotent on a replay and still refuses a divergent task under the same
+    # request id (the logical call key) before any dispatch.
+    base_task_record = runtime.record_task(
+        bounded, request_id=request_id, configuration=role_configuration
     )
 
     material = {
@@ -1468,20 +1474,78 @@ def execute_run(
                          *([acquisition_ref] if acquisition_ref else []), *source_refs],
     }
 
-    with registry.execution_write_guard(activation_token, store.project_id, allow_draining=True):
-        run_ref = _commit_atomic(
-            store, runtime=runtime, dispatch=dispatch, task_record=task_record,
-            dispatch_record=dispatch_record, result=result, outcome=outcome, content=content,
-            result_kind=result_kind, role_configuration=role_configuration, material=material,
-            receipt_payload={
-                "purpose": purpose, "config_ref": config_ref, "report_refs": report_refs,
-                "source_refs": source_refs, "extraction_ref": extraction_ref,
-                "acquisition_ref": acquisition_ref, "request_id": request_id,
-                "task_id": task_record.task_id, "plan": plan, "model_map": model_map,
-                "mode": mode, "pilot_ref": pilot_ref, "outcome": outcome, "input_digest": input_digest,
-            },
+    sleeper = _SLEEP if sleep is None else sleep
+    posted = False
+    # Bounded automatic retry of an ambiguous direct call (ADR 006). The logical
+    # call is ``request_id``; each attempt is a NEW deterministic identity
+    # (``request_id``, ``-r1``, ``-r2``). ``next_attempt`` owns the
+    # supersede/abandon transitions and the backoff, and raises on an
+    # unreconciled in-flight row; this loop runs one POST per ``dispatch``
+    # decision exactly as before.
+    while True:
+        decision = next_attempt(store, request_id, sleep=sleeper)
+        if decision.outcome != "dispatch":
+            # completed: a prior attempt succeeded -> read its receipt back.
+            # definitive | exhausted | refused_overhead: a definitive
+            # non-completion (never a completion without a completed member).
+            run_ref = (
+                _receipt_ref_for_dispatch(store, decision.dispatch)
+                if decision.outcome == "completed"
+                else None
+            )
+            return _readback(store, request_id, run_ref=run_ref, posted=posted)
+
+        attempt_id = decision.request_id
+        if attempt_id == request_id:
+            task_record = base_task_record
+        else:
+            task_record = runtime.record_task(
+                bounded, request_id=attempt_id, configuration=role_configuration
+            )
+
+        with registry.execution_write_guard(activation_token, store.project_id):
+            dispatch_record = dispatch.reserve_dispatch(
+                task_record, request_id=attempt_id, route="direct_call", stage=EXTRACTION_STAGE,
+                input_digest=input_digest, version_digest=version_digest,
+                reserve_usd=plan.reserve_usd, bound_evidence_digest=bound_evidence_digest,
+            )
+            dispatch_record = dispatch.mark_submitted(dispatch_record.dispatch_id)
+
+        # Point-in-time revalidation immediately before the POST (no lock over network).
+        _revalidate_before_send(
+            store, registry=registry, activation_token=activation_token, hosted_ref=hosted_ref,
+            purpose=purpose, mode=mode, config_ref=config_ref, report_refs=report_refs,
+            extraction_ref=extraction_ref, acquisition_ref=acquisition_ref, pilot_ref=pilot_ref,
         )
-    return _readback(store, request_id, run_ref=run_ref, posted=True)
+
+        posted = True
+        result = runtime_extraction.execute_extraction(plan, api_key=api_key, transport=transport)
+
+        outcome, content, result_kind = _classify_result(
+            result, purpose=purpose, config=config, passages=passages,
+            instructions_sha256=plan.instructions_sha256, dispatch_id=dispatch_record.dispatch_id,
+            input_digest=input_digest, model_ref=model_ref,
+        )
+
+        with registry.execution_write_guard(activation_token, store.project_id, allow_draining=True):
+            run_ref = _commit_atomic(
+                store, runtime=runtime, dispatch=dispatch, task_record=task_record,
+                dispatch_record=dispatch_record, result=result, outcome=outcome, content=content,
+                result_kind=result_kind, role_configuration=role_configuration, material=material,
+                receipt_payload={
+                    "purpose": purpose, "config_ref": config_ref, "report_refs": report_refs,
+                    "source_refs": source_refs, "extraction_ref": extraction_ref,
+                    "acquisition_ref": acquisition_ref, "request_id": attempt_id,
+                    "task_id": task_record.task_id, "plan": plan, "model_map": model_map,
+                    "mode": mode, "pilot_ref": pilot_ref, "outcome": outcome, "input_digest": input_digest,
+                },
+            )
+        if run_ref is not None:
+            # A completed proposal or an accepted diagnostic: terminal for this call.
+            return _readback(store, request_id, run_ref=run_ref, posted=posted)
+        # ``_commit_atomic`` returns ``None`` only for ``unknown`` (ambiguous:
+        # the next iteration supersedes and retries) and ``failed`` (definitive:
+        # the next iteration reports a definitive stop). Never a completion here.
 
 
 def _verify_hosted_dependencies(store, hosted_ref, config_ref, report_refs, extraction_ref, acquisition_ref, source_refs):
@@ -1553,24 +1617,59 @@ def _commit_atomic(
 # --------------------------------------------------------------------------- #
 # Replay + readback
 # --------------------------------------------------------------------------- #
-def _replay(store, request_id):
-    """An already-recorded request: observe the stored outcome; never re-send."""
-    runtime = RuntimeRepository(store)
-    dispatch = RuntimeDispatchRepository(store)
-    task = runtime.get_task_by_request(request_id)
-    dispatch_record = dispatch.get_dispatch_by_request(request_id)
-    run_ref = None
-    if task is not None and dispatch_record is not None and dispatch_record.state == "completed" and (
-        dispatch_record.result_kind == _RESULT_KIND_PROPOSAL
+def _resolve_chain_dispatch(dispatch, base_request_id):
+    """Resolve one logical call's retry chain to its deciding dispatch.
+
+    Prefer a **completed** member (the retry that succeeded); otherwise return the
+    last durable member — the base for a fresh/definitive call, or the resolved
+    last attempt of an exhausted/refused chain. ``None`` when no member exists.
+    """
+    rows = [dispatch.get_dispatch_by_request(rid) for rid in retry_request_ids(base_request_id)]
+    for row in rows:
+        if row is not None and row.state == "completed":
+            return row
+    last = None
+    for row in rows:
+        if row is not None:
+            last = row
+    return last
+
+
+def _receipt_ref_for_dispatch(store, dispatch_record):
+    """The run receipt ref bound to a completed accepted-proposal dispatch, or ``None``."""
+    if (
+        dispatch_record is None
+        or dispatch_record.state != "completed"
+        or dispatch_record.result_kind != _RESULT_KIND_PROPOSAL
     ):
-        for record in runtime.proposals_for_task(task.task_id):
-            if record.record_id == dispatch_record.result_ref:
-                content = json.loads(record.canonical.decode("utf-8")).get("content", {})
-                candidate = _receipt_ref_from_task(store, task, content)
-                if candidate is not None:
-                    run_ref = candidate
-                break
-    return _readback(store, request_id, run_ref=run_ref, posted=False)
+        return None
+    runtime = RuntimeRepository(store)
+    task = runtime.get_task(dispatch_record.task_id)
+    if task is None:
+        return None
+    for record in runtime.proposals_for_task(task.task_id):
+        if record.record_id == dispatch_record.result_ref:
+            content = json.loads(record.canonical.decode("utf-8")).get("content", {})
+            return _receipt_ref_from_task(store, task, content)
+    return None
+
+
+def _replay(store, request_id):
+    """An already-recorded request: observe the stored outcome; never re-send.
+
+    The retry chain for ``request_id`` is resolved to its **completed** member (a
+    retry that succeeded) or, absent a completion, the last durable member (a
+    definitive failure or an exhausted/refused chain). The readback carries the
+    base ``request_id``.
+    """
+    dispatch = RuntimeDispatchRepository(store)
+    dispatch_record = _resolve_chain_dispatch(dispatch, request_id)
+    return _readback(
+        store,
+        request_id,
+        run_ref=_receipt_ref_for_dispatch(store, dispatch_record),
+        posted=False,
+    )
 
 
 def _receipt_ref_from_task(store, task, content):
@@ -1595,8 +1694,10 @@ def _receipt_ref_from_task(store, task, content):
 def _readback(store, request_id: str, *, run_ref, posted: bool) -> dict:
     runtime = RuntimeRepository(store)
     dispatch = RuntimeDispatchRepository(store)
+    dispatch_record = _resolve_chain_dispatch(dispatch, request_id)
     task = runtime.get_task_by_request(request_id)
-    dispatch_record = dispatch.get_dispatch_by_request(request_id)
+    if dispatch_record is not None:
+        task = runtime.get_task(dispatch_record.task_id)
     mapping = {
         "request_id": request_id,
         "status": "blocked",

@@ -213,7 +213,13 @@ revisions; an equal pair raises `GenerationRoleModelError`.
   scope, so the per-role budget sum is computable and a replay with a different
   authorization conflicts rather than returning an unrelated run.
 - An already-recorded `request_id` is **observed, never re-sent**
-  (`get_dispatch_by_request` under the registry write guard).
+  (`get_dispatch_by_request` under the registry write guard). Under
+  [ADR 006](decisions/006-direct-call-retry.md) an **ambiguous** (`unknown`)
+  `direct_call` outcome is retried automatically under a **new** deterministic id
+  (`{base}-r1`, `{base}-r2`) via
+  `runtime.retry.next_attempt`; the same request identity is never re-POSTed, the
+  user-visible request id stays the base, and readback resolves the retry chain to
+  its completed member (or reports a definitive non-completion).
 - The critic/repair ports derive a **deterministic** request id
   `f"{review_id}.{role}.{sha256(canonical(material))[:16]}"`, so a resumed review
   replays the recorded dispatch (same material → same id → observed) instead of
@@ -240,7 +246,11 @@ human escalation point).
 
 Underlying runner outcomes (from `runtime/generation.py`) are `completed`,
 `refused`, `protocol_error`, `unknown`, `failed`, and the runner-level
-`oversized_output` diagnostic.
+`oversized_output` diagnostic. An ambiguous (`unknown`) `direct_call` outcome is
+retried under a new deterministic id (ADR 006); when every attempt is ambiguous
+(or the retry overhead cap refuses a further retry) the last attempt is resolved
+to a definitive `failed` (cost `estimated` = its full reserve) and the runner
+reports a non-completion — so a caller never observes a wedged `unknown`.
 
 ### Worker dispatch classification
 

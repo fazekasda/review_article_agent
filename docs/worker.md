@@ -402,6 +402,18 @@ workflow, a completion, or an approval.
   ([`runtime/execution_boundary.py`](../src/review_article_agent/runtime/execution_boundary.py))
   is **unchanged**, and no roles, ordinary-session isolation, or cost/concurrency
   defaults are altered.
+- **Bounded automatic direct-call retry (decision 006, owner 2026-11-01).** A
+  direct-call dispatch left **ambiguous** (`unknown` — a transport error, timeout,
+  or ambiguous status) is retried automatically, **without human approval**, by
+  [`runtime/retry.py`](../src/review_article_agent/runtime/retry.py): a **new**
+  deterministic identity (`{base}-r1`/`{base}-r2`, at most 3 attempts; the same
+  identity is never re-POSTed), the ambiguous predecessor resolved to terminal
+  `failed`/`estimated` = its full reserve (it may have been billed) so the single
+  serial remote slot is freed, bounded by a per-stage `30%` overhead cap over the
+  stage's other spend (all existing per-role/stage/project caps still apply). When
+  all attempts are ambiguous, or the cap refuses, the last attempt is resolved the
+  same way and the caller reports a definitive non-completion. The
+  `opencode_session` route is unchanged.
 - **Untrusted sources.** Provider metadata, corpus records, imported metadata, and
   lead output are **untrusted, non-authorizing** observations; the latest-proposal
   / readback surfaces carry `authorizes_execution=false`,
@@ -493,13 +505,23 @@ exception in [decision 004](decisions/004-step09-direct-extraction.md).
   variable the lead job uses). The worker reads the variable from its **own** environment
   at dispatch; the credential **value** is never accepted over IPC, never written to the
   DB, and never logged.
-- **Honest outcome; never a blind retry.** A terminal `completed`/`failed` outcome is
-  persisted as the job's safe accepted result, which references the run **receipt**
-  (`run_ref`) and carries no credential or raw output. An `unknown`/submitted external
-  outcome moves the job to `waiting_human` (reserve and runtime occupancy retained) and is
-  **never** re-POSTed: on restart the engine proves an existing outcome by replay from
-  durable rows with **zero** POST (`worker.extraction.replay_extract`), and an unprovable
-  attempt is escalated for an explicit owner `reconcile`.
+- **Bounded automatic retry; honest outcome.** An **ambiguous** (`unknown`)
+  `direct_call` outcome (a transport error, timeout, or ambiguous status) is
+  retried automatically and boundedly (decision 006) by
+  [`extraction/runner.py`](../src/review_article_agent/extraction/runner.py)
+  `execute_run`: each attempt is a **new** deterministic identity (`{request_id}`,
+  `-r1`, `-r2`) and the same identity is never re-POSTed; the ambiguous
+  predecessor is conservatively resolved to terminal `failed`/`estimated` = its
+  full reserve (it may have been billed), freeing the project's single serial
+  remote slot, and the per-stage overhead cap bounds the retry cost. A terminal
+  `completed`/`failed` outcome — including an exhausted or overhead-refused chain
+  (a definitive non-completion) — is persisted as the job's safe accepted result,
+  which references the run **receipt** (`run_ref`) and carries no credential or
+  raw output. On restart the engine proves an existing outcome by replay from
+  durable rows with **zero** POST
+  ([`worker.extraction.replay_extract`](../src/review_article_agent/worker/extraction.py),
+  which resolves the retry chain to its completed member); an unprovable attempt
+  is escalated for an explicit owner `reconcile`.
 - **Tests.** [`tests/test_extraction_worker.py`](../tests/test_extraction_worker.py) —
   submission validation, queued admission + asynchronous completion, receipt readback via
   `require_run`, missing credential/gate refusals, replay-is-one-run, ambiguous-outcome

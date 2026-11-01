@@ -38,7 +38,11 @@ from review_article_agent.runtime import generation, owner_auth  # noqa: E402
 from review_article_agent.runtime.gates import prepare_gate_snapshot  # noqa: E402
 from review_article_agent.runtime.lead import LeadConfig, TransportResponse  # noqa: E402
 from review_article_agent.runtime.owner_auth import OwnerApproval  # noqa: E402
-from review_article_agent.runtime.dispatch import RuntimeDispatchRepository  # noqa: E402
+from review_article_agent.runtime.dispatch import (  # noqa: E402
+    RuntimeDispatchRepository,
+    is_retry_resolved,
+    runtime_dispatch_remote_state,
+)
 from review_article_agent.storage import ArtifactRepository, ProjectStore, Registry, paths  # noqa: E402
 from review_article_agent.storage.agent_runtime import RuntimeRepository  # noqa: E402
 from review_article_agent.storage.human_approvals import HumanApprovalRepository  # noqa: E402
@@ -167,6 +171,10 @@ def _proposal():
     return {"section": "results", "text": "The trial reduced the outcome.", "citations": []}
 
 
+class _StopRetry(Exception):
+    """Sentinel used to stop the runner's retry loop mid-chain in a test."""
+
+
 class RunnerTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="raa-generation-runner-")
@@ -267,6 +275,58 @@ class RunnerTestBase(unittest.TestCase):
         HumanApprovalRepository(self.store).record_decision(prepared, capability)
 
     # -- runner helper ------------------------------------------------------- #
+    def _seed_non_chain_stage_spend(self, *, reserve="0.50", role="synthesis"):
+        """Seed a non-chain ``generation``-stage dispatch to clear the overhead cap.
+
+        Its role differs from the runner's, so it never counts toward the runner's
+        per-role budget, but ``_overhead_allows`` counts it as the stage's base
+        spend and thus permits the second retry (ADR 006 exhaustion path).
+        """
+        from review_article_agent.runtime.roles import (
+            BoundedTask,
+            ModelRef,
+            RoleConfig,
+            RoleConfiguration,
+        )
+
+        runtime = RuntimeRepository(self.store)
+        dispatch = RuntimeDispatchRepository(self.store)
+        model = ModelRef(provider_id="openrouter", model_id=_MODEL, variant="direct")
+        role_config = RoleConfig(role=role, model=model, steps=1)
+        role_set = RoleConfiguration(roles=(role_config,))
+        bounded = BoundedTask(
+            project_id=self.project_id,
+            role=role,
+            target={
+                "project_id": self.project_id,
+                "artifact_id": self.hosted_ref["artifact_id"],
+                "revision_id": self.hosted_ref["revision_id"],
+            },
+            input_refs=runner._normalize_input_refs(self.store, [self.input_ref]),
+            scope=[
+                runner.GENERATION_STAGE,
+                f"role={role}",
+                f"hosted={self.hosted_ref['artifact_id']}:{self.hosted_ref['revision_id']}",
+            ],
+            prompt_version="synthesis.generation.v1",
+            size_limit=runner.TASK_SIZE_LIMIT,
+            step_limit=1,
+            role_config=role_config,
+        )
+        task = runtime.record_task(
+            bounded, request_id="non-chain-spend", configuration=role_set
+        )
+        dispatch.reserve_dispatch(
+            task,
+            request_id="non-chain-spend",
+            route="direct_call",
+            stage=runner.GENERATION_STAGE,
+            input_digest="a" * 64,
+            version_digest="b" * 64,
+            reserve_usd=reserve,
+            bound_evidence_digest="c" * 64,
+        )
+
     def run_generation(
         self,
         *,
@@ -279,6 +339,7 @@ class RunnerTestBase(unittest.TestCase):
         api_key=_API_KEY,
         transport=None,
         material=None,
+        sleep=None,
     ):
         return execute_generation_task(
             self.store,
@@ -294,6 +355,7 @@ class RunnerTestBase(unittest.TestCase):
             source_refs=[self.source_ref] if source_refs is None else source_refs,
             api_key=api_key,
             transport=self.transport if transport is None else transport,
+            sleep=(lambda _delay: None) if sleep is None else sleep,
         )
 
 
@@ -416,6 +478,13 @@ class RefusalTest(RunnerTestBase):
             self.run_generation(hosted_ref=hosted)
         self.assertEqual(self.transport.call_count, 0)
 
+    def test_request_id_too_long_to_reserve_retry_room_refused(self):
+        # ADR 006: a base id must leave room for the deterministic ``-r2`` suffix.
+        long_id = "g" * (runner.MAX_IDENTIFIER_LEN - runner._RETRY_SUFFIX_ROOM + 1)
+        with self.assertRaises(GenerationRunnerError):
+            self.run_generation(request_id=long_id)
+        self.assertEqual(self.transport.call_count, 0)
+
     def test_second_call_after_settled_one_refused(self):
         # First call: reserve 0.065536 fits under the cap 0.0656.
         hosted = self._hosted("a-hosted-tight", "rev-tight", budget="0.0656")
@@ -434,22 +503,84 @@ class RefusalTest(RunnerTestBase):
 # Ambiguous / malformed outcomes
 # --------------------------------------------------------------------------- #
 class OutcomeTest(RunnerTestBase):
-    def test_http_5xx_unknown_reserve_retained_counted(self):
+    def test_http_5xx_retried_then_success_two_posts(self):
+        # ADR 006: an ambiguous 503 is retried under a new id; the base becomes a
+        # conservative terminal failure (estimated = its reserve) and the retried
+        # success is reported under the base request id.
         self.transport.responses.append(
             TransportResponse(status=503, body_text=json.dumps({"error": {"code": 503}}), truncated=False)
         )
+        self.transport.responses.append(_completion(_proposal()))
         result = self.run_generation()
-        self.assertEqual(result["outcome"], "unknown")
-        self.assertEqual(result["cost"]["state"], "unknown")
-        self.assertIsNone(result["cost"]["amount_usd"])
-        dispatch = RuntimeDispatchRepository(self.store).get_dispatch_by_request("gen-1")
-        self.assertEqual(dispatch.state, "unknown")
-        self.assertEqual(dispatch.reserve_usd, "0.065536")
-        # The retained reserve is counted against the budget.
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["proposal"], _proposal())
+        self.assertEqual(result["request_id"], "gen-1")
+
+        dispatch = RuntimeDispatchRepository(self.store)
+        base = dispatch.get_dispatch_by_request("gen-1")
+        self.assertTrue(is_retry_resolved(base))
+        self.assertEqual(base.state, "failed")
+        self.assertEqual(base.cost_state, "estimated")
+        self.assertEqual(base.cost_amount_usd, "0.065536")
+        retry = dispatch.get_dispatch_by_request("gen-1-r1")
+        self.assertEqual(retry.state, "completed")
+        # Readback by the base id resolves the chain to the completed member.
+        readback = get_generation_outcome(self.store, "gen-1")
+        self.assertEqual(readback["outcome"], "completed")
+        self.assertEqual(readback["dispatch_id"], retry.dispatch_id)
+
+    def test_three_ambiguous_exhausts_and_frees_slot(self):
+        # A large non-chain spend in the stage lets the retries clear the overhead
+        # cap, so all three attempts are sent and the last is abandoned.
+        self._seed_non_chain_stage_spend(reserve="0.50")
+        for _ in range(3):
+            self.transport.responses.append(
+                TransportResponse(status=503, body_text=json.dumps({"error": {"code": 503}}), truncated=False)
+            )
+        result = self.run_generation()
+        self.assertEqual(self.transport.call_count, 3)
+        self.assertEqual(result["outcome"], "failed")
+        dispatch = RuntimeDispatchRepository(self.store)
+        for rid in ("gen-1", "gen-1-r1", "gen-1-r2"):
+            self.assertTrue(is_retry_resolved(dispatch.get_dispatch_by_request(rid)), rid)
+        # The serial remote slot is released and readback reports a non-completion.
         self.assertEqual(
-            runner._role_exposure(self.store, role=_ROLE, hosted_ref=self.hosted_ref),
-            __import__("decimal").Decimal("0.065536"),
+            runtime_dispatch_remote_state(self.store.connection, self.project_id), "none"
         )
+        self.assertEqual(get_generation_outcome(self.store, "gen-1")["outcome"], "failed")
+
+    def test_rerun_with_preexisting_unknown_supersedes_and_retries(self):
+        # Simulate a crash that left the base attempt ambiguous (never sent again):
+        # stop the runner after the base attempt's error, then re-run.
+        base_id = "gen-1"
+        real_next = runner.next_attempt
+        calls = {"n": 0}
+
+        def stop_after_first(store, request_id, **kwargs):
+            # Let the base attempt run; abort before ``next_attempt`` supersedes it.
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise _StopRetry()
+            return real_next(store, request_id, **kwargs)
+
+        self.transport.responses.append(RuntimeError("synthetic network failure"))
+        with mock.patch.object(runner, "next_attempt", stop_after_first):
+            with self.assertRaises(_StopRetry):
+                self.run_generation(request_id=base_id)
+        dispatch = RuntimeDispatchRepository(self.store)
+        base = dispatch.get_dispatch_by_request(base_id)
+        self.assertEqual(base.state, "unknown")
+        self.assertEqual(self.transport.call_count, 1)
+
+        # Re-run: the pre-existing unknown base is superseded, never re-POSTed.
+        self.transport.responses.append(_completion(_proposal()))
+        result = self.run_generation(request_id=base_id)
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(result["outcome"], "completed")
+        base = dispatch.get_dispatch_by_request(base_id)
+        self.assertTrue(is_retry_resolved(base))
+        self.assertEqual(dispatch.get_dispatch_by_request("gen-1-r1").state, "completed")
 
     def test_malformed_json_not_completed_proposal_none(self):
         choice = {"finish_reason": "stop", "message": {"role": "assistant", "content": "not json"}}

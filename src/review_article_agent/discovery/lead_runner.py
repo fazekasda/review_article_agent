@@ -59,9 +59,13 @@ What this module deliberately **is not**
   :class:`~review_article_agent.storage.human_approvals.HumanApprovalRepository`.
   No field of the batch document (or the model's reply) can create, widen, or
   substitute for that gate.
-* **Not a retry engine.** One logical request per durable job: a completed
-  request returns its stored outcome; an interrupted one recovers to ``unknown``
-  and is never re-sent. It never activates execution itself.
+* **Bounded automatic retry, not a general retry engine.** One logical request
+  per durable job: a completed request returns its stored outcome; an interrupted
+  one recovers to ``unknown``. Under ADR 006 an ambiguous (``unknown``)
+  ``direct_call`` outcome is retried automatically under a **new** deterministic
+  id (:mod:`review_article_agent.runtime.retry`), never re-POSTing the same
+  identity; the retry is bounded and resolved to a definitive outcome. It never
+  activates execution itself.
 * **Not a legal or scientific verifier.** Provider-term, pricing, and
   privacy-review evidence references are only checked to be present, non-empty,
   and time-valid; they are human-reviewed evidence, never a machine legal
@@ -78,8 +82,9 @@ import hashlib
 import hmac
 import json
 import re
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ..domain.errors import ReviewAgentError
 from ..domain.records import (
@@ -90,7 +95,12 @@ from ..domain.records import (
     validate_rights_record,
 )
 from ..runtime import lead
-from ..runtime.dispatch import RuntimeDispatchRepository
+from ..runtime.dispatch import (
+    DispatchStateError,
+    RuntimeDispatchRepository,
+    retry_request_ids,
+)
+from ..runtime.retry import next_attempt
 from ..runtime.lead import LeadConfig, TransportResponse
 from ..runtime.roles import (
     BoundedTask,
@@ -153,6 +163,10 @@ LEAD_ADAPTER_REVISION = "lead.direct.v1"
 #: Bounded sizes for the evidence references and identifiers.
 MAX_EVIDENCE_REF_LEN = 2048
 MAX_IDENTIFIER_LEN = 512
+
+#: Characters a retry suffix (``-r2``) adds to a base request id (ADR 006), so a
+#: base id must leave this much room under :data:`MAX_IDENTIFIER_LEN`.
+_RETRY_SUFFIX_ROOM = len("-r2")
 
 #: The exact envelope and payload keys (no other key is permitted).
 _ENVELOPE_KEYS = ("schema_version", "document_type", "payload")
@@ -862,18 +876,50 @@ def _resolve_metadata(runtime, task, dispatch_record, outcome):
     return chosen
 
 
+def _resolve_chain_record(dispatch, request_id: str):
+    """Resolve one logical call's bounded retry chain to its terminal member.
+
+    ``request_id`` is the user-visible **base** id (ADR 006): the chain is
+    ``retry_request_ids(base)`` = ``[base, base-r1, base-r2]``. A **completed**
+    member wins (a retried success is still found); otherwise the most recent
+    recorded member is returned, so an ``exhausted``/``refused_overhead``
+    resolution (a terminal ``failed`` row) is reported as a definitive
+    non-completion and never as a completion. A ``request_id`` that already
+    carries a retry suffix is an internal attempt id: its exact row is returned.
+    """
+    try:
+        chain = retry_request_ids(request_id)
+    except ValueError:
+        # ``request_id`` already carries a retry suffix (an internal attempt id):
+        # resolve its exact row rather than treating it as a base.
+        return dispatch.get_dispatch_by_request(request_id)
+    rows = [dispatch.get_dispatch_by_request(rid) for rid in chain]
+    for row in rows:
+        if row is not None and row.state == "completed":
+            return row
+    existing = [row for row in rows if row is not None]
+    return existing[-1] if existing else None
+
+
 def _readback(store, request_id: str, *, posted: bool = False) -> dict:
     """Build the durable outcome mapping from stored rows (no API key, no text).
 
     Every value is recomputed from the exact persisted task/dispatch/machine
     records, so a crash between the runner commit and any outer job commit loses
     nothing. The monetary cost comes **only** from the authoritative
-    direct-dispatch ledger, never from the machine envelope.
+    direct-dispatch ledger, never from the machine envelope. The logical request's
+    bounded retry chain is resolved to its completed member (or its most recent
+    terminal member) so a retried success is found by the base id.
     """
     runtime = RuntimeRepository(store)
     dispatch = RuntimeDispatchRepository(store)
+    dispatch_record = _resolve_chain_record(dispatch, request_id)
     task = runtime.get_task_by_request(request_id)
-    dispatch_record = dispatch.get_dispatch_by_request(request_id)
+    if dispatch_record is not None:
+        # A retried success is attached to its attempt's task, not the base's.
+        attempt_task = runtime.get_task(dispatch_record.task_id)
+        if attempt_task is not None:
+            task = attempt_task
 
     mapping = {
         "request_id": request_id,
@@ -1161,21 +1207,32 @@ def execute_lead_proposal(
     request_id: str,
     api_key: str,
     transport=None,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict:
-    """Run **one** revision-scoped hosted lead proposal request (single-shot).
+    """Run **one** revision-scoped hosted lead proposal request (bounded retry).
 
     The exact approved batch is re-read from the store, its named
     ``batch``/``discovery.hosted_use.<purpose>`` gate and every pinned source's
     hosted-transfer rights and context are revalidated, a one-step lead task is
-    recorded, and a ``direct_call`` dispatch is reserved **before** the single
-    POST. An already-recorded request is returned from storage without a second
-    POST (the new-send decision and the reserve are made under one registry write
-    guard, so two concurrent callers can never both send); an ambiguous outcome
-    retains its reserve and is never re-sent, and restart reconciliation is the
-    outer worker's job. The returned mapping carries only safe IDs/status — never
-    the API key or source text.
+    recorded, and a ``direct_call`` dispatch is reserved **before** each POST. An
+    already-recorded request is returned from storage without a second POST (the
+    new-send decision and the reserve are made under one registry write guard, so
+    two concurrent callers can never both send). Under ADR 006 an ambiguous
+    (``unknown``) ``direct_call`` outcome is retried under a **new** deterministic
+    id (``{base}-r1``, ``{base}-r2``) by
+    :func:`~review_article_agent.runtime.retry.next_attempt`; the same request
+    identity is never re-POSTed, and restart reconciliation remains the outer
+    worker's job. The user-visible request id stays the base. ``sleep`` is the
+    backoff callable injected into ``next_attempt`` (tests pass a no-op; the
+    default is :func:`time.sleep`). The returned mapping carries only safe
+    IDs/status — never the API key or source text.
     """
     request_id = _require_identifier(request_id, "request_id")
+    if len(request_id) > MAX_IDENTIFIER_LEN - _RETRY_SUFFIX_ROOM:
+        # Reserve room for the deterministic ``-r2`` retry suffix (ADR 006).
+        raise HostedLeadError(
+            "request_id: is too long to reserve room for a bounded retry suffix"
+        )
     if not isinstance(api_key, str) or api_key == "":
         raise HostedLeadError("api_key: a non-empty credential is required")
     # The exact active, non-draining execution holder is required before any local
@@ -1187,61 +1244,92 @@ def execute_lead_proposal(
     runtime = RuntimeRepository(store)
     dispatch = RuntimeDispatchRepository(store)
 
-    # Idempotent task record (a divergent request under the same key conflicts).
-    task_record = runtime.record_task(
+    # The base logical task is recorded once (idempotent for a replay; a divergent
+    # request under the same key conflicts), so an already-recorded request is
+    # observed.
+    runtime.record_task(
         prepared["bounded"],
         request_id=prepared["request_id"],
         configuration=prepared["role_set"],
     )
 
-    # The single exclusive **new-send** decision is made inside the registry
-    # write guard, together with the reserve and the send claim. Two concurrent
-    # callers therefore can never both proceed to a POST: the loser observes the
-    # recorded dispatch here and returns its in-flight/stored state. A recorded
-    # logical request is never re-sent, and a live duplicate's remote execution
-    # is never mutated (restart reconciliation is the outer worker's job; a
-    # replay only observes).
-    with registry.execution_write_guard(activation_token, store.project_id):
-        existing = dispatch.get_dispatch_by_request(prepared["request_id"])
-        if existing is not None:
-            return _readback(store, prepared["request_id"], posted=False)
-        dispatch_record = dispatch.reserve_dispatch(
-            task_record,
-            request_id=prepared["request_id"],
-            route="direct_call",
-            stage=DISCOVERY_STAGE,
-            input_digest=prepared["input_digest"],
-            version_digest=prepared["version_digest"],
-            reserve_usd=prepared["plan"].reserve_usd,
-            bound_evidence_digest=prepared["bound_evidence_digest"],
+    effective_sleep = time.sleep if sleep is None else sleep
+    posted_any = False
+
+    # The bounded direct-call retry loop (ADR 006): ``next_attempt`` owns the
+    # supersede/abandon transitions; the runner only sends the decision's new
+    # identity. Each attempt gets its own task/dispatch id, so the same request
+    # identity is never re-POSTed.
+    while True:
+        try:
+            decision = next_attempt(
+                store, prepared["request_id"], sleep=effective_sleep, repo=dispatch
+            )
+        except DispatchStateError:
+            # A concurrent caller holds the in-flight send claim (or a crash left
+            # an unreconciled claim): observe the durable state, never race it.
+            return _readback(
+                store, prepared["request_id"], posted=posted_any
+            )
+        if decision.outcome != "dispatch":
+            return _readback(
+                store, prepared["request_id"], posted=posted_any
+            )
+
+        attempt_id = decision.request_id
+        attempt_task = runtime.record_task(
+            prepared["bounded"],
+            request_id=attempt_id,
+            configuration=prepared["role_set"],
         )
-        dispatch_record = dispatch.mark_submitted(dispatch_record.dispatch_id)
+        # The single exclusive **new-send** decision is made inside the registry
+        # write guard, together with the reserve and the send claim. Two concurrent
+        # callers therefore can never both proceed to a POST: the loser observes
+        # the recorded dispatch here and returns its in-flight/stored state. A
+        # re-claimed ``reserved`` row (never sent) reuses its own reserve.
+        with registry.execution_write_guard(activation_token, store.project_id):
+            existing = dispatch.get_dispatch_by_request(attempt_id)
+            if existing is None:
+                dispatch_record = dispatch.reserve_dispatch(
+                    attempt_task,
+                    request_id=attempt_id,
+                    route="direct_call",
+                    stage=DISCOVERY_STAGE,
+                    input_digest=prepared["input_digest"],
+                    version_digest=prepared["version_digest"],
+                    reserve_usd=prepared["plan"].reserve_usd,
+                    bound_evidence_digest=prepared["bound_evidence_digest"],
+                )
+            else:
+                dispatch_record = existing
+            dispatch_record = dispatch.mark_submitted(dispatch_record.dispatch_id)
 
-    # The registry lock is released before any network I/O (no lock over network):
-    # revalidate the exact gate and the active execution token immediately before
-    # the POST.
-    _assert_gate_satisfied(
-        store, prepared["batch_ref"]["artifact_id"], prepared["purpose"]
-    )
-    _assert_token_active(registry, store, activation_token)
-
-    result = lead.execute_lead(
-        prepared["plan"], api_key=prepared["api_key"], transport=transport
-    )
-
-    # Completing/reconciling already-accepted in-flight work must still commit if
-    # the owner began a drain while the request was in flight; the same
-    # token/project is required, and no new dispatch is started here.
-    with registry.execution_write_guard(
-        activation_token, store.project_id, allow_draining=True
-    ):
-        return _commit_result(
-            store,
-            runtime=runtime,
-            dispatch=dispatch,
-            prepared=prepared,
-            task_record=task_record,
-            dispatch_id=dispatch_record.dispatch_id,
-            fence=dispatch_record.current_fence,
-            result=result,
+        # The registry lock is released before any network I/O (no lock over
+        # network): revalidate the exact gate and the active execution token
+        # immediately before the POST.
+        _assert_gate_satisfied(
+            store, prepared["batch_ref"]["artifact_id"], prepared["purpose"]
         )
+        _assert_token_active(registry, store, activation_token)
+
+        result = lead.execute_lead(
+            prepared["plan"], api_key=prepared["api_key"], transport=transport
+        )
+        posted_any = True
+
+        # Completing/reconciling already-accepted in-flight work must still commit
+        # if the owner began a drain while the request was in flight; the same
+        # token/project is required, and no new dispatch is started here.
+        with registry.execution_write_guard(
+            activation_token, store.project_id, allow_draining=True
+        ):
+            _commit_result(
+                store,
+                runtime=runtime,
+                dispatch=dispatch,
+                prepared=prepared,
+                task_record=attempt_task,
+                dispatch_id=dispatch_record.dispatch_id,
+                fence=dispatch_record.current_fence,
+                result=result,
+            )

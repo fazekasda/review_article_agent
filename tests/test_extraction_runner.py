@@ -52,6 +52,12 @@ _FIXED_CHALLENGE = "TEST-CHAL-0001"
 _OWNER_UID = 1000
 _BASE_TIME = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
 
+
+def _no_sleep(_delay: float) -> None:
+    """A no-op retry backoff for tests (ADR 006 injects the sleeper)."""
+    return None
+
+
 # One paragraph and one table asset so asset coverage is exercised.
 JATS = (
     '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -375,6 +381,7 @@ class RunnerTestBase(unittest.TestCase):
             extraction_ref=extraction_ref, mode=mode, pilot_ref=pilot_ref,
             artifact_id=artifact_id, revision_id=revision_id,
             rights=_rights(self.project_id, artifact_id, revision_id),
+            sleep=_no_sleep,
         )
 
     def pilot_extraction(self, *, request_id="run-x", artifact_id="a-run-x", revision_id="rev-run-x"):
@@ -610,6 +617,151 @@ class ReplayTest(RunnerTestBase):
         self.pilot_extraction()
         with self.assertRaises(RuntimeConflictError):
             self.run_extraction(request_id="run-x", artifact_id="a-run-other", revision_id="rev-run-other")
+
+
+class DirectCallRetryTest(RunnerTestBase):
+    """The bounded automatic direct-call retry wired into ``execute_run`` (ADR 006)."""
+
+    def _dispatch_repo(self):
+        from review_article_agent.runtime.dispatch import RuntimeDispatchRepository
+
+        return RuntimeDispatchRepository(self.store)
+
+    def test_transport_error_then_success_retries_and_binds(self):
+        from review_article_agent.runtime.dispatch import (
+            is_retry_resolved,
+            runtime_dispatch_remote_state,
+        )
+
+        # The base POST is an ambiguous transport error; the retry (``-r1``) succeeds.
+        self.transport.responses.append(RuntimeError("ambiguous transport failure"))
+        self.transport.responses.append(_completion(_extraction_output(self.passages, self.source_keys)))
+        result = self.run_extraction(request_id="run-retry")
+
+        # Two distinct POSTs (never the same identity); the user-visible request id
+        # stays the base.
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(result["request_id"], "run-retry")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "completed")
+
+        dispatch = self._dispatch_repo()
+        base = dispatch.get_dispatch_by_request("run-retry")
+        attempt = dispatch.get_dispatch_by_request("run-retry-r1")
+        self.assertIsNotNone(base)
+        self.assertIsNotNone(attempt)
+        # The ambiguous base is conservatively resolved to failed/estimated = reserve.
+        self.assertTrue(is_retry_resolved(base))
+        self.assertEqual(base.state, "failed")
+        self.assertEqual(base.cost_state, "estimated")
+        self.assertEqual(base.cost_amount_usd, base.reserve_usd)
+        # The retry completed, and the result is bound to the completed retry.
+        self.assertEqual(attempt.state, "completed")
+        self.assertEqual(result["dispatch_id"], attempt.dispatch_id)
+        self.assertIsNotNone(result["run_ref"])
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id), "none"
+        )
+        # The receipt verifies against the completed retry (same plan/digest).
+        receipt = require_run(self.store, result["run_ref"], purpose="extraction")
+        self.assertEqual(receipt["dispatch_id"], attempt.dispatch_id)
+
+    def test_three_ambiguous_attempts_exhaust_and_free_the_slot(self):
+        from review_article_agent.runtime.dispatch import (
+            is_retry_resolved,
+            runtime_dispatch_remote_state,
+        )
+
+        # Seed non-chain stage spend so the per-stage overhead cap permits both
+        # retries (the first retry is floored, the second needs headroom).
+        self.transport.responses.append(
+            _completion(_extraction_output(self.passages, self.source_keys), cost=1.0)
+        )
+        self.run_extraction(request_id="run-seed", artifact_id="a-seed", revision_id="rev-seed")
+
+        # base, -r1, -r2 are all ambiguous.
+        for _ in range(3):
+            self.transport.responses.append(RuntimeError("ambiguous transport failure"))
+        result = self.run_extraction(
+            request_id="run-exhaust", artifact_id="a-exhaust", revision_id="rev-exhaust"
+        )
+
+        self.assertEqual(self.transport.call_count, 4)  # seed + three attempts
+        self.assertEqual(result["request_id"], "run-exhaust")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertIsNone(result["run_ref"])
+
+        dispatch = self._dispatch_repo()
+        for rid in ("run-exhaust", "run-exhaust-r1", "run-exhaust-r2"):
+            row = dispatch.get_dispatch_by_request(rid)
+            self.assertIsNotNone(row, rid)
+            self.assertTrue(is_retry_resolved(row), rid)
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id), "none"
+        )
+
+    def test_pre_existing_unknown_base_supersedes_and_retries(self):
+        from review_article_agent.runtime.dispatch import (
+            is_retry_resolved,
+            runtime_dispatch_remote_state,
+        )
+        from review_article_agent.runtime.retry import RetryDecision
+
+        # First pass: a transport error leaves the base ambiguous. Stop the loop
+        # after that attempt (as a crash between the POST and the retry would),
+        # so the base row is durably ``unknown``.
+        real_next = runner.next_attempt
+        calls = {"n": 0}
+
+        def stop_after_base(store, base_request_id, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_next(store, base_request_id, **kwargs)
+            return RetryDecision("definitive", base_request_id)
+
+        self.transport.responses.append(RuntimeError("ambiguous transport failure"))
+        with mock.patch.object(runner, "next_attempt", stop_after_base):
+            self.run_extraction(
+                request_id="run-preexisting", artifact_id="a-pre", revision_id="rev-pre"
+            )
+        self.assertEqual(self.transport.call_count, 1)
+        dispatch = self._dispatch_repo()
+        base = dispatch.get_dispatch_by_request("run-preexisting")
+        self.assertEqual(base.state, "unknown")
+
+        # Re-run: the pre-existing unknown base is superseded and the retry
+        # (``-r1``) succeeds; the base is never re-POSTed.
+        self.transport.responses.append(_completion(_extraction_output(self.passages, self.source_keys)))
+        result = self.run_extraction(
+            request_id="run-preexisting", artifact_id="a-pre", revision_id="rev-pre"
+        )
+        self.assertEqual(self.transport.call_count, 2)  # base (first pass) + one retry
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["request_id"], "run-preexisting")
+        base = dispatch.get_dispatch_by_request("run-preexisting")
+        attempt = dispatch.get_dispatch_by_request("run-preexisting-r1")
+        self.assertTrue(is_retry_resolved(base))
+        self.assertEqual(attempt.state, "completed")
+        self.assertEqual(result["dispatch_id"], attempt.dispatch_id)
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id), "none"
+        )
+
+    def test_request_id_leaves_room_for_the_retry_suffix(self):
+        # A base that leaves no room for the ``-r2`` suffix is refused before any
+        # dispatch; a base at the exact bound still retries within the bound.
+        bound = runner.MAX_IDENTIFIER_LEN - runner._RETRY_SUFFIX_LEN
+        with self.assertRaises(ExtractionRunnerError):
+            self.run_extraction(request_id="r" * (bound + 1))
+
+        at_bound = "r" * bound
+        self.transport.responses.append(RuntimeError("ambiguous transport failure"))
+        self.transport.responses.append(_completion(_extraction_output(self.passages, self.source_keys)))
+        result = self.run_extraction(request_id=at_bound)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["request_id"], at_bound)
+        self.assertEqual(self.transport.call_count, 2)
 
 
 class ReceiptIntegrityFixesTest(RunnerTestBase):
