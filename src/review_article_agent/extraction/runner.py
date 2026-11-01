@@ -1590,8 +1590,15 @@ def _commit_atomic(
                 result_ref=record.record_id, result_digest=record.stored_digest,
             )
         elif outcome == "failed":
-            dispatch._settle_cost_in_transaction(dispatch_record.dispatch_id, cost_state="not_incurred", allow_definitive_not_incurred=True)
+            # Mark the definitive failure *before* settling the cost. A
+            # ``submitted`` row may never claim ``not_incurred`` (the
+            # ``runtime_dispatch_state`` CHECK), so settling first raised an
+            # uncaught CHECK violation that the worker swallowed as an
+            # ``indeterminate`` ambiguous outcome. ``failed`` is not one of the
+            # forbidden states, so the ``not_incurred`` settlement is legal once
+            # the transition has been recorded.
             dispatch._mark_failed_in_transaction(dispatch_record.dispatch_id, definitive_rejection=True)
+            dispatch._settle_cost_in_transaction(dispatch_record.dispatch_id, cost_state="not_incurred", allow_definitive_not_incurred=True)
             return None
         elif outcome == "unknown":
             dispatch._settle_cost_in_transaction(dispatch_record.dispatch_id, cost_state="unknown")

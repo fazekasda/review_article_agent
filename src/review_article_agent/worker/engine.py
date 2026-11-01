@@ -2004,7 +2004,15 @@ class WorkerEngine:
                 escalate=True,
             )
             return
-        except BaseException:  # noqa: BLE001 - the POST may have happened: unknown
+        except BaseException as exc:  # noqa: BLE001 - the POST may have happened: unknown
+            # Fail closed: the outcome is unknown. Log only the exception class
+            # name (never the message, which may carry content) so the cause is
+            # visible to an operator; the classification itself is unchanged.
+            print(
+                f"worker: extraction job {job_id} outcome indeterminate "
+                f"({type(exc).__name__})",
+                file=sys.stderr,
+            )
             self._discovery_fail(
                 repo,
                 project_id,

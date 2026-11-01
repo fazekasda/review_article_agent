@@ -692,6 +692,69 @@ class ProtocolErrorDiagnosticTest(RunnerTestBase):
         for marker in ("sk-or-test", "PRIVATE_SOURCE", "openai/other", "gen-diag"):
             self.assertNotIn(marker, blob)
 
+    def test_definitive_rejection_commits_failed_without_check_violation(self):
+        # A definitive pre-billing rejection (HTTP 400) is a resolved ``failed``
+        # outcome. It must settle the cost ``not_incurred`` and record the
+        # dispatch ``failed`` without tripping the ``runtime_dispatch_state``
+        # CHECK (a submitted row may never claim ``not_incurred``). The old
+        # settle-before-fail order raised an uncaught sqlite CHECK violation,
+        # which the worker swallowed as an ``indeterminate`` ambiguous outcome.
+        from review_article_agent.runtime.dispatch import RuntimeDispatchRepository
+
+        self.transport.responses.append(
+            TransportResponse(
+                status=400,
+                body_text='{"error": {"message": "invalid request"}}',
+                truncated=False,
+            )
+        )
+        result = self.run_extraction(
+            request_id="run-def", artifact_id="a-run-def", revision_id="rev-run-def"
+        )
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["cost_state"], "not_incurred")
+        self.assertIsNone(result["cost_amount_usd"])
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch_by_request("run-def")
+        self.assertEqual(dispatch.state, "failed")
+        self.assertEqual(dispatch.cost_state, "not_incurred")
+        self.assertIsNone(dispatch.cost_amount_usd)
+
+    def test_float_in_model_output_does_not_raise_record_validation_error(self):
+        # The shared strict JSON parser parses floats as ``Decimal`` (for exact
+        # cost arithmetic). Untrusted extraction **content** must not leak a
+        # ``Decimal`` into the proposal: it is not JSON-serializable, so the
+        # runner's canonical-JSON step raised an uncaught
+        # ``RecordValidationError`` (which the worker swallowed as an
+        # ``indeterminate`` ambiguous outcome). A schema-valid numeric detail
+        # carrying a float must be accepted, and any float elsewhere must be a
+        # clean escalation, never a crash.
+        output = _extraction_output(self.passages, self.source_keys)
+        output["findings"][0]["numeric_details"] = [
+            {
+                "name": "clearance",
+                "value": {"state": "known", "value": 5.2},
+                "unit": {"state": "known", "value": "mg"},
+                "denominator": {"state": "not_applicable", "value": None},
+            }
+        ]
+        self.transport.responses.append(_completion(output))
+        result = self.run_extraction(
+            request_id="run-float", artifact_id="a-run-float", revision_id="rev-run-float"
+        )
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["status"], "completed")
+
+        # A bare float in a wrong place is a clean escalation, not a crash.
+        bad = {"schema_version": 1, "summary": 1.5}
+        self.transport.responses.append(_completion(bad))
+        result = self.run_extraction(
+            request_id="run-float-bad", artifact_id="a-run-float-bad",
+            revision_id="rev-run-float-bad",
+        )
+        self.assertEqual(result["outcome"], "escalation")
+        self.assertEqual(result["status"], "completed")
+
 
 class DirectCallRetryTest(RunnerTestBase):
     """The bounded automatic direct-call retry wired into ``execute_run`` (ADR 006)."""

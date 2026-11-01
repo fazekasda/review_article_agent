@@ -99,6 +99,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Callable, Mapping
 
 from ..domain.records import canonical_json
@@ -584,7 +585,29 @@ def _parse_extraction_json(text: str) -> Mapping[str, Any]:
         raise _ResponseDefect(
             "response_content_not_object", "extraction response is not a JSON object"
         )
-    return lead._deep_freeze(parsed)
+    return lead._deep_freeze(_json_portable(parsed))
+
+
+def _json_portable(value: Any) -> Any:
+    """Recursively narrow exact ``Decimal`` numbers to JSON-native floats.
+
+    The shared strict parser parses floats as ``Decimal`` for exact cost
+    arithmetic, but the extraction **content** is untrusted *data* destined for
+    schema validation and durable storage — not a cost field. A ``Decimal`` is
+    not JSON-serializable and the extraction schema accepts only ``int``/``float``,
+    so leaving one in the proposal made the runner's canonical-JSON step raise an
+    uncaught :class:`~review_article_agent.domain.records.RecordValidationError`
+    (which the worker then swallowed as an ``indeterminate`` ambiguous outcome).
+    Finite Decimals are safe to narrow to float — the strict parser already
+    rejected ``NaN``/``Infinity``.
+    """
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Mapping):
+        return {key: _json_portable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_portable(item) for item in value]
+    return value
 
 
 def _classify_completion(

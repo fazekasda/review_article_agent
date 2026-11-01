@@ -243,6 +243,47 @@ class ExtractAdmissionAndCompletionTest(ExtractionWorkerBase):
         for marker in ("sk-or-test", "openai/other", "gen-1"):
             self.assertNotIn(marker, blob)
 
+    def test_definitive_rejection_accepted_as_failed_not_indeterminate(self) -> None:
+        # A definitive pre-billing rejection (HTTP 400) is a resolved ``failed``
+        # outcome. It must be accepted as the job's result (cost ``not_incurred``)
+        # rather than escaping as an uncaught ``runtime_dispatch_state`` CHECK
+        # violation and being swallowed by the worker as an ``indeterminate``
+        # ambiguous outcome. This is the adapter->runner->worker seam of the live
+        # pilot failure (a job left ``waiting_human`` with no receipt).
+        from review_article_agent.runtime.dispatch import (
+            runtime_dispatch_remote_state,
+        )
+
+        self.transport.responses.append(
+            fx.TransportResponse(
+                status=400,
+                body_text='{"error": {"message": "invalid request"}}',
+                truncated=False,
+            )
+        )
+        engine = self.engine(api_key="sk-or-test")
+        res = self.submit(engine, request_id="run-def")
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        self.assertFalse(job["outcome_unresolved"])
+        accepted = job["accepted_result"]
+        self.assertIsNotNone(accepted)
+        result = accepted["result"]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["cost_state"], "not_incurred")
+        self.assertIsNone(result["cost_amount_usd"])
+        self.assertEqual(self.transport.call_count, 1)
+        # A definitive failure is not an in-flight/ambiguous remote outcome, so
+        # the single serial remote slot is freed.
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Missing credential / missing gate => zero POST
