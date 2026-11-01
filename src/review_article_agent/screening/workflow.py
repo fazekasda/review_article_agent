@@ -21,7 +21,7 @@ from ..parsing.core import NORMALIZATION_VERSION, PARSER_VERSION
 from ..parsing.repository import ParsingRepository, _NestedStore
 from ..runtime.dispatch import RuntimeDispatchRepository
 from ..runtime.gates import MAX_GATE_SNAPSHOT_ENTRIES
-from ..runtime.jev import MODEL, SAFE_MAX_REQUEST_BYTES, JevError, QuestionDef, build_request, validate_response
+from ..runtime.jev import MODEL, SAFE_MAX_REQUEST_BYTES, JevError, JevValidationError, QuestionDef, build_request, validate_response
 from ..storage.artifacts import ArtifactRepository, DependencyRef, sha256_digest
 from ..storage.decision_intents import DecisionIntentRepository
 from ..storage.decision_results import RESULT_KIND, DecisionResultRepository
@@ -271,7 +271,12 @@ def case_context(parsing, report_ref, passage_id, *, questions=None):
     # one-window case. Multi-window screening always goes through
     # :func:`case_windows` (one request per window).
     if questions is not None and ready:
-        context["text"] = case_windows(questions, context)[0]
+        try:
+            context["text"] = case_windows(questions, context)[0]
+        except JevError:
+            # A header/target region that cannot fit one request is not ready:
+            # fail closed and retain the case (never crash, never send).
+            context["ready"] = False
     return context
 
 
@@ -306,7 +311,17 @@ def _largest_body(definitions, prefix, suffix, text, start, bound):
     not cut a word; if the body has no whitespace the character boundary is used.
     Always advances by at least one character so packing terminates and loses
     nothing, even for a body that cannot itself fit ``bound``.
+
+    If even the **empty** body (the header/target/limitation region alone) does
+    not fit ``bound``, no body can ever fit, so this raises immediately instead of
+    emitting thousands of one-character windows. The check is cheap (one request
+    build) and is reached only for the first window of an otherwise-unpackable
+    case.
     """
+    if not _window_request_fits(definitions, prefix, "", suffix, bound):
+        raise JevValidationError(
+            "a window header/target/limitation region alone exceeds the request bound"
+        )
     if not _window_request_fits(definitions, prefix, text[start:start + 1], suffix, bound):
         return start + 1
     lo, hi = start + 1, len(text)

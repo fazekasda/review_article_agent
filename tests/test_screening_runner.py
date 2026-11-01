@@ -38,6 +38,8 @@ from review_article_agent.screening import ScreeningError, ScreeningRepository  
 from review_article_agent.screening import runner as screening_runner  # noqa: E402
 from review_article_agent.screening.runner import (  # noqa: E402
     ScreeningAuthorizationError,
+    ScreeningBudgetError,
+    ScreeningRunnerError,
     execute_screening_case,
 )
 from review_article_agent.storage import ArtifactRepository, ProjectStore, Registry, paths  # noqa: E402
@@ -266,6 +268,57 @@ class RunnerTestBase(unittest.TestCase):
         )
         return self.ref(artifact_id, revision_id)
 
+    def _put_source_bytes(self, artifact_id, revision_id, content):
+        self.artifacts.create_artifact(artifact_id, kind="document")
+        self.artifacts.import_revision(
+            artifact_id=artifact_id,
+            revision_id=revision_id,
+            content=content,
+            origin_locator="import:synthetic-source",
+            rights=_rights(self.project_id, artifact_id, revision_id),
+        )
+        return self.ref(artifact_id, revision_id)
+
+    def _put_report(self, source_ref, *, artifact_id, revision_id):
+        return ParsingRepository(self.store).parse_stored_document(
+            source_ref,
+            report_artifact_id=artifact_id,
+            report_revision_id=revision_id,
+            rights=_rights(self.project_id, artifact_id, revision_id),
+        )["report_ref"]
+
+    def large_report(self, *, paragraphs=400):
+        """A parsed report whose article text spans several Jev request windows."""
+        para = b"<sec><p>" + b"Alpha beta gamma delta epsilon zeta eta theta. " * 8 + b"</p></sec>"
+        body = para * paragraphs
+        jats = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b"<article><front><journal-meta/><article-meta>"
+            b'<article-id pub-id-type="pmid">12345678</article-id>'
+            b"</article-meta></front><body>" + body + b"</body></article>"
+        )
+        source = self._put_source_bytes("big-src", "big-rev", jats)
+        return self._put_report(source, artifact_id="big-report", revision_id="big-report-r1")
+
+    def huge_passage_report(self, *, words=8000):
+        """A parsed report with one passage so large its ``Target passage`` header
+        alone cannot fit one Jev request."""
+        body = ("word " * words).encode()
+        jats = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b"<article><front><journal-meta/><article-meta>"
+            b'<article-id pub-id-type="pmid">12345678</article-id>'
+            b"</article-meta></front><body><sec><p>" + body + b"</p></sec></body></article>"
+        )
+        source = self._put_source_bytes("huge-src", "huge-rev", jats)
+        return self._put_report(source, artifact_id="huge-report", revision_id="huge-report-r1")
+
+    def window_count(self, report_ref, *, passage_id=None):
+        from review_article_agent.screening.workflow import case_context, case_windows, questions
+        context = case_context(
+            ParsingRepository(self.store), report_ref, passage_id, questions=questions(_config()))
+        return len(case_windows(questions(_config()), context))
+
     def _put_screening(self, kind, payload, *, artifact_id=None, revision_id=None):
         artifact_id = artifact_id or kind
         revision_id = revision_id or (kind + "-r1")
@@ -361,6 +414,175 @@ class ExecuteTest(RunnerTestBase):
         with self.assertRaises(ScreeningAuthorizationError):
             self.run_case(token="not-the-active-token")
         self.assertEqual(self.transport.call_count, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Windowed dispatch (S19-SCRWIN-RUN)
+# --------------------------------------------------------------------------- #
+class MultiWindowTest(RunnerTestBase):
+    def test_one_request_per_window_and_ordered_refs(self):
+        report = self.large_report()
+        count = self.window_count(report)
+        self.assertGreater(count, 1)
+        for _ in range(count):
+            self.transport.responses.append(_jev_response(0.1))
+        result = self.run_case(request_id="multi-1", report_ref=report)
+        self.assertEqual(self.transport.call_count, count)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["window_count"], count)
+        self.assertEqual(result["windowing_version"], "screening-windows/1")
+        self.assertIsNone(result["decision_result_ref"])  # multi-window: no single ref
+        self.assertEqual(len(result["decision_result_refs"]), count)
+        self.assertEqual(
+            [w["request_id"] for w in result["windows"]],
+            ["multi-1-w%02d" % k for k in range(1, count + 1)],
+        )
+        # Each window is its own completed dispatch, and the ordered refs bind.
+        dispatch = RuntimeDispatchRepository(self.store)
+        for window in result["windows"]:
+            record = dispatch.get_dispatch(window["dispatch_id"])
+            self.assertEqual(record.state, "completed")
+            self.assertEqual(record.request_id, window["request_id"])
+
+    def test_ordered_refs_bind_in_case_and_follow_max_rule(self):
+        report = self.large_report()
+        count = self.window_count(report)
+        # A single low-probability window plus a high-probability last window:
+        # the aggregate must retain (max rule), not exclude.
+        for _ in range(count - 1):
+            self.transport.responses.append(_jev_response(0.1))
+        self.transport.responses.append(_jev_response(0.9))
+        result = self.run_case(request_id="multi-2", report_ref=report)
+        self.assertEqual(result["status"], "completed")
+        case = {
+            "id": "paper1", "report_ref": report, "passage_id": None,
+            "response": {"decision_result_refs": result["decision_result_refs"]},
+        }
+        observed = self.screening._case(_config(), case)
+        self.assertEqual(observed["response_provenance"], "verified_dispatch")
+        self.assertEqual(observed["machine"]["label"], "retain")
+        self.assertEqual(len(observed["windows"]), count)
+        self.assertEqual(observed["windowing_version"], "screening-windows/1")
+
+    def test_rerun_after_full_completion_zero_posts(self):
+        report = self.large_report()
+        count = self.window_count(report)
+        for _ in range(count):
+            self.transport.responses.append(_jev_response(0.1))
+        first = self.run_case(request_id="multi-3", report_ref=report)
+        self.assertEqual(self.transport.call_count, count)
+        replay = self.run_case(request_id="multi-3", report_ref=report)
+        self.assertEqual(self.transport.call_count, count)  # zero new POSTs
+        self.assertEqual(replay["status"], "completed")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(
+            [w["dispatch_id"] for w in replay["windows"]],
+            [w["dispatch_id"] for w in first["windows"]],
+        )
+
+    def test_ambiguous_window_stops_and_never_resends(self):
+        report = self.large_report()
+        count = self.window_count(report)
+        self.assertGreater(count, 2)
+        # Window 1 completes, window 2 is ambiguous (500): window 3 must not be sent.
+        self.transport.responses.append(_jev_response(0.1))
+        self.transport.responses.append(jev.TransportResponse(500, ""))
+        result = self.run_case(request_id="multi-4", report_ref=report)
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(result["status"], "unknown")
+        self.assertIsNone(result["decision_result_refs"])
+        self.assertEqual(len(result["windows"]), 2)  # window 3 never attempted
+        self.assertEqual(result["windows"][0]["status"], "completed")
+        self.assertEqual(result["windows"][1]["status"], "unknown")
+        # The missing windows have no dispatch rows at all.
+        dispatch = RuntimeDispatchRepository(self.store)
+        self.assertIsNone(dispatch.get_dispatch_by_request("multi-4-w03"))
+        # A re-run replays the completed window and does not re-POST window 2.
+        rerun = self.run_case(request_id="multi-4", report_ref=report)
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(rerun["status"], "unknown")
+        self.assertTrue(rerun["windows"][0]["replayed"])
+
+    def test_pre_reserve_budget_refusal_zero_dispatch(self):
+        report = self.large_report()
+        low = self._hosted("a-hosted-low", "rev-hosted-low", budget="0.000001")
+        self.approve(low, hosted_use.hosted_use_gate_id("screening"))
+        with self.assertRaises(ScreeningBudgetError):
+            self.run_case(request_id="multi-5", report_ref=report, hosted_ref=low)
+        self.assertEqual(self.transport.call_count, 0)
+        self.assertEqual(len(RuntimeDispatchRepository(self.store).list_dispatches()), 0)
+
+    def test_oversize_header_refused_pre_reserve(self):
+        report = self.huge_passage_report()
+        rep = ParsingRepository(self.store).read_report(report)
+        passage_id = rep["payload"]["passages"][0]["passage_id"]
+        with self.assertRaises(ScreeningRunnerError):
+            self.run_case(request_id="huge-1", report_ref=report, passage_id=passage_id)
+        self.assertEqual(self.transport.call_count, 0)
+        self.assertEqual(len(RuntimeDispatchRepository(self.store).list_dispatches()), 0)
+
+    def test_post_reserve_revalidation_failure_marks_not_sent(self):
+        self.transport.responses.append(_jev_response(0.1))
+        state = {"calls": 0}
+        real = screening_runner._assert_token_active
+
+        def flaky(registry, store, token):
+            state["calls"] += 1
+            if state["calls"] >= 2:  # the pre-POST revalidation
+                raise ScreeningAuthorizationError("token deactivated before POST")
+            return real(registry, store, token)
+
+        with mock.patch.object(screening_runner, "_assert_token_active", side_effect=flaky):
+            with self.assertRaises(ScreeningRunnerError):
+                self.run_case(request_id="rev-1")
+        self.assertEqual(self.transport.call_count, 0)
+        records = RuntimeDispatchRepository(self.store).list_dispatches()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.state, "failed")  # not left submitted
+        self.assertEqual(record.cost_state, "not_incurred")  # reserve released
+        # A re-run observes the definitive failure and never re-POSTs.
+        rerun = self.run_case(request_id="rev-1")
+        self.assertEqual(self.transport.call_count, 0)
+        self.assertEqual(rerun["status"], "failed")
+
+    def test_readback_recomputes_windows_and_missing_is_not_complete(self):
+        from review_article_agent.screening.runner import readback_screening_case
+
+        report = self.large_report()
+        count = self.window_count(report)
+        self.assertGreater(count, 1)
+        # No dispatches at all: not complete (a missing window is never accepted).
+        missing = readback_screening_case(
+            self.store, request_id="rb-1", config_ref=self.config_ref,
+            report_ref=report, passage_id=None)
+        self.assertNotEqual(missing["status"], "completed")
+        # Full completion: complete with the ordered per-window refs, zero POSTs.
+        for _ in range(count):
+            self.transport.responses.append(_jev_response(0.1))
+        self.run_case(request_id="rb-1", report_ref=report)
+        complete = readback_screening_case(
+            self.store, request_id="rb-1", config_ref=self.config_ref,
+            report_ref=report, passage_id=None)
+        self.assertEqual(complete["status"], "completed")
+        self.assertEqual(len(complete["decision_result_refs"]), count)
+        self.assertEqual(self.transport.call_count, count)
+
+    def test_oversize_case_request_id_refused_pre_reserve(self):
+        long_id = "r" * 250
+        with self.assertRaises(ScreeningRunnerError):
+            self.run_case(request_id=long_id)
+        self.assertEqual(self.transport.call_count, 0)
+        self.assertEqual(len(RuntimeDispatchRepository(self.store).list_dispatches()), 0)
+
+    def test_one_window_case_keeps_single_ref_backcompat(self):
+        self.transport.responses.append(_jev_response(0.1))
+        result = self.run_case(request_id="one-1")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["window_count"], 1)
+        self.assertIsNotNone(result["decision_result_ref"])
+        self.assertEqual(result["decision_result_refs"], [result["decision_result_ref"]])
+        self.assertEqual(result["windows"][0]["request_id"], "one-1-w01")
 
 
 # --------------------------------------------------------------------------- #

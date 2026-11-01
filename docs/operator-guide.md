@@ -276,6 +276,11 @@ review-article-agent --data-dir "$DD" screening show \
   `proposed_exclusion` only when **every** window's answer is below the exclude
   threshold and the maximum probability is used for the label; a refusal, missing,
   or malformed answer in any window keeps that case uncertain, never excluded.
+  The runner dispatches **one Jev request per window** (request ids
+  `"{request_id}-wNN"`, window order) and returns an ordered
+  `{"decision_result_refs": [ref, ...]}` from the job result; a pilot/batch case
+  binds exactly those refs. A window that was already dispatched is never
+  re-sent, so a re-run after a partial run completes only the missing windows.
 - No important failure and no **false exclusion** (a case the machine proposed to
   exclude but you judged `retain`/`uncertain`) — either blocks the pilot, and a
   false exclusion needs a corrective action.

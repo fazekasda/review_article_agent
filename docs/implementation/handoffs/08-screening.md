@@ -111,18 +111,41 @@ deeper-than-any-depth-prune corruption, a foreign-project transitive edge with
 local ids, an over-bound graph failing closed, and unable to authorize stale
 work). No full-suite run, network calls, costs, or scientific validation.
 
-**S19-SCRWIN-WF windowing.** `tests/test_screening_windows.py` (17 tests) covers
+**S19-SCRWIN-WF windowing.** `tests/test_screening_windows.py` (19 tests) covers
 short/large/oversize single-passage/passage-case packing (bounded, lossless,
 deterministic, limitation reserved, target in every window), the
-`aggregate_window_decisions` max/retain/refusal rules, and the `_case`
+`aggregate_window_decisions` max/retain/refusal rules, the `_case`
 `window_responses`/`decision_result_refs` forms (wrong count, per-window digest
-binding, mixed `observed_model`). Full fast tier `python3 scripts/run_tests.py -j 4`
-passes (147 modules, 3664 tests), and
+binding, mixed `observed_model`), and the oversize-header-region fail-closed
+hardening (a header/target region that alone cannot fit one request raises
+instead of emitting one-character windows; `case_context`/`_case` treat it as not
+ready and retain the case). Full fast tier `python3 scripts/run_tests.py -j 4`
+passes (147 modules, 3681 tests), and
 `python3 scripts/run_tests.py --slow -j 4 test_screening test_screening_runner
-test_screening_windows test_step15_e2e_front test_mvp_pipeline_e2e` passes. The
-**current** runner still sends one request per case (now exactly window 1, since
-`case_context` returns it); dispatching one request per window is the follow-up
-S19-SCRWIN-RUN task.
+test_screening_windows test_generation_worker test_step15_e2e_front
+test_step15_injected_faults test_mvp_pipeline_e2e` passes.
+
+**S19-SCRWIN-RUN windowed dispatch.** `execute_screening_case` now splits the
+whole article with `case_windows` and issues **one Jev request per window**
+(request ids `"{request_id}-wNN"`), each its own runtime task/dispatch/intent and
+ledger-committed result, exactly like the former single dispatch. Every window is
+planned/validated and the total not-yet-dispatched reserve is checked against the
+per-role cap **before** the first reserve (per-dispatch check retained); a
+`JevError` or not-ready context in that phase is a static `ScreeningRunnerError`
+(zero reserve, zero POST). Windows are processed sequentially and the first
+ambiguous/unknown window stops the run (later windows unsent). An already-recorded
+window is observed, never re-POSTed, so a same-input re-run replays completed
+windows and dispatches only the missing ones. A post-reserve pre-POST
+revalidation failure resolves the reserved dispatch to a definitive pre-send
+failure (state `failed`, cost `not_incurred`, reserve released) and raises
+`ScreeningRunnerError`; it is never left `submitted` with an outstanding reserve.
+`tests/test_screening_runner.py` (19 tests) and `tests/test_generation_worker.py`
+(26 tests) add multi-window dispatch/ordered-ref binding, full/partial re-run,
+pre-reserve budget and oversize-header refusal (through the worker → `blocked`),
+post-reserve revalidation failure, one-window back-compat, and worker replay of a
+missing window (not complete). `docs/generation.md` and `docs/operator-guide.md`
+describe the per-window ids/cost/replay and the `{"decision_result_refs": [...]}`
+job result.
 
 This MVP imports recorded Jev responses with explicit
 `imported_unverified_dispatch` provenance. Input/request digests are recorded,

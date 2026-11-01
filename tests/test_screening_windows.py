@@ -22,7 +22,7 @@ import test_acquisition_validation as av
 from review_article_agent.domain.records import canonical_json
 from review_article_agent.parsing import ParsingRepository
 from review_article_agent.parsing.core import NORMALIZATION_VERSION, PARSER_VERSION
-from review_article_agent.runtime.jev import MODEL, SAFE_MAX_REQUEST_BYTES, build_request
+from review_article_agent.runtime.jev import MODEL, SAFE_MAX_REQUEST_BYTES, build_request, JevValidationError
 from review_article_agent.screening import ScreeningError, ScreeningRepository
 from review_article_agent.screening import workflow
 from review_article_agent.screening.workflow import (
@@ -111,6 +111,17 @@ class WindowPackingTests(unittest.TestCase):
     def test_no_limitation_line_when_not_flagged(self):
         context = fake_context("short text")
         self.assertNotIn(workflow.NON_TEXT_MATERIAL_LIMITATION, case_windows(definitions(), context)[0])
+
+    def test_oversize_header_region_raises_not_character_windows(self):
+        # A target passage so large its "Target passage" header region alone
+        # cannot fit one request: raise immediately instead of emitting thousands
+        # of one-character windows.
+        huge_target = "T" * (SAFE_MAX_REQUEST_BYTES + 1)
+        context = fake_context("short body", target_passage=huge_target)
+        with self.assertRaises(JevValidationError):
+            case_windows(definitions(), context)
+        with self.assertRaises(JevValidationError):
+            window_bodies(definitions(), context)
 
 
 class AggregationTests(unittest.TestCase):
@@ -267,6 +278,25 @@ class CaseWindowFormsTest(ManifestBase):
                                staticmethod(fake_verify)):
             with self.assertRaises(ScreeningError):
                 self.screening._case(config(), self._item({"decision_result_refs": refs}))
+
+    def test_oversize_header_region_is_not_ready_and_retained(self):
+        # A single passage so large the "Target passage" header cannot fit one
+        # request: ``case_context`` is not ready and ``_case`` retains the case
+        # (a static ``ScreeningError``), never a crash or a silent pass.
+        big = b"<sec><p>" + b"word " * 8000 + b"</p></sec>"
+        source = self.put_source(av.jats(body=big))
+        report = ParsingRepository(self.store).parse_stored_document(
+            source, report_artifact_id="huge-report", report_revision_id="huge-report-r1",
+            rights=self.rights("huge-report", "huge-report-r1"))["report_ref"]
+        rep = ParsingRepository(self.store).read_report(report)
+        passage_id = rep["payload"]["passages"][0]["passage_id"]
+        context = case_context(
+            ParsingRepository(self.store), report, passage_id, questions=definitions())
+        self.assertFalse(context["ready"])
+        item = {"id": "p1", "report_ref": report, "passage_id": passage_id,
+                "response": response(0.1)}
+        with self.assertRaises(ScreeningError):
+            self.screening._case(config(), item)
 
 
 if __name__ == "__main__":

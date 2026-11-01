@@ -33,6 +33,45 @@ remain required before anything is authoritative.
   path (not the chat fallback) through the same hosted-use gate/rights/budget
   machinery and commits via the decision ledger.
 
+### Windowed screening dispatch (S19-SCRWIN-RUN)
+
+A real article (≈200 KB) is far larger than one Jev request
+(`runtime/jev.SAFE_MAX_REQUEST_BYTES`, 32 KiB), so `execute_screening_case` now
+splits the whole parsed article with the pure
+`screening/workflow.case_windows(definitions, context)` and issues **one Jev
+request per window** (request ids `"{request_id}-wNN"`, 1-based, window order).
+Every window is planned, cost-bounded, and validated **before** the first
+reserve; the total reserve of all not-yet-dispatched windows must fit the
+per-role cap (a whole-case pre-reserve check) in addition to the existing
+per-dispatch check. Each window then reserves its own runtime
+task/dispatch/intent **before** its single POST and commits its accepted result
+through the decision ledger, exactly like the former single dispatch. Windows are
+processed sequentially; the first ambiguous/unknown window stops the run and
+later windows are not sent. An already-recorded window is observed (never
+re-POSTed), so a same-input re-run replays the completed windows and dispatches
+only the missing ones. If the immediate pre-POST revalidation (gate/rights/token)
+fails after the reserve, the reserved dispatch is resolved to a definitive
+pre-send failure (state `failed`, cost `not_incurred`, reserve released) — never
+left `submitted` with an outstanding reserve while no POST happened.
+
+`execute_screening_case` returns a safe case-level mapping: `status` is
+`completed` only when **every** window completed; it also carries `window_count`,
+`windowing_version`, the ordered `windows` list
+(`request_id`/`dispatch_id`/`status`/`cost`/`decision_result_ref`), an ordered
+`decision_result_refs` list when all windows completed (else `None`), a single
+`decision_result_ref` only for a one-window case (back-compat), and an aggregate
+cost summary (`known` only when every window's cost is known). A pilot/batch case
+binds these refs as `{"decision_result_refs": [ref, ...]}` (see the screening
+workflow `_case`); the single `{"decision_result_ref": ...}` form remains valid
+only for a one-window case. The worker `screening_case` operation returns
+`status: "complete"` only when the runner status is `completed`, and its
+`accepted_result` keeps `decision_result_refs` and `window_count` (safe IDs
+only). Replay (`worker/generation._replay_screening_case`) recomputes the window
+count from the current inputs via the same `case_windows` split and reads every
+window's durable dispatch; a missing window is **not** complete (`None`), so
+nothing is silently accepted. A pre-windowing job that recorded the bare
+`request_id` for a one-window case is still read.
+
 ## Roles
 
 The closed role set is `runtime.generation.ROLES`. The direct-call dispatch stage
@@ -283,7 +322,9 @@ is the canonical pattern.
   `notes_plan` (`delivery_roles` over `delivery/workflow.DeliveryRepository`, reading
   the current manuscript/evidence from the recorded delivery state; `notes_plan`
   proposes an edit batch and never applies it); and `screening_case`
-  (`screening/runner.execute_screening_case`). No operation is refused. See
+  (`screening/runner.execute_screening_case`, now one Jev request **per article
+  window** — request ids `"{request_id}-wNN"` — with an ordered
+  `decision_result_refs` result). No operation is refused. See
   [`worker.md`](worker.md) §15 and [`cli.md`](cli.md) §23.
 - Live model validation of these roles is **unrun**; the user separately
   authorized one small live OpenRouter smoke test, which is not authorization to

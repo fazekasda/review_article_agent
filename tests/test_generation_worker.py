@@ -718,6 +718,68 @@ class GenerationWorkerScreeningCaseTest(_EngineBase, scr_fx.RunnerTestBase):
         dispatch = RuntimeDispatchRepository(self.store).get_dispatch(ref["dispatch_id"])
         self.assertEqual(dispatch.state, "completed")
 
+    def test_multi_window_case_reports_ordered_refs_and_window_count(self):
+        report = self.large_report()
+        count = self.window_count(report)
+        self.assertGreater(count, 1)
+        for _ in range(count):
+            self.transport.responses.append(scr_fx._jev_response(0.1))
+        engine = self.engine(transport=self.transport, api_key=scr_fx._API_KEY)
+        params = self._parameters()
+        params["report_ref"] = report
+        res = self._submit(engine, request_id="gen-sc-multi", parameters=params)
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        result = job["accepted_result"]["result"]
+        self.assertEqual(result["operation"], "screening_case")
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["screening_status"], "completed")
+        self.assertEqual(result["window_count"], count)
+        self.assertEqual(len(result["decision_result_refs"]), count)
+        self.assertIsNone(result["decision_result_ref"])  # multi-window: no single ref
+        self.assertEqual(self.transport.call_count, count)
+
+    def test_pre_reserve_budget_refusal_blocks_through_worker(self):
+        from review_article_agent.runtime.dispatch import RuntimeDispatchRepository
+
+        report = self.large_report()
+        low = self._hosted("a-hosted-low", "rev-hosted-low", budget="0.000001")
+        self.approve(low, hosted_use.hosted_use_gate_id("screening"))
+        engine = self.engine(transport=self.transport, api_key=scr_fx._API_KEY)
+        params = self._parameters()
+        params["report_ref"] = report
+        params["hosted_ref"] = low
+        res = self._submit(engine, request_id="gen-sc-budget", parameters=params)
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertEqual(job["wait_reason"], "discovery_blocked")
+        self.assertEqual(self.transport.call_count, 0)
+        self.assertEqual(len(RuntimeDispatchRepository(self.store).list_dispatches()), 0)
+
+    def test_replay_of_unrun_case_is_not_complete(self):
+        import types
+
+        from review_article_agent.worker import generation as wg
+
+        report = self.large_report()
+        job = types.SimpleNamespace(
+            request_id="never-run",
+            parameters={
+                "operation": "screening_case",
+                "config_ref": self.config_ref,
+                "report_ref": report,
+                "passage_id": None,
+            },
+        )
+        # A missing window must never be silently accepted as complete.
+        self.assertIsNone(wg._replay_screening_case(self.store, job))
+
 
 # --------------------------------------------------------------------------- #
 # Screening case refusals raised before any dispatch (S19-ENGINE)
