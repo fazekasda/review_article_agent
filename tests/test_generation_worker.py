@@ -29,6 +29,7 @@ Run::
 from __future__ import annotations
 
 import json
+import io
 import os
 import sys
 import time
@@ -716,6 +717,75 @@ class GenerationWorkerScreeningCaseTest(_EngineBase, scr_fx.RunnerTestBase):
 
         dispatch = RuntimeDispatchRepository(self.store).get_dispatch(ref["dispatch_id"])
         self.assertEqual(dispatch.state, "completed")
+
+
+# --------------------------------------------------------------------------- #
+# Screening case refusals raised before any dispatch (S19-ENGINE)
+# --------------------------------------------------------------------------- #
+class GenerationWorkerScreeningRefusalTest(_EngineBase, scr_fx.RunnerTestBase):
+    def _parameters(self) -> dict:
+        return {
+            "operation": "screening_case",
+            "config_ref": self.config_ref,
+            "report_ref": self.report,
+            "hosted_ref": self.hosted_ref,
+            "credential_env": "OPENROUTER_API_KEY",
+        }
+
+    def _run_with_refusal(self, exc: BaseException):
+        """Drive one screening_case job whose dispatch raises ``exc``.
+
+        Returns ``(job, attempts, stderr_text)``. The refusal is raised from the
+        real screening dispatcher seam (``execute_screening_case``), so the
+        worker's ``_run_generate_dispatch`` classification is exercised.
+        """
+        from review_article_agent.runtime.jobs import JobRepository
+
+        engine = self.engine(transport=self.transport, api_key=scr_fx._API_KEY)
+        res = self._submit(engine, request_id="gen-sc-refusal", parameters=self._parameters())
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        captured = io.StringIO()
+        with mock.patch.object(
+            scr_fx.screening_runner, "execute_screening_case", side_effect=exc
+        ), mock.patch.object(sys, "stderr", new=captured):
+            self._drive(engine)
+        job = self._job(engine, job_id)
+        attempts = JobRepository(self.store).attempts(job_id)
+        return job, attempts, captured.getvalue()
+
+    def test_screening_runner_error_blocks_zero_post(self) -> None:
+        from review_article_agent.screening.runner import ScreeningRunnerError
+
+        job, attempts, _ = self._run_with_refusal(ScreeningRunnerError("refused"))
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertEqual(job["wait_reason"], "discovery_blocked")
+        self.assertNotIn("indeterminate", job["wait_reason"])
+        # Zero POST: nothing was issued.
+        self.assertEqual(self.transport.call_count, 0)
+        # The attempt is reopened (proven undispatched), never marked ambiguous.
+        self.assertEqual([a.state for a in attempts], ["queued"])
+
+    def test_screening_budget_error_blocks_zero_post(self) -> None:
+        from review_article_agent.screening.runner import ScreeningBudgetError
+
+        job, attempts, _ = self._run_with_refusal(ScreeningBudgetError("over budget"))
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertEqual(job["wait_reason"], "discovery_blocked")
+        self.assertEqual(self.transport.call_count, 0)
+        self.assertEqual([a.state for a in attempts], ["queued"])
+
+    def test_unexpected_exception_is_indeterminate_and_logs_class_only(self) -> None:
+        job, attempts, stderr_text = self._run_with_refusal(
+            RuntimeError("sensitive-payload-must-not-leak")
+        )
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertEqual(job["wait_reason"], "discovery_indeterminate")
+        # Fail closed: the attempt is marked ambiguous, not reopened.
+        self.assertEqual([a.state for a in attempts], ["ambiguous"])
+        # The class name is logged; the message text is never echoed.
+        self.assertIn("RuntimeError", stderr_text)
+        self.assertNotIn("sensitive-payload-must-not-leak", stderr_text)
 
 
 # --------------------------------------------------------------------------- #

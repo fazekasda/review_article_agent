@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -2062,6 +2063,7 @@ class WorkerEngine:
         from ..generation.hosted_use import GenerationHostedUseError
         from ..generation.review_roles import ReviewPortError
         from ..generation.runner import GenerationRunnerError
+        from ..screening.runner import ScreeningRunnerError
 
         job_id = job.job_id
         if self._discovery_stop_requested(repo, project_id, job_id):
@@ -2099,7 +2101,12 @@ class WorkerEngine:
             # recorded its state after every completed call, so this is a terminal
             # result needing a human, never a crash and never a re-POST.
             raw = {"operation": self._generation_operation(job), "status": "model_not_completed"}
-        except (GenerationRunnerError, GenerationHostedUseError, BudgetExceededError):
+        except (
+            GenerationRunnerError,
+            GenerationHostedUseError,
+            BudgetExceededError,
+            ScreeningRunnerError,
+        ):
             # A refusal raised strictly *before* any reserve/POST.
             self._discovery_fail(
                 repo,
@@ -2111,7 +2118,15 @@ class WorkerEngine:
                 escalate=True,
             )
             return
-        except BaseException:  # noqa: BLE001 - the POST may have happened: unknown
+        except BaseException as exc:  # noqa: BLE001 - the POST may have happened: unknown
+            # Fail closed: the outcome is unknown. Log only the exception class
+            # name (never the message, which may carry content) so the cause is
+            # visible to an operator; the classification itself is unchanged.
+            print(
+                f"worker: generation job {job_id} outcome indeterminate "
+                f"({type(exc).__name__})",
+                file=sys.stderr,
+            )
             self._discovery_fail(
                 repo,
                 project_id,

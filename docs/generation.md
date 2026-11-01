@@ -203,6 +203,19 @@ Underlying runner outcomes (from `runtime/generation.py`) are `completed`,
 `refused`, `protocol_error`, `unknown`, `failed`, and the runner-level
 `oversized_output` diagnostic.
 
+### Worker dispatch classification
+
+For a detached `generation_run` job, the worker classifies a dispatch that raises
+*before any reserve/POST* as **`blocked`** (zero attempts counted as dispatched,
+the same attempt reopened, and the job escalated to a human) — this covers
+`GenerationRunnerError`, `GenerationHostedUseError`, `BudgetExceededError`, and the
+screening runner's pre-dispatch refusals (`ScreeningRunnerError` and its
+subclasses, e.g. `ScreeningBudgetError`). Any *other* exception is an unknown
+outcome and is classified **`indeterminate`** (fail closed: the attempt is marked
+ambiguous, the job escalates, and nothing is re-POSTed); the worker writes one
+line to stderr naming the exception **class** only — never the message, which may
+carry content.
+
 ## Testing with fake transports
 
 No test makes a live call. Inject a fake transport into `execute_generation_task`
