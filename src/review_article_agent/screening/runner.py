@@ -72,7 +72,9 @@ __all__ = [
     "ScreeningDocumentError",
     "ScreeningRightsError",
     "ScreeningBudgetError",
+    "MAX_REQUEST_ID_CHARS",
     "execute_screening_case",
+    "readback_screening_case",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +91,12 @@ PROMPT_VERSION = "screening.jev.v1"
 
 #: Bounded task size.
 TASK_SIZE_LIMIT = 262_144
+
+#: Conservative upper bound on a per-window request id. The case request id
+#: carries a ``-wNN`` suffix per window; refusing an over-long id **before** any
+#: reserve keeps every window's opaque identifier bounded (mirrors the
+#: acquisition request-id convention) and never truncates it.
+MAX_REQUEST_ID_CHARS = 200
 
 _OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
 
@@ -364,6 +372,182 @@ def _readback(store, request_id: str, *, replayed: bool) -> dict:
     return mapping
 
 
+def _window_request_ids(request_id: str, count: int) -> list[str]:
+    """The ordered per-window request ids ``"{request_id}-wNN"`` (1-based).
+
+    Every id is validated as an opaque identifier and length-bounded **before**
+    any reserve, so an over-long or unrepresentable case id is refused without a
+    dispatch (never truncated).
+    """
+    ids = []
+    for k in range(1, count + 1):
+        window_id = f"{request_id}-w{k:02d}"
+        if len(window_id) > MAX_REQUEST_ID_CHARS:
+            raise ScreeningRunnerError(
+                "screening: the case request id is too long to carry a per-window "
+                "suffix; refusing to dispatch."
+            )
+        try:
+            validate_identifier(window_id, "request_id")
+        except (RecordValidationError, TypeError, ValueError) as exc:
+            raise ScreeningRunnerError(
+                "screening: the case request id cannot form a valid per-window id; "
+                "refusing to dispatch."
+            ) from exc
+        ids.append(window_id)
+    return ids
+
+
+def _window_texts(definitions, context):
+    """The ordered window texts for one case context (fail closed on oversize)."""
+    try:
+        return _workflow.case_windows(definitions, context)
+    except jev.JevError as exc:
+        raise ScreeningRunnerError(
+            "screening: the article could not be split into request-bounded windows "
+            "within the Jev limit; refusing to dispatch."
+        ) from exc
+
+
+def _plan_window(definitions, window: str):
+    """Build and validate one window's dispatch plan (sends nothing)."""
+    try:
+        request = jev.build_request(definitions, window)
+        body = canonical_json(request)
+        bound = jev.estimate_cost_bound(len(body))
+        return jev.plan_dispatch(
+            definitions, window, reserve_usd=bound["cost_upper_bound_usd"],
+            server_cap=False,
+        )
+    except jev.JevError as exc:
+        raise ScreeningRunnerError(
+            "screening: a window request could not be planned within the Jev bound; "
+            "refusing to dispatch."
+        ) from exc
+
+
+def _mark_definitively_not_sent(store, dispatch_id: str) -> None:
+    """Resolve a reserved-then-revalidation-failed dispatch to a definitive pre-send
+    failure.
+
+    The dispatch was ``mark_submitted`` but the immediate pre-POST revalidation
+    failed, so no request was issued and nothing was billed. The existing
+    transaction-owned primitives record exactly that: the state becomes the
+    terminal ``failed`` and the cost becomes ``not_incurred`` (the reserve is
+    released). ``mark_failed`` first, then settle, because a ``submitted`` row may
+    never carry ``not_incurred``.
+    """
+    dispatch = RuntimeDispatchRepository(store)
+    with store.transaction():
+        dispatch._mark_failed_in_transaction(dispatch_id)
+        dispatch._settle_cost_in_transaction(
+            dispatch_id, cost_state="not_incurred", allow_definitive_not_incurred=True
+        )
+
+
+def _compose_case_result(store, request_id: str, window_ids, window_results) -> dict:
+    """Reduce the ordered per-window readbacks to the case-level safe mapping.
+
+    Only safe IDs/status/cost are exposed. The overall ``status`` is ``completed``
+    only when **every** window completed; otherwise it reflects the first
+    unresolved/failed window (an ambiguous window is ``unknown``). The ordered
+    ``decision_result_refs`` list is present only when every window completed, and
+    the legacy single ``decision_result_ref`` is present only for a one-window
+    case. The aggregate cost is ``known`` only when every attempted window's cost
+    is known; a later window that was never sent is simply absent from ``windows``.
+    """
+    window_count = len(window_ids)
+    statuses = [rb.get("status") for rb in window_results]
+    all_completed = (len(window_results) == window_count
+                     and all(status == "completed" for status in statuses))
+    if all_completed:
+        overall = "completed"
+    elif any(status == "unknown" for status in statuses):
+        overall = "unknown"
+    elif any(status == "failed" for status in statuses):
+        overall = "failed"
+    else:
+        overall = statuses[-1] if statuses else "reserved"
+    refs = ([rb["decision_result_ref"] for rb in window_results]
+            if all_completed else None)
+    total = Decimal("0")
+    known = True
+    for rb in window_results:
+        cost = rb.get("cost") or {}
+        if cost.get("state") in ("known", "estimated") and cost.get("amount_usd") is not None:
+            total += Decimal(cost["amount_usd"])
+        else:
+            known = False
+    windows = [
+        {
+            "request_id": rb["request_id"],
+            "dispatch_id": rb["dispatch_id"],
+            "status": rb["status"],
+            "cost": rb["cost"],
+            "decision_result_ref": rb["decision_result_ref"],
+            "result_id": rb["result_id"],
+            "replayed": rb["replayed"],
+        }
+        for rb in window_results
+    ]
+    return {
+        "request_id": request_id,
+        "status": overall,
+        "window_count": window_count,
+        "windowing_version": _workflow.WINDOWING_VERSION,
+        "windows": windows,
+        "decision_result_refs": refs,
+        "decision_result_ref": refs[0] if (all_completed and window_count == 1) else None,
+        # Back-compat for a one-window case: the window's own ids.
+        "dispatch_id": window_results[0]["dispatch_id"] if window_results else None,
+        "result_id": window_results[0]["result_id"] if window_results else None,
+        "cost": {"state": "known" if known else "unknown",
+                 "amount_usd": str(total) if known else None},
+        "replayed": bool(window_results) and all(rb.get("replayed") for rb in window_results),
+    }
+
+
+def readback_screening_case(store, *, request_id, config_ref, report_ref, passage_id) -> dict | None:
+    """Prove a screening case from the durable dispatch ledger with **zero** POST.
+
+    The per-window request ids are recomputed from the *current* inputs via the
+    same :func:`case_windows` split the runner uses, so a missing/extra window is
+    never silently accepted (a window with no completed dispatch leaves the case
+    not-``completed``). A pre-windowing job that recorded the bare ``request_id``
+    for a one-window case is still read (legacy back-compat). Returns ``None`` only
+    when the window count cannot be recomputed and no legacy dispatch exists.
+    """
+    request_id = _require_identifier(request_id, "request_id")
+    composed = None
+    try:
+        screening = _workflow.ScreeningRepository(store)
+        config = screening._config(config_ref)
+        definitions = _workflow.questions(config)
+        context = _workflow.case_context(
+            screening.parsing, report_ref, passage_id, questions=definitions
+        )
+        windows = _window_texts(definitions, context)
+        window_ids = _window_request_ids(request_id, len(windows))
+    except (ReviewAgentError, RecordValidationError, TypeError, ValueError):
+        window_ids = None
+    if window_ids is not None:
+        window_results = []
+        for window_id in window_ids:
+            readback = _readback(store, window_id, replayed=True)
+            window_results.append(readback)
+            if readback["status"] != "completed":
+                break
+        composed = _compose_case_result(store, request_id, window_ids, window_results)
+        if composed["status"] == "completed":
+            return composed
+    # Legacy back-compat: a pre-windowing job recorded the bare request id for a
+    # one-window case. Never claims completion for a multi-window case.
+    legacy = _readback(store, request_id, replayed=True)
+    if legacy["status"] == "completed":
+        return _compose_case_result(store, request_id, [request_id], [legacy])
+    return composed
+
+
 # --------------------------------------------------------------------------- #
 # Public runner
 # --------------------------------------------------------------------------- #
@@ -382,14 +566,16 @@ def execute_screening_case(
 ) -> dict:
     """Run **one** screening case through the direct Jev decision path.
 
-    The screening config and parsing report are re-read, the exact Jev request
-    is rebuilt, the hosted-use gate/rights/token are revalidated, the per-role
-    budget is enforced, and a ``direct_call`` dispatch (stage ``screening``) is
-    reserved **before** the one POST. The accepted result is committed through
-    the decision ledger atomically. An already-recorded ``request_id`` is
-    observed without a second POST; an ambiguous outcome retains its reserve and
-    is never re-sent. The returned mapping carries only safe IDs/status — never
-    the API key or the source text.
+    The whole parsed article is split into deterministic, request-bounded windows
+    (:func:`review_article_agent.screening.workflow.case_windows`) and **one**
+    direct-Jev dispatch is issued per window (request id ``"{request_id}-wNN"``).
+    Every window is planned, cost-bounded, and budget-checked before the first
+    reserve; each window then reserves its own task/dispatch/intent **before** its
+    one POST and commits its accepted result through the decision ledger. An
+    already-recorded window is observed without a second POST, and processing
+    stops on the first ambiguous/unknown window (later windows are not sent). The
+    returned mapping carries only safe IDs/status — never the API key or the
+    source text.
     """
     request_id = _require_identifier(request_id, "request_id")
     if not isinstance(api_key, str) or api_key == "":
@@ -408,14 +594,19 @@ def execute_screening_case(
     context = _workflow.case_context(
         screening.parsing, report_ref, passage_id, questions=definitions
     )
-    text = context["text"]
+    # A not-ready context (including an article whose header region alone cannot
+    # fit the Jev bound) is a pre-reserve refusal: nothing is reserved or sent.
+    if not context["ready"]:
+        raise ScreeningRunnerError(
+            "screening: the parsing report is not ready for screening; refusing to "
+            "dispatch."
+        )
     _verify_hosted_rights(store, context["report"]["source_ref"])
 
-    request = jev.build_request(definitions, text)
-    body = canonical_json(request)
-    bound = jev.estimate_cost_bound(len(body))
-    reserve_usd = bound["cost_upper_bound_usd"]
-    plan = jev.plan_dispatch(definitions, text, reserve_usd=reserve_usd, server_cap=False)
+    # -- plan/validate every window before reserving anything ---------------- #
+    windows = _window_texts(definitions, context)
+    window_ids = _window_request_ids(request_id, len(windows))
+    plans = [_plan_window(definitions, window) for window in windows]
 
     question_artifacts = _question_artifacts(store, config_ref, definitions)
     input_refs = []
@@ -430,10 +621,14 @@ def execute_screening_case(
             input_refs.append({**ref, "digest": _sha256_hex(content)})
 
     input_digest = _input_digest(store.project_id, input_refs)
-    version_map = _versions(input_digest, plan.request_sha256)
-    version_digest = _sha256_hex(canonical_json(version_map))
-    bound_evidence_digest = _sha256_hex(
-        canonical_json({"request_sha256": plan.request_sha256, "reserve_usd": reserve_usd}))
+    per_window_versions = []
+    for plan in plans:
+        version_map = _versions(input_digest, plan.request_sha256)
+        version_digest = _sha256_hex(canonical_json(version_map))
+        bound_evidence_digest = _sha256_hex(
+            canonical_json({"request_sha256": plan.request_sha256,
+                            "reserve_usd": plan.reserve_usd}))
+        per_window_versions.append((version_map, version_digest, bound_evidence_digest))
 
     model = ModelRef(provider_id="openrouter", model_id=jev.MODEL, variant="direct")
     role_config = RoleConfig(role="screening", model=model, steps=1)
@@ -458,46 +653,87 @@ def execute_screening_case(
     dispatch = RuntimeDispatchRepository(store)
     intents = DecisionIntentRepository(store)
     results = DecisionResultRepository(store)
-    task_record = runtime.record_task(bounded, request_id=request_id, configuration=role_set)
 
-    with registry.execution_write_guard(activation_token, store.project_id):
-        if dispatch.get_dispatch_by_request(request_id) is not None:
-            return _readback(store, request_id, replayed=True)
+    # -- the total reserve of all not-yet-dispatched windows must fit the cap -- #
+    outstanding = Decimal("0")
+    for window_id, plan in zip(window_ids, plans):
+        if dispatch.get_dispatch_by_request(window_id) is None:
+            outstanding += Decimal(plan.reserve_usd)
+    if outstanding > 0:
         _check_budget(
             store, hosted_ref=hosted_ref, budget_cap_usd=budget_cap_usd,
-            new_reserve=plan.reserve_usd,
+            new_reserve=str(outstanding),
         )
-        dispatch_record = dispatch.reserve_dispatch(
-            task_record,
-            request_id=request_id,
-            route="direct_call",
-            stage=SCREENING_STAGE,
-            input_digest=input_digest,
-            version_digest=version_digest,
-            reserve_usd=plan.reserve_usd,
-            bound_evidence_digest=bound_evidence_digest,
-        )
-        intents.record_intent(
-            task_record,
-            dispatch_record,
-            plan,
-            question_def_ref=qdef_refs,
-            criteria_ref=crit_refs,
-            versions=version_map,
-        )
-        dispatch_record = dispatch.mark_submitted(dispatch_record.dispatch_id)
 
-    # The registry lock is released before any network I/O: revalidate the exact
-    # gate, the source rights, and the active token immediately before the POST.
-    _require_hosted_use(store, hosted_ref, role="screening")
-    _verify_hosted_rights(store, context["report"]["source_ref"])
-    _assert_token_active(registry, store, activation_token)
+    # -- dispatch one window at a time, sequentially -------------------------- #
+    window_results = []
+    for window_id, plan, versions in zip(window_ids, plans, per_window_versions):
+        version_map, version_digest, bound_evidence_digest = versions
+        if dispatch.get_dispatch_by_request(window_id) is not None:
+            readback = _readback(store, window_id, replayed=True)
+            window_results.append(readback)
+            if readback["status"] != "completed":
+                break
+            continue
 
-    result = jev.dispatch_plan(plan, api_key=api_key, transport=transport)
+        task_record = runtime.record_task(
+            bounded, request_id=window_id, configuration=role_set)
 
-    with registry.execution_write_guard(
-        activation_token, store.project_id, allow_draining=True
-    ):
-        results.commit_result(
-            dispatch_record.dispatch_id, result, fence=dispatch_record.current_fence)
-    return _readback(store, request_id, replayed=False)
+        with registry.execution_write_guard(activation_token, store.project_id):
+            if dispatch.get_dispatch_by_request(window_id) is not None:
+                window_results.append(_readback(store, window_id, replayed=True))
+                break
+            # The existing per-dispatch check is retained in addition to the
+            # whole-case pre-reserve check above.
+            _check_budget(
+                store, hosted_ref=hosted_ref, budget_cap_usd=budget_cap_usd,
+                new_reserve=plan.reserve_usd,
+            )
+            dispatch_record = dispatch.reserve_dispatch(
+                task_record,
+                request_id=window_id,
+                route="direct_call",
+                stage=SCREENING_STAGE,
+                input_digest=input_digest,
+                version_digest=version_digest,
+                reserve_usd=plan.reserve_usd,
+                bound_evidence_digest=bound_evidence_digest,
+            )
+            intents.record_intent(
+                task_record,
+                dispatch_record,
+                plan,
+                question_def_ref=qdef_refs,
+                criteria_ref=crit_refs,
+                versions=version_map,
+            )
+            dispatch_record = dispatch.mark_submitted(dispatch_record.dispatch_id)
+
+        # The registry lock is released before any network I/O: revalidate the
+        # exact gate, the source rights, and the active token immediately before
+        # the POST. A failure here means no request was issued, so the reserved
+        # dispatch is resolved to a definitive pre-send failure (never left
+        # ``submitted`` with an outstanding reserve).
+        try:
+            _require_hosted_use(store, hosted_ref, role="screening")
+            _verify_hosted_rights(store, context["report"]["source_ref"])
+            _assert_token_active(registry, store, activation_token)
+        except ScreeningRunnerError:
+            _mark_definitively_not_sent(store, dispatch_record.dispatch_id)
+            raise
+
+        result = jev.dispatch_plan(plan, api_key=api_key, transport=transport)
+
+        with registry.execution_write_guard(
+            activation_token, store.project_id, allow_draining=True
+        ):
+            results.commit_result(
+                dispatch_record.dispatch_id, result, fence=dispatch_record.current_fence)
+
+        readback = _readback(store, window_id, replayed=False)
+        window_results.append(readback)
+        if readback["status"] != "completed":
+            # An ambiguous/unknown window outcome: stop; later windows are not sent.
+            break
+
+    return _compose_case_result(store, request_id, window_ids, window_results)

@@ -767,6 +767,8 @@ def _dispatch_screening_case(store, registry, token, job, api_key, transport):
         "operation": "screening_case",
         "status": "complete" if status == "completed" else "model_not_completed",
         "decision_result_ref": result.get("decision_result_ref") if isinstance(result, dict) else None,
+        "decision_result_refs": result.get("decision_result_refs") if isinstance(result, dict) else None,
+        "window_count": result.get("window_count") if isinstance(result, dict) else None,
         "screening_status": status,
     }
 
@@ -867,6 +869,8 @@ def accepted_result(raw: dict[str, Any]) -> dict[str, Any]:
         "delivery_id": raw.get("delivery_id"),
         "rounds_used": raw.get("rounds_used"),
         "decision_result_ref": raw.get("decision_result_ref"),
+        "decision_result_refs": raw.get("decision_result_refs"),
+        "window_count": raw.get("window_count"),
         "screening_status": raw.get("screening_status"),
         "edits_count": len(raw.get("edits") or []) if isinstance(raw.get("edits"), list) else None,
         "dropped_count": len(dropped) if isinstance(dropped, list) else None,
@@ -878,7 +882,8 @@ def accepted_result(raw: dict[str, Any]) -> dict[str, Any]:
 _SAFE_KEYS = (
     "kind", "mode", "operation", "request_id", "status", "outcome", "reason",
     "ref", "review_id", "review_status", "delivery_id", "rounds_used",
-    "decision_result_ref", "screening_status", "edits_count", "dropped_count",
+    "decision_result_ref", "decision_result_refs", "window_count",
+    "screening_status", "edits_count", "dropped_count",
     "generation", "authorizing",
 )
 
@@ -990,11 +995,25 @@ def _replay_global_review(store: Any, job: Any):
 
 
 def _replay_screening_case(store: Any, job: Any):
-    """Prove a resolved screening case from the dispatch ledger (no POST)."""
-    from ..screening.runner import _readback
+    """Prove a resolved screening case from the dispatch ledger (no POST).
 
+    The per-window request ids are recomputed from the current inputs (the same
+    ``case_windows`` split the runner uses) and every window's durable dispatch is
+    read back; a missing or non-completed window means the case is **not**
+    complete (``None``), so nothing is silently accepted. A pre-windowing job that
+    recorded the bare request id for a one-window case is still read.
+    """
+    from ..screening.runner import readback_screening_case
+
+    params = job.parameters if isinstance(job.parameters, dict) else {}
     try:
-        mapping = _readback(store, job.request_id, replayed=True)
+        mapping = readback_screening_case(
+            store,
+            request_id=job.request_id,
+            config_ref=params.get("config_ref"),
+            report_ref=params.get("report_ref"),
+            passage_id=params.get("passage_id"),
+        )
     except Exception:  # noqa: BLE001 - not a proven present outcome
         return None
     status = mapping.get("status") if isinstance(mapping, dict) else None
@@ -1004,6 +1023,8 @@ def _replay_screening_case(store: Any, job: Any):
         "operation": "screening_case",
         "status": "complete" if status == "completed" else "model_not_completed",
         "decision_result_ref": mapping.get("decision_result_ref"),
+        "decision_result_refs": mapping.get("decision_result_refs"),
+        "window_count": mapping.get("window_count"),
         "screening_status": status,
     }
     return accepted_result(raw), True

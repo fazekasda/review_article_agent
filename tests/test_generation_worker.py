@@ -29,6 +29,7 @@ Run::
 from __future__ import annotations
 
 import json
+import io
 import os
 import sys
 import time
@@ -716,6 +717,137 @@ class GenerationWorkerScreeningCaseTest(_EngineBase, scr_fx.RunnerTestBase):
 
         dispatch = RuntimeDispatchRepository(self.store).get_dispatch(ref["dispatch_id"])
         self.assertEqual(dispatch.state, "completed")
+
+    def test_multi_window_case_reports_ordered_refs_and_window_count(self):
+        report = self.large_report()
+        count = self.window_count(report)
+        self.assertGreater(count, 1)
+        for _ in range(count):
+            self.transport.responses.append(scr_fx._jev_response(0.1))
+        engine = self.engine(transport=self.transport, api_key=scr_fx._API_KEY)
+        params = self._parameters()
+        params["report_ref"] = report
+        res = self._submit(engine, request_id="gen-sc-multi", parameters=params)
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        result = job["accepted_result"]["result"]
+        self.assertEqual(result["operation"], "screening_case")
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["screening_status"], "completed")
+        self.assertEqual(result["window_count"], count)
+        self.assertEqual(len(result["decision_result_refs"]), count)
+        self.assertIsNone(result["decision_result_ref"])  # multi-window: no single ref
+        self.assertEqual(self.transport.call_count, count)
+
+    def test_pre_reserve_budget_refusal_blocks_through_worker(self):
+        from review_article_agent.runtime.dispatch import RuntimeDispatchRepository
+
+        report = self.large_report()
+        low = self._hosted("a-hosted-low", "rev-hosted-low", budget="0.000001")
+        self.approve(low, hosted_use.hosted_use_gate_id("screening"))
+        engine = self.engine(transport=self.transport, api_key=scr_fx._API_KEY)
+        params = self._parameters()
+        params["report_ref"] = report
+        params["hosted_ref"] = low
+        res = self._submit(engine, request_id="gen-sc-budget", parameters=params)
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertEqual(job["wait_reason"], "discovery_blocked")
+        self.assertEqual(self.transport.call_count, 0)
+        self.assertEqual(len(RuntimeDispatchRepository(self.store).list_dispatches()), 0)
+
+    def test_replay_of_unrun_case_is_not_complete(self):
+        import types
+
+        from review_article_agent.worker import generation as wg
+
+        report = self.large_report()
+        job = types.SimpleNamespace(
+            request_id="never-run",
+            parameters={
+                "operation": "screening_case",
+                "config_ref": self.config_ref,
+                "report_ref": report,
+                "passage_id": None,
+            },
+        )
+        # A missing window must never be silently accepted as complete.
+        self.assertIsNone(wg._replay_screening_case(self.store, job))
+
+
+# --------------------------------------------------------------------------- #
+# Screening case refusals raised before any dispatch (S19-ENGINE)
+# --------------------------------------------------------------------------- #
+class GenerationWorkerScreeningRefusalTest(_EngineBase, scr_fx.RunnerTestBase):
+    def _parameters(self) -> dict:
+        return {
+            "operation": "screening_case",
+            "config_ref": self.config_ref,
+            "report_ref": self.report,
+            "hosted_ref": self.hosted_ref,
+            "credential_env": "OPENROUTER_API_KEY",
+        }
+
+    def _run_with_refusal(self, exc: BaseException):
+        """Drive one screening_case job whose dispatch raises ``exc``.
+
+        Returns ``(job, attempts, stderr_text)``. The refusal is raised from the
+        real screening dispatcher seam (``execute_screening_case``), so the
+        worker's ``_run_generate_dispatch`` classification is exercised.
+        """
+        from review_article_agent.runtime.jobs import JobRepository
+
+        engine = self.engine(transport=self.transport, api_key=scr_fx._API_KEY)
+        res = self._submit(engine, request_id="gen-sc-refusal", parameters=self._parameters())
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        captured = io.StringIO()
+        with mock.patch.object(
+            scr_fx.screening_runner, "execute_screening_case", side_effect=exc
+        ), mock.patch.object(sys, "stderr", new=captured):
+            self._drive(engine)
+        job = self._job(engine, job_id)
+        attempts = JobRepository(self.store).attempts(job_id)
+        return job, attempts, captured.getvalue()
+
+    def test_screening_runner_error_blocks_zero_post(self) -> None:
+        from review_article_agent.screening.runner import ScreeningRunnerError
+
+        job, attempts, _ = self._run_with_refusal(ScreeningRunnerError("refused"))
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertEqual(job["wait_reason"], "discovery_blocked")
+        self.assertNotIn("indeterminate", job["wait_reason"])
+        # Zero POST: nothing was issued.
+        self.assertEqual(self.transport.call_count, 0)
+        # The attempt is reopened (proven undispatched), never marked ambiguous.
+        self.assertEqual([a.state for a in attempts], ["queued"])
+
+    def test_screening_budget_error_blocks_zero_post(self) -> None:
+        from review_article_agent.screening.runner import ScreeningBudgetError
+
+        job, attempts, _ = self._run_with_refusal(ScreeningBudgetError("over budget"))
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertEqual(job["wait_reason"], "discovery_blocked")
+        self.assertEqual(self.transport.call_count, 0)
+        self.assertEqual([a.state for a in attempts], ["queued"])
+
+    def test_unexpected_exception_is_indeterminate_and_logs_class_only(self) -> None:
+        job, attempts, stderr_text = self._run_with_refusal(
+            RuntimeError("sensitive-payload-must-not-leak")
+        )
+        self.assertEqual(job["state"], "waiting_human")
+        self.assertEqual(job["wait_reason"], "discovery_indeterminate")
+        # Fail closed: the attempt is marked ambiguous, not reopened.
+        self.assertEqual([a.state for a in attempts], ["ambiguous"])
+        # The class name is logged; the message text is never echoed.
+        self.assertIn("RuntimeError", stderr_text)
+        self.assertNotIn("sensitive-payload-must-not-leak", stderr_text)
 
 
 # --------------------------------------------------------------------------- #
