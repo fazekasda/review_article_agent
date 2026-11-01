@@ -142,6 +142,20 @@ def resp(status, obj):
     return lead.TransportResponse(status, body)
 
 
+def body_with_raw_content(content_literal, **overrides):
+    """A 200 body whose assistant content is the given raw JSON text.
+
+    The content is embedded as a Python **string** (not via ``json.dumps`` of a
+    Python number) so a numeric literal such as ``1e999`` is never round-tripped
+    through a Python float before the adapter parses it.
+    """
+    payload = valid_body(**overrides)
+    choice = valid_choices()
+    choice["message"]["content"] = content_literal
+    payload["choices"] = [choice]
+    return payload
+
+
 def plan(**overrides):
     text = overrides.pop("text", TEXT)
     purpose = overrides.pop("purpose", "extraction")
@@ -642,6 +656,60 @@ class ResponseDiagnosticCodeTests(unittest.TestCase):
         self.assertEqual(result.diagnostic.code, "response_model_mismatch")
         self.assertEqual(result.cost.state, "known")
         self.assertEqual(result.cost.amount_usd, "0.0001024")
+
+
+# --------------------------------------------------------------------------- #
+# Number representability (no silent rounding, no crash)
+# --------------------------------------------------------------------------- #
+class NumberRepresentabilityTests(unittest.TestCase):
+    """Untrusted numbers must not be silently rounded, and must never crash.
+
+    The strict parser parses floats as ``Decimal``; extraction content is
+    narrowed to a JSON-native float only when that narrowing is **exact**. An
+    overflow (``1e999``), underflow (``1e-999``), or over-precision number is a
+    terminal ``protocol_error`` carrying a bounded static code — never a silently
+    rounded accepted extraction, and never an uncaught canonical-JSON crash.
+    """
+
+    def _run_content(self, content_literal):
+        return run(FakeTransport(resp(200, body_with_raw_content(content_literal))))
+
+    def test_unrepresentable_numbers_are_protocol_errors_with_known_cost(self):
+        for literal in ("1e999", "1e-999", "0.123456789012345678901"):
+            with self.subTest(literal=literal):
+                result = self._run_content('{"value": %s}' % literal)
+                self.assertEqual(result.outcome, "protocol_error")
+                self.assertEqual(
+                    result.diagnostic.code,
+                    "response_content_number_unrepresentable",
+                )
+                self.assertIn(
+                    result.diagnostic.code, extraction.RESPONSE_DIAGNOSTIC_CODES
+                )
+                # The reported cost survives; the reserve is not released.
+                self.assertEqual(result.cost.state, "known")
+                self.assertEqual(result.cost.amount_usd, "0.0001024")
+                self.assertIsNone(result.proposal_json)
+                self.assertIsNone(result.proposal_text)
+
+    def test_unrepresentable_diagnostic_never_carries_the_number(self):
+        result = self._run_content('{"value": 1e999}')
+        self.assertNotIn("1e999", result.diagnostic.code)
+        self.assertNotIn("1e999", result.diagnostic.detail_redacted or "")
+        self.assertNotIn("999", result.diagnostic.detail_redacted or "")
+
+    def test_ordinary_numbers_are_accepted_and_narrowed(self):
+        result = self._run_content('{"value": 5.2, "small": 1e-3}')
+        self.assertEqual(result.outcome, "completed")
+        self.assertIsInstance(result.proposal_json["value"], float)
+        self.assertEqual(result.proposal_json["value"], 5.2)
+        self.assertEqual(result.proposal_json["small"], 0.001)
+
+    def test_integer_is_preserved_unchanged(self):
+        result = self._run_content('{"count": 7}')
+        self.assertEqual(result.outcome, "completed")
+        self.assertEqual(result.proposal_json["count"], 7)
+        self.assertIsInstance(result.proposal_json["count"], int)
 
 
 # --------------------------------------------------------------------------- #

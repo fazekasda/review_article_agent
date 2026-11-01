@@ -197,6 +197,21 @@ def _completion(content_obj, *, model=_MODEL, provider="deepseek", cost=0.0002, 
     return TransportResponse(status=200, body_text=json.dumps(payload), truncated=False)
 
 
+def _raw_completion(content_literal, *, model=_MODEL, provider="deepseek", cost=0.0002):
+    """A 200 completion whose assistant content is the given raw JSON text.
+
+    The content is embedded as a Python **string** so a numeric literal such as
+    ``1e999`` is never round-tripped through a Python float before the adapter
+    parses it.
+    """
+    payload = {
+        "id": "gen-num", "model": model, "provider": provider,
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": content_literal}}],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20, "cost": cost},
+    }
+    return TransportResponse(status=200, body_text=json.dumps(payload), truncated=False)
+
+
 def _extraction_output(passages, source_keys):
     """Build a schema-valid raw output over the receipt's real passages/assets."""
     findings = []
@@ -719,6 +734,40 @@ class ProtocolErrorDiagnosticTest(RunnerTestBase):
         self.assertEqual(dispatch.state, "failed")
         self.assertEqual(dispatch.cost_state, "not_incurred")
         self.assertIsNone(dispatch.cost_amount_usd)
+
+    def test_unrepresentable_number_is_terminal_diagnostic_not_crash(self):
+        # A number the model reported that a JSON-native float cannot hold
+        # (overflow/underflow/over-precision) must be a terminal protocol_error
+        # with the bounded static code — never a silently rounded accepted
+        # extraction and never an uncaught canonical-JSON crash. The dispatch is
+        # completed (accepted diagnostic), the reported cost is preserved, and
+        # the serial remote slot is freed.
+        from review_article_agent.runtime.dispatch import (
+            RuntimeDispatchRepository,
+            runtime_dispatch_remote_state,
+        )
+
+        for index, literal in enumerate(("1e999", "1e-999", "0.123456789012345678901")):
+            with self.subTest(literal=literal):
+                rid = f"run-num-{index}"
+                self.transport.responses.append(_raw_completion('{"value": %s}' % literal))
+                result = self.run_extraction(
+                    request_id=rid, artifact_id=f"a-num-{index}", revision_id=f"rev-num-{index}"
+                )
+                self.assertEqual(result["outcome"], "protocol_error")
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(
+                    result["diagnostic_code"],
+                    "response_content_number_unrepresentable",
+                )
+                self.assertEqual(result["cost_state"], "known")
+                self.assertEqual(result["cost_amount_usd"], "0.0002")
+                dispatch = RuntimeDispatchRepository(self.store).get_dispatch_by_request(rid)
+                self.assertEqual(dispatch.state, "completed")
+                self.assertEqual(
+                    runtime_dispatch_remote_state(self.store.connection, self.project_id),
+                    "none",
+                )
 
     def test_float_in_model_output_does_not_raise_record_validation_error(self):
         # The shared strict JSON parser parses floats as ``Decimal`` (for exact

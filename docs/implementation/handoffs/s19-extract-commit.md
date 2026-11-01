@@ -32,11 +32,24 @@ The shared strict JSON parser (`runtime.lead._parse_json`) parses floats as
 model's **content** and deep-froze it into `proposal_json`. The runner's
 canonical-JSON step (`canonical_json(result.proposal_json)`) then raised an
 uncaught `RecordValidationError` — a `ValueError`, not a `ReviewAgentError`.
+
 Fixed in `runtime/extraction.py`: the parsed content is narrowed to JSON-native
-floats (`_json_portable`) before freezing, so a schema-valid numeric detail
-(e.g. `{"state":"known","value":5.2}`) is accepted and any float elsewhere is a
-clean escalation, never a crash. The schema is unchanged (`_is_number` still
-accepts only `int`/`float`).
+floats (`_json_portable` / `_narrow_decimal`) before freezing. The narrowing is
+**lossless**: `float(value)` is accepted only when it is finite **and**
+`Decimal(str(converted)) == value`. Ordinary JSON numbers (`5.2`, `1e-3`) and
+integers are accepted (integers unchanged); a number that overflows (`1e999`),
+underflows (`1e-999`), or needs more precision than a float can hold is **never
+silently rounded** — it raises the new bounded static code
+`response_content_number_unrepresentable`, so the run is a terminal
+`protocol_error` (accepted diagnostic, reported cost preserved) instead of a
+wrong accepted extraction or a crash. The number is never coerced to a string or
+null, and the schema is unchanged (`_is_number` still accepts only `int`/`float`).
+
+Numeric-loss policy: the exact significant-figure **text** of a finding is
+already retained in the original passage snippet; numeric fields carry the
+JSON-native value, and any value that cannot be represented exactly without
+rounding is refused rather than approximated. Cost parsing remains exact
+`Decimal`.
 
 ## Diagnostics
 

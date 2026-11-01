@@ -98,6 +98,7 @@ Safety invariants
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Mapping
@@ -180,6 +181,7 @@ RESPONSE_DIAGNOSTIC_CODES = (
     "response_content_empty",
     "response_content_not_json",
     "response_content_not_object",
+    "response_content_number_unrepresentable",
     "protocol_error",
 )
 
@@ -595,19 +597,41 @@ def _json_portable(value: Any) -> Any:
     arithmetic, but the extraction **content** is untrusted *data* destined for
     schema validation and durable storage — not a cost field. A ``Decimal`` is
     not JSON-serializable and the extraction schema accepts only ``int``/``float``,
-    so leaving one in the proposal made the runner's canonical-JSON step raise an
-    uncaught :class:`~review_article_agent.domain.records.RecordValidationError`
-    (which the worker then swallowed as an ``indeterminate`` ambiguous outcome).
-    Finite Decimals are safe to narrow to float — the strict parser already
-    rejected ``NaN``/``Infinity``.
+    so it must be narrowed; but the narrowing must be **lossless**. A number that
+    overflows (``1e999``), underflows (``1e-999``), or needs more precision than a
+    float can hold is **never** silently rounded: it is a loud
+    :class:`_ResponseDefect` (``response_content_number_unrepresentable``), so the
+    run is a terminal, non-scientific diagnostic rather than a wrong accepted
+    extraction. Integers are preserved unchanged; unsupported numbers are never
+    coerced to strings or nulls.
     """
     if isinstance(value, Decimal):
-        return float(value)
+        return _narrow_decimal(value)
     if isinstance(value, Mapping):
         return {key: _json_portable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_portable(item) for item in value]
     return value
+
+
+def _narrow_decimal(value: Decimal) -> float:
+    """A **lossless** ``Decimal`` -> ``float`` narrowing, or a loud defect.
+
+    ``float(value)`` is accepted only when it is finite and round-trips back to
+    the exact original (``Decimal(str(converted)) == value``); a value that cannot
+    be represented without rounding is refused with a bounded, static diagnostic
+    code. No numeric or provider content is ever echoed.
+    """
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError):
+        converted = None
+    if converted is not None and math.isfinite(converted) and Decimal(str(converted)) == value:
+        return converted
+    raise _ResponseDefect(
+        "response_content_number_unrepresentable",
+        "the response contains a number that cannot be represented exactly",
+    )
 
 
 def _classify_completion(
