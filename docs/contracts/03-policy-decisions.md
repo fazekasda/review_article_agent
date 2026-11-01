@@ -522,6 +522,14 @@ before the affected work), with the fail-closed behavior stated per record.
   does not promise the review's total cost); only a **human** may increase a cap; a
   **restart does not reset** the counters.
 - **User evidence.** `"$25 / $10 / 2 (Recommended)"` — 2026-10-27.
+- **Owner amendment (2026-11-01, ADR 006).** A bounded automatic **direct-call
+  retry** is accepted: an ambiguous (`unknown`) `direct_call` dispatch may be
+  retried without human approval, up to 3 attempts under new deterministic
+  identities, with the ambiguous predecessor conservatively accounted at
+  `estimated` = its full reserve, bounded per accounting stage by a `30%` overhead
+  cap over that stage's other spend. The existing per-role/stage/project caps above
+  still apply unchanged to each new reserve; the `opencode_session` route is
+  unchanged. See [`docs/decisions/006-direct-call-retry.md`](../decisions/006-direct-call-retry.md).
 - **Decided against revision.** `ee7f7eafca80baa6c1aaca278361e56a663493c3`.
 - **Options.** (a) explicit ceilings + concurrency bound; (b) user-set per project
   with no default; (c) defer but block all paid calls.

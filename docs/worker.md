@@ -402,6 +402,18 @@ workflow, a completion, or an approval.
   ([`runtime/execution_boundary.py`](../src/review_article_agent/runtime/execution_boundary.py))
   is **unchanged**, and no roles, ordinary-session isolation, or cost/concurrency
   defaults are altered.
+- **Bounded automatic direct-call retry (decision 006, owner 2026-11-01).** A
+  direct-call dispatch left **ambiguous** (`unknown` — a transport error, timeout,
+  or ambiguous status) is retried automatically, **without human approval**, by
+  [`runtime/retry.py`](../src/review_article_agent/runtime/retry.py): a **new**
+  deterministic identity (`{base}-r1`/`{base}-r2`, at most 3 attempts; the same
+  identity is never re-POSTed), the ambiguous predecessor resolved to terminal
+  `failed`/`estimated` = its full reserve (it may have been billed) so the single
+  serial remote slot is freed, bounded by a per-stage `30%` overhead cap over the
+  stage's other spend (all existing per-role/stage/project caps still apply). When
+  all attempts are ambiguous, or the cap refuses, the last attempt is resolved the
+  same way and the caller reports a definitive non-completion. The
+  `opencode_session` route is unchanged.
 - **Untrusted sources.** Provider metadata, corpus records, imported metadata, and
   lead output are **untrusted, non-authorizing** observations; the latest-proposal
   / readback surfaces carry `authorizes_execution=false`,

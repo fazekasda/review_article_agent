@@ -58,12 +58,20 @@ What it guarantees
   is **single-use** — only the caller that won the send claim may proceed, and a
   second caller is refused rather than handed a record it did not win. On a
   restart an outstanding ``submitted`` becomes ``unknown`` (never reset, never
-  retried, never reclassified as a definitive failure) while an existing
-  ``opencode_session`` admission is retained for same-identity reconciliation.
-  The direct route never carries a durable admission. Initial scope allows **at
-  most one logical dispatch per task**: a different ``request_id`` for the same
-  task is refused in every state (including ``completed``/``failed``); a retry
-  would be a separate, explicitly authorized future task.
+  reclassified as a definitive failure) while an existing ``opencode_session``
+  admission is retained for same-identity reconciliation. The direct route never
+  carries a durable admission. Initial scope allows **at most one logical dispatch
+  per task**: a different ``request_id`` for the same task is refused in every
+  state (including ``completed``/``failed``).
+* **Bounded direct-call retry (ADR 006).** An ambiguous (``unknown``)
+  ``direct_call`` dispatch is *not* re-sent under its own identity; instead the
+  named primitives :meth:`RuntimeDispatchRepository.supersede_unknown_for_retry`
+  and :meth:`RuntimeDispatchRepository.abandon_unknown_after_retries` resolve it to
+  a terminal ``failed`` dispatch with a conservative ``estimated`` cost equal to
+  its full reserve, releasing the single serial remote slot. A supersession records
+  its deterministic successor request id (``X-r1`` supersedes ``X``), and the
+  successor is a **new** dispatch with a **new** identity/task. The
+  ``opencode_session`` route is never retried this way.
 * **Monotonic cost settlement.** Once a cost is submitted the dispatch can never
   claim ``not_incurred``, and an established ``known``/``estimated`` amount can
   never be discarded or lowered, so an overrun is never erased by a later weaker
@@ -127,6 +135,7 @@ __all__ = [
     "DISPATCH_PERFORMS_NETWORK_IO",
     "DISPATCH_ROUTES",
     "DISPATCH_STATES",
+    "RETRY_MAX_ATTEMPTS",
     "ROUTE_BUCKET",
     "RUNTIME_REMOTE_STATES",
     "DispatchConflictError",
@@ -137,6 +146,9 @@ __all__ = [
     "DispatchStateError",
     "DispatchValidationError",
     "RuntimeDispatchRepository",
+    "is_retry_resolved",
+    "retry_request_ids",
+    "retry_successor_request_id",
     "runtime_dispatch_integrity_problems",
     "runtime_dispatch_remote_state",
     "runtime_reserve_exposure",
@@ -193,6 +205,14 @@ DISPATCH_PERFORMS_NETWORK_IO = False
 #: Upper bound on a recorded result-kind label (an opaque token, never content).
 MAX_RESULT_KIND_LEN = 128
 
+#: Maximum attempts per logical direct-call request: the base attempt plus at most
+#: two deterministic retries (``base``, ``base-r1``, ``base-r2``). ADR 006.
+RETRY_MAX_ATTEMPTS = 3
+
+#: The deterministic retry suffix a request id may carry: ``-r<k>`` for the k-th
+#: retry (1-based). A **base** request id must not itself end in this suffix.
+_RETRY_SUFFIX_RE = re.compile(r"^(?P<base>.+)-r(?P<k>[0-9]+)$")
+
 #: A lowercase hex SHA-256 digest (the contract's single digest algorithm).
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -214,6 +234,66 @@ def _sha256_hex(data: bytes) -> str:
 def _scoped_id(prefix: str, project_id: str, key: str) -> str:
     digest = _sha256_hex((project_id + "\x00" + key).encode("utf-8"))
     return f"{prefix}_{digest[:32]}"
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic direct-call retry identities (ADR 006)
+# --------------------------------------------------------------------------- #
+def retry_request_ids(base_request_id: str) -> list[str]:
+    """The deterministic retry chain for one direct-call base request id.
+
+    Returns ``[base, f"{base}-r1", f"{base}-r2"]`` — the base attempt followed by
+    at most :data:`RETRY_MAX_ATTEMPTS` - 1 = 2 retries. The identities are derived
+    purely from the base, so a runner never has to persist a retry link: ``X-r1``
+    supersedes ``X`` and ``X-r2`` supersedes ``X-r1`` are derivable.
+
+    ``base_request_id`` must be a valid identifier that does **not** itself end in
+    a retry suffix (``-r<k>``); otherwise the chain would be ambiguous. A retry is
+    always a **new** dispatch under a **new** request id — the same request
+    identity is never re-POSTed.
+    """
+    base = validate_identifier(base_request_id, "base_request_id")
+    if _RETRY_SUFFIX_RE.match(base) is not None:
+        raise DispatchValidationError(
+            "base_request_id: must not itself end in a retry suffix."
+        )
+    return [base] + [f"{base}-r{k}" for k in range(1, RETRY_MAX_ATTEMPTS)]
+
+
+def retry_successor_request_id(request_id: str) -> str | None:
+    """The deterministic successor of ``request_id`` in the retry chain, or ``None``.
+
+    ``X`` -> ``X-r1``, ``X-r1`` -> ``X-r2``, and ``X-r2`` -> ``None`` (the chain
+    is exhausted). Used by the supersession primitive to refuse a successor id
+    that does not match the deterministic chain.
+    """
+    rid = validate_identifier(request_id, "request_id")
+    match = _RETRY_SUFFIX_RE.match(rid)
+    if match is None:
+        return f"{rid}-r1"
+    k = int(match.group("k"))
+    if k + 1 >= RETRY_MAX_ATTEMPTS:
+        return None
+    return f"{match.group('base')}-r{k + 1}"
+
+
+def is_retry_resolved(record: DispatchRecord) -> bool:
+    """``True`` iff ``record`` was resolved by the direct-call retry mechanism.
+
+    A superseded predecessor or an abandoned last attempt is a terminal ``failed``
+    dispatch whose cost was conservatively settled to ``estimated`` = its full
+    reserve. The named primitives
+    (:meth:`RuntimeDispatchRepository.supersede_unknown_for_retry` /
+    :meth:`RuntimeDispatchRepository.abandon_unknown_after_retries`) are the only
+    producers of this combination, so it is a durable, derivable marker with no
+    extra column (ADR 006).
+    """
+    return (
+        record.state == "failed"
+        and record.cost_state == "estimated"
+        and record.cost_amount_usd is not None
+        and Decimal(record.cost_amount_usd) == Decimal(record.reserve_usd)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1061,6 +1141,121 @@ class RuntimeDispatchRepository:
             (now, now, self.project_id, dispatch_id),
         )
         return self._require_dispatch(dispatch_id)
+
+    # -- direct-call retry resolution (ADR 006) ------------------------------- #
+    def supersede_unknown_for_retry(
+        self, dispatch_id: str, *, successor_request_id: str
+    ) -> DispatchRecord:
+        """Resolve an ambiguous ``direct_call`` dispatch and record its retry successor.
+
+        The explicit, named, validated transition the retry policy relies on. In
+        one transaction it:
+
+        1. requires the dispatch to be an **ambiguous** (``unknown``) ``direct_call``
+           dispatch — any other state/route is refused (a definitive outcome is
+           never superseded, and the OpenCode session route is never retried here);
+        2. requires ``successor_request_id`` to be the **deterministic** successor of
+           the dispatch's request id (``X`` -> ``X-r1``, ``X-r1`` -> ``X-r2``); a
+           wrong or exhausted successor is refused;
+        3. conservatively settles the predecessor's cost to ``estimated`` = its full
+           reserve (we assume it may have been billed) and marks it terminal
+           ``failed``, releasing the project's single serial remote slot.
+
+        The successor link is derivable from the request ids, so no extra column is
+        stored; the durable transition itself is the record. The caller then
+        reserves and POSTs a **new** dispatch under ``successor_request_id`` (a
+        fresh task/identity), never re-POSTing the same identity. This public form
+        owns its own transaction; a caller composing it with other writes uses
+        :meth:`_supersede_unknown_for_retry_in_transaction` inside one caller-owned
+        transaction.
+        """
+        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
+        successor_request_id = validate_identifier(
+            successor_request_id, "successor_request_id"
+        )
+        with self._store.transaction():
+            return self._supersede_unknown_for_retry_in_transaction(
+                dispatch_id, successor_request_id=successor_request_id
+            )
+
+    def _supersede_unknown_for_retry_in_transaction(
+        self, dispatch_id: str, *, successor_request_id: str
+    ) -> DispatchRecord:
+        """The transaction-owned supersession primitive (caller owns the unit)."""
+        self._require_own_transaction()
+        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
+        successor_request_id = validate_identifier(
+            successor_request_id, "successor_request_id"
+        )
+        record = self._require_retryable_unknown(dispatch_id)
+        expected = retry_successor_request_id(record.request_id)
+        if expected is None or successor_request_id != expected:
+            raise DispatchValidationError(
+                "successor_request_id: is not the deterministic successor of this "
+                "dispatch."
+            )
+        self._resolve_unknown_for_retry(record)
+        return self._require_dispatch(dispatch_id)
+
+    def abandon_unknown_after_retries(self, dispatch_id: str) -> DispatchRecord:
+        """Resolve an exhausted ambiguous ``direct_call`` dispatch to ``failed``.
+
+        The named primitive for the two exhaustion paths (all attempts ambiguous, or
+        the overhead cap refusing a further retry). It requires an ambiguous
+        (``unknown``) ``direct_call`` dispatch, conservatively settles its cost to
+        ``estimated`` = its full reserve, and marks it terminal ``failed`` so the
+        project's single serial remote slot is released and the caller reports a
+        definitive non-completion. No human approval is involved. This public form
+        owns its own transaction; a caller composing it with other writes uses
+        :meth:`_abandon_unknown_after_retries_in_transaction`.
+        """
+        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
+        with self._store.transaction():
+            return self._abandon_unknown_after_retries_in_transaction(dispatch_id)
+
+    def _abandon_unknown_after_retries_in_transaction(
+        self, dispatch_id: str
+    ) -> DispatchRecord:
+        """The transaction-owned abandonment primitive (caller owns the unit)."""
+        self._require_own_transaction()
+        dispatch_id = validate_identifier(dispatch_id, "dispatch_id")
+        record = self._require_retryable_unknown(dispatch_id)
+        self._resolve_unknown_for_retry(record)
+        return self._require_dispatch(dispatch_id)
+
+    def _require_retryable_unknown(self, dispatch_id: str) -> DispatchRecord:
+        """Return the dispatch iff it is an ambiguous direct-call dispatch (fail closed)."""
+        record = self._require_dispatch(dispatch_id)
+        if record.route != "direct_call":
+            raise DispatchStateError(
+                "only a direct_call dispatch is retried; the opencode_session route "
+                "is never retried by this mechanism."
+            )
+        if record.state != "unknown":
+            raise DispatchStateError(
+                "only an ambiguous (unknown) dispatch may be superseded or abandoned "
+                "for a retry; a definitive outcome is never retried."
+            )
+        return record
+
+    def _resolve_unknown_for_retry(self, record: DispatchRecord) -> None:
+        """Conservatively settle and terminally fail an ambiguous direct call.
+
+        Runs inside the caller's transaction: the cost is settled to
+        ``estimated`` = the full reserve (monotonic and conservative) **and** the
+        state becomes terminal ``failed`` in the same unit of work, so the
+        supersession can never leave a half-resolved row.
+        """
+        self._settle_cost_in_transaction(
+            record.dispatch_id, cost_state="estimated", amount_usd=record.reserve_usd
+        )
+        now = _utc_now()
+        self._conn().execute(
+            "UPDATE runtime_dispatch_state SET state = 'failed', "
+            " ended_at_utc = ?, updated_at_utc = ? "
+            "WHERE project_id = ? AND dispatch_id = ?",
+            (now, now, self.project_id, record.dispatch_id),
+        )
 
     def recover(self, dispatch_id: str) -> DispatchRecord:
         """Reconcile the dispatch after a restart from durable state (no new identity).

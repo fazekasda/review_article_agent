@@ -2,7 +2,7 @@
 
 ## Status and authority
 
-- **Contract version:** `v3.3` (representation dated 2026-10-27; minor clarification 2026-10-31).
+- **Contract version:** `v3.4` (representation dated 2026-10-27; minor clarifications 2026-10-31 and 2026-11-01).
 - **Approval state: behavioral direction APPROVED (2026-10-27); representation
   pending field-level review.** On 2026-10-27 the user approved the **behavior**
   described by the coordinated Step 01 contracts and selected the Step 01
@@ -761,8 +761,37 @@ Invariants:
   retry authorization/budget (`retry_authorized_by` recorded) **and** (b) either
   an established prior **definitive failure** (a non-billing rejection) or an
   explicit human risk disposition. An **ambiguous** prior outcome MUST NOT be
-  retried automatically — it reconciles from recorded state or escalates to a
-  human, consistent with §8.3.
+  retried automatically **except** under the bounded direct-call retry policy
+  below; otherwise it reconciles from recorded state or escalates to a human,
+  consistent with §8.3.
+- **Bounded automatic direct-call retry (amendment, 2026-11-01; ADR 006).** On
+  the owner's 2026-11-01 decision ("network errors or unknown errors are accepted
+  … ~30% cost increase can be accepted for retries like this; no human approval
+  required"), an ambiguous (`unknown`) **`direct_call`** dispatch MAY be retried
+  automatically without a human, under all of:
+  - **New deterministic identity, never a re-POST.** Each retry is a **new**
+    dispatch attempt under a new request id derived deterministically from the
+    base (`{base}-r1`, `{base}-r2`); the **same** request identity is still never
+    re-POSTed. At most **3** attempts per logical call.
+  - **Conservative supersession.** In one transaction the ambiguous predecessor
+    becomes terminal `failed` with `cost` `estimated` = its full reserve (it may
+    have been billed), recorded by an explicit, named, validated primitive that
+    refuses any non-ambiguous/non-`direct_call` predecessor or a successor id that
+    is not the deterministic successor.
+  - **Bounded overhead.** Per accounting stage a retry is allowed only while the
+    accumulated estimated cost of superseded/abandoned attempts plus the new
+    reserve stays within `30%` of the stage's other (known/estimated, or reserve
+    if outstanding) spend — floored so the first retry in a fresh stage is always
+    allowed. All existing per-role/stage/project caps still apply to the new
+    reserve.
+  - **Exhaustion releases the slot.** When all attempts are ambiguous, or the
+    overhead cap refuses a further retry, the last ambiguous attempt is resolved
+    to terminal `failed`/`estimated` by a named primitive, so the project's single
+    serial remote slot is released and the caller reports a definitive
+    non-completion.
+  - `retry_authorized_by` is not required for this bounded automatic path (the
+    owner decision is the standing authorization); the `opencode_session` route is
+    **unchanged** and is never retried this way.
 
 ### 8.2 Exactly-once boundary
 
@@ -791,7 +820,12 @@ Invariants:
   restart reconciles to an explicit unknown/interrupted, never a silent success).
 - An ambiguous external job MUST NOT be re-executed with a new identity; the
   application MUST reconcile from durable state or escalate to a human (step 03:
-  "Never blindly resend ambiguous external work with a new identity").
+  "Never blindly resend ambiguous external work with a new identity"). **Exception
+  (amendment, 2026-11-01; ADR 006):** an ambiguous **`direct_call`** dispatch MAY
+  be retried automatically under the bounded §8.1.1 policy — a **new deterministic
+  identity** per attempt with the ambiguous predecessor conservatively resolved to
+  terminal `failed`/`estimated` — but the **same** request identity is still never
+  re-POSTed, and the `opencode_session` route is unchanged.
 - A stale attempt MUST NOT overwrite a newer authorized result.
 - Lost event streams MUST be reconciled from durable state/messages; missing
   events MUST NOT lose a completion or approval action (step 04).
@@ -1146,4 +1180,5 @@ per-project** value is unset, dependent behavior is `blocked` (fail closed, §9)
 | `v3` | 2026-10-27 | Adapter-faithful decisions: predicate probability mandatory (no boolean/threshold), choice options/confidence/probabilities and score levels/legend per `live_jev.py`, `box` unsupported and excluded, singular typed `answer` with immutable `QuestionDef`/`question_def_ref`, `wire_type` persisted, per-question `missing_answer`/`provider_error`; human disposition cannot waive a confirmed blocker (`counter_evidence` required); `ValidationRecord` separated from `Round`, readiness before validation, reservation-before-dispatch with exactly-once finalize; `CostRecord` amount iff known/estimated with retained reserves; nullable `id|null` activation; waiting-external/pause retain project arbitration; direct retry needs authorization and a non-ambiguous prior outcome; ancestor-tuple stale clause; sibling references as the coordinated contract set; valid synthetic 64-hex digests with explicit out-of-band precondition; example validation against types, ranges, and digests. | Historical (superseded). |
 | `v3.1` | 2026-10-27 | Coordinator's bounded consistency correction after two worker repairs: predicate probability is conditionally mandatory, not mandatory for choice/score answers; read-only validation forbids repairs, not separately authorized model checks, and consumes no repair round. | Historical (superseded). |
 | `v3.2` | 2026-10-27 | Behavioral-direction alignment (2026-10-27 approval): status reframed — behavior approved, representation still proposed. Severity §4.4 becomes the four selected categories with `blocking`/`major`/unclassified-consequential preventing completion. Predicate mapping §6.2 becomes rubric-specific pilot-calibrated rules + uncertainty region (no universal cutoff; raw probability retained; human exclusion approval). Tracing §7.2 becomes required per-project limits (not a Step 01 unresolved item); `configuration_required` is a runtime project gate. New §5.6 records the selected USD 25 / USD 10 / 2 caps and reserve-before-dispatch. §7 adds the review-warning+companion secondary handling (no raw warning tag required; exact manuscript/dependency/warning-set approval; material edits reopen). §12 rewritten to selected policies vs mandatory per-project values. No numeric scientific threshold invented; the 3/2/2 repair maxima are unchanged. Prior "proposed/unapproved" wording retained only in the historical rows above. | Historical (superseded). |
-| `v3.3` | 2026-10-31 | Owner-approved clarification of **"dependency" for approval staleness**: a target's dependencies are the revisions reachable from the target through a path made **only of live (non-`version_of`) edges**; a revision reachable **only** through a `version_of` ancestry edge (the ancestor itself and, transitively, its own historical inputs) is historical lineage — pinned in the snapshot and integrity-verified (digest, size, rights), but a change to it does **not** make the target's approval `stale`. A source the target itself depends on through a live path still makes it `stale`. Added to the §2.2 snapshot invariant and the §3 stale table + invariants; the "any dependency `revision_id` changes" row is qualified as a **live-path** dependency. User decision 2026-10-31 (OpenChamber session `ses_e73abb6baffeVk8BLNhLn10U3p`); realized in `runtime/gates._exact_closure` and `storage/approvals.ApprovalRepository._build_snapshot`. | **Current (minor clarification; behavior approved 2026-10-27).** |
+| `v3.3` | 2026-10-31 | Owner-approved clarification of **"dependency" for approval staleness**: a target's dependencies are the revisions reachable from the target through a path made **only of live (non-`version_of`) edges**; a revision reachable **only** through a `version_of` ancestry edge (the ancestor itself and, transitively, its own historical inputs) is historical lineage — pinned in the snapshot and integrity-verified (digest, size, rights), but a change to it does **not** make the target's approval `stale`. A source the target itself depends on through a live path still makes it `stale`. Added to the §2.2 snapshot invariant and the §3 stale table + invariants; the "any dependency `revision_id` changes" row is qualified as a **live-path** dependency. User decision 2026-10-31 (OpenChamber session `ses_e73abb6baffeVk8BLNhLn10U3p`); realized in `runtime/gates._exact_closure` and `storage/approvals.ApprovalRepository._build_snapshot`. | Historical (superseded). |
+| `v3.4` | 2026-11-01 | Owner-approved **bounded automatic direct-call retry** (ADR 006). An ambiguous (`unknown`) `direct_call` dispatch MAY now be retried automatically, without human approval, under: new deterministic identities (`{base}-r1`/`{base}-r2`, at most 3 attempts, the same identity never re-POSTed); conservative supersession of the ambiguous predecessor to terminal `failed`/`estimated` = full reserve via a named, validated primitive; a per-stage overhead cap of `30%` of the stage's other spend (floored for the first retry); and exhaustion (all attempts ambiguous, or cap refusal) resolving the last ambiguous attempt to `failed`/`estimated` so the serial remote slot is released. Added to the §8.1.1 retry invariant and qualified the §8.3 "new identity" invariant. The `opencode_session` route is unchanged. Owner decision 2026-11-01 (network/unknown errors accepted; ~30% retry cost accepted; no human approval); realized in `runtime/dispatch.py` (`supersede_unknown_for_retry`/`abandon_unknown_after_retries`) and `runtime/retry.py`. | **Current (amendment; behavior approved 2026-11-01).** |
