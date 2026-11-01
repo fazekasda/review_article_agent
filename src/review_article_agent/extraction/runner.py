@@ -97,7 +97,7 @@ __all__ = [
 SCHEMA_VERSION = 1
 
 EXTRACTION_STAGE = "extraction"
-PROMPT_VERSION = "extraction.direct.v1"
+PROMPT_VERSION = "extraction.direct.v2"
 ADAPTER_REVISION = "extraction.direct.v1"
 
 HOSTED_USE_DOCUMENT_TYPE = "extraction_hosted_use"
@@ -914,11 +914,16 @@ def _classify_result(result, *, purpose, config, passages, instructions_sha256, 
                 _check_source_keys(raw, passages)
             else:
                 extraction_workflow.validate_quality(raw)
-        except ReviewAgentError:
-            return "escalation", _content(
+        except ReviewAgentError as exc:
+            content = _content(
                 purpose, "escalation", raw, instructions_sha256, "human",
                 "extraction_schema_invalid", metadata,
-            ), _RESULT_KIND_ESCALATION
+            )
+            # Validator messages name only schema vocabulary and indices (never
+            # model or source text), so the first failing field path is durable
+            # without a local replay.
+            content["validation_error"] = str(exc)[:300]
+            return "escalation", content, _RESULT_KIND_ESCALATION
         return "completed", _content(
             purpose, "completed", raw, instructions_sha256,
             raw.get("escalation", "none") if isinstance(raw, dict) else "none", None, metadata,
@@ -1821,6 +1826,8 @@ def _readback(store, request_id: str, *, run_ref, posted: bool) -> dict:
             mapping["http_status"] = metadata.get("http_status")
             mapping["request_sha256"] = metadata.get("request_sha256")
             mapping["diagnostic_code"] = metadata.get("diagnostic_code")
+            if content.get("validation_error") is not None:
+                mapping["validation_error"] = content["validation_error"]
             break
     return mapping
 

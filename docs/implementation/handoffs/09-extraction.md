@@ -88,3 +88,26 @@ null/negative reports are distinct from missing data. The model checker and huma
 audit—not a genuine snippet or structural validator—must detect semantic errors.
 Escalations preserve missing checks and limitations; they never auto-exclude a
 weak study. No live scientific pilot/audit has been performed for a real project.
+
+## Amendment 2026-11-01: numeric representation (prompt `extraction.direct.v2`)
+
+The first live pilot response put all 29 known numbers in as JSON strings (18 plain
+numbers such as `"15.35"` and 11 qualified values such as `"<0.01"`, `"2-3"`,
+`"Thirty"` and `"0, 10, 20, and 40"`). It also gave one omission with
+`target_kind: "topic"`. The validator rejected the response correctly. Policy from
+this amendment on:
+
+- A known `numeric_details[].value.value` is a single JSON number. Strings are
+  still refused and are never coerced into numbers.
+- A qualified value (range, inequality, approximation, list, or number in words)
+  uses `value: {"state": "not_applicable", "value": null}`. It carries the exact
+  original text in the new optional `reported_as` field, which must be an exact
+  substring of the finding's passage. `reported_as` is required whenever the
+  value is `not_applicable`.
+- An omission's `target_kind` is only `passage` or `asset`. A topic-level
+  omission leaves out both `target_kind` and `target_id`.
+- The instructions and the example output now state these rules. `PROMPT_VERSION`
+  is `extraction.direct.v2`, so receipts made under v1 are not reusable.
+- A schema-invalid escalation now keeps `validation_error`: the validator's first
+  failing field path, which uses schema vocabulary only and never model or source
+  text. The run readback shows it.

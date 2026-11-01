@@ -140,6 +140,8 @@ MISSING VALUES (never invent)
 NUMBERS
 - For each numeric detail give the reported value, its unit, and its denominator (e.g. per 1000, per 100 cells, total N). If the original gives a value without a unit or denominator, mark that part missing rather than inventing one.
 - Keep the number exactly as reported; do not round, convert, or normalise.
+- TYPES: a known `value.value` MUST be a JSON number, never a string: write {"state": "known", "value": 15.35}, NOT {"state": "known", "value": "15.35"}. Units such as "%" belong in `unit`, not in the value.
+- QUALIFIED VALUES: a range ("2-3"), inequality ("P<0.01", "at least twenty"), approximation ("~5"), list ("0, 10, 20, and 40"), or a number written in words ("Thirty") is NOT a single known number. Either give one numeric detail per stated number (for a list), or use {"state": "not_applicable", "value": null} and copy the exact original text into `reported_as`. `reported_as` MUST be an exact substring of the finding's passage. Never silently turn a qualified value into a plain number.
 
 CONTEXT (mandatory per finding)
 - Always fill species, population, assay, outcome, and conditions; use missing/unknown/not_applicable where the original does not state them. A finding whose applicable context is not carried cannot support a generalised claim.
@@ -152,7 +154,7 @@ ATTRIBUTION AND CITATION
 COVERAGE AND OMISSIONS (completeness, not just quote correctness)
 - `coverage` MUST account for EVERY supplied passage_id and every declared asset_id, exactly once, with disposition finding | no_finding | omitted.
 - `finding` requires the matching finding_id. `omitted` requires a non-empty reason (e.g. not_scientific_content, table_not_acquired, unreadable, missing_context). An omitted item is a known omission for a later human gate -- it is never silently dropped.
-- `omissions` records additional known omissions/escalations that are not a supplied passage id.
+- `omissions` records additional known omissions/escalations that are not a supplied passage id. Its optional `target_kind` is ONLY "passage" or "asset" (with the matching `target_id`); for a topic-level omission (e.g. a pathway component no passage addresses), omit both `target_kind` and `target_id` and explain it in `note`.
 
 DISTINCT IDENTITIES (do not conflate)
 - source_records: the document(s)/report(s) actually read; each has a unique source_key.
@@ -357,7 +359,14 @@ def _validate_context(value: object, *, label: str) -> dict:
     return {"context": out, "note": _optional_string(note, label=f"{label}.note")}
 
 
-def _validate_numeric(value: object, *, label: str) -> list:
+def _validate_numeric(value: object, *, label: str, passage: dict) -> list:
+    """Validate numeric details; ``reported_as`` carries a qualified value verbatim.
+
+    A known ``value`` is a single JSON number. A range, inequality, list,
+    approximation, or other qualified value is never coerced into one: its
+    ``value`` is ``not_applicable`` and the exact original text (an exact
+    substring of the finding's passage) is carried in ``reported_as``.
+    """
     items = _list(value, label=label)
     out = []
     for index, raw in enumerate(items):
@@ -366,15 +375,27 @@ def _validate_numeric(value: object, *, label: str) -> list:
             raw,
             label=item_label,
             required=frozenset({"name", "value", "unit", "denominator"}),
+            optional=frozenset({"reported_as"}),
         )
-        out.append(
-            {
-                "name": _string(item["name"], label=f"{item_label}.name"),
-                "value": _stated(item["value"], label=f"{item_label}.value", kind="number"),
-                "unit": _stated(item["unit"], label=f"{item_label}.unit", kind="str"),
-                "denominator": _stated(item["denominator"], label=f"{item_label}.denominator", kind="str"),
-            }
+        detail = {
+            "name": _string(item["name"], label=f"{item_label}.name"),
+            "value": _stated(item["value"], label=f"{item_label}.value", kind="number"),
+            "unit": _stated(item["unit"], label=f"{item_label}.unit", kind="str"),
+            "denominator": _stated(item["denominator"], label=f"{item_label}.denominator", kind="str"),
+        }
+        reported_as = item.get("reported_as")
+        if reported_as is not None:
+            reported_as = _string(reported_as, label=f"{item_label}.reported_as")
+            _require(
+                _snippet_grounded(reported_as, passage),
+                f"{item_label}.reported_as is not an exact substring of its passage",
+            )
+            detail["reported_as"] = reported_as
+        _require(
+            detail["value"]["state"] != "not_applicable" or reported_as is not None,
+            f"{item_label}.reported_as is required when value.state is not_applicable",
         )
+        out.append(detail)
     return out
 
 
@@ -417,7 +438,9 @@ def _validate_findings(value: object, sources: dict, passages: dict, id_lists: d
         context = _validate_context(item["context"], label=f"{label}.context")
         secondary_warning = _stated(item["secondary_warning"], label=f"{label}.secondary_warning", kind="bool")
         limitations = _stated(item["limitations"], label=f"{label}.limitations", kind="str")
-        numeric = _validate_numeric(item.get("numeric_details", []), label=f"{label}.numeric_details")
+        numeric = _validate_numeric(
+            item.get("numeric_details", []), label=f"{label}.numeric_details", passage=passage
+        )
         uncertainty = item.get("uncertainty")
         if uncertainty is not None:
             uncertainty = _stated(uncertainty, label=f"{label}.uncertainty", kind="str")
@@ -787,7 +810,7 @@ EXTRACTION_EXAMPLE_PASSAGES = [
     {
         "passage_id": "p0002",
         "source_key": "docA",
-        "text": "The 50 mg dose reduced tumor volume by 12.5 mm3 per mouse (n=8).",
+        "text": "The 50 mg dose reduced tumor volume by 12.5 mm3 per mouse (n=8; P<0.01) over 2-3 weeks.",
     },
     {
         "passage_id": "p0003",
@@ -852,7 +875,18 @@ EXTRACTION_OUTPUT_EXAMPLE = {
             "numeric_details": [
                 {"name": "tumor volume", "value": {"state": "known", "value": 12.5},
                  "unit": {"state": "known", "value": "mm3"},
-                 "denominator": {"state": "known", "value": "per mouse"}}
+                 "denominator": {"state": "known", "value": "per mouse"}},
+                {"name": "mice per group", "value": {"state": "known", "value": 8},
+                 "unit": {"state": "known", "value": "mice"},
+                 "denominator": {"state": "not_applicable", "value": None}},
+                {"name": "P value", "value": {"state": "not_applicable", "value": None},
+                 "reported_as": "P<0.01",
+                 "unit": {"state": "not_applicable", "value": None},
+                 "denominator": {"state": "not_applicable", "value": None}},
+                {"name": "treatment duration", "value": {"state": "not_applicable", "value": None},
+                 "reported_as": "2-3",
+                 "unit": {"state": "known", "value": "weeks"},
+                 "denominator": {"state": "not_applicable", "value": None}},
             ],
             "experiment_id": "E1",
         },

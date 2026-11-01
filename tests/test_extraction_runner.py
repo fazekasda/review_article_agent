@@ -804,6 +804,20 @@ class ProtocolErrorDiagnosticTest(RunnerTestBase):
         self.assertEqual(result["outcome"], "escalation")
         self.assertEqual(result["status"], "completed")
 
+        # A numeric string (the 2026-11-01 pilot rejection) escalates with the
+        # durable, text-free field path of the first schema failure.
+        output["findings"][0]["numeric_details"][0]["value"]["value"] = "5.2"
+        self.transport.responses.append(_completion(output))
+        result = self.run_extraction(
+            request_id="run-numstr", artifact_id="a-run-numstr", revision_id="rev-run-numstr"
+        )
+        self.assertEqual(result["outcome"], "escalation")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(
+            result["validation_error"],
+            "findings[0].numeric_details[0].value.value must be a finite number when known",
+        )
+
 
 class ProposalGuardRejectionTest(RunnerTestBase):
     """A proposal-guard rejection of model-owned content must not erase the
