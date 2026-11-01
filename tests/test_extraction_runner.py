@@ -817,6 +817,11 @@ class ProtocolErrorDiagnosticTest(RunnerTestBase):
             result["validation_error"],
             "findings[0].numeric_details[0].value.value must be a finite number when known",
         )
+        # The worker's safe projection (what `extraction run status` prints) keeps it.
+        from review_article_agent.worker import extraction as worker_extraction
+
+        projected = worker_extraction.status_projection(worker_extraction.accepted_result(result))
+        self.assertEqual(projected["validation_error"], result["validation_error"])
 
 
 class ProposalGuardRejectionTest(RunnerTestBase):

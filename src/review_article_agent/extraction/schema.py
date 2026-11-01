@@ -126,8 +126,13 @@ class ExtractionError(ReviewAgentError):
 EXTRACTION_INSTRUCTIONS = """\
 You extract evidence from the ORIGINAL passages supplied with this request. Return ONE JSON object only.
 
+IDENTIFIERS (copy exactly)
+- Copy every passage_id, asset id, and source_key EXACTLY as written in the supplied `[passage ...]` / `[source ...]` headers, including any report prefix. If the header reads `[passage rep-x:p0021]`, the passage_id is "rep-x:p0021", never "p0021". The example below uses short ids only because its passages are short; real ids are the full header strings.
+- An asset id is the value inside `asset_ids=[...]` on a header (e.g. "rep-x:f01:0"), NOT that header's passage_id (e.g. "rep-x:asset-0").
+- In source_records, omit `report_ref` (the runner binds each source_key to the report it read).
+
 GROUNDING (hard rules)
-- Every finding MUST cite a passage_id that appears in the supplied passages and a `snippet` that is an EXACT substring of that passage's original text. Never paraphrase, translate, clean up, correct, abbreviate, or re-order the snippet. If you cannot find an exact snippet, do not report the finding; record the passage as omitted with a reason.
+- Every finding MUST cite a passage_id that appears in the supplied passages and a `snippet` that is an EXACT substring of that passage's original text. Never paraphrase, translate, clean up, correct, abbreviate, or re-order the snippet. Never join separate parts with "..." or any ellipsis: a snippet is ONE contiguous span; split two parts into two findings. If you cannot find an exact snippet, do not report the finding; record the passage as omitted with a reason.
 - Never extract from a summary, abstract-only context, prior model output, or Jev decisions. The supplied original text is the only source.
 - Preserve negation. "did not reduce", "no effect", "not significant", "failed to" MUST remain verbatim in the snippet; never drop a negative.
 - Do not upgrade attribution. A claim stated by the authors is `author_interpretation`; a result measured in this report is `direct_observation`; a cited third-party claim is `secondary_account`. Never present author spin as a direct observation, and never present a secondary account as verified primary support.
@@ -152,7 +157,7 @@ ATTRIBUTION AND CITATION
 - secondary_warning: {"state": "known", "value": true} when a tracing/origin limit applies; otherwise state known false or not_applicable.
 
 COVERAGE AND OMISSIONS (completeness, not just quote correctness)
-- `coverage` MUST account for EVERY supplied passage_id and every declared asset_id, exactly once, with disposition finding | no_finding | omitted.
+- `coverage` MUST account for EVERY supplied passage_id and every declared asset_id, exactly once, with disposition finding | no_finding | omitted. A header with `asset_ids=[...]` therefore needs one coverage entry for its passage_id (target_kind "passage", e.g. its caption) AND one for each of its asset ids (target_kind "asset").
 - `finding` requires the matching finding_id. `omitted` requires a non-empty reason (e.g. not_scientific_content, table_not_acquired, unreadable, missing_context). An omitted item is a known omission for a later human gate -- it is never silently dropped.
 - `omissions` records additional known omissions/escalations that are not a supplied passage id. Its optional `target_kind` is ONLY "passage" or "asset" (with the matching `target_id`); for a topic-level omission (e.g. a pathway component no passage addresses), omit both `target_kind` and `target_id` and explain it in `note`.
 
@@ -828,8 +833,8 @@ EXTRACTION_OUTPUT_EXAMPLE = {
     "schema_version": SCHEMA_VERSION,
     "summary": "Compound Z effects in a mouse model, with a separate author interpretation.",
     "source_records": [
-        {"source_key": "docA", "source_kind": "document", "label": "Study A", "report_ref": "report:A"},
-        {"source_key": "docB", "source_kind": "document", "label": "Study B", "report_ref": "report:B"},
+        {"source_key": "docA", "source_kind": "document", "label": "Study A"},
+        {"source_key": "docB", "source_kind": "document", "label": "Study B"},
     ],
     "studies": [{"study_id": "S1", "label": "Z tumor study"}],
     "datasets": [{"dataset_id": "D1", "label": "Z measurements"}],
