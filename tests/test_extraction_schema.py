@@ -164,6 +164,59 @@ class CompletenessTests(unittest.TestCase):
             validate(out)
 
 
+class NumericRepresentationTests(unittest.TestCase):
+    """Shapes from the 2026-11-01 pilot rejection: numbers sent as JSON strings."""
+
+    def _numeric(self, **detail):
+        base = {"name": "tumor volume", "value": known(12.5), "unit": known("mm3"),
+                "denominator": known("per mouse")}
+        base.update(detail)
+        out = valid_output()
+        out["findings"][1]["numeric_details"] = [base]
+        return out
+
+    def test_numeric_strings_are_refused_not_coerced(self):
+        for value in ("12.5", "<0.01", "2-3", "Thirty", "0, 10, 20, and 40"):
+            with self.subTest(value=value), self.assertRaises(ExtractionError):
+                validate(self._numeric(value=known(value)))
+
+    def test_qualified_value_carries_grounded_reported_as(self):
+        result = validate(self._numeric(value={"state": "not_applicable", "value": None},
+                                        reported_as="(n=8)"))
+        detail = result["findings"][1]["numeric_details"][0]
+        self.assertEqual(detail["reported_as"], "(n=8)")
+        self.assertIsNone(detail["value"]["value"])
+
+    def test_reported_as_rules(self):
+        with self.subTest(case="required_when_not_applicable"), self.assertRaises(ExtractionError):
+            validate(self._numeric(value={"state": "not_applicable", "value": None}))
+        with self.subTest(case="must_be_exact_passage_substring"), self.assertRaises(ExtractionError):
+            validate(self._numeric(value={"state": "not_applicable", "value": None},
+                                   reported_as="n = 8"))
+        with self.subTest(case="absent_key_stays_absent"):
+            detail = validate(valid_output())["findings"][1]["numeric_details"][0]
+            self.assertNotIn("reported_as", detail)
+
+    def test_topic_omission_target_kind_is_refused_but_untargeted_note_passes(self):
+        out = valid_output()
+        out["omissions"] = [{"note": "no DAF-2 passage", "target_kind": "topic", "target_id": "DAF-2"}]
+        with self.assertRaises(ExtractionError):
+            validate(out)
+        out["omissions"] = [{"note": "no DAF-2 passage", "important": True}]
+        self.assertEqual(validate(out)["omissions"][0]["target_kind"], None)
+
+    def test_instructions_state_the_numeric_contract(self):
+        self.assertIn("MUST be a JSON number, never a string", EXTRACTION_INSTRUCTIONS)
+        self.assertIn("reported_as", EXTRACTION_INSTRUCTIONS)
+        example = raw_extraction_example()
+        details = [d for f in example["findings"] for d in f["numeric_details"]]
+        self.assertTrue(any("reported_as" in d for d in details))
+        for d in details:
+            if d["value"]["state"] == "known":
+                self.assertIsInstance(d["value"]["value"], (int, float))
+        extraction_example()  # the shown example passes the real validator
+
+
 class MissingValueTests(unittest.TestCase):
     def test_value_and_dimension_rules(self):
         # P1 merge (S19-PRUNE-A): the original standalone methods are preserved
