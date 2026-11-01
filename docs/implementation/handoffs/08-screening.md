@@ -147,6 +147,29 @@ missing window (not complete). `docs/generation.md` and `docs/operator-guide.md`
 describe the per-window ids/cost/replay and the `{"decision_result_refs": [...]}`
 job result.
 
+**S19-RETRY-SCREEN bounded automatic retry (ADR 006).** The per-window dispatch
+loop now runs the `runtime/retry.py` recipe: `next_attempt(store, "{request_id}-wNN")`
+inspects the deterministic chain (`-wNN`, `-wNN-r1`, `-wNN-r2`), owns the
+supersede/abandon ledger transitions, and returns the next action. An ambiguous
+attempt is superseded by a **new** dispatch under a new id (never a re-POST of the
+same identity); the retry's reserve is checked through the existing per-dispatch
+`_check_budget` (a superseded/abandoned predecessor counts toward the per-role
+exposure at its full reserve via `_dispatch_exposure`). A `completed` window
+contributes its completed member's readback; `definitive`/`exhausted`/
+`refused_overhead` stop the case with a definitive `failed` status (the serial
+remote slot is freed), and later windows are never sent. `_window_request_ids`
+reserves room for the `-rK` suffix in `MAX_REQUEST_ID_CHARS`. `readback_screening_case`
+follows each window's chain to its completed member (never claiming completion for
+a window with no completed member) while keeping the legacy single-id back-compat.
+The `transport=None` live bug is fixed in `runtime/jev.py`: `dispatch_plan` (and
+`execute`) now map `None` to the real `post_decisions`, matching the other
+direct-call runtimes — previously the worker's `transport=None` called `None(...)`
+and every window became an ambiguous `unknown`. `tests/test_screening_runner.py`
+adds retry-success, retry-exhaustion (slot freed), pre-existing-`unknown`
+supersede+retry, and superseded-exposure tests (all with a no-op sleep);
+`tests/test_jev_adapter.py` adds the `transport=None` → `post_decisions` test;
+`tests/test_generation_worker.py` adds the worker-path `transport=None` test.
+
 This MVP imports recorded Jev responses with explicit
 `imported_unverified_dispatch` provenance. Input/request digests are recorded,
 but do **not** prove those responses came from a dispatch on those inputs.

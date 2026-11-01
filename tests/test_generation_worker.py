@@ -718,6 +718,29 @@ class GenerationWorkerScreeningCaseTest(_EngineBase, scr_fx.RunnerTestBase):
         dispatch = RuntimeDispatchRepository(self.store).get_dispatch(ref["dispatch_id"])
         self.assertEqual(dispatch.state, "completed")
 
+    def test_screening_case_none_transport_uses_post_decisions(self) -> None:
+        # Production passes ``generation_transport=None``; the Jev adapter must
+        # then select the real ``post_decisions`` (patched here, so no network).
+        engine = WorkerEngine(
+            str(self.tmp / "app"), registry=self.registry,
+            generation_transport=None, generation_api_key=scr_fx._API_KEY,
+        )
+        self.addCleanup(engine.close)
+        with mock.patch.object(
+            scr_fx.jev, "post_decisions",
+            return_value=scr_fx._jev_response(0.1),
+        ) as post:
+            res = self._submit(
+                engine, request_id="gen-sc-none", parameters=self._parameters())
+            self.assertTrue(res["ok"], res)
+            job_id = res["job"]["job_id"]
+            self._drive(engine)
+            job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        result = job["accepted_result"]["result"]
+        self.assertEqual(result["screening_status"], "completed")
+        self.assertGreaterEqual(post.call_count, 1)
+
     def test_multi_window_case_reports_ordered_refs_and_window_count(self):
         report = self.large_report()
         count = self.window_count(report)

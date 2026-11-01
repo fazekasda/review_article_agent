@@ -1727,7 +1727,7 @@ def dispatch_plan(
     api_key: str,
     attempt_no: int = 1,
     timeout: float | None = None,
-    transport: Callable[..., TransportResponse] = post_decisions,
+    transport: Callable[..., TransportResponse] | None = None,
 ) -> DispatchResult:
     """Execute one planned dispatch. Exactly one POST; never retries.
 
@@ -1738,17 +1738,22 @@ def dispatch_plan(
     result is returned so a possibly-billed call is never reported
     ``not_incurred``. A server-reported cost is an exact decimal string; an absent
     one is explicit ``unknown`` with the reserve retained.
+
+    ``transport`` is the send callable; ``None`` (the default, and what the worker
+    passes in production) selects the real :func:`post_decisions`, matching the
+    other direct-call runtimes. Tests inject a fake transport.
     """
     _revalidate_plan(plan)
     if not api_key:
         raise JevCredentialError("a non-empty credential is required")
+    send = post_decisions if transport is None else transport
     attempt = _require_attempt_no(attempt_no)
     effective_timeout = (
         plan.timeout_seconds if timeout is None else _require_timeout(timeout)
     )
     body = bytes(plan.request_body)
     try:
-        response = transport(
+        response = send(
             body, api_key, endpoint=plan.endpoint, timeout=effective_timeout
         )
     except Exception:  # noqa: BLE001 - a submitted call must not escape as no-call
@@ -1884,7 +1889,7 @@ def execute(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     server_cap: bool = True,
     attempt_no: int = 1,
-    transport: Callable[..., TransportResponse] = post_decisions,
+    transport: Callable[..., TransportResponse] | None = None,
 ) -> DispatchResult:
     """Plan and perform **one** bounded direct dispatch.
 
@@ -1893,6 +1898,9 @@ def execute(
     authorization, a missing credential, or an invalid/over-budget plan. Nothing
     is sent in those cases. Once the request is submitted, exactly one attempt is
     made and no retry is ever performed.
+
+    ``transport`` is the send callable; ``None`` selects the real
+    :func:`post_decisions` (see :func:`dispatch_plan`).
     """
     if endpoint != ENDPOINT:
         return _blocked(

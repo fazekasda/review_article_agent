@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
@@ -30,7 +31,10 @@ from review_article_agent.generation import hosted_use  # noqa: E402
 from review_article_agent.parsing import ParsingRepository  # noqa: E402
 from review_article_agent.parsing.core import NORMALIZATION_VERSION, PARSER_VERSION  # noqa: E402
 from review_article_agent.runtime import jev, owner_auth  # noqa: E402
-from review_article_agent.runtime.dispatch import RuntimeDispatchRepository  # noqa: E402
+from review_article_agent.runtime.dispatch import (  # noqa: E402
+    RuntimeDispatchRepository,
+    runtime_dispatch_remote_state,
+)
 from review_article_agent.runtime.gates import prepare_gate_snapshot  # noqa: E402
 from review_article_agent.runtime.lead import LeadConfig  # noqa: E402
 from review_article_agent.runtime.owner_auth import OwnerApproval  # noqa: E402
@@ -343,7 +347,7 @@ class RunnerTestBase(unittest.TestCase):
     # -- runner helper ------------------------------------------------------- #
     def run_case(self, *, request_id="screen-1", hosted_ref=None, api_key=_API_KEY,
                  transport=None, config_ref=None, report_ref=None, passage_id=None,
-                 token=None):
+                 token=None, sleep=None):
         return execute_screening_case(
             self.store,
             registry=self.registry,
@@ -355,6 +359,8 @@ class RunnerTestBase(unittest.TestCase):
             hosted_ref=self.hosted_ref if hosted_ref is None else hosted_ref,
             api_key=api_key,
             transport=self.transport if transport is None else transport,
+            # A no-op backoff: tests never wait the real 2 s/8 s retry delays.
+            sleep=(lambda _seconds: None) if sleep is None else sleep,
         )
 
     def verified_case(self, *, request_id="screen-1", passage_id=None):
@@ -387,14 +393,25 @@ class ExecuteTest(RunnerTestBase):
         self.assertEqual(dispatch.route, "direct_call")
         self.assertEqual(dispatch.stage, "screening")
 
-    def test_ambiguous_result_is_unknown_with_reserve_retained(self):
+    def test_ambiguous_result_refused_overhead_and_frees_slot(self):
+        # A lone window has no other stage spend, so the overhead cap's floor
+        # permits exactly one retry: the base is superseded and the retry is then
+        # abandoned, both failed/estimated (reserve retained) and the slot freed.
         self.transport.responses.append(jev.TransportResponse(500, ""))
         result = self.run_case()
-        self.assertEqual(self.transport.call_count, 1)
-        dispatch = RuntimeDispatchRepository(self.store).get_dispatch(result["dispatch_id"])
-        self.assertEqual(dispatch.state, "unknown")
-        self.assertIsNone(dispatch.result_ref)
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(result["status"], "failed")
+        dispatch = RuntimeDispatchRepository(self.store)
+        for request_id in ("screen-1-w01", "screen-1-w01-r1"):
+            record = dispatch.get_dispatch_by_request(request_id)
+            self.assertEqual(record.state, "failed")
+            self.assertEqual(record.cost_state, "estimated")
+            self.assertEqual(record.cost_amount_usd, record.reserve_usd)
         self.assertIsNone(result["decision_result_ref"])
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
 
     def test_replay_never_resends(self):
         self.transport.responses.append(_jev_response(0.1))
@@ -480,29 +497,6 @@ class MultiWindowTest(RunnerTestBase):
             [w["dispatch_id"] for w in first["windows"]],
         )
 
-    def test_ambiguous_window_stops_and_never_resends(self):
-        report = self.large_report()
-        count = self.window_count(report)
-        self.assertGreater(count, 2)
-        # Window 1 completes, window 2 is ambiguous (500): window 3 must not be sent.
-        self.transport.responses.append(_jev_response(0.1))
-        self.transport.responses.append(jev.TransportResponse(500, ""))
-        result = self.run_case(request_id="multi-4", report_ref=report)
-        self.assertEqual(self.transport.call_count, 2)
-        self.assertEqual(result["status"], "unknown")
-        self.assertIsNone(result["decision_result_refs"])
-        self.assertEqual(len(result["windows"]), 2)  # window 3 never attempted
-        self.assertEqual(result["windows"][0]["status"], "completed")
-        self.assertEqual(result["windows"][1]["status"], "unknown")
-        # The missing windows have no dispatch rows at all.
-        dispatch = RuntimeDispatchRepository(self.store)
-        self.assertIsNone(dispatch.get_dispatch_by_request("multi-4-w03"))
-        # A re-run replays the completed window and does not re-POST window 2.
-        rerun = self.run_case(request_id="multi-4", report_ref=report)
-        self.assertEqual(self.transport.call_count, 2)
-        self.assertEqual(rerun["status"], "unknown")
-        self.assertTrue(rerun["windows"][0]["replayed"])
-
     def test_pre_reserve_budget_refusal_zero_dispatch(self):
         report = self.large_report()
         low = self._hosted("a-hosted-low", "rev-hosted-low", budget="0.000001")
@@ -583,6 +577,119 @@ class MultiWindowTest(RunnerTestBase):
         self.assertIsNotNone(result["decision_result_ref"])
         self.assertEqual(result["decision_result_refs"], [result["decision_result_ref"]])
         self.assertEqual(result["windows"][0]["request_id"], "one-1-w01")
+
+
+# --------------------------------------------------------------------------- #
+# Bounded automatic retry of ambiguous direct calls (ADR 006)
+# --------------------------------------------------------------------------- #
+class RetryTest(RunnerTestBase):
+    def test_window_transport_error_then_success_retries(self):
+        # A transport error on window 1 is retried under a NEW id; the retry
+        # completes, the base is superseded (failed/estimated = its reserve), and
+        # the case completes with the retry bound as a verified_dispatch.
+        self.transport.responses.append(jev.TransportResponse(500, ""))
+        self.transport.responses.append(_jev_response(0.1))
+        result = self.run_case(request_id="retry-1")
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(result["status"], "completed")
+        dispatch = RuntimeDispatchRepository(self.store)
+        base = dispatch.get_dispatch_by_request("retry-1-w01")
+        retry = dispatch.get_dispatch_by_request("retry-1-w01-r1")
+        self.assertEqual(base.state, "failed")
+        self.assertEqual(base.cost_state, "estimated")
+        self.assertEqual(base.cost_amount_usd, base.reserve_usd)
+        self.assertEqual(retry.state, "completed")
+        self.assertEqual(result["windows"][0]["request_id"], "retry-1-w01-r1")
+        self.assertFalse(result["windows"][0]["replayed"])  # sent this run
+        # The completed retry binds as a verified_dispatch response.
+        case = {
+            "id": "paper1", "report_ref": self.report, "passage_id": None,
+            "response": {"decision_result_refs": result["decision_result_refs"]},
+        }
+        observed = self.screening._case(_config(), case)
+        self.assertEqual(observed["response_provenance"], "verified_dispatch")
+        self.assertEqual(observed["model"], jev.MODEL)
+
+    def test_three_ambiguous_attempts_exhaust_and_free_slot(self):
+        report = self.large_report()
+        count = self.window_count(report)
+        self.assertGreater(count, 2)
+        # Window 1 completes with a large cost, so the stage's other spend lets
+        # window 2's overhead cap permit both retries. Window 2 then exhausts its
+        # three attempts (500 + two transport errors): the case is failed, the
+        # last attempt is resolved, and window 3 is never sent.
+        self.transport.responses.append(_jev_response(0.1, cost=1.0))
+        self.transport.responses.append(jev.TransportResponse(500, ""))
+        result = self.run_case(request_id="retry-2", report_ref=report)
+        self.assertEqual(self.transport.call_count, 4)  # 1 + three window-2 attempts
+        self.assertEqual(result["status"], "failed")
+        self.assertIsNone(result["decision_result_refs"])
+        self.assertEqual(len(result["windows"]), 2)  # window 3 never attempted
+        self.assertEqual(result["windows"][0]["status"], "completed")
+        self.assertEqual(result["windows"][1]["status"], "failed")
+        dispatch = RuntimeDispatchRepository(self.store)
+        for request_id in ("retry-2-w02", "retry-2-w02-r1", "retry-2-w02-r2"):
+            record = dispatch.get_dispatch_by_request(request_id)
+            self.assertEqual(record.state, "failed")
+            self.assertEqual(record.cost_state, "estimated")
+            self.assertEqual(record.cost_amount_usd, record.reserve_usd)
+        self.assertIsNone(dispatch.get_dispatch_by_request("retry-2-w03"))
+        # The exhausted slot is released: no remote-occupying row remains.
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
+
+    def test_rerun_after_pre_existing_unknown_supersedes_and_retries(self):
+        # The live state: an earlier run left the base window ambiguous (unknown)
+        # with no successor. A re-run supersedes it and retries under a new id,
+        # never re-POSTing the base identity.
+        real_next = screening_runner.next_attempt
+        state = {"n": 0}
+
+        def first_only(store, base_request_id, *, sleep=None, **kwargs):
+            state["n"] += 1
+            if state["n"] == 1:
+                return real_next(store, base_request_id, sleep=sleep, **kwargs)
+            raise RuntimeError("stop after the base attempt")
+
+        self.transport.responses.append(jev.TransportResponse(500, ""))
+        with mock.patch.object(screening_runner, "next_attempt", side_effect=first_only):
+            with self.assertRaises(RuntimeError):
+                self.run_case(request_id="live-1")
+        self.assertEqual(self.transport.call_count, 1)
+        dispatch = RuntimeDispatchRepository(self.store)
+        base = dispatch.get_dispatch_by_request("live-1-w01")
+        self.assertEqual(base.state, "unknown")
+        self.assertIsNone(dispatch.get_dispatch_by_request("live-1-w01-r1"))
+        # Re-run: supersede + retry; only the retry identity is POSTed.
+        self.transport.responses.append(_jev_response(0.1))
+        result = self.run_case(request_id="live-1")
+        self.assertEqual(self.transport.call_count, 2)
+        self.assertEqual(result["status"], "completed")
+        base = dispatch.get_dispatch_by_request("live-1-w01")
+        retry = dispatch.get_dispatch_by_request("live-1-w01-r1")
+        self.assertEqual(base.state, "failed")
+        self.assertEqual(base.cost_state, "estimated")
+        self.assertEqual(base.cost_amount_usd, base.reserve_usd)
+        self.assertEqual(retry.state, "completed")
+
+    def test_role_exposure_counts_superseded_at_estimated_cost(self):
+        # A superseded predecessor must count toward the per-role exposure at its
+        # full reserve (estimated), so the retry budget check never ignores it.
+        self.transport.responses.append(jev.TransportResponse(500, ""))
+        self.transport.responses.append(_jev_response(0.1))
+        self.run_case(request_id="exp-1")
+        exposure = screening_runner._role_exposure(
+            self.store, hosted_ref=self.hosted_ref)
+        dispatch = RuntimeDispatchRepository(self.store)
+        base = dispatch.get_dispatch_by_request("exp-1-w01")
+        retry = dispatch.get_dispatch_by_request("exp-1-w01-r1")
+        self.assertEqual(base.cost_state, "estimated")
+        self.assertEqual(
+            exposure,
+            Decimal(base.cost_amount_usd) + Decimal(retry.cost_amount_usd),
+        )
 
 
 # --------------------------------------------------------------------------- #

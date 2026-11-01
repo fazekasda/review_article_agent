@@ -281,6 +281,14 @@ review-article-agent --data-dir "$DD" screening show \
   `{"decision_result_refs": [ref, ...]}` from the job result; a pilot/batch case
   binds exactly those refs. A window that was already dispatched is never
   re-sent, so a re-run after a partial run completes only the missing windows.
+  An **ambiguous** window outcome (a transport error, timeout, or ambiguous HTTP
+  status) is retried automatically under a new deterministic id
+  (`"{request_id}-wNN-rK"`, at most 3 attempts total, bounded by a ~30% per-stage
+  cost-overhead cap; see decision 006). A window that is still unresolved after
+  the bounded retries is resolved to a definitive failure (never left occupying
+  the serial remote slot), the case reports `failed`, and later windows are not
+  sent; re-running resumes only what is missing. No human approval is required
+  for a retry.
 - No important failure and no **false exclusion** (a case the machine proposed to
   exclude but you judged `retain`/`uncertain`) — either blocks the pilot, and a
   false exclusion needs a corrective action.

@@ -873,6 +873,46 @@ class NoRetryTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Default transport selection (live-bug fix: ``transport=None``)
+# --------------------------------------------------------------------------- #
+class TransportDefaultTests(unittest.TestCase):
+    """``transport=None`` (what the worker passes in production) must select the
+    real :func:`jev.post_decisions`, matching the other direct-call runtimes."""
+
+    def test_dispatch_plan_none_transport_uses_post_decisions(self):
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        with mock.patch.object(
+            jev, "post_decisions", return_value=resp(200, valid_payload())
+        ) as post:
+            result = jev.dispatch_plan(plan, api_key=API_KEY, transport=None)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(post.call_count, 1)
+        # The exact request bytes were sent through the real transport.
+        self.assertEqual(post.call_args.args[0], plan.request_body)
+        self.assertEqual(post.call_args.args[1], API_KEY)
+
+    def test_execute_none_transport_uses_post_decisions(self):
+        with mock.patch.object(
+            jev, "post_decisions", return_value=resp(200, valid_payload())
+        ) as post:
+            result = jev.execute(
+                questions(), STATE, api_key=API_KEY, reserve_usd="0.25",
+                authorized=True, transport=None,
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(post.call_count, 1)
+
+    def test_dispatch_plan_explicit_transport_still_wins(self):
+        transport = FakeTransport(resp(200, valid_payload()))
+        plan = jev.plan_dispatch(questions(), STATE, reserve_usd="0.25")
+        with mock.patch.object(jev, "post_decisions") as post:
+            result = jev.dispatch_plan(plan, api_key=API_KEY, transport=transport)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(transport.calls), 1)
+        post.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
 # CostRecord invariants
 # --------------------------------------------------------------------------- #
 class CostRecordTests(unittest.TestCase):

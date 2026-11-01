@@ -41,8 +41,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from decimal import Decimal
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ..discovery import lead_runner as _lead
 from ..domain.errors import ReviewAgentError
@@ -54,7 +55,12 @@ from ..domain.records import (
 )
 from ..generation import hosted_use as _hosted
 from ..runtime import jev
-from ..runtime.dispatch import RuntimeDispatchRepository
+from ..runtime.dispatch import (
+    RETRY_MAX_ATTEMPTS,
+    RuntimeDispatchRepository,
+    retry_request_ids,
+)
+from ..runtime.retry import next_attempt
 from ..runtime.roles import BoundedTask, ModelRef, RoleConfig, RoleConfiguration
 from ..storage.agent_runtime import RuntimeRepository, validate_version_set
 from ..storage.artifacts import ArtifactRepository
@@ -93,10 +99,16 @@ PROMPT_VERSION = "screening.jev.v1"
 TASK_SIZE_LIMIT = 262_144
 
 #: Conservative upper bound on a per-window request id. The case request id
-#: carries a ``-wNN`` suffix per window; refusing an over-long id **before** any
-#: reserve keeps every window's opaque identifier bounded (mirrors the
-#: acquisition request-id convention) and never truncates it.
+#: carries a ``-wNN`` suffix per window and may carry a deterministic retry
+#: suffix (``-rK``, ADR 006); refusing an over-long id **before** any reserve
+#: keeps every window's opaque identifier bounded (mirrors the acquisition
+#: request-id convention) and never truncates it.
 MAX_REQUEST_ID_CHARS = 200
+
+#: The longest deterministic retry suffix a window request id may carry
+#: (``-r{RETRY_MAX_ATTEMPTS-1}``; ADR 006). The per-window bound reserves this
+#: room so an extended retry id still fits :data:`MAX_REQUEST_ID_CHARS`.
+_RETRY_SUFFIX_CHARS = len(f"-r{RETRY_MAX_ATTEMPTS - 1}")
 
 _OPS = ("acquisition", "storage", "redistribution", "hosted_transfer")
 
@@ -372,6 +384,29 @@ def _readback(store, request_id: str, *, replayed: bool) -> dict:
     return mapping
 
 
+def _readback_window(store, base_request_id: str, *, replayed: bool) -> dict:
+    """Read one window's retry chain, returning its completed member's readback.
+
+    A window's dispatch may have been superseded by a deterministic retry
+    (ADR 006), so the case readback must follow ``base``, ``base-r1``, ``base-r2``
+    to the attempt that actually completed. Returns the first completed member's
+    readback; otherwise the most advanced existing member's (a resolved ``failed``
+    retry, or an unresolved/legacy ``unknown``), or the base's empty readback when
+    no member exists. It never claims completion for a window with no completed
+    member.
+    """
+    last = None
+    for request_id in retry_request_ids(base_request_id):
+        readback = _readback(store, request_id, replayed=replayed)
+        if readback["status"] == "completed":
+            return readback
+        if readback["status"] is not None:
+            last = readback
+    return last if last is not None else _readback(
+        store, base_request_id, replayed=replayed
+    )
+
+
 def _window_request_ids(request_id: str, count: int) -> list[str]:
     """The ordered per-window request ids ``"{request_id}-wNN"`` (1-based).
 
@@ -382,7 +417,7 @@ def _window_request_ids(request_id: str, count: int) -> list[str]:
     ids = []
     for k in range(1, count + 1):
         window_id = f"{request_id}-w{k:02d}"
-        if len(window_id) > MAX_REQUEST_ID_CHARS:
+        if len(window_id) + _RETRY_SUFFIX_CHARS > MAX_REQUEST_ID_CHARS:
             raise ScreeningRunnerError(
                 "screening: the case request id is too long to carry a per-window "
                 "suffix; refusing to dispatch."
@@ -533,7 +568,7 @@ def readback_screening_case(store, *, request_id, config_ref, report_ref, passag
     if window_ids is not None:
         window_results = []
         for window_id in window_ids:
-            readback = _readback(store, window_id, replayed=True)
+            readback = _readback_window(store, window_id, replayed=True)
             window_results.append(readback)
             if readback["status"] != "completed":
                 break
@@ -563,19 +598,26 @@ def execute_screening_case(
     hosted_ref,
     api_key: str,
     transport=None,
+    sleep: Callable[[float], None] | None = None,
 ) -> dict:
     """Run **one** screening case through the direct Jev decision path.
 
     The whole parsed article is split into deterministic, request-bounded windows
     (:func:`review_article_agent.screening.workflow.case_windows`) and **one**
-    direct-Jev dispatch is issued per window (request id ``"{request_id}-wNN"``).
-    Every window is planned, cost-bounded, and budget-checked before the first
-    reserve; each window then reserves its own task/dispatch/intent **before** its
-    one POST and commits its accepted result through the decision ledger. An
-    already-recorded window is observed without a second POST, and processing
-    stops on the first ambiguous/unknown window (later windows are not sent). The
-    returned mapping carries only safe IDs/status — never the API key or the
-    source text.
+    direct-Jev dispatch is issued per window (base request id
+    ``"{request_id}-wNN"``). Every window is planned, cost-bounded, and
+    budget-checked before the first reserve; each window then reserves its own
+    task/dispatch/intent **before** its POST and commits its accepted result
+    through the decision ledger.
+
+    Each window is dispatched under the ADR 006 bounded-retry recipe: an ambiguous
+    (``unknown``) attempt is superseded by a deterministic new attempt
+    (``"{request_id}-wNN-rK"``) up to :data:`RETRY_MAX_ATTEMPTS`, and the case stops
+    with a definitive non-completion once a window is resolved
+    (``definitive``/``exhausted``/``refused_overhead``) — later windows are never
+    sent. ``sleep`` is the backoff callable passed to the retry policy; ``None``
+    selects :func:`time.sleep` and tests inject a no-op. The returned mapping
+    carries only safe IDs/status — never the API key or the source text.
     """
     request_id = _require_identifier(request_id, "request_id")
     if not isinstance(api_key, str) or api_key == "":
@@ -666,32 +708,35 @@ def execute_screening_case(
         )
 
     # -- dispatch one window at a time, sequentially -------------------------- #
-    window_results = []
-    for window_id, plan, versions in zip(window_ids, plans, per_window_versions):
+    # Each window runs the ADR 006 bounded-retry recipe: ``next_attempt`` inspects
+    # the window's deterministic retry chain (``{window_id}``, ``-r1``, ``-r2``),
+    # owns the supersede/abandon ledger transitions, and returns the next action.
+    # The base request id stays ``{request_id}-wNN``; each retry is a NEW dispatch
+    # under ``{window_id}-rK`` (never a re-POST of the same request identity).
+    _sleep = time.sleep if sleep is None else sleep
+    sent_this_run: set[str] = set()
+
+    def _run_one_attempt(attempt_request_id, plan, versions):
+        """Reserve -> intent -> submit -> revalidate -> POST -> commit one attempt."""
         version_map, version_digest, bound_evidence_digest = versions
-        if dispatch.get_dispatch_by_request(window_id) is not None:
-            readback = _readback(store, window_id, replayed=True)
-            window_results.append(readback)
-            if readback["status"] != "completed":
-                break
-            continue
-
         task_record = runtime.record_task(
-            bounded, request_id=window_id, configuration=role_set)
-
+            bounded, request_id=attempt_request_id, configuration=role_set)
         with registry.execution_write_guard(activation_token, store.project_id):
-            if dispatch.get_dispatch_by_request(window_id) is not None:
-                window_results.append(_readback(store, window_id, replayed=True))
-                break
-            # The existing per-dispatch check is retained in addition to the
-            # whole-case pre-reserve check above.
-            _check_budget(
-                store, hosted_ref=hosted_ref, budget_cap_usd=budget_cap_usd,
-                new_reserve=plan.reserve_usd,
-            )
+            if dispatch.get_dispatch_by_request(attempt_request_id) is None:
+                # The existing per-dispatch check is retained in addition to the
+                # whole-case pre-reserve check above. A retry's new reserve is
+                # checked here; a superseded/abandoned predecessor already counts
+                # toward the per-role exposure at its estimated cost.
+                _check_budget(
+                    store, hosted_ref=hosted_ref, budget_cap_usd=budget_cap_usd,
+                    new_reserve=plan.reserve_usd,
+                )
+            # ``reserve_dispatch`` is idempotent for an already-``reserved`` row
+            # (it returns the existing same-identity row), so re-claiming a
+            # reserved row never double-reserves.
             dispatch_record = dispatch.reserve_dispatch(
                 task_record,
-                request_id=window_id,
+                request_id=attempt_request_id,
                 route="direct_call",
                 stage=SCREENING_STAGE,
                 input_digest=input_digest,
@@ -730,10 +775,27 @@ def execute_screening_case(
             results.commit_result(
                 dispatch_record.dispatch_id, result, fence=dispatch_record.current_fence)
 
-        readback = _readback(store, window_id, replayed=False)
-        window_results.append(readback)
-        if readback["status"] != "completed":
-            # An ambiguous/unknown window outcome: stop; later windows are not sent.
+    window_results = []
+    for window_id, plan, versions in zip(window_ids, plans, per_window_versions):
+        completed_window = False
+        while True:
+            decision = next_attempt(store, window_id, sleep=_sleep)
+            if decision.outcome == "dispatch":
+                _run_one_attempt(decision.request_id, plan, versions)
+                sent_this_run.add(decision.request_id)
+                continue
+            # ``completed`` contributes its completed member's readback;
+            # ``definitive`` / ``exhausted`` / ``refused_overhead`` are a resolved
+            # non-completion (the serial remote slot is freed), so the case stops
+            # here and later windows are never sent.
+            readback = _readback(
+                store, decision.request_id,
+                replayed=decision.request_id not in sent_this_run,
+            )
+            window_results.append(readback)
+            completed_window = readback["status"] == "completed"
+            break
+        if not completed_window:
             break
 
     return _compose_case_result(store, request_id, window_ids, window_results)
