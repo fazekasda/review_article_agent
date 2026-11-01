@@ -56,7 +56,7 @@ from ..domain.errors import ReviewAgentError
 # --------------------------------------------------------------------------- #
 SCHEMA_VERSION = 1
 DOCUMENT_TYPE = "parsed_passages"
-PARSER_VERSION = "step07-jats-tei/1"
+PARSER_VERSION = "step07-jats-tei/2"
 NORMALIZATION_VERSION = "nfc-ligature-ws/1"
 
 #: Hard cap on accepted bytes (32 MiB); crossing it is an explicit rejection,
@@ -650,7 +650,16 @@ def _finalize(
         "citations": counts,
         "assets": assets,
         "non_text_assets_require_review": non_text,
-        "human_action_required": status != "parsed" or non_text,
+        # A cleanly ``parsed`` XML/JATS/TEI report does not itself force a human
+        # action just because the article declares figures/tables/supplements:
+        # the structural text was read and is usable original text, so it is
+        # processed like a cleanly parsed PDF. The non-text assets keep their own
+        # review flag (above) and are disclosed as a model-material limitation;
+        # any non-``parsed`` state (``needs_review``/``rejected``) still requires
+        # a human action. See ``docs/specification.md``: low-quality or empty text
+        # is ``needs_review``, never an automatic exclusion, and figures/tables
+        # needed for a decision still escalate.
+        "human_action_required": status != "parsed",
         "excludes_candidate": False,
         "reasons": ordered_reasons,
         "authorizes_scientific_processing": False,

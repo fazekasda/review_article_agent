@@ -206,6 +206,40 @@ class ParseAndReadbackTests(ParsingRepositoryTestBase):
             self.assertNotEqual(passage["raw_text"], passage["text"])  # raw vs normalized
             self.assertIn("effect", passage["text"])
 
+    def test_previous_parser_version_report_is_unverified_not_verified(self):
+        # An earlier XML parser version (/1) is still a member of the JATS
+        # family and stays readable, but this build (now /2) cannot reproduce it,
+        # so it is NEVER silently verified under /2: it reads back as an explicit
+        # parser_version_changed/unverified historical report.
+        with self.new_store() as store:
+            pid = store.project_id
+            src_ref, _ = self.add_document(store, "art-src", JATS_BYTES, "rev-src")
+            pr = ParsingRepository(store)
+            out = pr.parse_stored_document(
+                src_ref, report_artifact_id="art-rep", report_revision_id="rev-rep",
+                rights=_rights(pid, "art-rep", "rev-rep"),
+            )
+            base = json.loads(json.dumps(pr.read_report(out["report_ref"])["payload"]))
+            old = json.loads(json.dumps(base))
+            old["parser_version"] = "step07-jats-tei/1"
+            old_ref = self.write_generic_report(
+                store, "art-old", "rev-old",
+                {"schema_version": 1, "document_type": REPORT_DOCUMENT_TYPE, "payload": old},
+                src_ref,
+            )
+            record = pr.read_report(old_ref)
+            self.assertEqual(record["parser_version"], "step07-jats-tei/1")
+            self.assertTrue(record["parser_version_changed"])
+            self.assertFalse(record["verifiable"])
+            loc = dict(make_locator(old, "p0002"))
+            loc["report_ref"] = dict(old_ref)
+            loc["source_ref"] = dict(src_ref)
+            resolved = pr.resolve_passage(loc)
+            self.assertEqual(resolved["status"], "unverified")
+            self.assertFalse(resolved["verifiable"])
+            self.assertIn("parser_version_unverified", resolved["reasons"])
+            self.assertIn("parser_version_changed", resolved["current"]["reasons"])
+
 
 class RestartAndStalenessTests(ParsingRepositoryTestBase):
     def test_restart_historical_resolution_with_separate_staleness(self):

@@ -16,6 +16,7 @@ from typing import Mapping
 from ..acquisition.manifest import AcquisitionRepository
 from ..domain.errors import ReviewAgentError
 from ..domain.records import canonical_json, validate_identifier, validate_ref
+from ..extraction.runner import NON_TEXT_MATERIAL_LIMITATION
 from ..parsing.core import NORMALIZATION_VERSION, PARSER_VERSION
 from ..parsing.repository import ParsingRepository, _NestedStore
 from ..runtime.dispatch import RuntimeDispatchRepository
@@ -136,13 +137,22 @@ def is_decision_result_response(value):
     return isinstance(value, Mapping) and set(value) == {DECISION_RESULT_REF_KEY}
 
 
-def case_context(parsing, report_ref, passage_id):
+def case_context(parsing, report_ref, passage_id, *, questions=None):
     """Assemble the exact screening context text for one case (shared).
 
-    Returns ``{report, text, locator, ready}``. Context is the whole parsed
-    article, never an isolated sentence or a summary; oversize inputs are
-    retained, never silently truncated. The current source/report/rights are
-    always verified, even for whole-paper cases.
+    Returns ``{report, text, locator, ready, limitation_included}``. Context is
+    the whole parsed article, never an isolated sentence or a summary; oversize
+    inputs are retained, never silently truncated. The current
+    source/report/rights are always verified, even for whole-paper cases.
+
+    A cleanly ``parsed`` report is ready whenever its text is non-empty, even if
+    it declares figures/tables/supplements: those non-text assets keep their own
+    review flag and are disclosed as a fixed limitation line appended to the
+    context text. The line is added only when the resulting request still fits
+    the ``SAFE_MAX_REQUEST_BYTES`` bound (checked with ``questions`` when given);
+    otherwise the context text is left unchanged and ``limitation_included`` is
+    ``False``. A non-``parsed`` report (``needs_review``/``rejected``) is never
+    ready.
     """
     report = parsing.read_report(report_ref)
     passages = report["payload"]["passages"]
@@ -154,13 +164,24 @@ def case_context(parsing, report_ref, passage_id):
         text = ("Target passage: "
                 + next(p["text"] for p in passages if p["passage_id"] == passage_id)
                 + "\n\nOriginal article context:\n" + text)
-    ready = not report["human_action_required"] and bool(text.strip())
+    ready = report["status"] == "parsed" and bool(text.strip())
+    limitation_included = False
+    if report["payload"].get("non_text_assets_require_review") and questions is not None:
+        candidate = text + "\n\n" + NON_TEXT_MATERIAL_LIMITATION
+        try:
+            request = build_request(questions, candidate)
+            if len(canonical_json(request)) <= SAFE_MAX_REQUEST_BYTES:
+                text = candidate
+                limitation_included = True
+        except JevError:
+            limitation_included = False
     if passages:
         check = parsing.resolve_passage(
             parsing.make_passage_locator(report_ref, passages[0]["passage_id"]))
         require(not check["current"]["reasons"])
     parsing._assert_source_allows_derivative(report["source_ref"])
-    return {"report": report, "text": text, "locator": locator, "ready": ready}
+    return {"report": report, "text": text, "locator": locator, "ready": ready,
+            "limitation_included": limitation_included}
 
 
 def _response_from_observation(repository, observation):
@@ -338,12 +359,15 @@ class ScreeningRepository:
     def _case(self, config, item):
         require(set(item) == {"id", "report_ref", "passage_id", "response"})
         require(isinstance(item["id"], str) and 0 < len(item["id"]) <= 128)
-        context = case_context(self.parsing, item["report_ref"], item["passage_id"])
+        definitions = questions(config)
+        context = case_context(
+            self.parsing, item["report_ref"], item["passage_id"], questions=definitions
+        )
         report = context["report"]
         text = context["text"]
         ready = context["ready"]
         try:
-            request = build_request(questions(config), text)
+            request = build_request(definitions, text)
             require(len(canonical_json(request)) <= SAFE_MAX_REQUEST_BYTES)
         except JevError:
             request = None

@@ -118,6 +118,16 @@ PDF_MATERIAL_LIMITATION = (
     "require human review"
 )
 
+#: Fixed limitation line added to the material when any source report declares
+#: non-text assets that require review (figures/tables/supplements) and is not a
+#: PDF (a PDF already carries :data:`PDF_MATERIAL_LIMITATION`). The structural
+#: text was read, so the report is processed, but a model must never treat a
+#: value that lives only in a figure/table/supplement as extracted evidence.
+NON_TEXT_MATERIAL_LIMITATION = (
+    "Figures, tables and supplements were not read; any value shown only in a "
+    "figure/table must be marked missing, not inferred."
+)
+
 _ENVELOPE_KEYS = ("schema_version", "document_type", "payload")
 _EVIDENCE_KEYS = ("ref", "verified_at")
 _REF_KEYS = ("project_id", "artifact_id", "revision_id")
@@ -435,6 +445,7 @@ def _report_passages(report: dict) -> list[dict]:
     report_ref_string = canonical_json(report_ref).decode("utf-8")
     source_ref = dict(report["source_ref"])
     fmt = report.get("format")
+    non_text_review = bool(report["payload"].get("non_text_assets_require_review"))
     out: list[dict] = []
     for passage in report["payload"]["passages"]:
         original_id = passage["passage_id"]
@@ -449,6 +460,7 @@ def _report_passages(report: dict) -> list[dict]:
                 "section_path": list(passage.get("section_path", [])),
                 "page": page,
                 "format": fmt,
+                "non_text_assets_require_review": non_text_review,
                 "report_ref": report_ref_string,
                 "source_ref": source_ref,
                 "locator": {
@@ -479,6 +491,7 @@ def _report_passages(report: dict) -> list[dict]:
                 "section_path": [],
                 "page": None,
                 "format": fmt,
+                "non_text_assets_require_review": non_text_review,
                 "report_ref": report_ref_string,
                 "source_ref": source_ref,
                 "locator": {
@@ -618,6 +631,12 @@ def _assemble_material(passages: list[dict]) -> str:
     if any(passage.get("format") == "pdf" for passage in passages):
         lines.append("[limitations]")
         lines.append(PDF_MATERIAL_LIMITATION)
+    if any(
+        passage.get("non_text_assets_require_review") and passage.get("format") != "pdf"
+        for passage in passages
+    ):
+        lines.append("[limitations]")
+        lines.append(NON_TEXT_MATERIAL_LIMITATION)
     return "\n".join(lines)
 
 

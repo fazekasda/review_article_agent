@@ -440,9 +440,17 @@ class PilotRunTest(RunnerTestBase):
         self.assertFalse(asset_ids)
 
     def test_caption_does_not_replace_required_table_review(self):
+        # A cleanly parsed XML article that declares a table is usable original
+        # text (it is not refused), but the table is still surfaced as a required
+        # coverage handle and the material carries the fixed non-text limitation:
+        # a caption never substitutes for reading the table, and no value is
+        # inferred from it.
         _, report_ref, _ = self._store_report("table-src", "table-report", JATS.encode("utf-8"))
-        with self.assertRaises(ExtractionRunnerError):
-            runner._derive_material(self.store, [report_ref], config=_config_payload())
+        passages, _ = runner._derive_material(self.store, [report_ref], config=_config_payload())
+        asset_ids = [aid for p in passages for aid in p.get("asset_ids", [])]
+        self.assertTrue(asset_ids)
+        material = runner._assemble_material(passages)
+        self.assertIn(runner.NON_TEXT_MATERIAL_LIMITATION, material)
         self.assertEqual(self.transport.call_count, 0)
 
     def test_require_pilot_workflow_authority(self):

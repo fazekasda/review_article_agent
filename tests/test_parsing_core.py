@@ -137,7 +137,7 @@ class JatsParsingTests(unittest.TestCase):
     def test_structure_and_section_paths(self):
         self.assertEqual(self.parsed["format"], "jats")
         self.assertEqual(self.parsed["status"], "parsed")
-        self.assertEqual(self.parsed["parser_version"], "step07-jats-tei/1")
+        self.assertEqual(self.parsed["parser_version"], "step07-jats-tei/2")
         self.assertEqual(self.parsed["normalization_version"], "nfc-ligature-ws/1")
         self.assertEqual(self.parsed["source"]["byte_size"], len(JATS.encode("utf-8")))
         self.assertEqual(
@@ -185,7 +185,10 @@ class JatsParsingTests(unittest.TestCase):
         self.assertEqual(kinds["table"]["caption"], "Baseline values.")
         self.assertEqual(kinds["supplement"]["caption"], "Raw data.")
         self.assertTrue(self.parsed["non_text_assets_require_review"])
-        self.assertTrue(self.parsed["human_action_required"])
+        # A cleanly parsed XML article with figures/tables/supplements is usable
+        # original text: the non-text assets keep their own review flag (above)
+        # but do not by themselves force a per-report human action.
+        self.assertFalse(self.parsed["human_action_required"])
         self.assertIn("non_text_assets_present", self.parsed["reasons"])
         self.assertIn("jats_doctype_removed", self.parsed["reasons"])
 
