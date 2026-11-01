@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
 
 from test_drafting_workflow import BlueprintBase, blueprint_content  # noqa: E402
 from test_generation_runner import (  # noqa: E402
@@ -52,6 +53,12 @@ from review_article_agent.drafting.workspace import (  # noqa: E402
 )
 from review_article_agent.generation import hosted_use  # noqa: E402
 from review_article_agent.generation import drafting_roles as roles  # noqa: E402
+from review_article_agent.generation import runner as generation_runner  # noqa: E402
+from review_article_agent.runtime.dispatch import (  # noqa: E402
+    RuntimeDispatchRepository,
+    is_retry_resolved,
+    runtime_dispatch_remote_state,
+)
 from review_article_agent.runtime.lead import TransportResponse  # noqa: E402
 from review_article_agent.storage import Registry  # noqa: E402
 from _tiers import slow  # noqa: E402
@@ -366,16 +373,36 @@ class ProposeBlueprintTest(DirectRolesBase):
     def test_non_completed_writes_nothing(self):
         _s, _f, outline_ref = self.approved_chain()
         ws_ref = self.make_direct_workspace(outline_ref)
-        # A 5xx is an ambiguous (non-completed) outcome.
-        self.transport.responses.append(
-            TransportResponse(status=503, body_text=json.dumps({"error": {}}), truncated=False)
-        )
-        out = self.propose_blueprint_model(
-            ws_ref, artifact_id="bp-nc", revision="bp-nc-r1"
-        )
+        # Every attempt is a 5xx — an ambiguous (non-completed) outcome. Under
+        # ADR 006 the lone-call overhead floor permits one retry; the next is
+        # refused, so **every** attempt is non-completed and nothing may be written.
+        for _ in range(3):
+            self.transport.responses.append(
+                TransportResponse(status=503, body_text=json.dumps({"error": {}}), truncated=False)
+            )
+        # The 2 s backoff before the retry is injected as a no-op.
+        with mock.patch.object(generation_runner, "time", mock.Mock(sleep=lambda _s: None)):
+            out = self.propose_blueprint_model(
+                ws_ref, artifact_id="bp-nc", revision="bp-nc-r1"
+            )
         self.assertEqual(out["status"], "model_not_completed")
         self.assertNotEqual(out["outcome"], "completed")
         self.assertIsNone(self.artifacts.get_artifact("bp-nc"))
+
+        # The chain is resolved (superseded base + abandoned/refused retry): no
+        # ambiguous row survives and the serial remote slot is freed.
+        rows = RuntimeDispatchRepository(self.store).list_dispatches()
+        self.assertEqual(
+            sorted((record.request_id, record.state) for record in rows),
+            [("gen-bp-1", "failed"), ("gen-bp-1-r1", "failed")],
+        )
+        for record in rows:
+            self.assertEqual(record.cost_state, "estimated")
+            self.assertTrue(is_retry_resolved(record))
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
 
     def test_replay_no_second_post(self):
         _s, _f, outline_ref = self.approved_chain()

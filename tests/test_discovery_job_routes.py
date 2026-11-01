@@ -13,7 +13,8 @@ Extends the J0 ``discovery_submit`` operation
 * ``lead`` — one scoped hosted lead-proposal request through the existing
   revision-scoped runner, reading the credential from the single named
   environment variable at dispatch, reserving on the runtime dispatch ledger
-  before the one POST, and never re-POSTing an unknown outcome.
+  before each POST, retrying an ambiguous (``unknown``) outcome under a new
+  deterministic identity (ADR 006), and never re-POSTing the same identity.
 
 Everything runs against a real ``Registry``/``ProjectStore`` with an injected
 deterministic low-level transport and injected owner-auth seams: no test performs
@@ -56,6 +57,7 @@ from review_article_agent.discovery.transport import TransportResponse  # noqa: 
 from review_article_agent.runtime import owner_auth  # noqa: E402
 from review_article_agent.runtime.dispatch import (  # noqa: E402
     RuntimeDispatchRepository,
+    is_retry_resolved,
     runtime_dispatch_remote_state,
 )
 from review_article_agent.runtime.gates import prepare_gate_snapshot  # noqa: E402
@@ -1021,40 +1023,85 @@ class LeadRoutesTest(DiscoveryJobRoutesBase):
         self.assertEqual(lead2.call_count, 0)
         self.assertIn(self._job(engine2, job_id2)["state"], {"waiting_human"})
 
-    def test_unknown_retains_occupancy_and_never_reposts(self) -> None:
+    def test_unknown_retries_new_identity_and_frees_slot(self) -> None:
+        # ADR 006: an ambiguous (``unknown``) ``direct_call`` is retried under a
+        # **new** deterministic identity (``lead-unknown-r1``); the same identity
+        # is never re-POSTed. In a fresh stage the lone-call overhead floor allows
+        # exactly one retry, then the cap refuses the next, resolves the chain and
+        # frees the serial remote slot — a definitive non-completion, not a wedge.
         lead_transport = _LeadTransport([RuntimeError("ambiguous transport failure")])
         engine = self.engine(lead_transport=lead_transport, lead_api_key="sk-or-test")
+
+        # Record, at each POST, which dispatch identity is being sent. The observer
+        # runs inside the transport after the send claim, so the exact base/retry
+        # ids are captured (the request id is never in the POST body).
+        posted_ids: list[list[str]] = []
+
+        def _observe_post() -> None:
+            with engine.open_store(self.project_id) as store:
+                posted_ids.append(
+                    sorted(
+                        record.request_id
+                        for record in RuntimeDispatchRepository(store).list_dispatches()
+                        if record.state == "submitted"
+                    )
+                )
+
+        lead_transport.observer = _observe_post
+
         batch_ref = self._prepare()
         res = self._submit(
             engine, request_id="lead-unknown", mode="lead",
             parameters={"batch_ref": batch_ref, "credential_env": "OPENROUTER_API_KEY"},
         )
         job_id = res["job"]["job_id"]
-        self._drive(engine)
-        self.assertEqual(lead_transport.call_count, 1)
+        # The 2 s/8 s backoff is injected as a no-op (ADR 006 ``sleep`` seam).
+        with mock.patch.object(runner, "time", mock.Mock(sleep=lambda _s: None)):
+            self._drive(engine)
+
+        # Two POSTs under two **distinct** identities: the base, then its first
+        # retry. The base identity is POSTed exactly once.
+        self.assertEqual(posted_ids, [["lead-unknown"], ["lead-unknown-r1"]])
+        self.assertEqual(lead_transport.call_count, 2)
 
         job = self._job(engine, job_id)
-        self.assertIn(job["state"], {"waiting_human", "reconciliation_required"})
-        self.assertTrue(job["outcome_unresolved"])
-        self.assertIsNone(job.get("accepted_result"))
+        # The resolved chain is a definitive non-completion: the job settles.
+        self.assertEqual(job["state"], "completed")
+        self.assertFalse(job["outcome_unresolved"])
+        accepted = job["accepted_result"]
+        self.assertEqual(accepted["result_kind"], "discovery_lead")
+        self.assertEqual(accepted["result"]["status"], "failed")
 
-        # The reserve and the runtime occupancy are retained.
+        # The reserve and the runtime occupancy are resolved, not retained.
         with engine.open_store(self.project_id) as store:
+            repo = RuntimeDispatchRepository(store)
+            base = repo.get_dispatch_by_request("lead-unknown")
+            retry = repo.get_dispatch_by_request("lead-unknown-r1")
+            states = [record.state for record in repo.list_dispatches()]
             state = runtime_dispatch_remote_state(store.connection, self.project_id)
-            dispatch = RuntimeDispatchRepository(store).get_dispatch_by_request("lead-unknown")
-        self.assertEqual(state, "remote")
-        self.assertEqual(dispatch.state, "unknown")
-        self.assertIsNotNone(dispatch.reserve_usd)
+        # The superseded predecessor and the abandoned retry both end terminal
+        # ``failed`` with cost ``estimated`` = their full reserve (the ADR 006
+        # conservative accounting marker); no ambiguous row survives.
+        for record in (base, retry):
+            self.assertEqual(record.state, "failed")
+            self.assertEqual(record.cost_state, "estimated")
+            self.assertTrue(is_retry_resolved(record))
+        self.assertNotIn("unknown", states)
+        # The serial remote slot is freed.
+        self.assertEqual(state, "none")
 
-        # A restart never re-POSTs; the outcome is read back without a credential.
+        # A restart never re-POSTs: the resolved chain stays resolved and the
+        # definitive non-completion is read back without a credential.
         replay_transport = _LeadTransport([_completion_body()])
         engine.close()
         engine2 = self.engine(lead_transport=replay_transport, registry=Registry(self.data_dir))
         engine2.reconcile_startup()
-        self._drive(engine2)
+        with mock.patch.object(runner, "time", mock.Mock(sleep=lambda _s: None)):
+            self._drive(engine2)
         self.assertEqual(replay_transport.call_count, 0)
-        self.assertIn(self._job(engine2, job_id)["state"],
-                      {"waiting_human", "reconciliation_required"})
+        replay_job = self._job(engine2, job_id)
+        self.assertEqual(replay_job["state"], "completed")
+        self.assertFalse(replay_job["outcome_unresolved"])
 
     def test_success_recovery_reads_back_without_credential(self) -> None:
         lead_transport = _LeadTransport([_completion_body()])
