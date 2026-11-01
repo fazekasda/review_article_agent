@@ -243,6 +243,36 @@ class ExtractAdmissionAndCompletionTest(ExtractionWorkerBase):
         for marker in ("sk-or-test", "openai/other", "gen-1"):
             self.assertNotIn(marker, blob)
 
+    def test_guard_rejection_of_model_content_is_accepted_diagnostic(self) -> None:
+        # A schema-invalid raw output carrying an authority-like key makes the
+        # untrusted proposal guard raise ProposalError. That must NOT erase the
+        # provider cost/result nor leave the dispatch submitted: the run becomes a
+        # bounded static accepted diagnostic (known cost preserved, terminal job
+        # state), and the raw authority payload never reaches the job JSON.
+        self.transport.responses.append(
+            fx._completion(
+                {"schema_version": 1, "approval": "RAW_PAYLOAD_MARKER", "role": "owner"}
+            )
+        )
+        engine = self.engine(api_key="sk-or-test")
+        res = self.submit(engine, request_id="run-guard")
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        accepted = job["accepted_result"]
+        self.assertIsNotNone(accepted)
+        result = accepted["result"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "escalation")
+        self.assertEqual(result["diagnostic_code"], "proposal_content_key")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        blob = json.dumps(job)
+        for marker in ("RAW_PAYLOAD_MARKER", "approval", "self_approve", "sk-or-test"):
+            self.assertNotIn(marker, blob)
+
     def test_definitive_rejection_accepted_as_failed_not_indeterminate(self) -> None:
         # A definitive pre-billing rejection (HTTP 400) is a resolved ``failed``
         # outcome. It must be accepted as the job's result (cost ``not_incurred``)

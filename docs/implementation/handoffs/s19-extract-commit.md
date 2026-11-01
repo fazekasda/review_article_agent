@@ -1,6 +1,6 @@
 # S19 — extraction response/result-commit exception
 
-Status: **fixed** (two untrusted-input defects at the adapter→runner→worker seam).
+Status: **fixed** (three untrusted-input defects at the adapter→runner→worker seam).
 Authority: `docs/implementation/09-extraction.md`, `docs/specification.md` workflow 9,
 C02 §5.6/§6.3/§8.3, ADR 004, ADR 006.
 
@@ -58,12 +58,50 @@ rounding is refused rather than approximated. Cost parsing remains exact
 source, provider body, or credential — so a future indeterminate event is not
 silent. Logging alone does not fix a defect.
 
+## Defect 3 — proposal-guard rejection of model-owned content (`extraction/runner.py`)
+
+`_commit_atomic` called `runtime._record_proposal_in_transaction`, which runs the
+untrusted proposal guard (`roles.submit_proposal`). A **completed** model reply
+whose schema is invalid is escalated **with `raw_output`** (the raw model JSON),
+and a schema-valid reply can still exceed the task size limit. If that
+model-owned content carries a forbidden authority-like key (e.g. `approval`,
+`role`) or exceeds `TASK_SIZE_LIMIT` (262144, while the response cap is 2 MiB),
+the guard raised an uncaught `ProposalError` (`content_key` / `content_size`),
+rolling back the whole nested transaction: the provider cost/result was lost and
+the dispatch was left `submitted`. This matches the live bounded-retry failure
+(`extract-pilot02-2-r1` reached `submitted` then raised `ProposalError`; the raw
+HTTP response / `error.code` / charge were not saved because the transaction
+rolled back, so the exact live subtype is **not provable** from retained
+evidence — but both reproducible patterns are fixed here).
+
+Fixed by `_record_proposal_guarded`: a `ProposalError` whose **internally
+defined** `code` is one of `content_size` / `content_key` / `content_json` /
+`content_shape` is converted into a small, static, non-authorizing diagnostic
+that is recorded through the **same** guarded proposal/dispatch/receipt path. The
+raw model output is **discarded** (never smuggled around the guard) and the
+reported cost is preserved (`known`/`unknown` from `result.cost`). The static
+reason (`proposal_content_size` / `proposal_content_key` / `proposal_content_json`
+/ `proposal_content_shape`) is derived **only** from the guard's own `code` — the
+exception message, provider, source, and model data are never echoed — and
+surfaces in the runner readback and worker accepted result as
+`diagnostic_code`. The fallback is a fixed, tiny, trusted envelope that itself
+passes the same generic guard (no recursive fallback loop). Any other
+`ProposalError` code (config/task/envelope drift) and every non-`ProposalError`
+storage/corruption/fencing error is **not** allowlisted and still fails closed.
+The generic guard, the proposal size cap, and the extraction schema are
+unchanged.
+
 ## Confidence
 
 The retained evidence cannot distinguish which defect caused the specific r2
-call (the raw body was not kept). Both are reproducible at the real seam and both
-produce the identical silent `indeterminate` outcome; both are now fixed. No paid
-or live call was made.
+call (the raw body was not kept). Both original defects are reproducible at the
+real seam and both produce the identical silent `indeterminate` outcome; both are
+now fixed. The live retry's `ProposalError` is consistent with Defect 3 (guard
+rejection of model-owned content), reproduced here at the real adapter→runner→
+proposal→worker seam with a fake valid-cost HTTP 200 for (a) oversized raw
+content and (b) a schema-invalid raw JSON carrying a forbidden authority-like
+field; the ordinary accepted fixture is unchanged. The exact live subtype remains
+unprovable. No paid or live call was made.
 
 ## Latent siblings (out of scope, follow-up)
 

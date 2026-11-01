@@ -805,6 +805,179 @@ class ProtocolErrorDiagnosticTest(RunnerTestBase):
         self.assertEqual(result["status"], "completed")
 
 
+class ProposalGuardRejectionTest(RunnerTestBase):
+    """A proposal-guard rejection of model-owned content must not erase the
+    provider result/cost nor leave the dispatch ``submitted`` (S19-PROPOSAL-FAILURE).
+
+    The untrusted guard is never weakened: when the model-owned content is
+    rejected (oversized, forbidden authority-like key, invalid JSON/shape), the raw
+    output is **discarded** and only a bounded, static, non-authorizing diagnostic
+    -- derived solely from the guard's own ``code`` -- is recorded. The reported
+    cost is preserved, the dispatch reaches a terminal accepted-diagnostic state
+    (never ``submitted``/``unknown``), and no raw authority payload leaks.
+    """
+
+    def _dispatch_repo(self):
+        from review_article_agent.runtime.dispatch import RuntimeDispatchRepository
+
+        return RuntimeDispatchRepository(self.store)
+
+    def _stored_canonical(self, result):
+        from review_article_agent.storage.agent_runtime import RuntimeRepository
+
+        record = RuntimeRepository(self.store).get_proposal(result["proposal_record_id"])
+        return record.canonical.decode("utf-8")
+
+    def test_oversized_model_content_becomes_static_diagnostic(self):
+        # A schema-VALID extraction whose serialized content exceeds the task size
+        # limit (262144) while staying inside the 1 MiB response cap: the old code
+        # raised an uncaught ProposalError(content_size), leaving the dispatch
+        # submitted and the cost/result lost.
+        from review_article_agent.runtime.dispatch import (
+            RuntimeDispatchRepository,
+            runtime_dispatch_remote_state,
+        )
+
+        output = _extraction_output(self.passages, self.source_keys)
+        output["summary"] = "S" * (runner.TASK_SIZE_LIMIT + 4096)
+        self.transport.responses.append(_completion(output))
+        result = self.run_extraction(
+            request_id="run-big", artifact_id="a-run-big", revision_id="rev-run-big"
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "escalation")
+        self.assertEqual(result["diagnostic_code"], "proposal_content_size")
+        # Known reported cost is preserved through the guarded path.
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        dispatch = self._dispatch_repo().get_dispatch_by_request("run-big")
+        self.assertEqual(dispatch.state, "completed")
+        self.assertEqual(dispatch.cost_state, "known")
+        self.assertEqual(dispatch.cost_amount_usd, "0.0002")
+        # The serial remote slot is freed; no submitted/unknown row remains.
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
+        # The discarded oversized raw output is not stored.
+        self.assertLess(
+            len(self._stored_canonical(result)), runner.TASK_SIZE_LIMIT + 1
+        )
+
+    def test_forbidden_authority_key_becomes_static_diagnostic(self):
+        # A schema-invalid raw output carrying an authority-like key is escalated
+        # WITH raw_output; the guard rejects that key. The run must become a
+        # bounded static diagnostic -- never a crash, and never smuggling the
+        # payload around the guard.
+        from review_article_agent.runtime.dispatch import (
+            RuntimeDispatchRepository,
+            runtime_dispatch_remote_state,
+        )
+
+        bad = {
+            "schema_version": 1,
+            "approval": "RAW_PAYLOAD_MARKER",
+            "self_approve": True,
+            "role": "owner",
+        }
+        self.transport.responses.append(_completion(bad))
+        result = self.run_extraction(
+            request_id="run-key", artifact_id="a-run-key", revision_id="rev-run-key"
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "escalation")
+        self.assertEqual(result["diagnostic_code"], "proposal_content_key")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        dispatch = self._dispatch_repo().get_dispatch_by_request("run-key")
+        self.assertEqual(dispatch.state, "completed")
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
+        # No raw authority payload (key or value) leaks into the readback or the
+        # durable accepted proposal.
+        blob = json.dumps(result) + self._stored_canonical(result)
+        for marker in ("RAW_PAYLOAD_MARKER", "approval", "self_approve", "owner"):
+            self.assertNotIn(marker, blob)
+
+    def test_ordinary_valid_extraction_unchanged(self):
+        # Control: a valid extraction is still an accepted completed proposal.
+        result = self.pilot_extraction()
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["diagnostic_code"], None)
+        receipt = require_run(self.store, result["run_ref"], purpose="extraction")
+        self.assertEqual(receipt["raw_output"]["schema_version"], 1)
+
+    def test_fallback_discards_raw_output_and_passes_the_same_guard(self):
+        from unittest import mock
+
+        from review_article_agent.runtime import roles
+
+        runtime = mock.Mock()
+        rejected = {
+            "purpose": "extraction",
+            "outcome": "escalation",
+            "raw_output": {"approval": "RAW_PAYLOAD_MARKER", "role": "owner"},
+            "instructions_sha256": "a" * 64,
+            "escalation": "human",
+            "reason": "extraction_schema_invalid",
+            "execution_metadata": {"dispatch_id": "disp-x", "actual_model": "m"},
+        }
+        captured: dict = {}
+
+        def _record(task, payload, *, configuration):
+            content = payload["content"]
+            if content.get("raw_output") is not None:
+                raise roles.ProposalError("content_key", "rejected")
+            captured["content"] = content
+            return mock.Mock(record_id="prop-1", stored_digest="d" * 64)
+
+        runtime._record_proposal_in_transaction.side_effect = _record
+        _record_out, outcome, content, kind = runner._record_proposal_guarded(
+            runtime,
+            task_record=mock.Mock(),
+            content=rejected,
+            outcome="escalation",
+            result_kind=runner._RESULT_KIND_ESCALATION,
+            role_configuration=mock.Mock(),
+        )
+        self.assertEqual(outcome, "escalation")
+        self.assertEqual(kind, runner._RESULT_KIND_ESCALATION)
+        # The raw model output is discarded, never smuggled around the guard.
+        self.assertIsNone(captured["content"]["raw_output"])
+        self.assertEqual(captured["content"]["reason"], "proposal_content_key")
+        self.assertEqual(
+            captured["content"]["execution_metadata"]["diagnostic_code"],
+            "proposal_content_key",
+        )
+        # The fallback itself passes the same generic guard primitives.
+        roles._reject_forbidden_keys(captured["content"])
+        self.assertLess(
+            len(runner.canonical_json(captured["content"])), runner.TASK_SIZE_LIMIT
+        )
+
+    def test_non_allowlisted_proposal_error_still_fails_closed(self):
+        from unittest import mock
+
+        from review_article_agent.runtime import roles
+
+        runtime = mock.Mock()
+        runtime._record_proposal_in_transaction.side_effect = roles.ProposalError(
+            "task_drift", "drift"
+        )
+        with self.assertRaises(roles.ProposalError):
+            runner._record_proposal_guarded(
+                runtime,
+                task_record=mock.Mock(),
+                content={"purpose": "extraction", "raw_output": None},
+                outcome="completed",
+                result_kind=runner._RESULT_KIND_PROPOSAL,
+                role_configuration=mock.Mock(),
+            )
+
+
 class DirectCallRetryTest(RunnerTestBase):
     """The bounded automatic direct-call retry wired into ``execute_run`` (ADR 006)."""
 
