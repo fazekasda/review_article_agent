@@ -405,7 +405,9 @@ def execute_screening_case(
     definitions = _workflow.questions(config)
 
     report_ref = _require_same_project_ref(store, report_ref, "report_ref")
-    context = _workflow.case_context(screening.parsing, report_ref, passage_id)
+    context = _workflow.case_context(
+        screening.parsing, report_ref, passage_id, questions=definitions
+    )
     text = context["text"]
     _verify_hosted_rights(store, context["report"]["source_ref"])
 

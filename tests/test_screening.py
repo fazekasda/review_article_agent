@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from test_acquisition_manifest import ManifestBase, _jats
+import test_acquisition_validation as av
 from review_article_agent.parsing import ParsingRepository
 from review_article_agent.acquisition.manifest import ManifestNotAcquiredError
 from review_article_agent.cli.screening import dispatch_screening
@@ -121,6 +122,38 @@ class WorkflowTests(ManifestBase):
         self.put("config", cfg, revision="config-r2", parent="config-r1")
         with self.assertRaises(ScreeningError):
             self.screening.require_pilot(self.pilot)
+
+    def test_case_context_ready_for_report_with_non_text_assets(self):
+        # A cleanly parsed article that declares a figure is ready for screening
+        # (not a human block): the figure keeps its own review flag and the
+        # context text carries the fixed non-text limitation line.
+        jats = av.jats(body=(
+            b"<sec><p>Results body text for screening.</p>"
+            b'<fig id="f1"><label>Figure 1</label>'
+            b"<caption><p>A figure.</p></caption></fig></sec>"
+        ))
+        source = self.put_source(jats)
+        report = ParsingRepository(self.store).parse_stored_document(
+            source, report_artifact_id="fig-report", report_revision_id="fig-report-r1",
+            rights=self.rights("fig-report", "fig-report-r1"))["report_ref"]
+        context = workflow.case_context(
+            ParsingRepository(self.store), report, None, questions=questions(config()))
+        payload = context["report"]["payload"]
+        self.assertTrue(payload["non_text_assets_require_review"])
+        self.assertFalse(payload["human_action_required"])
+        self.assertTrue(context["ready"])
+        self.assertTrue(context["limitation_included"])
+        self.assertIn(workflow.NON_TEXT_MATERIAL_LIMITATION, context["text"])
+
+    def test_case_context_not_ready_for_needs_review_report(self):
+        # A report with no substantive text stays needs_review and is never ready.
+        source = self.put_source(b"<article><body/></article>")
+        report = ParsingRepository(self.store).parse_stored_document(
+            source, report_artifact_id="empty-report", report_revision_id="empty-report-r1",
+            rights=self.rights("empty-report", "empty-report-r1"))["report_ref"]
+        context = workflow.case_context(
+            ParsingRepository(self.store), report, None, questions=questions(config()))
+        self.assertFalse(context["ready"])
 
     def test_acquisition_rejection_blocks_batch(self):
         self.approve_ref(self.pilot, "pilot", "screening.pilot")
