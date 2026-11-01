@@ -90,13 +90,17 @@ Safety invariants
   synthetic framing states the untrusted-data and no-authority rules.
 * **No blind retry.** One POST per call, ever.
 * **Static, redacted diagnostics.** No raw peer text, source text, or credential
-  is retained.
+  is retained. A malformed/unprocessable 200 response carries a bounded, static
+  diagnostic **code** (:data:`RESPONSE_DIAGNOSTIC_CODES`) that names the failing
+  branch, so the reason survives durably without the response body.
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Callable, Mapping
 
 from ..domain.records import canonical_json
@@ -106,6 +110,7 @@ __all__ = [
     "ENDPOINT",
     "PURPOSES",
     "OUTCOMES",
+    "RESPONSE_DIAGNOSTIC_CODES",
     "ExtractionError",
     "ExtractionValidationError",
     "ExtractionEndpointError",
@@ -154,6 +159,45 @@ ExtractionProtocolError = lead.LeadProtocolError
 #: there is no second model/pricing bound to drift out of sync and **no model
 #: default**: the caller must supply every bound.
 ExtractionConfig = lead.LeadConfig
+
+#: Bounded, static diagnostic **codes** for a malformed/unprocessable response.
+#: Each is a fixed literal authored here (never peer text), so a parser-failure
+#: *branch* is durable and distinguishable without retaining the response body,
+#: the finish reason string, or any provider message. The result ``outcome``
+#: stays ``protocol_error``; these codes are the diagnostic *reason*.
+RESPONSE_DIAGNOSTIC_CODES = (
+    "transport_malformed",
+    "response_too_large",
+    "response_envelope_not_json",
+    "response_not_object",
+    "response_error_object",
+    "response_model_mismatch",
+    "response_usage_malformed",
+    "response_choices_malformed",
+    "response_message_malformed",
+    "response_tool_calls",
+    "response_finish_length",
+    "response_finish_not_stop",
+    "response_content_empty",
+    "response_content_not_json",
+    "response_content_not_object",
+    "response_content_number_unrepresentable",
+    "protocol_error",
+)
+
+
+class _ResponseDefect(lead.LeadProtocolError):
+    """A malformed/unprocessable response carrying a bounded, static ``code``.
+
+    Subclasses :class:`~review_article_agent.runtime.lead.LeadProtocolError` so
+    every existing ``except LeadProtocolError`` seam is unchanged; the extra
+    ``code`` is one of :data:`RESPONSE_DIAGNOSTIC_CODES` and never carries peer
+    text, a finish-reason string, or a provider message.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # --------------------------------------------------------------------------- #
@@ -530,12 +574,64 @@ def _parse_extraction_json(text: str) -> Mapping[str, Any]:
     """Strictly parse the assistant text as one JSON object (data only).
 
     Any parse failure, or valid JSON that is not an object, is a loud
-    :class:`LeadProtocolError`: a malformed extraction is never accepted.
+    :class:`LeadProtocolError` carrying a bounded, static diagnostic code: a
+    malformed extraction is never accepted.
     """
-    parsed = lead._parse_json(text)
+    try:
+        parsed = lead._parse_json(text)
+    except lead.LeadProtocolError as exc:
+        raise _ResponseDefect(
+            "response_content_not_json", "extraction response is not valid JSON"
+        ) from exc
     if not isinstance(parsed, Mapping):
-        raise lead.LeadProtocolError("extraction response is not a JSON object")
-    return lead._deep_freeze(parsed)
+        raise _ResponseDefect(
+            "response_content_not_object", "extraction response is not a JSON object"
+        )
+    return lead._deep_freeze(_json_portable(parsed))
+
+
+def _json_portable(value: Any) -> Any:
+    """Recursively narrow exact ``Decimal`` numbers to JSON-native floats.
+
+    The shared strict parser parses floats as ``Decimal`` for exact cost
+    arithmetic, but the extraction **content** is untrusted *data* destined for
+    schema validation and durable storage — not a cost field. A ``Decimal`` is
+    not JSON-serializable and the extraction schema accepts only ``int``/``float``,
+    so it must be narrowed; but the narrowing must be **lossless**. A number that
+    overflows (``1e999``), underflows (``1e-999``), or needs more precision than a
+    float can hold is **never** silently rounded: it is a loud
+    :class:`_ResponseDefect` (``response_content_number_unrepresentable``), so the
+    run is a terminal, non-scientific diagnostic rather than a wrong accepted
+    extraction. Integers are preserved unchanged; unsupported numbers are never
+    coerced to strings or nulls.
+    """
+    if isinstance(value, Decimal):
+        return _narrow_decimal(value)
+    if isinstance(value, Mapping):
+        return {key: _json_portable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_portable(item) for item in value]
+    return value
+
+
+def _narrow_decimal(value: Decimal) -> float:
+    """A **lossless** ``Decimal`` -> ``float`` narrowing, or a loud defect.
+
+    ``float(value)`` is accepted only when it is finite and round-trips back to
+    the exact original (``Decimal(str(converted)) == value``); a value that cannot
+    be represented without rounding is refused with a bounded, static diagnostic
+    code. No numeric or provider content is ever echoed.
+    """
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError):
+        converted = None
+    if converted is not None and math.isfinite(converted) and Decimal(str(converted)) == value:
+        return converted
+    raise _ResponseDefect(
+        "response_content_number_unrepresentable",
+        "the response contains a number that cannot be represented exactly",
+    )
 
 
 def _classify_completion(
@@ -544,28 +640,43 @@ def _classify_completion(
     """Classify a 200 body into ``(outcome, actual_model, provider, id, usage,
     proposal_text)``. Raises :class:`LeadProtocolError` for a schema defect."""
     if not isinstance(payload, Mapping):
-        raise lead.LeadProtocolError("response is not a JSON object")
+        raise _ResponseDefect("response_not_object", "response is not a JSON object")
     if payload.get("error") not in (None,):
-        raise lead.LeadProtocolError("response carries an error object")
+        raise _ResponseDefect("response_error_object", "response carries an error object")
     actual_model = payload.get("model")
     if not isinstance(actual_model, str) or actual_model != config.model_id:
-        raise lead.LeadProtocolError("response model is not the requested model")
-    usage = lead._extract_usage(payload)
+        raise _ResponseDefect(
+            "response_model_mismatch", "response model is not the requested model"
+        )
+    try:
+        usage = lead._extract_usage(payload)
+    except lead.LeadProtocolError as exc:
+        raise _ResponseDefect(
+            "response_usage_malformed", "response usage is malformed"
+        ) from exc
     provider = lead._bounded_meta(payload.get("provider"), "provider")
     response_id = lead._bounded_meta(payload.get("id"), "id")
     choices = payload.get("choices")
     if not isinstance(choices, (list, tuple)) or len(choices) != 1:
-        raise lead.LeadProtocolError("response must carry exactly one choice")
+        raise _ResponseDefect(
+            "response_choices_malformed", "response must carry exactly one choice"
+        )
     choice = choices[0]
     if not isinstance(choice, Mapping):
-        raise lead.LeadProtocolError("response choice is not an object")
+        raise _ResponseDefect(
+            "response_choices_malformed", "response choice is not an object"
+        )
     message = choice.get("message")
     if not isinstance(message, Mapping):
-        raise lead.LeadProtocolError("response choice message is not an object")
+        raise _ResponseDefect(
+            "response_message_malformed", "response choice message is not an object"
+        )
     if message.get("role") not in (None, "assistant"):
-        raise lead.LeadProtocolError("response choice role is not assistant")
+        raise _ResponseDefect(
+            "response_message_malformed", "response choice role is not assistant"
+        )
     if message.get("tool_calls") not in (None, (), []):
-        raise lead.LeadProtocolError("response contains tool calls")
+        raise _ResponseDefect("response_tool_calls", "response contains tool calls")
     finish_reason = choice.get("finish_reason")
     refusal = message.get("refusal")
     refused = (
@@ -574,21 +685,33 @@ def _classify_completion(
     if refused:
         return ("refused", actual_model, provider, response_id, usage, None)
     if finish_reason != "stop":
-        raise lead.LeadProtocolError("response finish_reason is not stop")
+        code = (
+            "response_finish_length"
+            if finish_reason == "length"
+            else "response_finish_not_stop"
+        )
+        raise _ResponseDefect(code, "response finish_reason is not stop")
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise lead.LeadProtocolError("response choice has no assistant text")
+        raise _ResponseDefect(
+            "response_content_empty", "response choice has no assistant text"
+        )
     # The extraction contract requires a structured JSON object; a non-JSON or
     # non-object reply is never a completed extraction.
     _parse_extraction_json(content)
     return ("completed", actual_model, provider, response_id, usage, content)
 
 
-def _malformed(plan: ExtractionPlan, status: int | None, message: str) -> ExtractionResult:
+def _malformed(
+    plan: ExtractionPlan,
+    status: int | None,
+    message: str,
+    code: str = "transport_malformed",
+) -> ExtractionResult:
     return _result(
         plan, outcome="protocol_error", http_status=status,
         cost=lead._unknown_cost(plan.reserve_usd), submitted=True,
-        code="protocol_error", message=message,
+        code=code, message=message,
     )
 
 
@@ -610,7 +733,10 @@ def _finish_extraction(plan: ExtractionPlan, response: object) -> ExtractionResu
             message="response body exceeded the permitted size",
         )
     if lead._utf8_len(response.body_text) > plan.max_response_bytes:
-        return _malformed(plan, status, "response body exceeded the permitted size")
+        return _malformed(
+            plan, status, "response body exceeded the permitted size",
+            code="response_too_large",
+        )
     if status != 200:
         if status in lead._DEFINITIVE_STATUSES:
             return _result(
@@ -633,7 +759,7 @@ def _finish_extraction(plan: ExtractionPlan, response: object) -> ExtractionResu
         return _result(
             plan, outcome="protocol_error", http_status=200,
             cost=lead._cost_or_unknown(plan, lead._best_effort_cost(response.body_text)),
-            submitted=True, code="protocol_error",
+            submitted=True, code="response_envelope_not_json",
             message="the request was submitted (http 200) and the response was malformed",
         )
     reported_cost = lead._extract_reported_cost(payload)
@@ -641,11 +767,11 @@ def _finish_extraction(plan: ExtractionPlan, response: object) -> ExtractionResu
         outcome, actual_model, provider, response_id, usage, proposal_text = (
             _classify_completion(payload, plan.config)
         )
-    except lead.LeadProtocolError:
+    except lead.LeadProtocolError as exc:
         return _result(
             plan, outcome="protocol_error", http_status=200,
             cost=lead._cost_or_unknown(plan, reported_cost), submitted=True,
-            code="protocol_error",
+            code=getattr(exc, "code", "protocol_error"),
             message="the request was submitted (http 200) and the response was malformed",
         )
     cost = lead._cost_or_unknown(plan, reported_cost)

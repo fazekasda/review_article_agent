@@ -359,6 +359,7 @@ def accepted_result(mapping: dict[str, Any]) -> dict[str, Any]:
         "usage": mapping.get("usage"),
         "http_status": mapping.get("http_status"),
         "request_sha256": mapping.get("request_sha256"),
+        "diagnostic_code": mapping.get("diagnostic_code"),
         "run_ref": mapping.get("run_ref"),
         "posted": mapping.get("posted"),
         "no_automatic_retry": mapping.get("no_automatic_retry"),
@@ -371,7 +372,7 @@ _SAFE_KEYS = (
     "kind", "mode", "request_id", "status", "outcome", "dispatch_id",
     "dispatch_state", "task_id", "proposal_record_id", "cost_state",
     "cost_amount_usd", "reserve_usd", "actual_model", "provider", "response_id",
-    "usage", "http_status", "request_sha256", "run_ref", "posted",
+    "usage", "http_status", "request_sha256", "diagnostic_code", "run_ref", "posted",
     "no_automatic_retry", "authorizing",
 )
 

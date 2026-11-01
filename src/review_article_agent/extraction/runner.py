@@ -55,6 +55,7 @@ from ..runtime.retry import RETRY_MAX_ATTEMPTS, next_attempt
 from ..runtime.roles import (
     BoundedTask,
     ModelRef,
+    ProposalError,
     RoleConfig,
     RoleConfiguration,
 )
@@ -182,6 +183,20 @@ _RESULT_KIND_PROPOSAL = "extraction_proposal"
 _RESULT_KIND_ESCALATION = "extraction_escalation"
 _RESULT_KIND_REFUSED = "extraction_refused"
 _RESULT_KIND_PROTOCOL = "extraction_protocol_error"
+
+#: Allowlisted, static, non-authorizing reasons for a **model-owned** proposal
+#: content rejected by the untrusted proposal guard (:func:`roles.submit_proposal`).
+#: The reason is derived **only** from the internally defined
+#: :class:`~review_article_agent.runtime.roles.ProposalError` ``code`` -- never
+#: from the exception message, the provider, the source, or the model data. Any
+#: other ``ProposalError`` code (config/task/envelope) and every non-``ProposalError``
+#: storage/corruption/fencing error is **not** in this map and still fails closed.
+_PROPOSAL_REJECTION_REASONS = {
+    "content_size": "proposal_content_size",
+    "content_key": "proposal_content_key",
+    "content_json": "proposal_content_json",
+    "content_shape": "proposal_content_shape",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -937,6 +952,10 @@ def _execution_metadata(*, dispatch_id, result, input_digest, model_ref):
             "completion_tokens": result.usage.completion_tokens,
             "total_tokens": result.usage.total_tokens,
         }
+    # A bounded, static parser-failure code (never peer text or a provider
+    # message) so a non-completed run's reason is durable and distinguishable.
+    diagnostic = result.diagnostic
+    diagnostic_code = diagnostic.code if diagnostic is not None else None
     return {
         "actual_model": result.actual_model,
         "upstream_provider": result.provider,
@@ -945,6 +964,7 @@ def _execution_metadata(*, dispatch_id, result, input_digest, model_ref):
         "version_set_json": canonical_json(versions).decode("utf-8"),
         "http_status": result.http_status,
         "request_sha256": result.request_sha256,
+        "diagnostic_code": diagnostic_code,
         "dispatch_id": dispatch_id,
         "no_automatic_retry": True,
     }
@@ -1566,14 +1586,58 @@ def _verify_hosted_dependencies(store, hosted_ref, config_ref, report_refs, extr
         raise ExtractionHostedUseError("hosted-use: the revision does not pin its declared rights closure")
 
 
+def _record_proposal_guarded(
+    runtime, *, task_record, content, outcome, result_kind, role_configuration,
+):
+    """Record the non-authorizing proposal, converting a **model-owned** guard
+    rejection into a small, static, non-authorizing diagnostic.
+
+    The untrusted proposal guard must never be weakened. If the model-owned
+    content is rejected for size/keys/JSON/shape, the raw model output is
+    **discarded** (it is never smuggled around the guard) and only a bounded,
+    static diagnostic -- derived solely from the guard's own internally defined
+    ``code`` -- is recorded instead, preserving the reported cost through the
+    normal guarded proposal/dispatch path. A genuine storage/corruption/fencing
+    error is **not** a :class:`ProposalError` and is never reclassified: it still
+    fails closed. There is no recursive fallback: the fallback is a fixed, tiny,
+    trusted envelope that itself passes the same guard.
+    """
+    try:
+        record = runtime._record_proposal_in_transaction(
+            task_record, {"content": content}, configuration=role_configuration
+        )
+        return record, outcome, content, result_kind
+    except ProposalError as exc:
+        reason = _PROPOSAL_REJECTION_REASONS.get(getattr(exc, "code", None))
+        if reason is None:
+            # A config/task/envelope defect (or any code outside the allowlist) is
+            # not model-owned content: fail closed exactly as before.
+            raise
+    # Build the fallback ONLY from trusted runner-computed provenance (the
+    # execution metadata this runner authored) -- never from the rejected model
+    # output -- plus the static reason. It re-passes the same generic guard.
+    metadata = content.get("execution_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata["diagnostic_code"] = reason
+    fallback = _content(
+        content.get("purpose"), "escalation", None, content.get("instructions_sha256"),
+        "human", reason, metadata,
+    )
+    record = runtime._record_proposal_in_transaction(
+        task_record, {"content": fallback}, configuration=role_configuration
+    )
+    return record, "escalation", fallback, _RESULT_KIND_ESCALATION
+
+
 def _commit_atomic(
     store, *, runtime, dispatch, task_record, dispatch_record, result, outcome, content,
     result_kind, role_configuration, material, receipt_payload,
 ):
     """Commit proposal + dispatch result/cost + receipt in ONE nested transaction."""
     with _NestedStore(store).transaction():
-        record = runtime._record_proposal_in_transaction(
-            task_record, {"content": content}, configuration=role_configuration
+        record, outcome, content, result_kind = _record_proposal_guarded(
+            runtime, task_record=task_record, content=content, outcome=outcome,
+            result_kind=result_kind, role_configuration=role_configuration,
         )
         fence = dispatch_record.current_fence
         if outcome == "completed":
@@ -1585,8 +1649,15 @@ def _commit_atomic(
                 result_ref=record.record_id, result_digest=record.stored_digest,
             )
         elif outcome == "failed":
-            dispatch._settle_cost_in_transaction(dispatch_record.dispatch_id, cost_state="not_incurred", allow_definitive_not_incurred=True)
+            # Mark the definitive failure *before* settling the cost. A
+            # ``submitted`` row may never claim ``not_incurred`` (the
+            # ``runtime_dispatch_state`` CHECK), so settling first raised an
+            # uncaught CHECK violation that the worker swallowed as an
+            # ``indeterminate`` ambiguous outcome. ``failed`` is not one of the
+            # forbidden states, so the ``not_incurred`` settlement is legal once
+            # the transition has been recorded.
             dispatch._mark_failed_in_transaction(dispatch_record.dispatch_id, definitive_rejection=True)
+            dispatch._settle_cost_in_transaction(dispatch_record.dispatch_id, cost_state="not_incurred", allow_definitive_not_incurred=True)
             return None
         elif outcome == "unknown":
             dispatch._settle_cost_in_transaction(dispatch_record.dispatch_id, cost_state="unknown")
@@ -1718,6 +1789,7 @@ def _readback(store, request_id: str, *, run_ref, posted: bool) -> dict:
         "usage": None,
         "http_status": None,
         "request_sha256": None,
+        "diagnostic_code": None,
     }
     if dispatch_record is None:
         return mapping
@@ -1748,6 +1820,7 @@ def _readback(store, request_id: str, *, run_ref, posted: bool) -> dict:
             mapping["usage"] = metadata.get("usage")
             mapping["http_status"] = metadata.get("http_status")
             mapping["request_sha256"] = metadata.get("request_sha256")
+            mapping["diagnostic_code"] = metadata.get("diagnostic_code")
             break
     return mapping
 

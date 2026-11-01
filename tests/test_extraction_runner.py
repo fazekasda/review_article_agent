@@ -197,6 +197,21 @@ def _completion(content_obj, *, model=_MODEL, provider="deepseek", cost=0.0002, 
     return TransportResponse(status=200, body_text=json.dumps(payload), truncated=False)
 
 
+def _raw_completion(content_literal, *, model=_MODEL, provider="deepseek", cost=0.0002):
+    """A 200 completion whose assistant content is the given raw JSON text.
+
+    The content is embedded as a Python **string** so a numeric literal such as
+    ``1e999`` is never round-tripped through a Python float before the adapter
+    parses it.
+    """
+    payload = {
+        "id": "gen-num", "model": model, "provider": provider,
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": content_literal}}],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20, "cost": cost},
+    }
+    return TransportResponse(status=200, body_text=json.dumps(payload), truncated=False)
+
+
 def _extraction_output(passages, source_keys):
     """Build a schema-valid raw output over the receipt's real passages/assets."""
     findings = []
@@ -617,6 +632,350 @@ class ReplayTest(RunnerTestBase):
         self.pilot_extraction()
         with self.assertRaises(RuntimeConflictError):
             self.run_extraction(request_id="run-x", artifact_id="a-run-other", revision_id="rev-run-other")
+
+
+class ProtocolErrorDiagnosticTest(RunnerTestBase):
+    """A non-completed run persists a bounded, static diagnostic code (S19).
+
+    The exact live failure could not be reproduced (no raw body was retained);
+    these tests pin the *observability* that makes the next live call
+    distinguishable, and prove the code is durable, cost is preserved, and no
+    secret/source/peer marker leaks into the readback or the stored metadata.
+    """
+
+    def _malformed_completion(self, *, model=_MODEL, finish_reason="stop", cost=0.0002):
+        payload = {
+            "id": "gen-diag", "model": model, "provider": "deepseek",
+            "choices": [{
+                "finish_reason": finish_reason,
+                "message": {"role": "assistant", "content": json.dumps({"x": 1})},
+            }],
+            "usage": {
+                "prompt_tokens": 12, "completion_tokens": 8,
+                "total_tokens": 20, "cost": cost,
+            },
+        }
+        return TransportResponse(status=200, body_text=json.dumps(payload), truncated=False)
+
+    def _metadata_for(self, result):
+        from review_article_agent.storage.agent_runtime import RuntimeRepository
+
+        record = RuntimeRepository(self.store).get_proposal(result["proposal_record_id"])
+        return json.loads(record.canonical.decode("utf-8"))["content"]["execution_metadata"]
+
+    def test_wrong_model_persists_code_and_keeps_known_cost(self):
+        self.transport.responses.append(self._malformed_completion(model="openai/other"))
+        result = self.run_extraction(
+            request_id="run-diag-model", artifact_id="a-run-diag", revision_id="rev-run-diag"
+        )
+        self.assertEqual(result["outcome"], "protocol_error")
+        self.assertEqual(result["status"], "completed")  # accepted diagnostic
+        self.assertEqual(result["diagnostic_code"], "response_model_mismatch")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        # Durable in the accepted (non-authorizing) proposal's metadata.
+        self.assertEqual(
+            self._metadata_for(result)["diagnostic_code"], "response_model_mismatch"
+        )
+
+    def test_length_finish_is_distinguished_from_other_branches(self):
+        self.transport.responses.append(self._malformed_completion(finish_reason="length"))
+        result = self.run_extraction(
+            request_id="run-diag-len", artifact_id="a-run-len", revision_id="rev-run-len"
+        )
+        self.assertEqual(result["outcome"], "protocol_error")
+        self.assertEqual(result["diagnostic_code"], "response_finish_length")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+
+    def test_envelope_not_json_is_distinguished(self):
+        self.transport.responses.append(
+            TransportResponse(status=200, body_text="<html>nope</html>", truncated=False)
+        )
+        result = self.run_extraction(
+            request_id="run-diag-env", artifact_id="a-run-env", revision_id="rev-run-env"
+        )
+        self.assertEqual(result["outcome"], "protocol_error")
+        self.assertEqual(result["diagnostic_code"], "response_envelope_not_json")
+
+    def test_readback_carries_no_private_markers(self):
+        self.transport.responses.append(self._malformed_completion(model="openai/other"))
+        result = self.run_extraction(
+            request_id="run-diag-leak", artifact_id="a-run-leak", revision_id="rev-run-leak"
+        )
+        blob = json.dumps(result)
+        for marker in ("sk-or-test", "PRIVATE_SOURCE", "openai/other", "gen-diag"):
+            self.assertNotIn(marker, blob)
+
+    def test_definitive_rejection_commits_failed_without_check_violation(self):
+        # A definitive pre-billing rejection (HTTP 400) is a resolved ``failed``
+        # outcome. It must settle the cost ``not_incurred`` and record the
+        # dispatch ``failed`` without tripping the ``runtime_dispatch_state``
+        # CHECK (a submitted row may never claim ``not_incurred``). The old
+        # settle-before-fail order raised an uncaught sqlite CHECK violation,
+        # which the worker swallowed as an ``indeterminate`` ambiguous outcome.
+        from review_article_agent.runtime.dispatch import RuntimeDispatchRepository
+
+        self.transport.responses.append(
+            TransportResponse(
+                status=400,
+                body_text='{"error": {"message": "invalid request"}}',
+                truncated=False,
+            )
+        )
+        result = self.run_extraction(
+            request_id="run-def", artifact_id="a-run-def", revision_id="rev-run-def"
+        )
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["cost_state"], "not_incurred")
+        self.assertIsNone(result["cost_amount_usd"])
+        dispatch = RuntimeDispatchRepository(self.store).get_dispatch_by_request("run-def")
+        self.assertEqual(dispatch.state, "failed")
+        self.assertEqual(dispatch.cost_state, "not_incurred")
+        self.assertIsNone(dispatch.cost_amount_usd)
+
+    def test_unrepresentable_number_is_terminal_diagnostic_not_crash(self):
+        # A number the model reported that a JSON-native float cannot hold
+        # (overflow/underflow/over-precision) must be a terminal protocol_error
+        # with the bounded static code — never a silently rounded accepted
+        # extraction and never an uncaught canonical-JSON crash. The dispatch is
+        # completed (accepted diagnostic), the reported cost is preserved, and
+        # the serial remote slot is freed.
+        from review_article_agent.runtime.dispatch import (
+            RuntimeDispatchRepository,
+            runtime_dispatch_remote_state,
+        )
+
+        for index, literal in enumerate(("1e999", "1e-999", "0.123456789012345678901")):
+            with self.subTest(literal=literal):
+                rid = f"run-num-{index}"
+                self.transport.responses.append(_raw_completion('{"value": %s}' % literal))
+                result = self.run_extraction(
+                    request_id=rid, artifact_id=f"a-num-{index}", revision_id=f"rev-num-{index}"
+                )
+                self.assertEqual(result["outcome"], "protocol_error")
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(
+                    result["diagnostic_code"],
+                    "response_content_number_unrepresentable",
+                )
+                self.assertEqual(result["cost_state"], "known")
+                self.assertEqual(result["cost_amount_usd"], "0.0002")
+                dispatch = RuntimeDispatchRepository(self.store).get_dispatch_by_request(rid)
+                self.assertEqual(dispatch.state, "completed")
+                self.assertEqual(
+                    runtime_dispatch_remote_state(self.store.connection, self.project_id),
+                    "none",
+                )
+
+    def test_float_in_model_output_does_not_raise_record_validation_error(self):
+        # The shared strict JSON parser parses floats as ``Decimal`` (for exact
+        # cost arithmetic). Untrusted extraction **content** must not leak a
+        # ``Decimal`` into the proposal: it is not JSON-serializable, so the
+        # runner's canonical-JSON step raised an uncaught
+        # ``RecordValidationError`` (which the worker swallowed as an
+        # ``indeterminate`` ambiguous outcome). A schema-valid numeric detail
+        # carrying a float must be accepted, and any float elsewhere must be a
+        # clean escalation, never a crash.
+        output = _extraction_output(self.passages, self.source_keys)
+        output["findings"][0]["numeric_details"] = [
+            {
+                "name": "clearance",
+                "value": {"state": "known", "value": 5.2},
+                "unit": {"state": "known", "value": "mg"},
+                "denominator": {"state": "not_applicable", "value": None},
+            }
+        ]
+        self.transport.responses.append(_completion(output))
+        result = self.run_extraction(
+            request_id="run-float", artifact_id="a-run-float", revision_id="rev-run-float"
+        )
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["status"], "completed")
+
+        # A bare float in a wrong place is a clean escalation, not a crash.
+        bad = {"schema_version": 1, "summary": 1.5}
+        self.transport.responses.append(_completion(bad))
+        result = self.run_extraction(
+            request_id="run-float-bad", artifact_id="a-run-float-bad",
+            revision_id="rev-run-float-bad",
+        )
+        self.assertEqual(result["outcome"], "escalation")
+        self.assertEqual(result["status"], "completed")
+
+
+class ProposalGuardRejectionTest(RunnerTestBase):
+    """A proposal-guard rejection of model-owned content must not erase the
+    provider result/cost nor leave the dispatch ``submitted`` (S19-PROPOSAL-FAILURE).
+
+    The untrusted guard is never weakened: when the model-owned content is
+    rejected (oversized, forbidden authority-like key, invalid JSON/shape), the raw
+    output is **discarded** and only a bounded, static, non-authorizing diagnostic
+    -- derived solely from the guard's own ``code`` -- is recorded. The reported
+    cost is preserved, the dispatch reaches a terminal accepted-diagnostic state
+    (never ``submitted``/``unknown``), and no raw authority payload leaks.
+    """
+
+    def _dispatch_repo(self):
+        from review_article_agent.runtime.dispatch import RuntimeDispatchRepository
+
+        return RuntimeDispatchRepository(self.store)
+
+    def _stored_canonical(self, result):
+        from review_article_agent.storage.agent_runtime import RuntimeRepository
+
+        record = RuntimeRepository(self.store).get_proposal(result["proposal_record_id"])
+        return record.canonical.decode("utf-8")
+
+    def test_oversized_model_content_becomes_static_diagnostic(self):
+        # A schema-VALID extraction whose serialized content exceeds the task size
+        # limit (262144) while staying inside the 1 MiB response cap: the old code
+        # raised an uncaught ProposalError(content_size), leaving the dispatch
+        # submitted and the cost/result lost.
+        from review_article_agent.runtime.dispatch import (
+            RuntimeDispatchRepository,
+            runtime_dispatch_remote_state,
+        )
+
+        output = _extraction_output(self.passages, self.source_keys)
+        output["summary"] = "S" * (runner.TASK_SIZE_LIMIT + 4096)
+        self.transport.responses.append(_completion(output))
+        result = self.run_extraction(
+            request_id="run-big", artifact_id="a-run-big", revision_id="rev-run-big"
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "escalation")
+        self.assertEqual(result["diagnostic_code"], "proposal_content_size")
+        # Known reported cost is preserved through the guarded path.
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        dispatch = self._dispatch_repo().get_dispatch_by_request("run-big")
+        self.assertEqual(dispatch.state, "completed")
+        self.assertEqual(dispatch.cost_state, "known")
+        self.assertEqual(dispatch.cost_amount_usd, "0.0002")
+        # The serial remote slot is freed; no submitted/unknown row remains.
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
+        # The discarded oversized raw output is not stored.
+        self.assertLess(
+            len(self._stored_canonical(result)), runner.TASK_SIZE_LIMIT + 1
+        )
+
+    def test_forbidden_authority_key_becomes_static_diagnostic(self):
+        # A schema-invalid raw output carrying an authority-like key is escalated
+        # WITH raw_output; the guard rejects that key. The run must become a
+        # bounded static diagnostic -- never a crash, and never smuggling the
+        # payload around the guard.
+        from review_article_agent.runtime.dispatch import (
+            RuntimeDispatchRepository,
+            runtime_dispatch_remote_state,
+        )
+
+        bad = {
+            "schema_version": 1,
+            "approval": "RAW_PAYLOAD_MARKER",
+            "self_approve": True,
+            "role": "owner",
+        }
+        self.transport.responses.append(_completion(bad))
+        result = self.run_extraction(
+            request_id="run-key", artifact_id="a-run-key", revision_id="rev-run-key"
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "escalation")
+        self.assertEqual(result["diagnostic_code"], "proposal_content_key")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        dispatch = self._dispatch_repo().get_dispatch_by_request("run-key")
+        self.assertEqual(dispatch.state, "completed")
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
+        # No raw authority payload (key or value) leaks into the readback or the
+        # durable accepted proposal.
+        blob = json.dumps(result) + self._stored_canonical(result)
+        for marker in ("RAW_PAYLOAD_MARKER", "approval", "self_approve", "owner"):
+            self.assertNotIn(marker, blob)
+
+    def test_ordinary_valid_extraction_unchanged(self):
+        # Control: a valid extraction is still an accepted completed proposal.
+        result = self.pilot_extraction()
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["diagnostic_code"], None)
+        receipt = require_run(self.store, result["run_ref"], purpose="extraction")
+        self.assertEqual(receipt["raw_output"]["schema_version"], 1)
+
+    def test_fallback_discards_raw_output_and_passes_the_same_guard(self):
+        from unittest import mock
+
+        from review_article_agent.runtime import roles
+
+        runtime = mock.Mock()
+        rejected = {
+            "purpose": "extraction",
+            "outcome": "escalation",
+            "raw_output": {"approval": "RAW_PAYLOAD_MARKER", "role": "owner"},
+            "instructions_sha256": "a" * 64,
+            "escalation": "human",
+            "reason": "extraction_schema_invalid",
+            "execution_metadata": {"dispatch_id": "disp-x", "actual_model": "m"},
+        }
+        captured: dict = {}
+
+        def _record(task, payload, *, configuration):
+            content = payload["content"]
+            if content.get("raw_output") is not None:
+                raise roles.ProposalError("content_key", "rejected")
+            captured["content"] = content
+            return mock.Mock(record_id="prop-1", stored_digest="d" * 64)
+
+        runtime._record_proposal_in_transaction.side_effect = _record
+        _record_out, outcome, content, kind = runner._record_proposal_guarded(
+            runtime,
+            task_record=mock.Mock(),
+            content=rejected,
+            outcome="escalation",
+            result_kind=runner._RESULT_KIND_ESCALATION,
+            role_configuration=mock.Mock(),
+        )
+        self.assertEqual(outcome, "escalation")
+        self.assertEqual(kind, runner._RESULT_KIND_ESCALATION)
+        # The raw model output is discarded, never smuggled around the guard.
+        self.assertIsNone(captured["content"]["raw_output"])
+        self.assertEqual(captured["content"]["reason"], "proposal_content_key")
+        self.assertEqual(
+            captured["content"]["execution_metadata"]["diagnostic_code"],
+            "proposal_content_key",
+        )
+        # The fallback itself passes the same generic guard primitives.
+        roles._reject_forbidden_keys(captured["content"])
+        self.assertLess(
+            len(runner.canonical_json(captured["content"])), runner.TASK_SIZE_LIMIT
+        )
+
+    def test_non_allowlisted_proposal_error_still_fails_closed(self):
+        from unittest import mock
+
+        from review_article_agent.runtime import roles
+
+        runtime = mock.Mock()
+        runtime._record_proposal_in_transaction.side_effect = roles.ProposalError(
+            "task_drift", "drift"
+        )
+        with self.assertRaises(roles.ProposalError):
+            runner._record_proposal_guarded(
+                runtime,
+                task_record=mock.Mock(),
+                content={"purpose": "extraction", "raw_output": None},
+                outcome="completed",
+                result_kind=runner._RESULT_KIND_PROPOSAL,
+                role_configuration=mock.Mock(),
+            )
 
 
 class DirectCallRetryTest(RunnerTestBase):

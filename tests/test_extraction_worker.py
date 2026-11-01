@@ -220,6 +220,100 @@ class ExtractAdmissionAndCompletionTest(ExtractionWorkerBase):
         self.assertNotIn("sk-or-test", json.dumps(job))
         self.assertNotIn("raw_output", json.dumps(result))
 
+    def test_protocol_error_run_carries_static_diagnostic_code(self) -> None:
+        # A malformed 200 (wrong model) is an accepted diagnostic, never a
+        # completion; the safe projection surfaces the bounded static code and
+        # the settled cost, and never the response body, model, or credential.
+        self.transport.responses.append(fx._completion({"x": 1}, model="openai/other"))
+        engine = self.engine(api_key="sk-or-test")
+        res = self.submit(engine, request_id="run-diag")
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        accepted = job["accepted_result"]
+        self.assertIsNotNone(accepted)
+        result = accepted["result"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "protocol_error")
+        self.assertEqual(result["diagnostic_code"], "response_model_mismatch")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        blob = json.dumps(job)
+        for marker in ("sk-or-test", "openai/other", "gen-1"):
+            self.assertNotIn(marker, blob)
+
+    def test_guard_rejection_of_model_content_is_accepted_diagnostic(self) -> None:
+        # A schema-invalid raw output carrying an authority-like key makes the
+        # untrusted proposal guard raise ProposalError. That must NOT erase the
+        # provider cost/result nor leave the dispatch submitted: the run becomes a
+        # bounded static accepted diagnostic (known cost preserved, terminal job
+        # state), and the raw authority payload never reaches the job JSON.
+        self.transport.responses.append(
+            fx._completion(
+                {"schema_version": 1, "approval": "RAW_PAYLOAD_MARKER", "role": "owner"}
+            )
+        )
+        engine = self.engine(api_key="sk-or-test")
+        res = self.submit(engine, request_id="run-guard")
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        accepted = job["accepted_result"]
+        self.assertIsNotNone(accepted)
+        result = accepted["result"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "escalation")
+        self.assertEqual(result["diagnostic_code"], "proposal_content_key")
+        self.assertEqual(result["cost_state"], "known")
+        self.assertEqual(result["cost_amount_usd"], "0.0002")
+        blob = json.dumps(job)
+        for marker in ("RAW_PAYLOAD_MARKER", "approval", "self_approve", "sk-or-test"):
+            self.assertNotIn(marker, blob)
+
+    def test_definitive_rejection_accepted_as_failed_not_indeterminate(self) -> None:
+        # A definitive pre-billing rejection (HTTP 400) is a resolved ``failed``
+        # outcome. It must be accepted as the job's result (cost ``not_incurred``)
+        # rather than escaping as an uncaught ``runtime_dispatch_state`` CHECK
+        # violation and being swallowed by the worker as an ``indeterminate``
+        # ambiguous outcome. This is the adapter->runner->worker seam of the live
+        # pilot failure (a job left ``waiting_human`` with no receipt).
+        from review_article_agent.runtime.dispatch import (
+            runtime_dispatch_remote_state,
+        )
+
+        self.transport.responses.append(
+            fx.TransportResponse(
+                status=400,
+                body_text='{"error": {"message": "invalid request"}}',
+                truncated=False,
+            )
+        )
+        engine = self.engine(api_key="sk-or-test")
+        res = self.submit(engine, request_id="run-def")
+        self.assertTrue(res["ok"], res)
+        job_id = res["job"]["job_id"]
+        self._drive(engine)
+        job = self._job(engine, job_id)
+        self.assertEqual(job["state"], "completed")
+        self.assertFalse(job["outcome_unresolved"])
+        accepted = job["accepted_result"]
+        self.assertIsNotNone(accepted)
+        result = accepted["result"]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["cost_state"], "not_incurred")
+        self.assertIsNone(result["cost_amount_usd"])
+        self.assertEqual(self.transport.call_count, 1)
+        # A definitive failure is not an in-flight/ambiguous remote outcome, so
+        # the single serial remote slot is freed.
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Missing credential / missing gate => zero POST
@@ -428,6 +522,38 @@ class ExtractionRunCliTest(cli_fx.DiscoveryJobsCliBase):
             "extraction", "run", "status", "--project", pid, "--request-id", "absent",
             expect=2,
         )
+
+    def test_run_status_surfaces_diagnostic_code(self) -> None:
+        # A protocol_error run's bounded static diagnostic code and settled cost
+        # are surfaced by the readback CLI (no raw body, no model output).
+        pid = self.create_project()
+
+        def _make(store):
+            repo = JobRepository(store)
+            job = repo.submit("run-1", task_kind="extraction_run", parameters={})
+            attempt = repo.begin_attempt(job.job_id, dispatch_kind="local")
+            repo.accept_result(
+                attempt.attempt_id,
+                result_kind="extraction_run",
+                result={
+                    "kind": "extraction_run",
+                    "mode": "extraction_run",
+                    "status": "completed",
+                    "outcome": "protocol_error",
+                    "diagnostic_code": "response_finish_length",
+                    "cost_state": "known",
+                    "cost_amount_usd": "0.0002",
+                    "authorizing": False,
+                },
+            )
+
+        self.with_store(pid, _make)
+        out = self.cli(
+            "extraction", "run", "status", "--project", pid, "--request-id", "run-1"
+        )
+        self.assertEqual(out["run"]["outcome"], "protocol_error")
+        self.assertEqual(out["run"]["diagnostic_code"], "response_finish_length")
+        self.assertEqual(out["run"]["cost_amount_usd"], "0.0002")
 
     def test_help_documents_run_commands(self) -> None:
         parser = cli_fx.cli_main.build_parser()

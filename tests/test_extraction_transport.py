@@ -142,6 +142,20 @@ def resp(status, obj):
     return lead.TransportResponse(status, body)
 
 
+def body_with_raw_content(content_literal, **overrides):
+    """A 200 body whose assistant content is the given raw JSON text.
+
+    The content is embedded as a Python **string** (not via ``json.dumps`` of a
+    Python number) so a numeric literal such as ``1e999`` is never round-tripped
+    through a Python float before the adapter parses it.
+    """
+    payload = valid_body(**overrides)
+    choice = valid_choices()
+    choice["message"]["content"] = content_literal
+    payload["choices"] = [choice]
+    return payload
+
+
 def plan(**overrides):
     text = overrides.pop("text", TEXT)
     purpose = overrides.pop("purpose", "extraction")
@@ -548,6 +562,154 @@ class NeverSuccessTests(unittest.TestCase):
     def test_content_filter_is_refused(self):
         result = self._run_body(choices=[valid_choices(finish_reason="content_filter")])
         self.assertEqual(result.outcome, "refused")
+
+
+# --------------------------------------------------------------------------- #
+# Bounded, static parser-failure diagnostic codes
+# --------------------------------------------------------------------------- #
+class ResponseDiagnosticCodeTests(unittest.TestCase):
+    """A malformed 200 carries a *distinguishable*, bounded, static code.
+
+    These are the branches a live protocol_error previously collapsed into one
+    generic code; the code (never the body, finish-reason string, or provider
+    message) is what becomes durable on the run.
+    """
+
+    def _code(self, response):
+        return run(FakeTransport(response)).diagnostic.code
+
+    def test_codes_are_from_the_bounded_set(self):
+        for response in (
+            resp(200, valid_body(model="openai/other")),
+            resp(200, "<html>not json</html>"),
+        ):
+            with self.subTest(response=str(response)[:40]):
+                self.assertIn(
+                    self._code(response), extraction.RESPONSE_DIAGNOSTIC_CODES
+                )
+
+    def test_distinct_branches_have_distinct_codes(self):
+        length = valid_choices()
+        length["finish_reason"] = "length"
+        other_finish = valid_choices()
+        other_finish["finish_reason"] = "tool_calls"
+        bad_json = valid_choices()
+        bad_json["message"]["content"] = "not json at all"
+        not_object = valid_choices()
+        not_object["message"]["content"] = "[1, 2, 3]"
+        empty = valid_choices()
+        empty["message"]["content"] = "   "
+
+        error_body = valid_body()
+        error_body["error"] = {"code": 500, "message": CANARY}
+        missing_choices = valid_body()
+        del missing_choices["choices"]
+        bad_usage = valid_body()
+        bad_usage["usage"] = "not an object"
+
+        observed = {
+            "model_mismatch": self._code(resp(200, valid_body(model="openai/other"))),
+            "finish_length": self._code(resp(200, valid_body(choices=[length]))),
+            "finish_not_stop": self._code(resp(200, valid_body(choices=[other_finish]))),
+            "content_not_json": self._code(resp(200, valid_body(choices=[bad_json]))),
+            "content_not_object": self._code(resp(200, valid_body(choices=[not_object]))),
+            "content_empty": self._code(resp(200, valid_body(choices=[empty]))),
+            "error_object": self._code(resp(200, error_body)),
+            "choices_malformed": self._code(resp(200, missing_choices)),
+            "usage_malformed": self._code(resp(200, bad_usage)),
+            "envelope_not_json": self._code(resp(200, "<html>nope</html>")),
+            "transport_malformed": self._code("not-a-transport-response"),
+        }
+        # Every branch is a distinct, static code (no collapsed generic code).
+        self.assertEqual(
+            observed["finish_length"], "response_finish_length"
+        )
+        self.assertEqual(observed["content_not_json"], "response_content_not_json")
+        self.assertEqual(observed["envelope_not_json"], "response_envelope_not_json")
+        self.assertEqual(len(set(observed.values())), len(observed))
+        self.assertNotIn("protocol_error", set(observed.values()))
+        for code in observed.values():
+            self.assertIn(code, extraction.RESPONSE_DIAGNOSTIC_CODES)
+
+    def test_diagnostic_code_never_carries_peer_text(self):
+        # The provider error object and the (untrusted) content carry the canary;
+        # the diagnostic code and its redacted detail must not.
+        error_body = valid_body()
+        error_body["error"] = {"code": 400, "message": f"{API_KEY} {CANARY}"}
+        result = run(FakeTransport(resp(200, error_body)))
+        self.assertEqual(result.diagnostic.code, "response_error_object")
+        self.assertNotIn(API_KEY, result.diagnostic.code)
+        self.assertNotIn(CANARY, result.diagnostic.code)
+        self.assertNotIn(CANARY, result.diagnostic.detail_redacted)
+
+        bad_content = valid_choices()
+        bad_content["message"]["content"] = f"{CANARY} not json"
+        result = run(FakeTransport(resp(200, valid_body(choices=[bad_content]))))
+        self.assertNotIn(CANARY, result.diagnostic.code)
+        self.assertNotIn(CANARY, result.diagnostic.detail_redacted)
+
+    def test_known_cost_preserved_on_classify_failure(self):
+        # A reported cost survives a parser-branch failure (the reserve is not
+        # released and the amount is never zeroed).
+        result = run(FakeTransport(resp(200, valid_body(model="openai/other"))))
+        self.assertEqual(result.outcome, "protocol_error")
+        self.assertEqual(result.diagnostic.code, "response_model_mismatch")
+        self.assertEqual(result.cost.state, "known")
+        self.assertEqual(result.cost.amount_usd, "0.0001024")
+
+
+# --------------------------------------------------------------------------- #
+# Number representability (no silent rounding, no crash)
+# --------------------------------------------------------------------------- #
+class NumberRepresentabilityTests(unittest.TestCase):
+    """Untrusted numbers must not be silently rounded, and must never crash.
+
+    The strict parser parses floats as ``Decimal``; extraction content is
+    narrowed to a JSON-native float only when that narrowing is **exact**. An
+    overflow (``1e999``), underflow (``1e-999``), or over-precision number is a
+    terminal ``protocol_error`` carrying a bounded static code — never a silently
+    rounded accepted extraction, and never an uncaught canonical-JSON crash.
+    """
+
+    def _run_content(self, content_literal):
+        return run(FakeTransport(resp(200, body_with_raw_content(content_literal))))
+
+    def test_unrepresentable_numbers_are_protocol_errors_with_known_cost(self):
+        for literal in ("1e999", "1e-999", "0.123456789012345678901"):
+            with self.subTest(literal=literal):
+                result = self._run_content('{"value": %s}' % literal)
+                self.assertEqual(result.outcome, "protocol_error")
+                self.assertEqual(
+                    result.diagnostic.code,
+                    "response_content_number_unrepresentable",
+                )
+                self.assertIn(
+                    result.diagnostic.code, extraction.RESPONSE_DIAGNOSTIC_CODES
+                )
+                # The reported cost survives; the reserve is not released.
+                self.assertEqual(result.cost.state, "known")
+                self.assertEqual(result.cost.amount_usd, "0.0001024")
+                self.assertIsNone(result.proposal_json)
+                self.assertIsNone(result.proposal_text)
+
+    def test_unrepresentable_diagnostic_never_carries_the_number(self):
+        result = self._run_content('{"value": 1e999}')
+        self.assertNotIn("1e999", result.diagnostic.code)
+        self.assertNotIn("1e999", result.diagnostic.detail_redacted or "")
+        self.assertNotIn("999", result.diagnostic.detail_redacted or "")
+
+    def test_ordinary_numbers_are_accepted_and_narrowed(self):
+        result = self._run_content('{"value": 5.2, "small": 1e-3}')
+        self.assertEqual(result.outcome, "completed")
+        self.assertIsInstance(result.proposal_json["value"], float)
+        self.assertEqual(result.proposal_json["value"], 5.2)
+        self.assertEqual(result.proposal_json["small"], 0.001)
+
+    def test_integer_is_preserved_unchanged(self):
+        result = self._run_content('{"count": 7}')
+        self.assertEqual(result.outcome, "completed")
+        self.assertEqual(result.proposal_json["count"], 7)
+        self.assertIsInstance(result.proposal_json["count"], int)
 
 
 # --------------------------------------------------------------------------- #
