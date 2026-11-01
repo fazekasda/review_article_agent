@@ -11,6 +11,34 @@ sampling policy. Builds on Step 07's partial XML parser. Step 08 remains unticke
   counts. Jev responses are validated with the existing typed adapter; raw
   probabilities remain separate from human adjudications. Errors, missing
   context, oversize articles, and uncertainty retain cases for review.
+- **Windowed whole text (S19-SCRWIN-WF).** `SAFE_MAX_REQUEST_BYTES` (32 KiB) is
+  far below a real article (≈200 KB), so the whole parsed article is split by the
+  pure `case_windows(definitions, context)` into deterministic, document-order
+  windows, each of which fits one Jev request (size is measured with the real
+  `build_request`/`canonical_json`, not estimated). Every window begins with a
+  fixed `Article window {k} of {n}.` header (and the `Target passage: …` text in
+  its header region for a passage case) and, when the report declares non-text
+  assets, ends with the fixed non-text limitation line (reserved in every
+  window). No text is dropped or reordered: `window_bodies(...)` concatenates
+  back to the whole article text exactly; a single passage too large for one
+  window is split at whitespace boundaries (character boundary as a fallback).
+  `case_context` is now ready for any cleanly `parsed` report with non-empty text
+  regardless of size, and the old "fits the bound" limitation fallback is gone.
+  `WINDOWING_VERSION = "screening-windows/1"` is recorded in every case.
+- A case binds one verified Jev result per window, in window order, via
+  `{"decision_result_refs": [ref, ...]}` (length must equal the window count);
+  the single `{"decision_result_ref": ...}` form stays valid only for a
+  one-window case. Multi-window imports use
+  `{"window_responses": [envelope, ...]}`. The per-question raw probability is
+  stored per window (`window_decisions`) and aggregated conservatively by
+  `aggregate_window_decisions`: a question is a proposed exclusion only if
+  **every** window genuinely answered it and the **maximum** probability is below
+  the exclude threshold; a refusal/malformed/missing answer in any window keeps
+  that question uncertain and can never exclude. `observed_model` must be
+  identical across windows (refused otherwise). The case `request_sha256` is the
+  digest of the ordered list of per-window request digests; `windows` lists each
+  window's `request_sha256`/`input_sha256`, and `input_sha256` is the whole
+  article text.
 - Exact parser/model/config versions and source/report dependencies. Current
   acquisition plus `pilot / screening.pilot` approval are required for batches.
   A pilot does not depend on the corpus, so adding papers alone does not stale it.
@@ -82,6 +110,19 @@ after config/source change, rejected on tampered target/dependency bytes,
 deeper-than-any-depth-prune corruption, a foreign-project transitive edge with
 local ids, an over-bound graph failing closed, and unable to authorize stale
 work). No full-suite run, network calls, costs, or scientific validation.
+
+**S19-SCRWIN-WF windowing.** `tests/test_screening_windows.py` (17 tests) covers
+short/large/oversize single-passage/passage-case packing (bounded, lossless,
+deterministic, limitation reserved, target in every window), the
+`aggregate_window_decisions` max/retain/refusal rules, and the `_case`
+`window_responses`/`decision_result_refs` forms (wrong count, per-window digest
+binding, mixed `observed_model`). Full fast tier `python3 scripts/run_tests.py -j 4`
+passes (147 modules, 3664 tests), and
+`python3 scripts/run_tests.py --slow -j 4 test_screening test_screening_runner
+test_screening_windows test_step15_e2e_front test_mvp_pipeline_e2e` passes. The
+**current** runner still sends one request per case (now exactly window 1, since
+`case_context` returns it); dispatching one request per window is the follow-up
+S19-SCRWIN-RUN task.
 
 This MVP imports recorded Jev responses with explicit
 `imported_unverified_dispatch` provenance. Input/request digests are recorded,

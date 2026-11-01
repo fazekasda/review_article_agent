@@ -125,8 +125,9 @@ class WorkflowTests(ManifestBase):
 
     def test_case_context_ready_for_report_with_non_text_assets(self):
         # A cleanly parsed article that declares a figure is ready for screening
-        # (not a human block): the figure keeps its own review flag and the
-        # context text carries the fixed non-text limitation line.
+        # (not a human block): the figure keeps its own review flag and the fixed
+        # non-text limitation line is reserved in every window (not the context
+        # text, which stays the unmodified article text).
         jats = av.jats(body=(
             b"<sec><p>Results body text for screening.</p>"
             b'<fig id="f1"><label>Figure 1</label>'
@@ -143,7 +144,10 @@ class WorkflowTests(ManifestBase):
         self.assertFalse(payload["human_action_required"])
         self.assertTrue(context["ready"])
         self.assertTrue(context["limitation_included"])
-        self.assertIn(workflow.NON_TEXT_MATERIAL_LIMITATION, context["text"])
+        windows = workflow.case_windows(questions(config()), context)
+        self.assertTrue(windows)
+        for window in windows:
+            self.assertIn(workflow.NON_TEXT_MATERIAL_LIMITATION, window)
 
     def test_case_context_not_ready_for_needs_review_report(self):
         # A report with no substantive text stays needs_review and is never ready.

@@ -271,6 +271,11 @@ review-article-agent --data-dir "$DD" screening show \
 - Every case has a human adjudication (`retain`/`exclude`/`uncertain`) with
   `inspected_source: true` and a non-empty rationale.
 - The case count is at least the configured `pilot_size`.
+- A whole article too large for one Jev request is split into deterministic
+  windows (each fits the 32 KiB bound, no text dropped). A case is a machine
+  `proposed_exclusion` only when **every** window's answer is below the exclude
+  threshold and the maximum probability is used for the label; a refusal, missing,
+  or malformed answer in any window keeps that case uncertain, never excluded.
 - No important failure and no **false exclusion** (a case the machine proposed to
   exclude but you judged `retain`/`uncertain`) — either blocks the pilot, and a
   false exclusion needs a corrective action.
