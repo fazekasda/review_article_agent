@@ -505,13 +505,23 @@ exception in [decision 004](decisions/004-step09-direct-extraction.md).
   variable the lead job uses). The worker reads the variable from its **own** environment
   at dispatch; the credential **value** is never accepted over IPC, never written to the
   DB, and never logged.
-- **Honest outcome; never a blind retry.** A terminal `completed`/`failed` outcome is
-  persisted as the job's safe accepted result, which references the run **receipt**
-  (`run_ref`) and carries no credential or raw output. An `unknown`/submitted external
-  outcome moves the job to `waiting_human` (reserve and runtime occupancy retained) and is
-  **never** re-POSTed: on restart the engine proves an existing outcome by replay from
-  durable rows with **zero** POST (`worker.extraction.replay_extract`), and an unprovable
-  attempt is escalated for an explicit owner `reconcile`.
+- **Bounded automatic retry; honest outcome.** An **ambiguous** (`unknown`)
+  `direct_call` outcome (a transport error, timeout, or ambiguous status) is
+  retried automatically and boundedly (decision 006) by
+  [`extraction/runner.py`](../src/review_article_agent/extraction/runner.py)
+  `execute_run`: each attempt is a **new** deterministic identity (`{request_id}`,
+  `-r1`, `-r2`) and the same identity is never re-POSTed; the ambiguous
+  predecessor is conservatively resolved to terminal `failed`/`estimated` = its
+  full reserve (it may have been billed), freeing the project's single serial
+  remote slot, and the per-stage overhead cap bounds the retry cost. A terminal
+  `completed`/`failed` outcome — including an exhausted or overhead-refused chain
+  (a definitive non-completion) — is persisted as the job's safe accepted result,
+  which references the run **receipt** (`run_ref`) and carries no credential or
+  raw output. On restart the engine proves an existing outcome by replay from
+  durable rows with **zero** POST
+  ([`worker.extraction.replay_extract`](../src/review_article_agent/worker/extraction.py),
+  which resolves the retry chain to its completed member); an unprovable attempt
+  is escalated for an explicit owner `reconcile`.
 - **Tests.** [`tests/test_extraction_worker.py`](../tests/test_extraction_worker.py) —
   submission validation, queued admission + asynchronous completion, receipt readback via
   `require_run`, missing credential/gate refusals, replay-is-one-run, ambiguous-outcome

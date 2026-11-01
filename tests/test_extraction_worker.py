@@ -17,7 +17,9 @@ Covers ``src/review_article_agent/worker/extraction.py`` plus the narrow
   :func:`review_article_agent.extraction.runner.require_run`;
 * a missing credential and a missing gate are refused with **zero** POST;
 * an identical replay under the same request id is one run; an ambiguous outcome
-  is never re-sent on recovery (the runner replays by request id);
+  is retried under NEW deterministic identities (never re-sent) and, when the
+  overhead cap refuses a further attempt, resolves to a definitive failure that
+  recovery replays with zero POST (the runner resolves the retry chain);
 * the CLI ``extraction run submit``/``status`` surface.
 
 Run::
@@ -275,18 +277,38 @@ class ExtractReplayTest(ExtractionWorkerBase):
         self.assertEqual(self.transport.call_count, 1)
 
     def test_unknown_outcome_never_reposts_on_recovery(self) -> None:
-        # A transport failure is an ambiguous outcome (the POST may have billed):
-        # the job escalates and is never re-sent, even across a restart.
+        # A transport failure is an ambiguous outcome. The bounded retry sends
+        # NEW identities (never the same request) and, when the per-stage
+        # overhead cap refuses a further attempt, resolves the run to a
+        # definitive non-completion (the single serial remote slot freed).
+        # Recovery then replays the terminal outcome with zero POST.
+        from review_article_agent.extraction import runner as runner_mod
+        from review_article_agent.runtime.dispatch import (
+            runtime_dispatch_remote_state,
+        )
+
         self.transport.responses.append(RuntimeError("ambiguous transport failure"))
         engine = self.engine(api_key="sk-or-test")
         res = self.submit(engine, request_id="run-unknown")
         job_id = res["job"]["job_id"]
-        self._drive(engine)
-        self.assertEqual(self.transport.call_count, 1)
+        with mock.patch.object(runner_mod, "_SLEEP", lambda _delay: None):
+            self._drive(engine)
+        # base + one retry (-r1); each attempt is a distinct request identity.
+        self.assertEqual(self.transport.call_count, 2)
         job = self._job(engine, job_id)
-        self.assertIn(job["state"], {"waiting_human", "reconciliation_required"})
-        self.assertTrue(job["outcome_unresolved"])
-        self.assertIsNone(job.get("accepted_result"))
+        # A terminal run (here a definitive non-completion) is the job's accepted
+        # result; the run status/outcome distinguishes it.
+        self.assertEqual(job["state"], "completed")
+        self.assertFalse(job["outcome_unresolved"])
+        accepted = job.get("accepted_result")
+        self.assertIsNotNone(accepted)
+        self.assertEqual(accepted["result"]["status"], "failed")
+        self.assertEqual(accepted["result"]["outcome"], "failed")
+        # No ambiguous row is left occupying the single serial remote slot.
+        self.assertEqual(
+            runtime_dispatch_remote_state(self.store.connection, self.project_id),
+            "none",
+        )
 
         # A restart proves the outcome by replay and issues no POST.
         engine.close()
@@ -297,10 +319,7 @@ class ExtractReplayTest(ExtractionWorkerBase):
         engine2.reconcile_startup()
         self._drive(engine2)
         self.assertEqual(replay_transport.call_count, 0)
-        self.assertIn(
-            self._job(engine2, job_id)["state"],
-            {"waiting_human", "reconciliation_required"},
-        )
+        self.assertEqual(self._job(engine2, job_id)["state"], "completed")
 
     def test_persisted_run_read_seam(self) -> None:
         self._queue_completion()

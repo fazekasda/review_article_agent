@@ -12,12 +12,20 @@ Status: **complete as a locally verified, XML-text MVP**. Authority:
   `EXTRACTION_EXAMPLE_PASSAGES` provide a synthetic schema example. Links—even
   model-labelled “confirmed” links—remain proposals; unlinked is not independent.
 - `runtime/extraction.py`: bounded single-shot direct OpenRouter extraction and
-  quality checks; explicit models/provider/prices, no automatic retry.
+  quality checks; explicit models/provider/prices; one POST per plan, no retry in
+  the adapter itself (the runner applies the bounded retry, below).
 - `extraction/runner.py`: scoped transfer gates, active-project fencing, cost
   reservations and durable dispatch/proposal-bound receipts. `execute_run(...)`
   is an explicit library call, not a detached worker job or automatic scheduler.
-  `require_run(store, ref, purpose=...)` revalidates the original material and
-  exact accepted dispatch. No imported response can substitute for a dispatch.
+  An **ambiguous** (`unknown`) `direct_call` outcome (transport error/timeout/
+  ambiguous status) is retried automatically and boundedly (decision 006): each
+  attempt is a new deterministic identity (`{request_id}`, `-r1`, `-r2`; the same
+  identity is never re-POSTed), the ambiguous predecessor is resolved to terminal
+  `failed`/`estimated` = its full reserve so the serial remote slot is freed, and
+  the overhead cap bounds the retry cost; an exhausted/overhead-refused chain is a
+  definitive non-completion. `require_run(store, ref, purpose=...)` revalidates
+  the original material and exact accepted dispatch. No imported response can
+  substitute for a dispatch.
 - `extraction/workflow.py`: project-approved appraisal and sampling config, one
   iterative extraction/quality pilot, random/risk output audits, and
   `require_for_synthesis(audit_ref)`. Important audit errors permanently pause the
