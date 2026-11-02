@@ -158,3 +158,12 @@ id. Required items must still be covered exactly once, ids outside the pool are
 still refused, and a finding still cannot cite empty text. This changes the
 validator only; the prompt stays `extraction.direct.v4`. The stored rejected
 response is not re-classified; it remains an escalation.
+
+## Amendment 2026-11-02 (c): pilot hosted-use must not declare an acquisition
+
+The accepted PMC13450824 pilot receipt could not feed its quality check. Its
+hosted-use document declared `acquisition_ref`, so the pilot receipt recorded that
+reference, and `require_run` refuses a pilot receipt that declares bulk authority.
+`execute_run` now refuses that combination before any reserve or POST. The pilot
+hosted-use documents were revised with `acquisition_ref: null`; bulk documents
+keep theirs. The unusable receipt stays in history and is not edited.

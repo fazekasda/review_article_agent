@@ -1440,6 +1440,13 @@ def execute_run(
     ):
         raise ExtractionHostedUseError("hosted-use: extraction_ref does not match the request")
     acquisition_ref = hosted["acquisition_ref"]
+    if mode == "pilot" and acquisition_ref is not None:
+        # A pilot receipt must not declare bulk authority (require_run refuses
+        # it), so refuse before any reserve/POST rather than mint a paid receipt
+        # that no quality run or pilot gate can ever consume.
+        raise ExtractionHostedUseError(
+            "hosted-use: a pilot run's hosted-use must not declare an acquisition_ref"
+        )
 
     passages, source_refs = _derive_material(store, report_refs, config=config)
 
