@@ -310,6 +310,17 @@ class MultiFindingCoverageTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, EXTRACTION_INSTRUCTIONS)
 
+    def test_kind_level_omission_without_target_id(self):
+        # Pilot r7: {"target_kind": "asset", "target_id": null} for figures in general.
+        out = valid_output()
+        out["omissions"] = [{"note": "figure values not read", "target_kind": "asset",
+                             "target_id": None, "important": True}]
+        self.assertEqual(validate(out)["omissions"][0]["target_kind"], "asset")
+        for bad in ("", 7):
+            out["omissions"][0]["target_id"] = bad
+            with self.subTest(target_id=bad), self.assertRaises(ExtractionError):
+                validate(out)
+
     def test_context_extra_key_is_refused(self):
         out = valid_output()
         out["findings"][0]["context"]["conditions_note"] = known("20 °C")

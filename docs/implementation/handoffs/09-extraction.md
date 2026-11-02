@@ -201,3 +201,11 @@ These were omissions and overstatements, not structural errors:
 
 A COMPLETENESS section in the instructions now addresses each of these. Under the
 approved acceptance rule, the pilot is re-run under config r7.
+
+## Amendment 2026-11-02 (f): kind-level omissions
+
+The first v6 call on PMC13450824 (64 findings) was rejected only because an
+omission note said `{"target_kind": "asset", "target_id": null}`, meaning figure
+values in general. An omission may now give `target_kind` with a null `target_id`.
+A given `target_id` must still be a non-empty string. This changes the validator
+only.

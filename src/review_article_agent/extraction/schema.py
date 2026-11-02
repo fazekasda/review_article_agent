@@ -595,7 +595,10 @@ def _validate_omissions(value: object) -> list:
         target_id = item.get("target_id")
         if target_kind is not None:
             _enum(target_kind, label=f"{label}.target_kind", allowed=("passage", "asset"))
-            _string(target_id, label=f"{label}.target_id")
+            # A null target_id is a kind-level omission (e.g. "figure values in
+            # general"); a given target_id must still be a non-empty string.
+            if target_id is not None:
+                _string(target_id, label=f"{label}.target_id")
         else:
             _require(target_id is None, f"{label}.target_id requires target_kind")
         important = item.get("important")
