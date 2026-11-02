@@ -232,6 +232,51 @@ class NumericRepresentationTests(unittest.TestCase):
             validate(out)
 
 
+class MultiFindingCoverageTests(unittest.TestCase):
+    """Third pilot rejection: 67 findings from 35 passages could not be covered."""
+
+    def _two_on_p0002(self):
+        out = valid_output()
+        out["findings"].append(finding("F4", "p0002", "(n=8)"))
+        return out
+
+    def test_finding_ids_cover_several_findings_of_one_passage(self):
+        out = self._two_on_p0002()
+        with self.subTest(case="single finding_id leaves F4 unclaimed"), self.assertRaises(ExtractionError):
+            validate(out)
+        out["coverage"][1] = {"target_kind": "passage", "target_id": "p0002",
+                              "disposition": "finding", "finding_ids": ["F2", "F4"]}
+        entry = validate(out)["coverage"][1]
+        self.assertEqual((entry["finding_id"], entry["finding_ids"]), ("F2", ["F2", "F4"]))
+
+    def test_finding_ids_rules(self):
+        base = {"target_kind": "passage", "target_id": "p0002", "disposition": "finding"}
+        for case, extra in {
+            "both_forms": {"finding_id": "F2", "finding_ids": ["F2", "F4"]},
+            "empty": {"finding_ids": []},
+            "duplicate": {"finding_ids": ["F2", "F2", "F4"]},
+            "other_passage": {"finding_ids": ["F2", "F4", "F1"]},
+            "undeclared": {"finding_ids": ["F2", "F4", "F9"]},
+        }.items():
+            out = self._two_on_p0002()
+            out["coverage"][1] = {**base, **extra}
+            with self.subTest(case=case), self.assertRaises(ExtractionError):
+                validate(out)
+        out = valid_output()
+        out["coverage"][2] = {"target_kind": "passage", "target_id": "p0003",
+                              "disposition": "no_finding", "finding_ids": ["F3"]}
+        with self.subTest(case="not_with_no_finding"), self.assertRaises(ExtractionError):
+            validate(out)
+
+    def test_context_extra_key_is_refused(self):
+        out = valid_output()
+        out["findings"][0]["context"]["conditions_note"] = known("20 °C")
+        with self.assertRaises(ExtractionError):
+            validate(out)
+        self.assertIn("EXACTLY these five keys", EXTRACTION_INSTRUCTIONS)
+        self.assertIn("finding_ids", EXTRACTION_INSTRUCTIONS)
+
+
 class MissingValueTests(unittest.TestCase):
     def test_value_and_dimension_rules(self):
         # P1 merge (S19-PRUNE-A): the original standalone methods are preserved
