@@ -631,6 +631,28 @@ class ResponseDiagnosticCodeTests(unittest.TestCase):
         for code in observed.values():
             self.assertIn(code, extraction.RESPONSE_DIAGNOSTIC_CODES)
 
+    def test_not_json_content_is_classified_without_being_accepted(self):
+        # 2026-11-02 pilot: finish_reason stop, content not strict JSON, cause
+        # unknowable. Each shape gets its own static code; all stay refused.
+        doc = json.dumps({"schema_version": 1, "summary": "s"})
+        cases = {
+            "```json\n" + doc + "\n```": "response_content_json_fenced",
+            "Here is the JSON:\n" + doc: "response_content_json_leading_text",
+            doc + "\nDone.": "response_content_json_trailing_text",
+            doc[:-1]: "response_content_json_truncated",
+            '{"a": 1, "a": 2}': "response_content_json_duplicate_key",
+            '{"a": NaN}': "response_content_json_nonfinite",
+            '{"a": tru}': "response_content_not_json",
+        }
+        for content, code in cases.items():
+            choice = valid_choices()
+            choice["message"]["content"] = content
+            with self.subTest(code=code):
+                result = run(FakeTransport(resp(200, valid_body(choices=[choice]))))
+                self.assertEqual(result.diagnostic.code, code)
+                self.assertIn(code, extraction.RESPONSE_DIAGNOSTIC_CODES)
+                self.assertNotEqual(result.outcome, "completed")
+
     def test_diagnostic_code_never_carries_peer_text(self):
         # The provider error object and the (untrusted) content carry the canary;
         # the diagnostic code and its redacted detail must not.

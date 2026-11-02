@@ -37,7 +37,13 @@ a provider message). The code is persisted in the non-authorizing proposal's
 (readback `diagnostic_code`). It distinguishes branches such as
 `response_finish_length` (the completion hit `max_output_tokens`),
 `response_content_not_json` / `response_content_not_object` (the assistant text
-was not one JSON object), `response_model_mismatch` (the reply was not the
+was not one JSON object). The not-JSON case is broken down further, for diagnosis
+only (the response is still refused): `response_content_json_fenced` (wrapped in a
+Markdown code fence), `_leading_text` / `_trailing_text` (prose before or after one
+JSON value), `_truncated` (stopped early despite finish `stop`), `_duplicate_key`,
+`_nonfinite` (`NaN`/`Infinity`), and `_too_deep`.
+`response_content_not_json` remains the code for any other malformed text.
+Other codes are `response_model_mismatch` (the reply was not the
 requested model), `response_error_object`, `response_envelope_not_json` (the body
 was not JSON at all), and `response_too_large`. A provider-reported cost is
 preserved (exact decimal) on these protocol failures; the reserve is retained when

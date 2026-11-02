@@ -98,6 +98,7 @@ Safety invariants
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from dataclasses import dataclass
 from decimal import Decimal
@@ -180,6 +181,13 @@ RESPONSE_DIAGNOSTIC_CODES = (
     "response_finish_not_stop",
     "response_content_empty",
     "response_content_not_json",
+    "response_content_json_fenced",
+    "response_content_json_leading_text",
+    "response_content_json_trailing_text",
+    "response_content_json_truncated",
+    "response_content_json_duplicate_key",
+    "response_content_json_nonfinite",
+    "response_content_json_too_deep",
     "response_content_not_object",
     "response_content_number_unrepresentable",
     "protocol_error",
@@ -581,13 +589,49 @@ def _parse_extraction_json(text: str) -> Mapping[str, Any]:
         parsed = lead._parse_json(text)
     except lead.LeadProtocolError as exc:
         raise _ResponseDefect(
-            "response_content_not_json", "extraction response is not valid JSON"
+            _not_json_code(text), "extraction response is not valid JSON"
         ) from exc
     if not isinstance(parsed, Mapping):
         raise _ResponseDefect(
             "response_content_not_object", "extraction response is not a JSON object"
         )
     return lead._deep_freeze(_json_portable(parsed))
+
+
+def _not_json_code(text: str) -> str:
+    """Classify why strict parsing failed, as one static code (never echoing text).
+
+    Diagnosis only: the response is still refused. The checks re-parse leniently
+    to tell a fenced, prefixed, suffixed, truncated, duplicate-key, non-finite,
+    or over-deep document apart from otherwise malformed text.
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        return "response_content_json_fenced"
+    start = stripped.find("{")
+    if start > 0:
+        return "response_content_json_leading_text"
+    decoder = json.JSONDecoder()
+    try:
+        _value, end = decoder.raw_decode(stripped)
+    except RecursionError:
+        return "response_content_json_too_deep"
+    except json.JSONDecodeError as exc:
+        # A failure in the last few characters of the text means it stopped early.
+        if exc.pos >= len(stripped) - 2:
+            return "response_content_json_truncated"
+        return "response_content_not_json"
+    if stripped[end:].strip():
+        return "response_content_json_trailing_text"
+    try:
+        json.loads(stripped, object_pairs_hook=lead._no_duplicate_keys)
+    except ValueError:
+        return "response_content_json_duplicate_key"
+    except RecursionError:
+        return "response_content_json_too_deep"
+    if any(token in stripped for token in ("NaN", "Infinity")):
+        return "response_content_json_nonfinite"
+    return "response_content_json_too_deep"
 
 
 def _json_portable(value: Any) -> Any:
