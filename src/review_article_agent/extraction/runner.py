@@ -97,7 +97,7 @@ __all__ = [
 SCHEMA_VERSION = 1
 
 EXTRACTION_STAGE = "extraction"
-PROMPT_VERSION = "extraction.direct.v4"
+PROMPT_VERSION = "extraction.direct.v5"
 ADAPTER_REVISION = "extraction.direct.v1"
 
 HOSTED_USE_DOCUMENT_TYPE = "extraction_hosted_use"
@@ -689,7 +689,9 @@ _QUALITY_CONTRACT = (
     "- escalation: \"none\"|\"human\"|\"stronger_model\".\n"
     "Explicitly seek OMISSIONS and QUALIFICATIONS (things present in the original but "
     "missing or softened in the extraction), not only re-check returned fields. Never "
-    "invent a universal quality score."
+    "invent a universal quality score. "
+    "Be concise: one short sentence per description and per corrective_action; list "
+    "every blocking or major issue, and group similar minor/style issues into one item."
 )
 
 

@@ -285,6 +285,18 @@ class MultiFindingCoverageTests(unittest.TestCase):
         with self.subTest(case="unknown_id"), self.assertRaises(ExtractionError):
             validate(out, pool=pool)
 
+    def test_instructions_cover_citation_markers_and_no_finding_citations(self):
+        # Fifth/sixth pilot rejections: a dropped inline citation ("published,66
+        # whereas") and findings citing passages covered as no_finding.
+        self.assertIn("Inline citation markers are part of the original text", EXTRACTION_INSTRUCTIONS)
+        self.assertIn("must NOT be cited by any finding", EXTRACTION_INSTRUCTIONS)
+        pool = passages()
+        pool[1]["text"] = "The 50 mg dose reduced tumor volume,12 by 12.5 mm3 per mouse (n=8)."
+        out = valid_output()
+        out["findings"][1]["snippet"] = "reduced tumor volume by 12.5 mm3"
+        with self.assertRaises(ExtractionError):
+            validate(out, pool=pool)
+
     def test_context_extra_key_is_refused(self):
         out = valid_output()
         out["findings"][0]["context"]["conditions_note"] = known("20 °C")
