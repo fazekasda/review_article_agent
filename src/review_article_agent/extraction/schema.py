@@ -595,7 +595,16 @@ def _validate_omissions(value: object) -> list:
     return out
 
 
-def _validate_coverage(value: object, findings: dict, required: set) -> tuple[list, set]:
+def _validate_coverage(
+    value: object, findings: dict, required: set, supplied: frozenset = frozenset()
+) -> tuple[list, set]:
+    """Validate coverage; ``supplied`` are pool items that are not required.
+
+    An empty passage (e.g. an asset header without a caption) carries no
+    evidence, so it need not be covered -- but a model that accounts for it
+    (typically as ``omitted``) references a real supplied id, which is accepted.
+    Ids outside the pool are still refused.
+    """
     items = _list(value, label="coverage")
     out = []
     covered: set = set()
@@ -611,7 +620,7 @@ def _validate_coverage(value: object, findings: dict, required: set) -> tuple[li
         target_kind = _enum(item["target_kind"], label=f"{label}.target_kind", allowed=("passage", "asset"))
         target_id = _identifier(item["target_id"], label=f"{label}.target_id")
         key = (target_kind, target_id)
-        _require(key in required, f"{label} references an unknown required item")
+        _require(key in required or key in supplied, f"{label} references an unknown required item")
         _require(key not in covered, "duplicate coverage entry")
         disposition = _enum(item["disposition"], label=f"{label}.disposition", allowed=COVERAGE_DISPOSITIONS)
         finding_id = item.get("finding_id")
@@ -785,7 +794,8 @@ def validate_extraction(output, *, passages, appraisal_dimensions):
     if limitations is not None:
         limitations = _stated(limitations, label="limitations", kind="str")
 
-    coverage, _covered = _validate_coverage(item["coverage"], findings, required)
+    supplied = frozenset(("passage", pid) for pid in passages_by_id) - required
+    coverage, _covered = _validate_coverage(item["coverage"], findings, required, supplied)
 
     normalized = {
         "schema_version": SCHEMA_VERSION,

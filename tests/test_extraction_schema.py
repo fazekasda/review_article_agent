@@ -268,6 +268,23 @@ class MultiFindingCoverageTests(unittest.TestCase):
         with self.subTest(case="not_with_no_finding"), self.assertRaises(ExtractionError):
             validate(out)
 
+    def test_empty_supplied_passage_may_be_covered_but_unknown_ids_are_refused(self):
+        # Fourth pilot rejection: caption-less asset headers (empty passages) were
+        # honestly covered as omitted; they are supplied but not required.
+        pool = passages() + [{"passage_id": "p0004", "source_key": "docA", "text": ""}]
+        out = valid_output()
+        validate(out, pool=pool)  # not required
+        out["coverage"].append({"target_kind": "passage", "target_id": "p0004",
+                                "disposition": "omitted", "reason": "empty_asset_header"})
+        self.assertEqual(validate(out, pool=pool)["coverage"][-1]["target_id"], "p0004")
+        out["coverage"].append({"target_kind": "passage", "target_id": "p0004",
+                                "disposition": "omitted", "reason": "again"})
+        with self.subTest(case="still_exactly_once"), self.assertRaises(ExtractionError):
+            validate(out, pool=pool)
+        out["coverage"][-1]["target_id"] = "p0099"
+        with self.subTest(case="unknown_id"), self.assertRaises(ExtractionError):
+            validate(out, pool=pool)
+
     def test_context_extra_key_is_refused(self):
         out = valid_output()
         out["findings"][0]["context"]["conditions_note"] = known("20 °C")
