@@ -128,3 +128,21 @@ asset-id versus passage-id distinction and the double coverage, tell the model t
 leave out `report_ref`, and forbid ellipsis-joined snippets. The example no longer
 shows a `report_ref`. The validator is unchanged and still strict.
 `extraction run status` now prints `validation_error`.
+
+## Amendment 2026-11-02: several findings per passage (prompt `extraction.direct.v4`)
+
+The v3 call met the id rules but showed a gap in the schema. Coverage takes exactly
+one entry per passage, that entry named one `finding_id`, and every finding had to be
+claimed, so a passage could only yield one finding. The call returned 67 findings
+from 35 passages.
+
+- A `finding` coverage entry may now give `finding_ids` (a non-empty list without
+  duplicates) instead of `finding_id`, but not both. Every listed finding must cite
+  that passage. Every finding must still be claimed.
+- The normalized entry keeps `finding_id` (the first id) and adds `finding_ids` when
+  there are several.
+
+The same call also put an invented `conditions_note` key in `context`. The validator
+still refuses it; the prompt now says `context` has exactly five keys plus `note`.
+Re-expressed in these two forms, the live v3 response validates, with all snippets
+and `reported_as` values grounded.

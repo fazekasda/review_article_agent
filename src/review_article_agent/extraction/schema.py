@@ -149,7 +149,7 @@ NUMBERS
 - QUALIFIED VALUES: a range ("2-3"), inequality ("P<0.01", "at least twenty"), approximation ("~5"), list ("0, 10, 20, and 40"), or a number written in words ("Thirty") is NOT a single known number. Either give one numeric detail per stated number (for a list), or use {"state": "not_applicable", "value": null} and copy the exact original text into `reported_as`. `reported_as` MUST be an exact substring of the finding's passage. Never silently turn a qualified value into a plain number.
 
 CONTEXT (mandatory per finding)
-- Always fill species, population, assay, outcome, and conditions; use missing/unknown/not_applicable where the original does not state them. A finding whose applicable context is not carried cannot support a generalised claim.
+- Always fill species, population, assay, outcome, and conditions; use missing/unknown/not_applicable where the original does not state them. `context` has EXACTLY these five keys plus an optional free-text `note`; put any extra detail (e.g. a qualifier on conditions) in `note`, never in a new key. A finding whose applicable context is not carried cannot support a generalised claim.
 
 ATTRIBUTION AND CITATION
 - attribution: direct_observation | author_interpretation | secondary_account | mixed | unclear | proposed_synthesis.
@@ -158,7 +158,7 @@ ATTRIBUTION AND CITATION
 
 COVERAGE AND OMISSIONS (completeness, not just quote correctness)
 - `coverage` MUST account for EVERY supplied passage_id and every declared asset_id, exactly once, with disposition finding | no_finding | omitted. A header with `asset_ids=[...]` therefore needs one coverage entry for its passage_id (target_kind "passage", e.g. its caption) AND one for each of its asset ids (target_kind "asset").
-- `finding` requires the matching finding_id. `omitted` requires a non-empty reason (e.g. not_scientific_content, table_not_acquired, unreadable, missing_context). An omitted item is a known omission for a later human gate -- it is never silently dropped.
+- `finding` requires the matching finding_id. When ONE passage yields SEVERAL findings, give that passage ONE coverage entry with `finding_ids`: [all of its finding ids] instead of `finding_id`; every finding must be listed by the coverage entry of its own passage. `omitted` requires a non-empty reason (e.g. not_scientific_content, table_not_acquired, unreadable, missing_context). An omitted item is a known omission for a later human gate -- it is never silently dropped.
 - `omissions` records additional known omissions/escalations that are not a supplied passage id. Its optional `target_kind` is ONLY "passage" or "asset" (with the matching `target_id`); for a topic-level omission (e.g. a pathway component no passage addresses), omit both `target_kind` and `target_id` and explain it in `note`.
 
 DISTINCT IDENTITIES (do not conflate)
@@ -599,13 +599,14 @@ def _validate_coverage(value: object, findings: dict, required: set) -> tuple[li
     items = _list(value, label="coverage")
     out = []
     covered: set = set()
+    claimed: set = set()
     for index, raw in enumerate(items):
         label = f"coverage[{index}]"
         item = _keys(
             raw,
             label=label,
             required=frozenset({"target_kind", "target_id", "disposition"}),
-            optional=frozenset({"finding_id", "reason"}),
+            optional=frozenset({"finding_id", "finding_ids", "reason"}),
         )
         target_kind = _enum(item["target_kind"], label=f"{label}.target_kind", allowed=("passage", "asset"))
         target_id = _identifier(item["target_id"], label=f"{label}.target_id")
@@ -614,27 +615,45 @@ def _validate_coverage(value: object, findings: dict, required: set) -> tuple[li
         _require(key not in covered, "duplicate coverage entry")
         disposition = _enum(item["disposition"], label=f"{label}.disposition", allowed=COVERAGE_DISPOSITIONS)
         finding_id = item.get("finding_id")
+        finding_ids = item.get("finding_ids")
         reason = item.get("reason")
         if disposition == "finding":
-            finding_id = _identifier(finding_id, label=f"{label}.finding_id")
-            _require(finding_id in findings, f"{label}.finding_id is not a declared finding")
-            if target_kind == "passage":
-                _require(
-                    findings[finding_id]["passage_id"] == target_id,
-                    f"{label}.finding_id cites a different passage",
-                )
+            # One passage may yield several findings: `finding_ids` lists them all
+            # (`finding_id` remains the single-finding form; not both).
+            if finding_ids is None:
+                ids = [_identifier(finding_id, label=f"{label}.finding_id")]
+            else:
+                _require(finding_id is None, f"{label} must use finding_id or finding_ids, not both")
+                ids = [
+                    _identifier(fid, label=f"{label}.finding_ids[]")
+                    for fid in _list(finding_ids, label=f"{label}.finding_ids", allow_empty=False)
+                ]
+                _require(len(set(ids)) == len(ids), f"{label}.finding_ids has duplicates")
+            for fid in ids:
+                _require(fid in findings, f"{label}.finding_id is not a declared finding")
+                if target_kind == "passage":
+                    _require(
+                        findings[fid]["passage_id"] == target_id,
+                        f"{label}.finding_id cites a different passage",
+                    )
+                claimed.add(fid)
+            finding_id = ids[0]
             _require(reason is None, f"{label}.reason is only allowed when omitted")
         else:
-            _require(finding_id is None, f"{label}.finding_id is only allowed with disposition 'finding'")
+            _require(
+                finding_id is None and finding_ids is None,
+                f"{label}.finding_id is only allowed with disposition 'finding'",
+            )
+            ids = []
             if disposition == "omitted":
                 _string(reason, label=f"{label}.reason")
         covered.add(key)
-        out.append(
-            {"target_kind": target_kind, "target_id": target_id, "disposition": disposition,
-             "finding_id": finding_id, "reason": reason}
-        )
+        entry = {"target_kind": target_kind, "target_id": target_id, "disposition": disposition,
+                 "finding_id": finding_id, "reason": reason}
+        if len(ids) > 1:
+            entry["finding_ids"] = ids
+        out.append(entry)
     # Every finding must be claimed by exactly one coverage entry (completeness).
-    claimed = {entry["finding_id"] for entry in out if entry["disposition"] == "finding"}
     unclaimed = set(findings) - claimed
     _require(not unclaimed, "some findings are not accounted in coverage")
     # Every required passage/asset id must be accounted (fail closed).
@@ -914,10 +933,31 @@ EXTRACTION_OUTPUT_EXAMPLE = {
             "limitations": {"state": "known", "value": "author interpretation, not measured"},
             "numeric_details": [],
         },
+        {
+            "finding_id": "F4",
+            "source_key": "docA",
+            "passage_id": "p0002",
+            "snippet": "(n=8; P<0.01)",
+            "statement": "The 50 mg dose effect was reported with n=8 and P<0.01.",
+            "attribution": "direct_observation",
+            "citation_flag": "own_result",
+            "context": {
+                "species": {"state": "known", "value": "mouse"},
+                "population": {"state": "known", "value": "n=8 mice"},
+                "assay": {"state": "known", "value": "tumor volume"},
+                "outcome": {"state": "known", "value": "statistical significance"},
+                "conditions": {"state": "known", "value": "50 mg dose"},
+                "note": "second finding from the same passage; listed with F2 in finding_ids",
+            },
+            "secondary_warning": {"state": "not_applicable", "value": None},
+            "limitations": {"state": "missing", "value": None},
+            "numeric_details": [],
+            "experiment_id": "E1",
+        },
     ],
     "coverage": [
         {"target_kind": "passage", "target_id": "p0001", "disposition": "finding", "finding_id": "F1"},
-        {"target_kind": "passage", "target_id": "p0002", "disposition": "finding", "finding_id": "F2"},
+        {"target_kind": "passage", "target_id": "p0002", "disposition": "finding", "finding_ids": ["F2", "F4"]},
         {"target_kind": "passage", "target_id": "p0003", "disposition": "finding", "finding_id": "F3"},
         {"target_kind": "asset", "target_id": "tbl1", "disposition": "omitted", "reason": "table_not_acquired"},
     ],

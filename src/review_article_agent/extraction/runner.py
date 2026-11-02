@@ -97,7 +97,7 @@ __all__ = [
 SCHEMA_VERSION = 1
 
 EXTRACTION_STAGE = "extraction"
-PROMPT_VERSION = "extraction.direct.v3"
+PROMPT_VERSION = "extraction.direct.v4"
 ADAPTER_REVISION = "extraction.direct.v1"
 
 HOSTED_USE_DOCUMENT_TYPE = "extraction_hosted_use"
