@@ -167,3 +167,16 @@ reference, and `require_run` refuses a pilot receipt that declares bulk authorit
 `execute_run` now refuses that combination before any reserve or POST. The pilot
 hosted-use documents were revised with `acquisition_ref: null`; bulk documents
 keep theirs. The unusable receipt stays in history and is not edited.
+
+## Amendment 2026-11-02 (d): prompt `extraction.direct.v5` and quality output budget
+
+- PMC13714240 attempts 2 and 3 were rejected for two reasons. Some findings cited
+  passages that the model's own coverage marked `no_finding`. One snippet left out
+  an inline citation marker ("as published,66 whereas"). The instructions now say
+  to keep citation markers inside a snippet or end the snippet before them, and
+  that a `no_finding`/`omitted` passage is never cited. The validator is unchanged.
+- The first Haiku quality check of the accepted PMC13450824 receipt (66 findings)
+  stopped at the 8,192-token output limit (`response_finish_length`). The quality
+  contract now asks for concise items and groups minor issues. It still lists every
+  blocking and major issue. The pilot config r6 raises the quality
+  `max_output_tokens`.
