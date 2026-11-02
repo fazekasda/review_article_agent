@@ -1507,6 +1507,23 @@ class FullFlowIntegrationTest(acq_manifest.ManifestBase):
         synthesis = self.workflow.require_for_synthesis(audit2)
         self.assertTrue(synthesis["accepted"])
 
+    def test_pilot_hosted_use_declaring_acquisition_is_refused_before_post(self):
+        # 2026-11-02 pilot: a pilot hosted-use carried acquisition_ref, so the
+        # paid pilot receipt declared bulk authority and require_run refused it
+        # for every downstream quality run / pilot gate.
+        src, acquisition_ref = self._acquire()
+        self._config_and_report(src)
+        hosted = self._hosted(
+            purpose="extraction", artifact_id="art-hpa", revision_id="rev-hpa",
+            acquisition_ref=acquisition_ref,
+        )
+        with self.assertRaises(runner.ExtractionHostedUseError):
+            self._execute(
+                purpose="extraction", mode="pilot", request_id="p-acq", artifact_id="art-pa",
+                revision_id="rev-pa", hosted_ref=hosted,
+            )
+        self.assertEqual(self.transport.calls, [])
+
     def test_presend_revalidates_revoked_pilot(self):
         src, acquisition_ref = self._acquire()
         self._config_and_report(src)
