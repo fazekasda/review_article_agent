@@ -180,3 +180,24 @@ keep theirs. The unusable receipt stays in history and is not edited.
   contract now asks for concise items and groups minor issues. It still lists every
   blocking and major issue. The pilot config r6 raises the quality
   `max_output_tokens`.
+
+## Amendment 2026-11-02 (e): completeness rules (prompt `extraction.direct.v6`)
+
+Under config r6 both pilot extractions passed the schema, and their Haiku quality
+checks escalated to human review:
+
+- PMC13450824: 1 blocking and 9 major issues.
+- PMC13694258: 1 blocking and 5 major issues.
+
+These were omissions and overstatements, not structural errors:
+
+- results passages marked `no_finding`;
+- null results folded into positive ones or dropped;
+- figure-legend N and test values not captured;
+- a source unit conflict (mM vs µM) and a duration conflict not flagged;
+- a Xenopus-oocyte experiment that lost its species;
+- abstract-only numbers;
+- author mechanism claims tagged as observations.
+
+A COMPLETENESS section in the instructions now addresses each of these. Under the
+approved acceptance rule, the pilot is re-run under config r7.

@@ -161,6 +161,16 @@ COVERAGE AND OMISSIONS (completeness, not just quote correctness)
 - `finding` requires the matching finding_id. When ONE passage yields SEVERAL findings, give that passage ONE coverage entry with `finding_ids`: [all of its finding ids] instead of `finding_id`; every finding must be listed by the coverage entry of its own passage. A passage whose coverage disposition is no_finding or omitted must NOT be cited by any finding; if a finding cites it, its disposition is finding. `omitted` requires a non-empty reason (e.g. not_scientific_content, table_not_acquired, unreadable, missing_context). An omitted item is a known omission for a later human gate -- it is never silently dropped.
 - `omissions` records additional known omissions/escalations that are not a supplied passage id. Its optional `target_kind` is ONLY "passage" or "asset" (with the matching `target_id`); for a topic-level omission (e.g. a pathway component no passage addresses), omit both `target_kind` and `target_id` and explain it in `note`.
 
+COMPLETENESS (omissions are audited against the original)
+- `no_finding` is ONLY for passages that report no result (background, generic methods, acknowledgements). A passage that reports a measured result, including a secondary outcome (development, reproduction, stress, behaviour) or a cost or trade-off, gets a finding even when the review question focuses on another outcome.
+- Every null, non-significant, or negative result is its OWN finding (e.g. "did not significantly affect ROS in aqp-2 mutants"); never fold it into a positive finding.
+- Keep qualifications with the result: non-significance in some conditions, block- or batch-dependence, exclusions or censoring (e.g. matricide excluded), and the comparator. Name the basis of a percentage (relative change vs percentage points) when the original states it; otherwise say in `limitations` that the basis is not stated.
+- Figure and table legends are original text: extract the sample sizes, statistical tests and p-values they state. Values shown only inside a figure or table image stay missing.
+- If the original contradicts itself (e.g. 20 mM in Methods vs 20 µM in the Abstract, or two different durations), report each statement with its own snippet and say in `limitations` that the source is internally inconsistent; never silently pick one.
+- An experiment in another organism or system (e.g. Xenopus oocytes, cell lines) is a finding whose `species` is that organism, not C. elegans.
+- A number stated only in the abstract or summary and not in the body: record it, and say in `limitations` that it is abstract-only and not verified in the body.
+- A claim supported only by a figure the text does not describe, or a mechanism the authors propose (e.g. "establishing a feedforward loop"), is `author_interpretation`, never `direct_observation`.
+
 DISTINCT IDENTITIES (do not conflate)
 - source_records: the document(s)/report(s) actually read; each has a unique source_key.
 - studies, datasets, experiments: separate identity namespaces with unique ids.
