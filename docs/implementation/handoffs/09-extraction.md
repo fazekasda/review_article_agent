@@ -146,3 +146,15 @@ The same call also put an invented `conditions_note` key in `context`. The valid
 still refuses it; the prompt now says `context` has exactly five keys plus `note`.
 Re-expressed in these two forms, the live v3 response validates, with all snippets
 and `reported_as` values grounded.
+
+## Amendment 2026-11-02 (b): coverage of empty supplied passages
+
+The first v4 call on PMC13450824 was **accepted**. The first v4 call on PMC13714240
+was rejected only because it covered 14 asset headers that have no caption as
+`omitted` (`empty_asset_header`). An empty passage carries no evidence, so it is
+not required, and before this amendment a coverage entry for it counted as an
+"unknown required item". Coverage may now also account for any supplied passage
+id. Required items must still be covered exactly once, ids outside the pool are
+still refused, and a finding still cannot cite empty text. This changes the
+validator only; the prompt stays `extraction.direct.v4`. The stored rejected
+response is not re-classified; it remains an escalation.
