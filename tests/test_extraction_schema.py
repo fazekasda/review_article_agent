@@ -297,6 +297,19 @@ class MultiFindingCoverageTests(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             validate(out, pool=pool)
 
+    def test_instructions_carry_the_pilot_completeness_rules(self):
+        # Pilot quality checks (2026-11-02) found omissions, not structural errors.
+        for phrase in (
+            "`no_finding` is ONLY for passages that report no result",
+            "is its OWN finding",
+            "Figure and table legends are original text",
+            "the source is internally inconsistent",
+            "abstract-only and not verified in the body",
+            "is `author_interpretation`, never `direct_observation`",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, EXTRACTION_INSTRUCTIONS)
+
     def test_context_extra_key_is_refused(self):
         out = valid_output()
         out["findings"][0]["context"]["conditions_note"] = known("20 °C")
